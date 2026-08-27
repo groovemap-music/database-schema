@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from postgres_schema import _USER_TABLES
+from groovemap_schema.postgres import _USER_TABLES
 
 
 def test_queue_metrics_table_in_schema() -> None:

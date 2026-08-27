@@ -1,6 +1,6 @@
 """Tests for release_rarity schema definition."""
 
-from postgres_schema import _INSIGHTS_TABLES
+from groovemap_schema.postgres import _INSIGHTS_TABLES
 
 
 class TestReleaseRaritySchema:

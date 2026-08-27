@@ -1,11 +1,11 @@
-"""Tests for schema-init/neo4j_schema.py."""
+"""Tests for the Neo4j schema definitions."""
 
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from neo4j_schema import SCHEMA_STATEMENTS, create_neo4j_schema
+from groovemap_schema.neo4j import SCHEMA_STATEMENTS, create_neo4j_schema
 
 
 @pytest.fixture

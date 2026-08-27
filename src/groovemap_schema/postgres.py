@@ -1,4 +1,4 @@
-"""PostgreSQL schema definitions for the discogsography platform.
+"""PostgreSQL schema definitions for GrooveMap.
 
 Single source of truth for all PostgreSQL tables and indexes.
 All statements use IF NOT EXISTS — safe to run on every startup; subsequent
@@ -9,6 +9,7 @@ import logging
 from typing import Any, cast
 
 from psycopg import sql
+
 
 logger = logging.getLogger(__name__)
 
@@ -778,7 +779,7 @@ async def create_postgres_schema(pool: Any) -> int:
         await conn.set_autocommit(True)
         # psycopg async cursor types are not fully inferred by mypy
         async with conn.cursor() as cursor_cm:
-            cursor = cast(Any, cursor_cm)
+            cursor = cast("Any", cursor_cm)
 
             # ── Per-entity tables and shared indexes ──────────────────────────
             for table_name in _ENTITY_TABLES:
@@ -798,18 +799,14 @@ async def create_postgres_schema(pool: Any) -> int:
                     ),
                     (
                         f"idx_{table_name}_hash",
-                        sql.SQL(
-                            "CREATE INDEX IF NOT EXISTS {index} ON {table} (hash)"
-                        ).format(
+                        sql.SQL("CREATE INDEX IF NOT EXISTS {index} ON {table} (hash)").format(
                             index=sql.Identifier(f"idx_{table_name}_hash"),
                             table=sql.Identifier(table_name),
                         ),
                     ),
                     (
                         f"idx_{table_name}_updated_at",
-                        sql.SQL(
-                            "CREATE INDEX IF NOT EXISTS {index} ON {table} (updated_at)"
-                        ).format(
+                        sql.SQL("CREATE INDEX IF NOT EXISTS {index} ON {table} (updated_at)").format(
                             index=sql.Identifier(f"idx_{table_name}_updated_at"),
                             table=sql.Identifier(table_name),
                         ),
@@ -820,7 +817,7 @@ async def create_postgres_schema(pool: Any) -> int:
                         await cursor.execute(stmt)
                         logger.info(f"✅ Schema: {name}")
                         success_count += 1
-                    except Exception as e:  # noqa: BLE001 - one failed schema object is counted and reported, not fatal
+                    except Exception as e:
                         logger.error(f"❌ Failed to create schema object '{name}': {e}")
                         failure_count += 1
 
@@ -830,7 +827,7 @@ async def create_postgres_schema(pool: Any) -> int:
                     await cursor.execute(stmt)
                     logger.info(f"✅ Schema: {name}")
                     success_count += 1
-                except Exception as e:  # noqa: BLE001 - one failed schema object is counted and reported, not fatal
+                except Exception as e:
                     logger.error(f"❌ Failed to create schema object '{name}': {e}")
                     failure_count += 1
 
@@ -840,7 +837,7 @@ async def create_postgres_schema(pool: Any) -> int:
                     await cursor.execute(stmt)
                     logger.info(f"✅ Schema: {name}")
                     success_count += 1
-                except Exception as e:  # noqa: BLE001 - one failed schema object is counted and reported, not fatal
+                except Exception as e:
                     logger.error(f"❌ Failed to create schema object '{name}': {e}")
                     failure_count += 1
 
@@ -850,7 +847,7 @@ async def create_postgres_schema(pool: Any) -> int:
                     await cursor.execute(stmt)
                     logger.info(f"✅ Schema: {name}")
                     success_count += 1
-                except Exception as e:  # noqa: BLE001 - one failed schema object is counted and reported, not fatal
+                except Exception as e:
                     logger.error(f"❌ Failed to create schema object '{name}': {e}")
                     failure_count += 1
 
@@ -860,7 +857,7 @@ async def create_postgres_schema(pool: Any) -> int:
                     await cursor.execute(stmt)
                     logger.info(f"✅ Schema: {name}")
                     success_count += 1
-                except Exception as e:  # noqa: BLE001 - one failed schema object is counted and reported, not fatal
+                except Exception as e:
                     logger.error(f"❌ Failed to create schema object '{name}': {e}")
                     failure_count += 1
 
@@ -872,8 +869,5 @@ async def create_postgres_schema(pool: Any) -> int:
         + len(_MUSICBRAINZ_TABLES)
         + len(_MUSICBRAINZ_INDEXES)
     )
-    logger.info(
-        f"✅ PostgreSQL schema creation complete: "
-        f"{success_count} succeeded, {failure_count} failed (total: {total})"
-    )
+    logger.info(f"✅ PostgreSQL schema creation complete: {success_count} succeeded, {failure_count} failed (total: {total})")
     return failure_count

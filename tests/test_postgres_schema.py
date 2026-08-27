@@ -1,11 +1,11 @@
-"""Tests for schema-init/postgres_schema.py."""
+"""Tests for the PostgreSQL schema definitions."""
 
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from postgres_schema import (
+from groovemap_schema.postgres import (
     _ENTITY_TABLES,
     _INSIGHTS_TABLES,
     _MUSICBRAINZ_INDEXES,

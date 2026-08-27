@@ -1,6 +1,6 @@
 """Tests for MusicBrainz PostgreSQL schema definitions."""
 
-from postgres_schema import _MUSICBRAINZ_INDEXES, _MUSICBRAINZ_TABLES
+from groovemap_schema.postgres import _MUSICBRAINZ_INDEXES, _MUSICBRAINZ_TABLES
 
 
 def test_musicbrainz_tables_defined():

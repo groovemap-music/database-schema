@@ -1,4 +1,4 @@
-"""Neo4j schema definitions: constraints and indexes for the discogsography platform.
+"""Neo4j schema definitions: constraints and indexes for GrooveMap.
 
 Single source of truth for all Neo4j constraints and indexes.
 All statements use IF NOT EXISTS — safe to run on every startup; subsequent
@@ -12,6 +12,7 @@ of conflicts between constraint-backed indexes and explicit range indexes.
 
 import logging
 from typing import Any
+
 
 logger = logging.getLogger(__name__)
 
@@ -181,13 +182,10 @@ async def create_neo4j_schema(driver: Any) -> int:
                 await result.consume()
                 logger.info(f"✅ Schema: {name}")
                 success_count += 1
-            except Exception as e:  # noqa: BLE001 - one failed schema object is counted and reported, not fatal
+            except Exception as e:
                 logger.error(f"❌ Failed to create schema object '{name}': {e}")
                 failure_count += 1
 
     total = len(SCHEMA_STATEMENTS)
-    logger.info(
-        f"✅ Neo4j schema creation complete: "
-        f"{success_count} succeeded, {failure_count} failed (total: {total})"
-    )
+    logger.info(f"✅ Neo4j schema creation complete: {success_count} succeeded, {failure_count} failed (total: {total})")
     return failure_count

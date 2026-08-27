@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "discogsography-schema-init"
+name = "groovemap-database-schema"
 version = "0.1.0"
-description = "One-shot schema initializer for Neo4j and PostgreSQL"
+description = "Versioned Neo4j and PostgreSQL schema definitions for GrooveMap"
 authors = [{name = "Robert Wlodarczyk", email = "robert@simplicityguy.com"}]
 readme = "README.md"
 requires-python = ">=3.13"
@@ -15,32 +15,87 @@ classifiers = [
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
 ]
-license = {text = "PolyForm-Noncommercial-1.0.0"}
-dependencies = [
-    "neo4j-rust-ext>=6.2.0.0",
-    "psycopg[binary]>=3.3.4",
-    "structlog>=26.1.0",
+license = "LicenseRef-PolyForm-Noncommercial-1.0.0"
+license-files = ["LICENSE"]
+dependencies = ["psycopg[binary]>=3.3.4"]
+
+[project.optional-dependencies]
+runtime = [
+    "groovemap-runtime[neo4j,postgres] @ git+ssh://git@github.com/groovemap-music/python-libraries.git@28fa329702bc76896cc54ab8d05ec5b1bd3d929e",
 ]
+
+[project.urls]
+Homepage = "https://groovemap.music"
+Repository = "https://github.com/groovemap-music/database-schema"
+Issues = "https://github.com/groovemap-music/database-schema/issues"
 
 [tool.hatch.build.targets.wheel]
-packages = ["."]
+packages = ["src/groovemap_schema"]
 
-# Tool configurations inherit from root pyproject.toml
-# Only service-specific overrides are defined here
+[tool.hatch.build.targets.wheel.force-include]
+"contracts" = "groovemap_schema/contracts"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[dependency-groups]
+dev = [
+    "commitizen>=4.18.0",
+    "cyclonedx-bom>=7.3.1",
+    "mypy>=2.3.1",
+    "pip-audit>=2.10.1",
+    "pip-licenses>=5.5.5",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.16.4",
+]
+
+[tool.ruff]
+line-length = 150
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["ARG", "B", "C4", "E", "F", "I", "PLC", "PTH", "RUF", "S", "SIM", "T20", "TCH", "UP", "W"]
+ignore = ["B008", "C901", "E501", "S101"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["groovemap_schema"]
+lines-after-imports = 2
 
 [tool.ruff.lint.per-file-ignores]
-"schema_init.py" = ["T201"]    # Allow print statements for ASCII art
+"**/__init__.py" = ["F401"]
+"tests/**/*.py" = ["PLC", "S105", "T201"]
 
-[[tool.mypy.overrides]]
-module = [
-    "neo4j.*",
-    "psycopg.*",
-]
-ignore_missing_imports = true
-
-[tool.coverage.run]
-source = ["schema-init"]
+[tool.mypy]
+python_version = "3.13"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+packages = ["groovemap_schema"]
 
 [tool.pytest.ini_options]
-testpaths = ["../tests/schema-init"]
+addopts = "-ra -q --strict-markers --tb=short"
+testpaths = ["tests"]
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.commitizen]
+name = "cz_conventional_commits"
+version_provider = "uv"
+version_scheme = "pep440"
+version_files = ["src/groovemap_schema/__init__.py"]
+tag_format = "v$version"
+annotated_tag = true
+update_changelog_on_bump = true
+changelog_file = "CHANGELOG.md"
+changelog_start_rev = "8543cab"
