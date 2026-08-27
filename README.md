@@ -41,7 +41,7 @@ artifacts; it does not publish a package or GitHub Release.
 
 ## License and history
 
-The current tree preserves the source [PolyForm Noncommercial 1.0.0 license](LICENSE).
+The current tree is licensed under the [MIT License](LICENSE).
 History was extracted from `SimplicityGuy/discogsography` by filtering only `main` for
 `schema-init/`, `tests/schema-init/`, and `LICENSE`, then promoting the owned paths to the
 repository root. The exact reproducible command and source commit are in
