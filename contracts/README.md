@@ -1,7 +1,7 @@
 # Persistence contracts
 
 See the repository [documentation index](../docs/README.md) for schema ownership and
-provenance.
+runtime behavior.
 
 `database-schema` owns Neo4j and PostgreSQL compatibility. Versioned metadata in
 `persistence/` defines the policy; the executable definitions are packaged from
