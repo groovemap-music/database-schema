@@ -12,7 +12,10 @@ esac
 trap 'rm -rf -- "$check_dir"' EXIT
 
 uv venv --python 3.14 "$check_dir/venv"
-uv pip install --python "$check_dir/venv/bin/python" "$schema_wheel"
+uv pip install \
+  --python "$check_dir/venv/bin/python" \
+  --find-links .build/private \
+  "$schema_wheel"
 "$check_dir/venv/bin/python" - <<'PY'
 from importlib.resources import files
 

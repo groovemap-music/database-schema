@@ -1,0 +1,11 @@
+.git
+.github
+.venv
+python-libraries
+htmlcov
+**/__pycache__
+**/*.pyc
+tests
+docs
+secrets
+.env*

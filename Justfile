@@ -22,7 +22,7 @@ typecheck:
     uv run mypy
 
 test:
-    uv run pytest
+    uv run pytest --cov=groovemap_schema --cov-report=term-missing --cov-report=xml
 
 contract-check:
     uv run python scripts/check-contracts.py
@@ -30,7 +30,13 @@ contract-check:
 build:
     uv build --out-dir dist --clear
 
-install-check: build
+prepare-runtime-wheel:
+    bash scripts/prepare-runtime-wheel.sh
+
+image: build prepare-runtime-wheel
+    bash scripts/build-image.sh
+
+install-check: build prepare-runtime-wheel
     bash scripts/install-check.sh
 
 license-check:
