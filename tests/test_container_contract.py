@@ -10,6 +10,8 @@ import pytest
 
 
 ROOT = Path(__file__).parent.parent
+AUTOMATION_REVISION = "2f34a4da5c552bc23c75edd3d8d81be0a4b3271c"
+PRIVATE_LIBRARY_REVISION = "28fa329702bc76896cc54ab8d05ec5b1bd3d929e"
 
 
 def test_dockerfile_uses_repository_image_identity() -> None:
@@ -106,8 +108,75 @@ def test_legal_and_repository_documentation_contract() -> None:
 
 
 def test_reusable_workflows_are_immutably_pinned() -> None:
-    for name in ("ci.yml", "release.yml"):
+    expected = {
+        "ci.yml": "reusable-ci.yml",
+        "release.yml": "reusable-release.yml",
+    }
+    for name, reusable_name in expected.items():
         workflow = (ROOT / ".github" / "workflows" / name).read_text()
-        refs = re.findall(r"uses: groovemap-music/\.github/\.github/workflows/[^@]+@([^\s]+)", workflow)
-        assert refs
-        assert all(re.fullmatch(r"[0-9a-f]{40}", ref) for ref in refs)
+        refs = re.findall(
+            rf"uses: groovemap-music/automation/\.github/workflows/{reusable_name}@([^\s]+)",
+            workflow,
+        )
+        assert refs == [AUTOMATION_REVISION]
+        assert "groovemap-music/.github/" not in workflow
+        assert "secrets: inherit" not in workflow
+
+
+def test_dependabot_pull_requests_run_the_ordinary_required_ci_graph() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+
+    assert "pull_request:" in workflow
+    assert "schedule:" in workflow
+    assert "workflow_dispatch:" in workflow
+    jobs = workflow.split("jobs:\n", 1)[1]
+    assert len(re.findall(r"^  [a-zA-Z0-9_-]+:\s*$", jobs, re.MULTILINE)) == 1
+    assert "jobs:\n  required:" in workflow
+    assert "github.actor" not in workflow.lower()
+    assert "dependabot" not in workflow.lower()
+    assert "fallback-command" not in workflow
+    assert "if:" not in workflow.lower()
+
+    for fragment in (
+        "language: python",
+        "setup-command: just setup",
+        "check-command: just check",
+        "coverage-command: just test",
+        "audit-command: just audit",
+        "license-command: just license-check",
+        "secret-scan-command: just secret-scan",
+        "package-command: just build",
+        "install-command: just install-check",
+        "image-command: just image",
+        "coverage-files: coverage.xml",
+        "upload-codecov: true",
+        "requires-private-library: true",
+        "private-library-client-id: ${{ vars.GROOVEMAP_CI_APP_CLIENT_ID }}",
+        f"private-library-revision: {PRIVATE_LIBRARY_REVISION}",
+        "PRIVATE_LIBRARY_PRIVATE_KEY: ${{ secrets.GROOVEMAP_CI_APP_PRIVATE_KEY }}",
+        "CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}",
+    ):
+        assert fragment in workflow
+
+
+def test_release_is_tag_only_and_uses_repository_named_image() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()
+
+    assert re.search(r'on:\s*\n  push:\s*\n    tags: \["v\*"\]', workflow)
+    assert "workflow_dispatch:" not in workflow
+    assert "schedule:" not in workflow
+    assert "branches:" not in workflow
+    assert "repository-name: database-schema" in workflow
+    assert "release-command: just release-dry-run" in workflow
+    assert "publish-image: true" in workflow
+    assert "prepare-image-command: just prepare-runtime-wheel" in workflow
+    assert "latest" not in workflow.lower()
+
+
+def test_release_dry_run_produces_shared_automation_evidence() -> None:
+    script = (ROOT / "scripts" / "release-dry-run.sh").read_text()
+
+    assert "dist/SHA256SUMS" in script
+    assert "dist/sbom.json" in script
+    assert "dist/THIRD_PARTY_NOTICES.json" in script
+    assert "pip-licenses --format=json" in script
