@@ -24,6 +24,18 @@ database when needed and applies both schema families. See the
 [runtime configuration](docs/runtime-configuration.md) for its environment and secret-file
 interface.
 
+The installed command exposes a local-only help and version surface without contacting a
+database:
+
+```bash
+database-schema --help
+database-schema --version
+```
+
+Running `database-schema` without an informational option applies the schemas. The command
+returns zero only after PostgreSQL and Neo4j both succeed; deployment uses that process exit
+status as its readiness dependency.
+
 ## Compatibility and runtime boundary
 
 Additive changes may remain within a contract version. Renames, removals, type changes,
@@ -43,9 +55,6 @@ only. An approved `v*` tag publishes a provenance-attested, SBOM-enabled image t
 
 ## License and history
 
-The current tree is licensed under the [MIT License](LICENSE).
-History was extracted from `SimplicityGuy/discogsography` by filtering only `main` for
-`schema-init/`, `tests/schema-init/`, and `LICENSE`, then promoting the owned paths to the
-repository root. The exact reproducible command and source commit are in
-[`docs/extraction.md`](docs/extraction.md). The original monorepo remains unchanged. See
-the [documentation index](docs/README.md) for runtime ownership and provenance.
+The current tree is licensed under the [MIT License](LICENSE). The accompanying
+[NOTICE](NOTICE) records the prior-license boundary. See the
+[documentation index](docs/README.md) for architecture, runtime ownership, and configuration.
