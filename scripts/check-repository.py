@@ -9,6 +9,8 @@ import sys
 import tomllib
 from pathlib import Path
 
+from repository_source import RepositorySourceError, check_retired_branding
+
 
 ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY = "https://github.com/groovemap-music/database-schema"
@@ -162,12 +164,15 @@ require(not list((ROOT / ".github/workflows").glob("*claude*")), "legacy Claude 
 
 retired_name = "discogs" + "ography"
 published_extensions = {".json", ".md", ".py", ".sh", ".toml", ".yaml", ".yml"}
-for path in ROOT.rglob("*"):
-    if not path.is_file() or path.suffix not in published_extensions:
-        continue
-    if any(part in {".git", ".venv", ".build", "dist"} for part in path.relative_to(ROOT).parts):
-        continue
-    require(retired_name not in path.read_text().lower(), f"published source retains retired project branding: {path.relative_to(ROOT)}")
+try:
+    check_retired_branding(
+        ROOT,
+        retired_name=retired_name,
+        published_extensions=published_extensions,
+        excluded_parts={".git", ".venv", ".build", "dist"},
+    )
+except RepositorySourceError as error:
+    raise SystemExit(str(error)) from error
 
 readme = (ROOT / "README.md").read_text()
 docs_index = (ROOT / "docs/README.md").read_text()
