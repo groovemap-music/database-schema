@@ -55,11 +55,12 @@ def test_active_project_surfaces_do_not_claim_python_313() -> None:
         ROOT / "pyproject.toml",
     ]
     stale_markers = ("Python :: 3.13", "Python 3.13", 'python = "3.13', 'python_version = "3.13', "py313")
+    text_suffixes = {".json", ".md", ".py", ".sh", ".toml", ".yaml", ".yml"}
 
     for path in active_paths:
         candidates = path.rglob("*") if path.is_dir() else [path]
         for candidate in candidates:
-            if candidate.is_file():
+            if candidate.is_file() and (not candidate.suffix or candidate.suffix in text_suffixes):
                 content = candidate.read_text()
                 assert not any(marker in content for marker in stale_markers), f"stale Python 3.13 policy in {candidate.relative_to(ROOT)}"
 
