@@ -4,6 +4,11 @@ ARG PYTHON_IMAGE=python:3.14.5-slim@sha256:c845af9399020c7e562969a13689e929074a1
 
 FROM ${PYTHON_IMAGE} AS builder
 
+ARG VCS_REF
+
+COPY scripts/validate_vcs_ref.py /tmp/validate_vcs_ref.py
+RUN python /tmp/validate_vcs_ref.py "${VCS_REF}" && rm /tmp/validate_vcs_ref.py
+
 RUN pip install --no-cache-dir uv==0.12.5
 WORKDIR /app
 

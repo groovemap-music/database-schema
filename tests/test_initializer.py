@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from groovemap_schema import initializer
+from groovemap_schema import __version__, initializer
 
 
 @pytest.fixture(autouse=True)
@@ -207,3 +207,21 @@ def test_runtime_defaults_use_groovemap_identity() -> None:
     assert initializer.NEO4J_PASSWORD == "groovemap"
     assert initializer.SERVICE_NAME == "database-schema"
     assert initializer.SERVICE_NAME in initializer.BANNER
+
+
+def test_cli_version_is_local_and_does_not_initialize(capsys: pytest.CaptureFixture[str]) -> None:
+    with patch.object(initializer.asyncio, "run") as run, pytest.raises(SystemExit) as raised:
+        initializer.cli(["--version"])
+
+    assert raised.value.code == 0
+    assert capsys.readouterr().out.strip() == f"database-schema {__version__}"
+    run.assert_not_called()
+
+
+def test_cli_runs_initializer_and_propagates_status() -> None:
+    with patch.object(initializer.asyncio, "run", return_value=1) as run, pytest.raises(SystemExit) as raised:
+        initializer.cli([])
+
+    assert raised.value.code == 1
+    run.assert_called_once()
+    run.call_args.args[0].close()

@@ -7,9 +7,9 @@ statement is idempotent, so running the command at each deployment is safe.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import os
-import sys
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -25,6 +25,7 @@ from common import (
 from common.config import _build_neo4j_uri, get_secret
 from psycopg import sql
 
+from groovemap_schema import __version__
 from groovemap_schema.neo4j import create_neo4j_schema
 from groovemap_schema.postgres import create_postgres_schema
 
@@ -156,10 +157,16 @@ async def main() -> int:
     return 1
 
 
-def cli() -> NoReturn:
-    """Console-script boundary."""
+def cli(argv: list[str] | None = None) -> NoReturn:
+    """Parse the stable command interface and run the one-shot initializer."""
+    parser = argparse.ArgumentParser(
+        prog=SERVICE_NAME,
+        description="Apply the GrooveMap PostgreSQL and Neo4j schemas.",
+    )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.parse_args(argv)
     raise SystemExit(asyncio.run(main()))
 
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    cli()
