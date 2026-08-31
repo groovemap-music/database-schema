@@ -96,6 +96,7 @@ for fragment in (
 
 ci = (ROOT / ".github/workflows/ci.yml").read_text()
 release = (ROOT / ".github/workflows/release.yml").read_text()
+require("attestations: write" in release, "release.yml must grant the reusable release attestation permission")
 for workflow_name, workflow, reusable_name in (
     ("ci.yml", ci, "reusable-ci.yml"),
     ("release.yml", release, "reusable-release.yml"),
