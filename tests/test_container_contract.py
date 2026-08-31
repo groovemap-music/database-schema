@@ -229,6 +229,7 @@ def test_dependabot_pull_requests_run_the_ordinary_required_ci_graph() -> None:
 def test_release_is_tag_only_and_uses_repository_named_image() -> None:
     workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()
 
+    assert re.search(r"permissions:\s*\n(?:  [^\n]+\n)*  attestations: write", workflow)
     assert re.search(r'on:\s*\n  push:\s*\n    tags: \["v\*"\]', workflow)
     assert "workflow_dispatch:" not in workflow
     assert "schedule:" not in workflow
