@@ -2,6 +2,7 @@
 
 import json
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -12,6 +13,17 @@ import pytest
 ROOT = Path(__file__).parent.parent
 AUTOMATION_REVISION = "2f34a4da5c552bc23c75edd3d8d81be0a4b3271c"
 PRIVATE_LIBRARY_REVISION = "28fa329702bc76896cc54ab8d05ec5b1bd3d929e"
+
+
+def _required_executable(name: str) -> str:
+    executable = shutil.which(name)
+    if executable is None:
+        raise RuntimeError(f"required test executable is unavailable: {name}")
+    return executable
+
+
+GIT = _required_executable("git")
+BASH = _required_executable("bash")
 
 
 def test_dockerfile_uses_repository_image_identity() -> None:
@@ -38,6 +50,7 @@ def test_one_shot_image_uses_exit_status_as_health_contract() -> None:
 
 def test_local_image_name_matches_repository() -> None:
     script = (ROOT / "scripts" / "build-image.sh").read_text()
+    assert "bash scripts/check-image-source.sh" in script
     assert "--tag database-schema:local" in script
     assert "VCS_REF=${revision}" in script
     assert 'expect_invalid_revision_rejected ""' in script
@@ -45,6 +58,60 @@ def test_local_image_name_matches_repository() -> None:
     assert "BUILD_VERSION=${version}" in script
     assert "BUILD_DATE=${build_date}" in script
     assert "check-image-metadata.py" in script
+
+
+def _image_source_repository(tmp_path: Path) -> Path:
+    repository = tmp_path / "repository"
+    scripts = repository / "scripts"
+    scripts.mkdir(parents=True)
+    shutil.copy(ROOT / "scripts" / "check-image-source.sh", scripts)
+    (repository / "tracked.txt").write_text("committed\n")
+    subprocess.run([GIT, "init", "--quiet"], cwd=repository, check=True)  # noqa: S603
+    subprocess.run([GIT, "add", "."], cwd=repository, check=True)  # noqa: S603
+    subprocess.run(  # noqa: S603
+        [
+            GIT,
+            "-c",
+            "user.name=GrooveMap Test",
+            "-c",
+            "user.email=test@groovemap.music",
+            "commit",
+            "--quiet",
+            "-m",
+            "test: establish image source",
+        ],
+        cwd=repository,
+        check=True,
+    )
+    return repository
+
+
+def test_image_source_check_allows_hosted_dependency_checkout(tmp_path: Path) -> None:
+    repository = _image_source_repository(tmp_path)
+    dependency = repository / "python-libraries"
+    dependency.mkdir()
+    (dependency / "README.md").write_text("workflow-injected dependency\n")
+
+    subprocess.run([BASH, "scripts/check-image-source.sh"], cwd=repository, check=True)  # noqa: S603
+
+
+@pytest.mark.parametrize("staged", [False, True], ids=["unstaged", "staged"])
+def test_image_source_check_rejects_modified_tracked_source(tmp_path: Path, staged: bool) -> None:
+    repository = _image_source_repository(tmp_path)
+    (repository / "tracked.txt").write_text("modified\n")
+    if staged:
+        subprocess.run([GIT, "add", "tracked.txt"], cwd=repository, check=True)  # noqa: S603
+
+    result = subprocess.run(  # noqa: S603
+        [BASH, "scripts/check-image-source.sh"],
+        cwd=repository,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "modified tracked source" in result.stderr
 
 
 @pytest.mark.parametrize("revision", ["", "abc123", "A" * 40, "g" * 40, "0" * 39, "0" * 41])
