@@ -4,10 +4,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${repo_root}"
 
-if [[ -n "$(git status --short)" ]]; then
-  echo "Refusing to label an image from a dirty source tree." >&2
-  exit 2
-fi
+bash scripts/check-image-source.sh
 
 version="$(python - <<'PY'
 import tomllib

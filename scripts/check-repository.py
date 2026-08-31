@@ -83,6 +83,7 @@ require("dist" not in dockerignore and ".build" not in dockerignore, "Docker con
 
 build_image = (ROOT / "scripts/build-image.sh").read_text()
 for fragment in (
+    "bash scripts/check-image-source.sh",
     "BUILD_DATE=${build_date}",
     "BUILD_VERSION=${version}",
     "VCS_REF=${revision}",
