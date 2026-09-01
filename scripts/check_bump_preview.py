@@ -1,4 +1,4 @@
-"""Validate the next Commitizen bump, including the released-HEAD no-op state."""
+"""Validate the next Commitizen bump, including explicit release-boundary states."""
 
 from __future__ import annotations
 
@@ -14,11 +14,22 @@ if TYPE_CHECKING:
 COMMAND = ("cz", "bump", "--dry-run", "--changelog", "--yes", "--check-consistency")
 NO_COMMITS_EXIT = 3
 NO_COMMITS_MARKERS = ("[NO_COMMITS_FOUND]", "No new commits found.")
+RELEASE_GAP_EXIT = 16
+RELEASE_GAP_MARKERS = (
+    "bump: version ",
+    "tag to create: v",
+    "increment detected: ",
+    "No tag found to do an incremental changelog",
+)
 
 
 def accepted_result(returncode: int, output: str) -> bool:
-    """Return whether Commitizen produced a valid preview or released-HEAD no-op."""
-    return returncode == 0 or (returncode == NO_COMMITS_EXIT and all(marker in output for marker in NO_COMMITS_MARKERS))
+    """Return whether Commitizen produced a valid explicit preview state."""
+    return (
+        returncode == 0
+        or (returncode == NO_COMMITS_EXIT and all(marker in output for marker in NO_COMMITS_MARKERS))
+        or (returncode == RELEASE_GAP_EXIT and all(marker in output for marker in RELEASE_GAP_MARKERS))
+    )
 
 
 def main(command: Sequence[str] = COMMAND) -> int:
