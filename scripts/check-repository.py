@@ -15,7 +15,7 @@ from repository_source import RepositorySourceError, check_retired_branding
 ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY = "https://github.com/groovemap-music/database-schema"
 AUTOMATION_REVISION = "2f34a4da5c552bc23c75edd3d8d81be0a4b3271c"
-PRIVATE_LIBRARY_REVISION = "28fa329702bc76896cc54ab8d05ec5b1bd3d929e"
+PYTHON_LIBRARIES_REVISION = "28fa329702bc76896cc54ab8d05ec5b1bd3d929e"
 
 
 def require(condition: bool, message: str) -> None:
@@ -122,15 +122,20 @@ for fragment in (
     "image-command: just image",
     "coverage-files: coverage.xml",
     "upload-codecov: true",
-    "requires-private-library: true",
-    "private-library-client-id: ${{ vars.GROOVEMAP_CI_APP_CLIENT_ID }}",
-    f"private-library-revision: {PRIVATE_LIBRARY_REVISION}",
-    "PRIVATE_LIBRARY_PRIVATE_KEY: ${{ secrets.GROOVEMAP_CI_APP_PRIVATE_KEY }}",
     "CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}",
 ):
     require(fragment in ci, f"CI does not execute the full shared validation contract: {fragment}")
 for forbidden in ("fallback-command", "github.actor", "dependabot", "if:"):
     require(forbidden not in ci.lower(), f"CI must not reduce or skip checks based on pull-request author: {forbidden}")
+for forbidden in (
+    "requires-private-library",
+    "private-library-client-id",
+    "private-library-revision",
+    "private_library_private_key",
+    "groovemap_ci_app_client_id",
+    "groovemap_ci_app_private_key",
+):
+    require(forbidden not in ci.lower(), f"CI retains obsolete private-library credential configuration: {forbidden}")
 ci_jobs = ci.split("jobs:\n", 1)[1]
 require(len(re.findall(r"^  [a-zA-Z0-9_-]+:\s*$", ci_jobs, re.MULTILINE)) == 1, "CI must expose one required caller job for every event")
 
@@ -146,14 +151,23 @@ for fragment in (
     "build-context: .",
     "dockerfile: Dockerfile",
     "prepare-image-command: just prepare-runtime-wheel",
-    "requires-private-library: true",
-    "private-library-client-id: ${{ vars.GROOVEMAP_CI_APP_CLIENT_ID }}",
-    f"private-library-revision: {PRIVATE_LIBRARY_REVISION}",
-    "PRIVATE_LIBRARY_PRIVATE_KEY: ${{ secrets.GROOVEMAP_CI_APP_PRIVATE_KEY }}",
 ):
     require(fragment in release, f"release does not execute the full shared release contract: {fragment}")
 for forbidden in ("workflow_dispatch:", "schedule:", "branches:", "latest", "secrets: inherit"):
     require(forbidden not in release.lower(), f"release caller contains a forbidden mutable or non-tag path: {forbidden}")
+for forbidden in (
+    "requires-private-library",
+    "private-library-client-id",
+    "private-library-revision",
+    "private_library_private_key",
+    "groovemap_ci_app_client_id",
+    "groovemap_ci_app_private_key",
+):
+    require(forbidden not in release.lower(), f"release retains obsolete private-library credential configuration: {forbidden}")
+
+pyproject_text = (ROOT / "pyproject.toml").read_text()
+require("https://github.com/groovemap-music/python-libraries.git" in pyproject_text, "public python-libraries source is missing")
+require(PYTHON_LIBRARIES_REVISION in pyproject_text, "python-libraries source is not pinned to the approved revision")
 
 for forbidden_path in (
     ROOT / "renovate.json",
