@@ -12,7 +12,7 @@ import pytest
 
 ROOT = Path(__file__).parent.parent
 AUTOMATION_REVISION = "2f34a4da5c552bc23c75edd3d8d81be0a4b3271c"
-PRIVATE_LIBRARY_REVISION = "28fa329702bc76896cc54ab8d05ec5b1bd3d929e"
+PYTHON_LIBRARIES_REVISION = "28fa329702bc76896cc54ab8d05ec5b1bd3d929e"
 
 
 def _required_executable(name: str) -> str:
@@ -217,13 +217,23 @@ def test_dependabot_pull_requests_run_the_ordinary_required_ci_graph() -> None:
         "image-command: just image",
         "coverage-files: coverage.xml",
         "upload-codecov: true",
-        "requires-private-library: true",
-        "private-library-client-id: ${{ vars.GROOVEMAP_CI_APP_CLIENT_ID }}",
-        f"private-library-revision: {PRIVATE_LIBRARY_REVISION}",
-        "PRIVATE_LIBRARY_PRIVATE_KEY: ${{ secrets.GROOVEMAP_CI_APP_PRIVATE_KEY }}",
         "CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}",
     ):
         assert fragment in workflow
+
+    for marker in (
+        "requires-private-library",
+        "private-library-client-id",
+        "private-library-revision",
+        "private_library_private_key",
+        "groovemap_ci_app_client_id",
+        "groovemap_ci_app_private_key",
+    ):
+        assert marker not in workflow.lower()
+
+    pyproject = (ROOT / "pyproject.toml").read_text()
+    assert "https://github.com/groovemap-music/python-libraries.git" in pyproject
+    assert PYTHON_LIBRARIES_REVISION in pyproject
 
 
 def test_release_is_tag_only_and_uses_repository_named_image() -> None:
@@ -239,6 +249,15 @@ def test_release_is_tag_only_and_uses_repository_named_image() -> None:
     assert "publish-image: true" in workflow
     assert "prepare-image-command: just prepare-runtime-wheel" in workflow
     assert "latest" not in workflow.lower()
+    for marker in (
+        "requires-private-library",
+        "private-library-client-id",
+        "private-library-revision",
+        "private_library_private_key",
+        "groovemap_ci_app_client_id",
+        "groovemap_ci_app_private_key",
+    ):
+        assert marker not in workflow.lower()
 
 
 def test_release_dry_run_produces_shared_automation_evidence() -> None:
