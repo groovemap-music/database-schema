@@ -57,7 +57,7 @@ audit:
     uv run pip-audit
 
 bump-preview:
-    uv run cz bump --dry-run --changelog --yes --check-consistency
+    uv run python scripts/check_bump_preview.py
 
 # Update local version metadata and changelog only; do not commit, tag, push, or publish.
 bump:
