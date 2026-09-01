@@ -2,6 +2,13 @@
 
 All notable changes to the GrooveMap database schema will be documented here.
 
+## v0.1.2 (2026-08-31)
+
+### Fixed
+
+- Republish the unchanged initializer after the organization release-action
+  allowlist prevented the v0.1.1 workflow from starting.
+
 ## v0.1.1 (2026-08-31)
 
 ### Fixed
