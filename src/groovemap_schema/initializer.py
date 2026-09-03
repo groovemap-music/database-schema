@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import time
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -18,9 +19,12 @@ import structlog
 from common import (
     AsyncPostgreSQLPool,
     AsyncResilientNeo4jDriver,
+    get_meter,
     neo4j_security_kwargs,
     parse_postgres_host_port,
     setup_logging,
+    setup_telemetry,
+    shutdown_telemetry,
 )
 from common.config import _build_neo4j_uri, get_secret
 from psycopg import sql
@@ -49,6 +53,36 @@ BANNER = r"""
 \__,_\__,_|\__\__,_|_.__/\__,_/__/\___|   /__/\__|_||_\___|_|_|_\__,_|
                          database-schema
 """.strip("\n")
+
+# service.name for OTEL telemetry: the docker-compose service key, distinct from SERVICE_NAME
+# above (the structured-logging label, which stays "database-schema" for compatibility).
+TELEMETRY_SERVICE_NAME = "schema-init"
+
+# Captured once at import, per the OTEL API's proxy-provider pattern: a meter obtained before
+# setup_telemetry() runs still starts recording correctly once setup_telemetry() installs the
+# real provider. Instruments built from it are created lazily, on first use.
+_METER = get_meter("groovemap.schema_init")
+_schema_init_duration: Any | None = None
+
+
+def _duration_histogram() -> Any:
+    """Return the shared groovemap.schema_init.duration histogram, built on first use."""
+    global _schema_init_duration
+    if _schema_init_duration is None:
+        _schema_init_duration = _METER.create_histogram(
+            "groovemap.schema_init.duration",
+            unit="s",
+            description="Duration of a database-schema store initialization.",
+        )
+    return _schema_init_duration
+
+
+def _record_schema_init_duration(store: str, outcome: str, duration_s: float) -> None:
+    """Record one groovemap.schema_init.duration measurement. Never raises."""
+    try:
+        _duration_histogram().record(duration_s, {"store": store, "outcome": outcome})
+    except Exception:
+        logger.debug("Could not record groovemap.schema_init.duration", exc_info=True)
 
 
 def _postgres_connection_params() -> dict[str, Any]:
@@ -86,6 +120,7 @@ def _ensure_postgres_database(params: dict[str, Any]) -> None:
 
 async def _init_postgres(params: dict[str, Any]) -> bool:
     """Apply all PostgreSQL schema statements."""
+    start = time.perf_counter()
     pool: AsyncPostgreSQLPool | None = None
     try:
         pool = AsyncPostgreSQLPool(
@@ -99,10 +134,13 @@ async def _init_postgres(params: dict[str, Any]) -> bool:
         failures = await create_postgres_schema(pool)
         if failures:
             logger.error("PostgreSQL schema had partial failures", failure_count=failures)
+            _record_schema_init_duration("postgresql", "failure", time.perf_counter() - start)
             return False
+        _record_schema_init_duration("postgresql", "success", time.perf_counter() - start)
         return True
     except Exception as error:
         logger.error("PostgreSQL schema initialization failed", error=str(error))
+        _record_schema_init_duration("postgresql", "failure", time.perf_counter() - start)
         return False
     finally:
         if pool is not None:
@@ -111,6 +149,7 @@ async def _init_postgres(params: dict[str, Any]) -> bool:
 
 async def _init_neo4j() -> bool:
     """Verify Neo4j connectivity and apply all schema statements."""
+    start = time.perf_counter()
     driver: AsyncResilientNeo4jDriver | None = None
     try:
         driver = AsyncResilientNeo4jDriver(
@@ -124,10 +163,13 @@ async def _init_neo4j() -> bool:
         failures = await create_neo4j_schema(driver)
         if failures:
             logger.error("Neo4j schema had partial failures", failure_count=failures)
+            _record_schema_init_duration("neo4j", "failure", time.perf_counter() - start)
             return False
+        _record_schema_init_duration("neo4j", "success", time.perf_counter() - start)
         return True
     except Exception as error:
         logger.error("Neo4j schema initialization failed", error=str(error))
+        _record_schema_init_duration("neo4j", "failure", time.perf_counter() - start)
         return False
     finally:
         if driver is not None:
@@ -137,24 +179,33 @@ async def _init_neo4j() -> bool:
 async def main() -> int:
     """Run the one-shot initializer and return its process status."""
     setup_logging(SERVICE_NAME, log_file=Path("/logs/database-schema.log"))
-    print(BANNER)  # noqa: T201 -- repository-name startup banner is intentional
-    logger.info("Database schema initializer starting")
-
-    params = _postgres_connection_params()
+    setup_telemetry(TELEMETRY_SERVICE_NAME)
     try:
-        _ensure_postgres_database(params)
-    except Exception as error:
-        logger.error("Failed to ensure PostgreSQL database exists", error=str(error))
+        print(BANNER)  # noqa: T201 -- repository-name startup banner is intentional
+        logger.info("Database schema initializer starting")
+
+        overall_start = time.perf_counter()
+        params = _postgres_connection_params()
+        try:
+            _ensure_postgres_database(params)
+        except Exception as error:
+            logger.error("Failed to ensure PostgreSQL database exists", error=str(error))
+            _record_schema_init_duration("all", "failure", time.perf_counter() - overall_start)
+            return 1
+
+        postgres_ok, neo4j_ok = await asyncio.gather(_init_postgres(params), _init_neo4j())
+        overall_outcome = "success" if postgres_ok and neo4j_ok else "failure"
+        _record_schema_init_duration("all", overall_outcome, time.perf_counter() - overall_start)
+
+        if postgres_ok and neo4j_ok:
+            logger.info("Database schema initialization complete")
+            return 0
+
+        failed_systems = [name for name, succeeded in (("PostgreSQL", postgres_ok), ("Neo4j", neo4j_ok)) if not succeeded]
+        logger.error("Database schema initialization failed", systems=", ".join(failed_systems))
         return 1
-
-    postgres_ok, neo4j_ok = await asyncio.gather(_init_postgres(params), _init_neo4j())
-    if postgres_ok and neo4j_ok:
-        logger.info("Database schema initialization complete")
-        return 0
-
-    failed_systems = [name for name, succeeded in (("PostgreSQL", postgres_ok), ("Neo4j", neo4j_ok)) if not succeeded]
-    logger.error("Database schema initialization failed", systems=", ".join(failed_systems))
-    return 1
+    finally:
+        shutdown_telemetry()
 
 
 def cli(argv: list[str] | None = None) -> NoReturn:
