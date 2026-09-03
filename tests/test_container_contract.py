@@ -12,7 +12,7 @@ import pytest
 
 ROOT = Path(__file__).parent.parent
 AUTOMATION_REVISION = "2f34a4da5c552bc23c75edd3d8d81be0a4b3271c"
-PYTHON_LIBRARIES_REVISION = "28fa329702bc76896cc54ab8d05ec5b1bd3d929e"
+PYTHON_LIBRARIES_REVISION = "3c8309bfb6123b2c85107e949e9d626e3193db6d"
 
 
 def _required_executable(name: str) -> str:
