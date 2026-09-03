@@ -199,6 +199,58 @@ class TestMain:
         postgres.assert_not_awaited()
         neo4j.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_telemetry_is_set_up_and_shut_down_around_a_successful_run(self) -> None:
+        with (
+            patch.object(initializer, "_ensure_postgres_database"),
+            patch.object(initializer, "_init_postgres", new_callable=AsyncMock, return_value=True),
+            patch.object(initializer, "_init_neo4j", new_callable=AsyncMock, return_value=True),
+            patch.object(initializer, "setup_telemetry") as setup,
+            patch.object(initializer, "shutdown_telemetry") as shutdown,
+        ):
+            assert await initializer.main() == 0
+
+        setup.assert_called_once_with(initializer.TELEMETRY_SERVICE_NAME)
+        shutdown.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_admin_database_failure_still_flushes_telemetry_and_exits_nonzero(self) -> None:
+        """Shutdown must run even when the process never reaches schema application."""
+        with (
+            patch.object(initializer, "_ensure_postgres_database", side_effect=ConnectionError("unavailable")),
+            patch.object(initializer, "_init_postgres", new_callable=AsyncMock) as postgres,
+            patch.object(initializer, "_init_neo4j", new_callable=AsyncMock) as neo4j,
+            patch.object(initializer, "shutdown_telemetry") as shutdown,
+        ):
+            assert await initializer.main() == 1
+
+        shutdown.assert_called_once()
+        postgres.assert_not_awaited()
+        neo4j.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("postgres_ok", "neo4j_ok"),
+        [(False, True), (True, False), (False, False)],
+    )
+    async def test_schema_failure_still_flushes_telemetry_and_exits_nonzero(self, postgres_ok: bool, neo4j_ok: bool) -> None:
+        """A failing store initialization must still flush telemetry before the process exits."""
+        with (
+            patch.object(initializer, "_ensure_postgres_database"),
+            patch.object(initializer, "_init_postgres", new_callable=AsyncMock, return_value=postgres_ok),
+            patch.object(initializer, "_init_neo4j", new_callable=AsyncMock, return_value=neo4j_ok),
+            patch.object(initializer, "shutdown_telemetry") as shutdown,
+        ):
+            assert await initializer.main() == 1
+
+        shutdown.assert_called_once()
+
+
+def test_record_schema_init_duration_swallows_instrument_errors() -> None:
+    """A broken telemetry instrument must never turn a working run into a failure."""
+    with patch.object(initializer, "_duration_histogram", side_effect=RuntimeError("boom")):
+        initializer._record_schema_init_duration("postgresql", "success", 0.1)
+
 
 def test_runtime_defaults_use_groovemap_identity() -> None:
     assert initializer.POSTGRES_DATABASE == "groovemap"
@@ -207,6 +259,7 @@ def test_runtime_defaults_use_groovemap_identity() -> None:
     assert initializer.NEO4J_PASSWORD == "groovemap"
     assert initializer.SERVICE_NAME == "database-schema"
     assert initializer.SERVICE_NAME in initializer.BANNER
+    assert initializer.TELEMETRY_SERVICE_NAME == "schema-init"
 
 
 def test_cli_version_is_local_and_does_not_initialize(capsys: pytest.CaptureFixture[str]) -> None:

@@ -21,7 +21,7 @@ classifiers = [
 license = "MIT"
 license-files = ["LICENSE", "NOTICE"]
 dependencies = [
-    "groovemap-runtime[neo4j,postgres]==0.1.0",
+    "groovemap-runtime[neo4j,otel,postgres]==0.1.0",
     "psycopg[binary]>=3.3.4",
 ]
 
@@ -62,7 +62,7 @@ allow-direct-references = true
 exclude-newer = "2 days"
 
 [tool.uv.sources]
-groovemap-runtime = { git = "https://github.com/groovemap-music/python-libraries.git", rev = "28fa329702bc76896cc54ab8d05ec5b1bd3d929e" }
+groovemap-runtime = { git = "https://github.com/groovemap-music/python-libraries.git", rev = "3c8309bfb6123b2c85107e949e9d626e3193db6d" }
 
 [tool.ruff]
 line-length = 150
