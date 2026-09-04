@@ -53,6 +53,8 @@ class TestSchemaStatements:
             "genre_name",
             "style_name",
             "person_name",
+            "medium_id",
+            "media_family_name",
         }
 
     def test_sha256_indexes_present(self) -> None:
@@ -81,6 +83,33 @@ class TestSchemaStatements:
         assert "person_credit_count" in names, "Person credit_count index missing"
         assert "person_name_fulltext" in names, "Person fulltext index missing"
 
+    def test_media_schema_present(self) -> None:
+        """Verify Medium/MediaFamily schema objects exist (ADR 0007)."""
+        names = {n for n, _ in SCHEMA_STATEMENTS}
+        assert "medium_id" in names, "Medium unique id constraint missing"
+        assert "media_family_name" in names, "MediaFamily unique name constraint missing"
+        assert "release_media_families_index" in names, "Release.media_families index missing"
+
+    def test_media_constraints_are_unique_constraints(self) -> None:
+        statements = dict(SCHEMA_STATEMENTS)
+        assert statements["medium_id"] == "CREATE CONSTRAINT medium_id IF NOT EXISTS FOR (md:Medium) REQUIRE md.id IS UNIQUE"
+        assert statements["media_family_name"] == "CREATE CONSTRAINT media_family_name IF NOT EXISTS FOR (mf:MediaFamily) REQUIRE mf.name IS UNIQUE"
+
+    def test_release_media_families_is_a_plain_index(self) -> None:
+        statements = dict(SCHEMA_STATEMENTS)
+        cypher = statements["release_media_families_index"]
+        assert cypher == ("CREATE INDEX release_media_families_index IF NOT EXISTS FOR (r:Release) ON (r.media_families)")
+
+    def test_media_statement_ordering(self) -> None:
+        """Medium/MediaFamily constraints precede the release_media_families_index,
+        which in turn precedes the fulltext indexes — constraints, then range
+        indexes, then fulltext indexes, as the module's ordering contract requires."""
+        names = [n for n, _ in SCHEMA_STATEMENTS]
+        assert names.index("medium_id") < names.index("release_media_families_index")
+        assert names.index("media_family_name") < names.index("release_media_families_index")
+        first_fulltext = next(i for i, (_, c) in enumerate(SCHEMA_STATEMENTS) if "FULLTEXT" in c)
+        assert names.index("release_media_families_index") < first_fulltext
+
     def test_constraints_listed_before_range_indexes(self) -> None:
         """Constraints must come first so their backing indexes exist before
         any additional range/fulltext index statements run."""
@@ -95,8 +124,8 @@ class TestSchemaStatements:
         assert constraint_max < first_non_constraint, "All CONSTRAINT statements must appear before INDEX statements"
 
     def test_total_statement_count(self) -> None:
-        # 8 constraints + 11 range indexes + 4 MBID indexes + 6 fulltext = 29
-        assert len(SCHEMA_STATEMENTS) == 29
+        # 10 constraints + 12 range indexes + 4 MBID indexes + 6 fulltext = 32
+        assert len(SCHEMA_STATEMENTS) == 32
 
 
 class TestCreateNeo4jSchema:

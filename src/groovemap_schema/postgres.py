@@ -64,6 +64,16 @@ _SPECIFIC_INDEXES: list[tuple[str, str]] = [
         "idx_releases_labels",
         "CREATE INDEX IF NOT EXISTS idx_releases_labels ON releases USING GIN ((data->'labels'))",
     ),
+    # Canonical media block (ADR 0007) — additive column plus a GIN index on the
+    # sorted family-id list for fast media-family filtering.
+    (
+        "releases add media column",
+        "ALTER TABLE releases ADD COLUMN IF NOT EXISTS media JSONB",
+    ),
+    (
+        "idx_releases_media_families",
+        "CREATE INDEX IF NOT EXISTS idx_releases_media_families ON releases USING GIN ((media->'families'))",
+    ),
     # Full-text search GIN indexes — used by /api/search
     (
         "idx_artists_fts",
@@ -197,6 +207,7 @@ _USER_TABLES: list[tuple[str, str]] = [
             artist       VARCHAR(500),
             year         INTEGER,
             formats      JSONB,
+            media        JSONB,
             label        VARCHAR(255),
             condition    VARCHAR(100),
             rating       SMALLINT,
@@ -209,6 +220,12 @@ _USER_TABLES: list[tuple[str, str]] = [
         )
         """,
     ),
+    # Canonical media block (ADR 0007): user_collections converges on the same
+    # `media` column shape as the release tables and user_wantlists.
+    (
+        "user_collections.media column",
+        "ALTER TABLE user_collections ADD COLUMN IF NOT EXISTS media JSONB",
+    ),
     (
         "idx_user_collections_user_id",
         "CREATE INDEX IF NOT EXISTS idx_user_collections_user_id ON user_collections (user_id)",
@@ -216,6 +233,10 @@ _USER_TABLES: list[tuple[str, str]] = [
     (
         "idx_user_collections_release_id",
         "CREATE INDEX IF NOT EXISTS idx_user_collections_release_id ON user_collections (release_id)",
+    ),
+    (
+        "idx_user_collections_media_families",
+        "CREATE INDEX IF NOT EXISTS idx_user_collections_media_families ON user_collections USING GIN ((media->'families'))",
     ),
     (
         "user_wantlists table",
@@ -228,6 +249,7 @@ _USER_TABLES: list[tuple[str, str]] = [
             artist     VARCHAR(500),
             year       INTEGER,
             format     VARCHAR(255),
+            media      JSONB,
             rating     SMALLINT,
             notes      TEXT,
             date_added TIMESTAMP WITH TIME ZONE,
@@ -237,6 +259,13 @@ _USER_TABLES: list[tuple[str, str]] = [
             UNIQUE(user_id, release_id)
         )
         """,
+    ),
+    # Canonical media block (ADR 0007): user_wantlists converges on the same
+    # `media` column shape as the release tables and user_collections. The
+    # scalar `format` column is retained as legacy provenance.
+    (
+        "user_wantlists.media column",
+        "ALTER TABLE user_wantlists ADD COLUMN IF NOT EXISTS media JSONB",
     ),
     (
         "idx_user_wantlists_user_id",
@@ -515,6 +544,21 @@ _INSIGHTS_TABLES: list[tuple[str, str]] = [
         "insights.release_rarity add collection_prevalence",
         "ALTER TABLE insights.release_rarity ADD COLUMN IF NOT EXISTS collection_prevalence REAL",
     ),
+    # Media-neutral rarity (ADR 0007): the descriptor-keyed format_rarity signal
+    # is retained, and rarity gains a medium-keyed signal plus the per-family
+    # breakdown so a filtered or family-scoped score can be reconstructed.
+    (
+        "insights.release_rarity add media_families",
+        "ALTER TABLE insights.release_rarity ADD COLUMN IF NOT EXISTS media_families JSONB",
+    ),
+    (
+        "insights.release_rarity add family_signals",
+        "ALTER TABLE insights.release_rarity ADD COLUMN IF NOT EXISTS family_signals JSONB",
+    ),
+    (
+        "insights.release_rarity add medium_rarity",
+        "ALTER TABLE insights.release_rarity ADD COLUMN IF NOT EXISTS medium_rarity REAL",
+    ),
 ]
 
 
@@ -576,9 +620,15 @@ _MUSICBRAINZ_TABLES: list[tuple[str, str]] = [
             release_group_mbid UUID,
             discogs_release_id BIGINT,
             data JSONB,
+            media JSONB,
             created_at TIMESTAMPTZ DEFAULT NOW(),
             updated_at TIMESTAMPTZ DEFAULT NOW()
         )""",
+    ),
+    # Canonical media block (ADR 0007), additive for existing installs.
+    (
+        "musicbrainz.releases.media column",
+        "ALTER TABLE musicbrainz.releases ADD COLUMN IF NOT EXISTS media JSONB",
     ),
     (
         "musicbrainz.release_groups table",
@@ -722,6 +772,10 @@ _MUSICBRAINZ_INDEXES: list[tuple[str, str]] = [
     (
         "idx_mb_releases_discogs_id",
         "CREATE INDEX IF NOT EXISTS idx_mb_releases_discogs_id ON musicbrainz.releases (discogs_release_id) WHERE discogs_release_id IS NOT NULL",
+    ),
+    (
+        "idx_mb_releases_media_families",
+        "CREATE INDEX IF NOT EXISTS idx_mb_releases_media_families ON musicbrainz.releases USING GIN ((media->'families'))",
     ),
     (
         "idx_mb_release_groups_discogs_id",
