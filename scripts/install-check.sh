@@ -11,7 +11,7 @@ case "$check_dir" in
 esac
 trap 'rm -rf -- "$check_dir"' EXIT
 
-uv venv --python 3.14.5 "$check_dir/venv"
+uv venv --python 3.14.7 "$check_dir/venv"
 uv pip install \
   --python "$check_dir/venv/bin/python" \
   --find-links .build/private \
