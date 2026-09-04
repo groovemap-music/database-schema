@@ -8,7 +8,7 @@ from typing import Any
 
 ROOT = Path(__file__).parent.parent
 SUPPORTED_MINOR = (3, 14)
-SUPPORTED_PATCH = "3.14.5"
+SUPPORTED_PATCH = "3.14.7"
 
 
 def _load_toml(path: Path) -> dict[str, Any]:
