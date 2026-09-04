@@ -10,4 +10,4 @@ __all__ = [
     "create_neo4j_schema",
     "create_postgres_schema",
 ]
-__version__ = "0.1.2"
+__version__ = "0.2.0"

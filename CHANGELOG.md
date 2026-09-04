@@ -2,6 +2,19 @@
 
 All notable changes to the GrooveMap database schema will be documented here.
 
+## v0.2.0 (2026-09-04)
+
+### Feat
+
+- **postgres**: add media JSONB columns, GIN indexes, and rarity columns
+- **neo4j**: add Medium and MediaFamily constraints and media indexes
+- **telemetry**: adopt common.telemetry and record schema-init metrics
+
+### Fix
+
+- **ci**: use public python libraries
+- **release**: record v0.1.2 verification
+
 ## v0.1.2 (2026-08-31)
 
 ### Fixed
