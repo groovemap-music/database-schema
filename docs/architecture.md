@@ -42,8 +42,11 @@ is named `ghcr.io/groovemap-music/database-schema` when released.
 
 ## Neo4j media schema
 
-ADR 0007 introduces a canonical media taxonomy. Neo4j gains two supporting node types
-alongside the existing Artist, Label, Master, Release, Genre, Style, User, and Person nodes:
+[ADR 0007](https://github.com/groovemap-music/design/blob/main/docs/adr/0007-canonical-media-taxonomy.md)
+introduces a canonical media taxonomy, with the canonical block shape defined by
+[`taxonomy/media/v1/media-block.schema.json`](https://github.com/groovemap-music/design/blob/main/taxonomy/media/v1/media-block.schema.json)
+in the design repository. Neo4j gains two supporting node types alongside the existing
+Artist, Label, Master, Release, Genre, Style, User, and Person nodes:
 
 - `Medium` — one canonical medium (for example `vinyl_lp`), unique on `id`, with `family` and
   `label` properties.
@@ -75,3 +78,17 @@ GIN index on `media->'families'` for medium-family filtering; the raw provider f
 additive, media-neutral rarity signals alongside the retained `format_rarity`. Every change
 is additive within persistence contract v1 — see
 [the persistence compatibility contract](../contracts/persistence/).
+
+## Media schema consumer promotion
+
+Downstream services do not track `database-schema` continuously; each pins
+`contracts/persistence/v1` to a specific, reviewed `database-schema` commit and promotes to a
+later commit deliberately, the same way
+[`compatibility.json`](../contracts/persistence/v1/compatibility.json) pins the tested
+`groovemap-runtime` commit for that contract version. The Neo4j and PostgreSQL media changes
+described above are additive within persistence contract version 1: no rename, removal, type
+change, or relationship-semantics change, so a consumer promotes to a commit that includes
+them without a migration or a lockstep upgrade across services. See
+[the persistence compatibility contract](../contracts/README.md) for the full
+additive-versus-destructive policy and the expand/migrate/contract ordering a breaking change
+would require.
