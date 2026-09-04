@@ -65,7 +65,10 @@ class TestSpecificIndexes:
             assert "DROP" not in stmt.upper(), f"Index '{name}' contains a DROP statement"
 
     def test_covers_all_entity_tables(self) -> None:
-        index_tables = {stmt.split("ON ")[1].split(" ")[0] for _, stmt in _SPECIFIC_INDEXES}
+        # _SPECIFIC_INDEXES also carries the "releases add media column" ALTER
+        # (it must run before the media GIN index below it), which has no
+        # "ON <table>" clause — only CREATE INDEX statements name a table that way.
+        index_tables = {stmt.split("ON ")[1].split(" ")[0] for _, stmt in _SPECIFIC_INDEXES if "CREATE INDEX" in stmt.upper()}
         for table in _ENTITY_TABLES:
             assert table in index_tables, f"No specific indexes for table '{table}'"
 

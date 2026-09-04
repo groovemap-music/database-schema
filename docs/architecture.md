@@ -63,3 +63,15 @@ Two relationships connect them into the existing graph:
 present on that release — so consumers can filter by family without traversing `ISSUED_ON`
 edges. See `SCHEMA_STATEMENTS` in `src/groovemap_schema/neo4j.py` for the backing
 constraints and index.
+
+## PostgreSQL media schema
+
+The PostgreSQL family gains an indexed `media JSONB` column, holding the canonical media
+block, on every release-shaped table: `releases`, `musicbrainz.releases`, `user_collections`,
+and `user_wantlists`. `releases`, `musicbrainz.releases`, and `user_collections` each carry a
+GIN index on `media->'families'` for medium-family filtering; the raw provider fields
+(`data`, `formats`, `format`) are unchanged and remain the provenance record.
+`insights.release_rarity` gains `media_families`, `family_signals`, and `medium_rarity` as
+additive, media-neutral rarity signals alongside the retained `format_rarity`. Every change
+is additive within persistence contract v1 — see
+[the persistence compatibility contract](../contracts/persistence/).
