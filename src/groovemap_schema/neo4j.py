@@ -24,7 +24,8 @@ SCHEMA_STATEMENTS: list[tuple[str, str]] = [
     # ── Unique constraints ────────────────────────────────────────────────────
     # Each constraint implicitly creates a backing range index on the property.
     # Do NOT add explicit range indexes for Artist.id, Label.id, Master.id,
-    # Release.id, Genre.name, or Style.name — they would conflict.
+    # Release.id, Genre.name, Style.name, Medium.id, or MediaFamily.name — they
+    # would conflict.
     (
         "artist_id",
         "CREATE CONSTRAINT artist_id IF NOT EXISTS FOR (a:Artist) REQUIRE a.id IS UNIQUE",
@@ -48,6 +49,16 @@ SCHEMA_STATEMENTS: list[tuple[str, str]] = [
     (
         "style_name",
         "CREATE CONSTRAINT style_name IF NOT EXISTS FOR (s:Style) REQUIRE s.name IS UNIQUE",
+    ),
+    # Medium and MediaFamily back the canonical media taxonomy (ADR 0007):
+    # (:Medium)-[:IN_FAMILY]->(:MediaFamily) and (:Release)-[:ISSUED_ON {qty, source}]->(:Medium).
+    (
+        "medium_id",
+        "CREATE CONSTRAINT medium_id IF NOT EXISTS FOR (md:Medium) REQUIRE md.id IS UNIQUE",
+    ),
+    (
+        "media_family_name",
+        "CREATE CONSTRAINT media_family_name IF NOT EXISTS FOR (mf:MediaFamily) REQUIRE mf.name IS UNIQUE",
     ),
     (
         "user_id",
@@ -93,6 +104,12 @@ SCHEMA_STATEMENTS: list[tuple[str, str]] = [
     (
         "master_year_index",
         "CREATE INDEX master_year_index IF NOT EXISTS FOR (m:Master) ON (m.year)",
+    ),
+    # media_families is a list property (see ADR 0007) used for cheap filtering
+    # of releases by media family without traversing ISSUED_ON edges.
+    (
+        "release_media_families_index",
+        "CREATE INDEX release_media_families_index IF NOT EXISTS FOR (r:Release) ON (r.media_families)",
     ),
     # first_year indexes for genre-emergence queries.  Pre-computed by
     # graphinator after release import; allows emergence lookups with
