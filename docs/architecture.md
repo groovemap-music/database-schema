@@ -39,3 +39,27 @@ healthy.
 
 The image runs as numeric user and group `1000:1000`, writes optional logs under `/logs`, and
 is named `ghcr.io/groovemap-music/database-schema` when released.
+
+## Neo4j media schema
+
+ADR 0007 introduces a canonical media taxonomy. Neo4j gains two supporting node types
+alongside the existing Artist, Label, Master, Release, Genre, Style, User, and Person nodes:
+
+- `Medium` — one canonical medium (for example `vinyl_lp`), unique on `id`, with `family` and
+  `label` properties.
+- `MediaFamily` — one of the closed set of media families (for example `vinyl`), unique on
+  `name`.
+
+Two relationships connect them into the existing graph:
+
+- `(:Medium)-[:IN_FAMILY]->(:MediaFamily)` — the medium's family.
+- `(:Release)-[:ISSUED_ON {qty, source}]->(:Medium)` — the media a release was issued on.
+  `qty` is the unit count for that medium on that release (Discogs `qty`, or `1` per
+  MusicBrainz medium); `source` names the producer that asserted the edge (`discogs` or
+  `musicbrainz`), so a release known to both catalogs can carry both catalogs' media and the
+  API can reconcile disagreements between them.
+
+`Release` also carries a `media_families` list property — the sorted, unique family names
+present on that release — so consumers can filter by family without traversing `ISSUED_ON`
+edges. See `SCHEMA_STATEMENTS` in `src/groovemap_schema/neo4j.py` for the backing
+constraints and index.
