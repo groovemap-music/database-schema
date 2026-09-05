@@ -12,7 +12,7 @@ import asyncio
 import os
 import time
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import psycopg
 import structlog
@@ -20,19 +20,25 @@ from common import (
     AsyncPostgreSQLPool,
     AsyncResilientNeo4jDriver,
     get_meter,
+    get_tracer,
     neo4j_security_kwargs,
     parse_postgres_host_port,
     setup_logging,
     setup_telemetry,
     shutdown_telemetry,
+    start_event_loop_monitor,
 )
 from common.config import _build_neo4j_uri, get_secret
+from opentelemetry.trace import NoOpTracer, StatusCode, get_current_span
 from psycopg import sql
 
 from groovemap_schema import __version__
 from groovemap_schema.neo4j import create_neo4j_schema
 from groovemap_schema.postgres import create_postgres_schema
 
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
 
 logger = structlog.get_logger(__name__)
 
@@ -58,10 +64,13 @@ BANNER = r"""
 # above (the structured-logging label, which stays "database-schema" for compatibility).
 TELEMETRY_SERVICE_NAME = "schema-init"
 
+# The instrumentation scope both signals this service produces are reported under.
+TELEMETRY_SCOPE = "groovemap.schema_init"
+
 # Captured once at import, per the OTEL API's proxy-provider pattern: a meter obtained before
 # setup_telemetry() runs still starts recording correctly once setup_telemetry() installs the
 # real provider. Instruments built from it are created lazily, on first use.
-_METER = get_meter("groovemap.schema_init")
+_METER = get_meter(TELEMETRY_SCOPE)
 _schema_init_duration: Any | None = None
 
 
@@ -83,6 +92,79 @@ def _record_schema_init_duration(store: str, outcome: str, duration_s: float) ->
         _duration_histogram().record(duration_s, {"store": store, "outcome": outcome})
     except Exception:
         logger.debug("Could not record groovemap.schema_init.duration", exc_info=True)
+
+
+def _tracer() -> Any:
+    """Return the tracer this service opens its domain spans with. Never raises.
+
+    Resolved on every use instead of captured at import, which is the opposite of the meter
+    above: get_tracer reads the installed TracerProvider at call time, so a tracer taken before
+    setup_telemetry() would hand out non-recording spans for the rest of the process.
+    """
+    try:
+        return get_tracer(TELEMETRY_SCOPE)
+    except Exception:
+        logger.debug("Could not obtain a tracer; schema_init spans are disabled", exc_info=True)
+        return NoOpTracer()
+
+
+def _mark_store_error(error: BaseException) -> None:
+    """Attach `error.type` to the schema_init span the failing store is running inside.
+
+    The exception's class name and nothing else. The SDK would otherwise record an exception
+    event carrying the message and the traceback, and copy the message into the span status
+    description, which is exactly the payload the conventions keep off a span -- so
+    _initialize_store switches both defaults off and this is what replaces them. Never raises.
+    """
+    try:
+        get_current_span().set_attribute("error.type", type(error).__name__)
+    except Exception:
+        logger.debug("Could not attach error.type to the schema_init span", exc_info=True)
+
+
+def _close_schema_init_span(span: Any, outcome: str) -> None:
+    """Record a run's outcome on its schema_init span, failing the span when it did not succeed.
+
+    Never raises: the span describes an initialization, it must not decide whether one worked.
+    Sets the status code alone; a failure that raised carries its `error.type` from
+    _mark_store_error, and no message, statement, id, or traceback is ever attached.
+    """
+    try:
+        span.set_attribute("outcome", outcome)
+        if outcome != "success":
+            span.set_status(StatusCode.ERROR)
+    except Exception:
+        logger.debug("Could not annotate the schema_init span", exc_info=True)
+
+
+async def _initialize_store(store: str, initialize: Callable[[], Awaitable[bool]]) -> bool:
+    """Run one store initialization inside its root `schema_init {store}` span.
+
+    The span is that store's trace root, so the db spans the PostgreSQL pool and the Neo4j
+    driver open on their own nest underneath it. It carries the same closed store/outcome pair
+    as the groovemap.schema_init.duration measurement taken around it, and both are produced
+    here so the metric and the span can never disagree about a run. The two stores initialize
+    concurrently and each is its own trace, which is what makes either one readable alone.
+    """
+    start = time.perf_counter()
+    succeeded = False
+    with _tracer().start_as_current_span(
+        f"schema_init {store}",
+        attributes={"store": store},
+        # The SDK defaults both to True, which would attach an exception event holding the
+        # message and the traceback and copy the message into the status description. The
+        # conventions allow a status and an `error.type`, so both are off and _mark_store_error
+        # supplies the type instead.
+        record_exception=False,
+        set_status_on_exception=False,
+    ) as span:
+        try:
+            succeeded = await initialize()
+        finally:
+            outcome = "success" if succeeded else "failure"
+            _record_schema_init_duration(store, outcome, time.perf_counter() - start)
+            _close_schema_init_span(span, outcome)
+    return succeeded
 
 
 def _postgres_connection_params() -> dict[str, Any]:
@@ -118,9 +200,8 @@ def _ensure_postgres_database(params: dict[str, Any]) -> None:
         logger.info("PostgreSQL database created", database=POSTGRES_DATABASE)
 
 
-async def _init_postgres(params: dict[str, Any]) -> bool:
-    """Apply all PostgreSQL schema statements."""
-    start = time.perf_counter()
+async def _apply_postgres_schema(params: dict[str, Any]) -> bool:
+    """Apply all PostgreSQL schema statements. Telemetry is owned by _initialize_store."""
     pool: AsyncPostgreSQLPool | None = None
     try:
         pool = AsyncPostgreSQLPool(
@@ -134,22 +215,24 @@ async def _init_postgres(params: dict[str, Any]) -> bool:
         failures = await create_postgres_schema(pool)
         if failures:
             logger.error("PostgreSQL schema had partial failures", failure_count=failures)
-            _record_schema_init_duration("postgresql", "failure", time.perf_counter() - start)
             return False
-        _record_schema_init_duration("postgresql", "success", time.perf_counter() - start)
         return True
     except Exception as error:
         logger.error("PostgreSQL schema initialization failed", error=str(error))
-        _record_schema_init_duration("postgresql", "failure", time.perf_counter() - start)
+        _mark_store_error(error)
         return False
     finally:
         if pool is not None:
             await pool.close()
 
 
-async def _init_neo4j() -> bool:
+async def _init_postgres(params: dict[str, Any]) -> bool:
+    """Apply the PostgreSQL schema inside its measured `schema_init postgresql` span."""
+    return await _initialize_store("postgresql", lambda: _apply_postgres_schema(params))
+
+
+async def _apply_neo4j_schema() -> bool:
     """Verify Neo4j connectivity and apply all schema statements."""
-    start = time.perf_counter()
     driver: AsyncResilientNeo4jDriver | None = None
     try:
         driver = AsyncResilientNeo4jDriver(
@@ -163,23 +246,30 @@ async def _init_neo4j() -> bool:
         failures = await create_neo4j_schema(driver)
         if failures:
             logger.error("Neo4j schema had partial failures", failure_count=failures)
-            _record_schema_init_duration("neo4j", "failure", time.perf_counter() - start)
             return False
-        _record_schema_init_duration("neo4j", "success", time.perf_counter() - start)
         return True
     except Exception as error:
         logger.error("Neo4j schema initialization failed", error=str(error))
-        _record_schema_init_duration("neo4j", "failure", time.perf_counter() - start)
+        _mark_store_error(error)
         return False
     finally:
         if driver is not None:
             await driver.close()
 
 
+async def _init_neo4j() -> bool:
+    """Apply the Neo4j schema inside its measured `schema_init neo4j` span."""
+    return await _initialize_store("neo4j", _apply_neo4j_schema)
+
+
 async def main() -> int:
     """Run the one-shot initializer and return its process status."""
     setup_logging(SERVICE_NAME, log_file=Path("/logs/database-schema.log"))
     setup_telemetry(TELEMETRY_SERVICE_NAME)
+    # This one-shot job does its work on an asyncio loop, so event-loop lag is a signal it can
+    # actually produce. Started from the running loop, as the monitor requires, and cancelled
+    # by shutdown_telemetry() in the finally below.
+    start_event_loop_monitor()
     try:
         print(BANNER)  # noqa: T201 -- repository-name startup banner is intentional
         logger.info("Database schema initializer starting")

@@ -22,7 +22,11 @@ The built `groovemap-database-schema` wheel contains the initializer, Python def
 and versioned JSON compatibility contract. The container creates the configured PostgreSQL
 database when needed and applies both schema families. See the
 [runtime configuration](docs/runtime-configuration.md) for its environment and secret-file
-interface.
+interface, and its [telemetry section](docs/runtime-configuration.md#telemetry) for the metrics
+and spans it emits: a `groovemap.schema_init.duration` measurement and a root
+`schema_init {store}` span per store, the database spans and process metrics the shared runtime
+contributes, and the event-loop lag histogram. Both signals export over OTLP/HTTP and are
+flushed before the one-shot process exits.
 
 The installed command exposes a local-only help and version surface without contacting a
 database:
