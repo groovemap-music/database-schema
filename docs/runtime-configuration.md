@@ -19,10 +19,15 @@ services.
 | `NEO4J_TLS_ENABLED` | `false` | Enable encrypted Bolt transport |
 | `NEO4J_TLS_VERIFY` | `true` | Verify the Neo4j server certificate when TLS is enabled |
 | `LOG_LEVEL` | runtime default | Structured-log level |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | OTLP/HTTP collector base URL, for example `http://otel-collector:4318`. Unset disables metrics export |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | OTLP/HTTP collector base URL, for example `http://otel-collector:4318`. Unset disables both metrics and trace export |
 | `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | falls back to `OTEL_EXPORTER_OTLP_ENDPOINT` | Metrics-only endpoint override |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | falls back to `OTEL_EXPORTER_OTLP_ENDPOINT` | Traces-only endpoint override |
 | `OTEL_METRICS_EXPORTER` | `otlp` | Set to `none` to force metrics export off even with an endpoint configured |
+| `OTEL_TRACES_EXPORTER` | `otlp` | Set to `none` to force trace export off while metrics keep flowing |
+| `OTEL_TRACES_SAMPLER` | `parentbased_traceidratio` | Sampler the SDK applies to root spans |
+| `OTEL_TRACES_SAMPLER_ARG` | `1.0` | Sampling ratio; deployment turns this down in production |
 | `OTEL_METRIC_EXPORT_INTERVAL` | SDK default | Push interval in milliseconds |
+| `OTEL_SDK_DISABLED` | `false` | `true` makes the SDK a no-op even with an endpoint configured |
 | `OTEL_SERVICE_NAME` | `schema-init` | Overrides the `service.name` resource attribute |
 | `OTEL_RESOURCE_ATTRIBUTES` | empty | Extra resource attributes, for example `service.namespace=groovemap,deployment.environment.name=dev` |
 
@@ -35,12 +40,50 @@ must persist beyond the one-shot container.
 
 ## Telemetry
 
-The initializer records one `groovemap.schema_init.duration` histogram measurement (seconds)
-around each store's initialization, tagged `store=postgresql|neo4j` and
-`outcome=success|failure`, plus one overall measurement tagged `store=all` covering the whole
-run. Metrics export over OTLP/HTTP; there is no Prometheus scrape endpoint. When
-`OTEL_EXPORTER_OTLP_ENDPOINT` is unset (the default in development and in `just check`), the
-initializer installs a no-op meter provider and behaves exactly as it does without the `otel`
+Metrics and traces are two independent signals over one shared OTLP/HTTP endpoint. There is no
+Prometheus scrape endpoint. Either can be switched off without touching the other, and when
+`OTEL_EXPORTER_OTLP_ENDPOINT` is unset -- the default in development and in `just check` -- both
+fall back to no-op providers and the initializer behaves exactly as it does without the `otel`
 extra: telemetry never fails startup, never blocks, and never changes the process exit code.
-Telemetry is flushed and shut down before the process exits, including on failure, so the last
-measurement is not dropped.
+
+Because this is a one-shot job, everything recorded during the run would be lost at exit
+without an explicit flush. Telemetry is shut down in a `finally` block that covers the success
+path and every failure path, including a run that never reaches schema application, and that
+shutdown force-flushes the tracer provider and then the meter provider.
+
+### Metrics
+
+| Metric | Kind | Attributes | Source |
+| --- | --- | --- | --- |
+| `groovemap.schema_init.duration` | histogram, seconds | `store` (`postgresql`, `neo4j`, `all`), `outcome` (`success`, `failure`) | this service, once per store plus one `store=all` measurement covering the whole run |
+| `db.client.operation.duration` | histogram, seconds | `db.system.name`, `db.operation.name`, `error.type` on failure | the runtime's PostgreSQL pool and Neo4j driver |
+| `groovemap.pipeline.reconnects` | counter | `system` | the runtime's resilient connection wrappers |
+| `groovemap.pipeline.circuit_breaker.state` | observable gauge | `system` | the runtime's circuit breakers |
+| `groovemap.runtime.event_loop.lag` | histogram, seconds | none | the event-loop monitor, sampled once a second |
+| `process.*` and `cpython.gc.*` | observable counters and gauges | see the runtime contract | the runtime's process view, installed by `setup_telemetry` |
+
+The process view covers CPU time and utilization, resident and virtual memory, thread count,
+open file descriptors, context switches, and garbage collection. It is process-scoped only: no
+`system.*` host metric is reported, because the host is scraped once by node-exporter.
+
+The event-loop monitor runs because this initializer does its work on an asyncio loop. It is
+started from that running loop right after telemetry is configured and cancelled during
+shutdown, so the lag histogram covers exactly the schema application.
+
+### Spans
+
+| Span | Kind | Attributes |
+| --- | --- | --- |
+| `schema_init postgresql`, `schema_init neo4j` | `INTERNAL` | `store`, `outcome` |
+| `{db.operation.name} {db.system.name}`, for example `execute postgresql` | `CLIENT` | `db.system.name`, `db.operation.name`, `error.type` on failure |
+
+Each store's `schema_init` span is a trace root, and the database spans the runtime's pool and
+driver open on their own nest underneath it. The two stores initialize concurrently and each
+one is therefore its own trace, which is what lets an operator read a single store's
+initialization without untangling the other. A store that did not initialize carries
+`outcome=failure` and span status `ERROR`; no statement, message, stack trace, or identifier is
+ever attached to a span. There is no `schema_init all` span: the overall run is a metric only,
+because wrapping the stores in a parent span would stop each store's span from being a root.
+
+Call counts and durations per span name are derived by the collector's span-metrics connector.
+This service never emits them itself.

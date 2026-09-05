@@ -84,6 +84,29 @@ class TestEnsurePostgresDatabase:
         assert cursor.execute.call_count == 2
 
 
+class TestStoreSpanWrapper:
+    @pytest.mark.asyncio
+    async def test_outcome_is_recorded_for_both_signals(self) -> None:
+        recorded: list[tuple[str, str]] = []
+        with patch.object(initializer, "_record_schema_init_duration", side_effect=lambda store, outcome, _: recorded.append((store, outcome))):
+            assert await initializer._initialize_store("neo4j", AsyncMock(return_value=True)) is True
+            assert await initializer._initialize_store("neo4j", AsyncMock(return_value=False)) is False
+
+        assert recorded == [("neo4j", "success"), ("neo4j", "failure")]
+
+    def test_span_annotation_swallows_instrument_errors(self) -> None:
+        """A broken span must never turn a working initialization into a failure."""
+        span = MagicMock()
+        span.set_attribute.side_effect = RuntimeError("boom")
+        initializer._close_schema_init_span(span, "success")
+
+    def test_tracer_falls_back_to_a_no_op_when_the_provider_cannot_be_reached(self) -> None:
+        with patch.object(initializer, "get_tracer", side_effect=RuntimeError("boom")):
+            tracer = initializer._tracer()
+        with tracer.start_as_current_span("schema_init neo4j") as span:
+            assert span.is_recording() is False
+
+
 class TestPostgresInitialization:
     @pytest.mark.asyncio
     async def test_success_initializes_and_closes_pool(self) -> None:
@@ -212,6 +235,23 @@ class TestMain:
 
         setup.assert_called_once_with(initializer.TELEMETRY_SERVICE_NAME)
         shutdown.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_event_loop_monitor_starts_on_the_running_loop_after_telemetry_is_configured(self) -> None:
+        """The lag histogram only samples when the monitor is started from inside the loop."""
+        calls: list[str] = []
+
+        with (
+            patch.object(initializer, "_ensure_postgres_database"),
+            patch.object(initializer, "_init_postgres", new_callable=AsyncMock, return_value=True),
+            patch.object(initializer, "_init_neo4j", new_callable=AsyncMock, return_value=True),
+            patch.object(initializer, "setup_telemetry", side_effect=lambda *_: calls.append("setup")),
+            patch.object(initializer, "start_event_loop_monitor", side_effect=lambda: calls.append("monitor")),
+            patch.object(initializer, "shutdown_telemetry", side_effect=lambda: calls.append("shutdown")),
+        ):
+            assert await initializer.main() == 0
+
+        assert calls == ["setup", "monitor", "shutdown"]
 
     @pytest.mark.asyncio
     async def test_admin_database_failure_still_flushes_telemetry_and_exits_nonzero(self) -> None:
