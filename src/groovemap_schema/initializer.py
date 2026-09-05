@@ -29,7 +29,7 @@ from common import (
     start_event_loop_monitor,
 )
 from common.config import _build_neo4j_uri, get_secret
-from opentelemetry.trace import NoOpTracer, StatusCode
+from opentelemetry.trace import NoOpTracer, StatusCode, get_current_span
 from psycopg import sql
 
 from groovemap_schema import __version__
@@ -108,11 +108,26 @@ def _tracer() -> Any:
         return NoOpTracer()
 
 
+def _mark_store_error(error: BaseException) -> None:
+    """Attach `error.type` to the schema_init span the failing store is running inside.
+
+    The exception's class name and nothing else. The SDK would otherwise record an exception
+    event carrying the message and the traceback, and copy the message into the span status
+    description, which is exactly the payload the conventions keep off a span -- so
+    _initialize_store switches both defaults off and this is what replaces them. Never raises.
+    """
+    try:
+        get_current_span().set_attribute("error.type", type(error).__name__)
+    except Exception:
+        logger.debug("Could not attach error.type to the schema_init span", exc_info=True)
+
+
 def _close_schema_init_span(span: Any, outcome: str) -> None:
     """Record a run's outcome on its schema_init span, failing the span when it did not succeed.
 
     Never raises: the span describes an initialization, it must not decide whether one worked.
-    Only the closed store/outcome pair is attached -- no statement, no error message, no id.
+    Sets the status code alone; a failure that raised carries its `error.type` from
+    _mark_store_error, and no message, statement, id, or traceback is ever attached.
     """
     try:
         span.set_attribute("outcome", outcome)
@@ -136,6 +151,10 @@ async def _initialize_store(store: str, initialize: Callable[[], Awaitable[bool]
     with _tracer().start_as_current_span(
         f"schema_init {store}",
         attributes={"store": store},
+        # The SDK defaults both to True, which would attach an exception event holding the
+        # message and the traceback and copy the message into the status description. The
+        # conventions allow a status and an `error.type`, so both are off and _mark_store_error
+        # supplies the type instead.
         record_exception=False,
         set_status_on_exception=False,
     ) as span:
@@ -200,6 +219,7 @@ async def _apply_postgres_schema(params: dict[str, Any]) -> bool:
         return True
     except Exception as error:
         logger.error("PostgreSQL schema initialization failed", error=str(error))
+        _mark_store_error(error)
         return False
     finally:
         if pool is not None:
@@ -230,6 +250,7 @@ async def _apply_neo4j_schema() -> bool:
         return True
     except Exception as error:
         logger.error("Neo4j schema initialization failed", error=str(error))
+        _mark_store_error(error)
         return False
     finally:
         if driver is not None:

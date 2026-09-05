@@ -218,6 +218,7 @@ async def test_each_store_gets_a_root_schema_init_span_that_db_spans_nest_under(
         assert span.parent is None, "each store's span is a trace root, so one store reads on its own"
         assert dict(span.attributes or {}) == {"store": store, "outcome": "success"}
         assert span.status.status_code is not StatusCode.ERROR
+        assert span.events == ()
 
     root = spans["schema_init postgresql"]
     db = spans["execute postgresql"]
@@ -245,13 +246,18 @@ async def test_a_failing_store_fails_its_span_with_the_outcome_attribute(
 
     spans = _spans_by_name(in_memory_spans)
     failed = spans["schema_init postgresql"]
-    assert dict(failed.attributes or {}) == {"store": "postgresql", "outcome": "failure"}
     assert failed.status.status_code is StatusCode.ERROR
-    assert failed.status.description is None, "a failed span carries no message, stack trace, or payload"
+    # The type of what went wrong, and nothing more. The SDK's automatic exception recording
+    # would have attached an event holding the message and the traceback here, and copied
+    # "unavailable" into the status description; both are payloads a span never carries.
+    assert dict(failed.attributes or {}) == {"store": "postgresql", "outcome": "failure", "error.type": "ConnectionError"}
+    assert failed.status.description is None, "a failed span carries no message"
+    assert failed.events == (), "a failed span carries no exception event, so no traceback reaches the collector"
 
     succeeded = spans["schema_init neo4j"]
     assert dict(succeeded.attributes or {}) == {"store": "neo4j", "outcome": "success"}
     assert succeeded.status.status_code is not StatusCode.ERROR
+    assert succeeded.events == ()
 
 
 @pytest.mark.asyncio

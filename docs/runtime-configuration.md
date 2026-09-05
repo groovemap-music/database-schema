@@ -74,16 +74,22 @@ shutdown, so the lag histogram covers exactly the schema application.
 
 | Span | Kind | Attributes |
 | --- | --- | --- |
-| `schema_init postgresql`, `schema_init neo4j` | `INTERNAL` | `store`, `outcome` |
+| `schema_init postgresql`, `schema_init neo4j` | `INTERNAL` | `store`, `outcome`, `error.type` on a failure that raised |
 | `{db.operation.name} {db.system.name}`, for example `execute postgresql` | `CLIENT` | `db.system.name`, `db.operation.name`, `error.type` on failure |
 
 Each store's `schema_init` span is a trace root, and the database spans the runtime's pool and
 driver open on their own nest underneath it. The two stores initialize concurrently and each
 one is therefore its own trace, which is what lets an operator read a single store's
-initialization without untangling the other. A store that did not initialize carries
-`outcome=failure` and span status `ERROR`; no statement, message, stack trace, or identifier is
-ever attached to a span. There is no `schema_init all` span: the overall run is a metric only,
-because wrapping the stores in a parent span would stop each store's span from being a root.
+initialization without untangling the other. There is no `schema_init all` span: the overall
+run is a metric only, because wrapping the stores in a parent span would stop each store's span
+from being a root.
+
+A store that did not initialize carries `outcome=failure` and span status `ERROR`, plus
+`error.type` -- the exception's class name -- when the failure raised rather than being a count
+of rejected statements. Nothing else is attached: no statement, message, stack trace, or
+identifier. The SDK's automatic exception recording is switched off for that reason, since it
+would otherwise add a span event holding the message and the traceback and copy the message
+into the span's status description.
 
 Call counts and durations per span name are derived by the collector's span-metrics connector.
 This service never emits them itself.

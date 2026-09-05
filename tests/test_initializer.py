@@ -94,6 +94,13 @@ class TestStoreSpanWrapper:
 
         assert recorded == [("neo4j", "success"), ("neo4j", "failure")]
 
+    def test_error_type_annotation_swallows_instrument_errors(self) -> None:
+        """A broken span must never turn a failing initialization into a crash."""
+        span = MagicMock()
+        span.set_attribute.side_effect = RuntimeError("boom")
+        with patch.object(initializer, "get_current_span", return_value=span):
+            initializer._mark_store_error(ConnectionError("unavailable"))
+
     def test_span_annotation_swallows_instrument_errors(self) -> None:
         """A broken span must never turn a working initialization into a failure."""
         span = MagicMock()
