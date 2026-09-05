@@ -14,7 +14,7 @@ from repository_source import RepositorySourceError, check_retired_branding
 
 ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY = "https://github.com/groovemap-music/database-schema"
-AUTOMATION_REVISION = "2f34a4da5c552bc23c75edd3d8d81be0a4b3271c"
+AUTOMATION_REVISION = "833cb464507678c38ab78bd4718ce697399463e9"
 PYTHON_LIBRARIES_REVISION = "455523ec388fdb9862d7aca65d9434aa7073dcb5"
 
 
