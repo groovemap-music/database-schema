@@ -22,7 +22,7 @@ license = "MIT"
 license-files = ["LICENSE", "NOTICE"]
 dependencies = [
     "groovemap-runtime[neo4j,otel,postgres]==0.1.0",
-    "psycopg[binary]>=3.3.4",
+    "psycopg[binary]>=3.3.5",
 ]
 
 [project.scripts]
