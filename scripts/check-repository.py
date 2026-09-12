@@ -113,7 +113,7 @@ for fragment in (
     "language: python",
     "setup-command: just setup",
     "check-command: just check",
-    "coverage-command: just test",
+    "coverage-command: just coverage",
     "audit-command: just audit",
     "license-command: just license-check",
     "secret-scan-command: just secret-scan",
