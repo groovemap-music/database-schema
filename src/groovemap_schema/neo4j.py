@@ -10,8 +10,14 @@ fulltext indexes are listed after, so there is no property overlap and no risk
 of conflicts between constraint-backed indexes and explicit range indexes.
 """
 
+from __future__ import annotations
+
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 
 logger = logging.getLogger(__name__)
@@ -175,6 +181,22 @@ SCHEMA_STATEMENTS: list[tuple[str, str]] = [
 ]
 
 
+async def _execute_schema_statements(session: Any, statements: Iterable[tuple[str, str]]) -> tuple[int, int]:
+    """Execute every statement, returning success and failure counts."""
+    success_count = 0
+    failure_count = 0
+    for name, cypher in statements:
+        try:
+            result = await session.run(cypher)
+            await result.consume()
+            logger.info("✅ Schema: %s", name)
+            success_count += 1
+        except Exception as error:
+            logger.error("❌ Failed to create schema object '%s': %s", name, error)
+            failure_count += 1
+    return success_count, failure_count
+
+
 async def create_neo4j_schema(driver: Any) -> int:
     """Create all Neo4j constraints and indexes.
 
@@ -189,19 +211,8 @@ async def create_neo4j_schema(driver: Any) -> int:
     """
     logger.info("🔧 Creating Neo4j schema (constraints and indexes)...")
 
-    success_count = 0
-    failure_count = 0
-
     async with driver.session(database="neo4j") as session:
-        for name, cypher in SCHEMA_STATEMENTS:
-            try:
-                result = await session.run(cypher)
-                await result.consume()
-                logger.info(f"✅ Schema: {name}")
-                success_count += 1
-            except Exception as e:
-                logger.error(f"❌ Failed to create schema object '{name}': {e}")
-                failure_count += 1
+        success_count, failure_count = await _execute_schema_statements(session, SCHEMA_STATEMENTS)
 
     total = len(SCHEMA_STATEMENTS)
     logger.info(f"✅ Neo4j schema creation complete: {success_count} succeeded, {failure_count} failed (total: {total})")

@@ -200,6 +200,14 @@ def _ensure_postgres_database(params: dict[str, Any]) -> None:
         logger.info("PostgreSQL database created", database=POSTGRES_DATABASE)
 
 
+def _schema_succeeded(store: str, failure_count: int) -> bool:
+    """Convert a best-effort schema result into the initializer's fail-closed result."""
+    if failure_count:
+        logger.error(f"{store} schema had partial failures", failure_count=failure_count)
+        return False
+    return True
+
+
 async def _apply_postgres_schema(params: dict[str, Any]) -> bool:
     """Apply all PostgreSQL schema statements. Telemetry is owned by _initialize_store."""
     pool: AsyncPostgreSQLPool | None = None
@@ -212,11 +220,7 @@ async def _apply_postgres_schema(params: dict[str, Any]) -> bool:
             health_check_interval=30,
         )
         await pool.initialize()
-        failures = await create_postgres_schema(pool)
-        if failures:
-            logger.error("PostgreSQL schema had partial failures", failure_count=failures)
-            return False
-        return True
+        return _schema_succeeded("PostgreSQL", await create_postgres_schema(pool))
     except Exception as error:
         logger.error("PostgreSQL schema initialization failed", error=str(error))
         _mark_store_error(error)
@@ -243,11 +247,7 @@ async def _apply_neo4j_schema() -> bool:
         async with driver.session(database="neo4j") as session:
             result = await session.run("RETURN 1 AS health")
             await result.single()
-        failures = await create_neo4j_schema(driver)
-        if failures:
-            logger.error("Neo4j schema had partial failures", failure_count=failures)
-            return False
-        return True
+        return _schema_succeeded("Neo4j", await create_neo4j_schema(driver))
     except Exception as error:
         logger.error("Neo4j schema initialization failed", error=str(error))
         _mark_store_error(error)
