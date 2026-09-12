@@ -6,10 +6,7 @@ default:
 setup:
     uv sync --dev --frozen
 
-check: format-check lint typecheck test contract-check repository-check build install-check license-check secret-scan bump-preview
-
-# Credential-free validation used when private-library access is unavailable.
-source-check: repository-check
+check: format-check lint typecheck coverage contract-check repository-check install-check license-check secret-scan bump-preview
 
 format:
     uv run ruff format .
@@ -27,11 +24,13 @@ typecheck:
 test:
     uv run pytest --cov=groovemap_schema --cov-report=term-missing --cov-report=xml
 
+coverage: test
+
 contract-check:
     uv run python scripts/check-contracts.py
 
 repository-check:
-    python scripts/check-repository.py
+    uv run python scripts/check-repository.py
 
 build:
     uv build --out-dir dist --clear

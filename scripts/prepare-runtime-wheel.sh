@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-expected="$(python - <<'PY'
+expected="$(uv run python - <<'PY'
 import tomllib
 from pathlib import Path
 
