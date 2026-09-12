@@ -38,6 +38,19 @@ file path instead of placing the corresponding value directly in the environment
 The image writes its file log to `/logs/database-schema.log`; mount `/logs` when the log
 must persist beyond the one-shot container.
 
+## Image and operational behavior
+
+The published image is `ghcr.io/groovemap-music/database-schema`. It runs as numeric user and
+group `1000:1000`, declares `/logs` as its volume, and launches `database-schema` directly as
+its entrypoint. It exposes no port and defines no Docker health check: completion status is the
+only health signal. A zero exit means database creation (when needed) and both schema families
+succeeded; any connection, connectivity, or statement failure produces a nonzero exit.
+
+Image builds accept an exact 40-character lowercase Git commit as `VCS_REF` and refuse modified
+tracked source. The resulting OCI labels record that revision, the package version, the source
+repository, and the MIT license. Release automation publishes only from an approved `v*` tag;
+building locally with `just image` never publishes or applies a live schema.
+
 ## Telemetry
 
 Metrics and traces are two independent signals over one shared OTLP/HTTP endpoint. There is no

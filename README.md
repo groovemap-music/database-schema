@@ -18,6 +18,12 @@ compatibility rules. It never connects to or mutates a live database. Use `just 
 `just build`, and `just install-check` separately as needed. `just audit` intentionally
 uses network vulnerability data and is outside the fast gate.
 
+`just check` expands to formatting, lint, type checking, coverage, compatibility and repository
+checks, package/install verification, license checks, secret scanning, and a non-mutating
+version-bump preview. `just image` builds and then verifies the local one-shot image;
+`just release-dry-run` adds release-artifact validation. Schema application, version changes
+(`just bump`), tagging, and publishing remain separate operations.
+
 The built `groovemap-database-schema` wheel contains the initializer, Python definitions,
 and versioned JSON compatibility contract. The container creates the configured PostgreSQL
 database when needed and applies both schema families. See the

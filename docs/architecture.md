@@ -5,6 +5,25 @@ contract, and the one-shot initializer image. Deployment owns credentials, servi
 resource policy, and the released image digest. Schema implementation files do not move into
 deployment.
 
+```mermaid
+flowchart LR
+    DI[discogs-ingestion] -->|owns| DE[Discogs event contract]
+    MI[musicbrainz-ingestion] -->|owns| ME[MusicBrainz event contract]
+    DS[database-schema] -->|owns| PC[Persistence contract and initializer image]
+    RT[python-libraries / groovemap-runtime] -->|owns| CL[Database driver and pool implementations]
+    API[catalog-api] -->|owns| AC[Consumer API contract]
+    DEP[deployment] -->|owns| OP[Credentials, configuration, ordering, image digest]
+    PC -->|declares| PG[(PostgreSQL schema)]
+    PC -->|declares| N[(Neo4j schema)]
+    PC -. uses .-> CL
+    OP -. runs .-> PC
+```
+
+The source-specific ingestion repositories own their event shapes. This repository owns only
+the persistence definitions and compatibility metadata; it does not own producer payloads,
+consumer API shape, credentials, or rollout orchestration. The former combined
+`catalog-ingestion` repository is retired and is not an active owner.
+
 ## Execution flow
 
 ```mermaid
@@ -67,6 +86,16 @@ present on that release — so consumers can filter by family without traversing
 edges. See `SCHEMA_STATEMENTS` in `src/groovemap_schema/neo4j.py` for the backing
 constraints and index.
 
+The complete executable inventory is `SCHEMA_STATEMENTS` in
+[`src/groovemap_schema/neo4j.py`](../src/groovemap_schema/neo4j.py). It currently declares
+unique constraints for `Artist.id`, `Label.id`, `Master.id`, `Release.id`, `Genre.name`,
+`Style.name`, `Medium.id`, `MediaFamily.name`, `User.id`, and `Person.name`. Constraint-backed
+properties deliberately have no duplicate range index. Additional range indexes cover
+ingestion hashes, selected names and years, `Release.media_families`, genre/style first years,
+`Person.credit_count`, and MusicBrainz identifiers; six full-text indexes cover artist,
+release, label, genre, style, and person text search. These are schema declarations, not node
+or relationship creation: the source-specific producers populate the graph.
+
 ## PostgreSQL media schema
 
 The PostgreSQL family gains an indexed `media JSONB` column, holding the canonical media
@@ -78,6 +107,27 @@ GIN index on `media->'families'` for medium-family filtering; the raw provider f
 additive, media-neutral rarity signals alongside the retained `format_rarity`. Every change
 is additive within persistence contract v1 — see
 [the persistence compatibility contract](../contracts/persistence/).
+
+The executable PostgreSQL inventory is in
+[`src/groovemap_schema/postgres.py`](../src/groovemap_schema/postgres.py):
+
+- public Discogs document tables: `artists`, `labels`, `masters`, and `releases`;
+- account and operational tables: `users`, `oauth_tokens`, `app_tokens`, `app_config`,
+  `user_collections`, `user_wantlists`, `sync_history`, `extraction_history`, `queue_metrics`,
+  `service_health_metrics`, and `admin_audit_log`;
+- insight tables in the `insights` schema: `artist_centrality`, `genre_trends`,
+  `label_longevity`, `monthly_anniversaries`, `data_completeness`, `release_rarity`,
+  `community_counts`, and `computation_log`; and
+- MusicBrainz tables in the `musicbrainz` schema: `artists`, `labels`, `releases`,
+  `release_groups`, `relationships`, and `external_links`.
+
+The statement lists also carry the migrations required for an existing database: additive
+authentication and media columns, rarity-signal columns, Discogs cross-reference widening to
+`BIGINT`, and the widened `musicbrainz.relationships` natural key. The latter uses `UNIQUE NULLS
+NOT DISTINCT` across both entity identifiers and types, relationship type, dates, and
+attributes. These statements intentionally run with the table/index declarations because
+`CREATE TABLE IF NOT EXISTS` cannot update an existing table. Do not translate them into an
+out-of-band migration or remove retained provenance fields.
 
 ## Media schema consumer promotion
 
