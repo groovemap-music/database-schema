@@ -6,7 +6,7 @@ cd "${repo_root}"
 
 bash scripts/check-image-source.sh
 
-version="$(python - <<'PY'
+version="$(uv run python - <<'PY'
 import tomllib
 from pathlib import Path
 
@@ -55,4 +55,4 @@ DOCKER_HOST="${docker_host}" docker --config "${docker_config}" run --rm \
 
 DOCKER_HOST="${docker_host}" docker --config "${docker_config}" image inspect database-schema:local \
   > "${docker_config}/image.json"
-python scripts/check-image-metadata.py "${docker_config}/image.json" "${revision}" "${version}"
+uv run python scripts/check-image-metadata.py "${docker_config}/image.json" "${revision}" "${version}"

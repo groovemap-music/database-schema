@@ -29,7 +29,7 @@ assert any(entry.name == "database-schema" and entry.value == "groovemap_schema.
 assert any(str(path).endswith("licenses/LICENSE") for path in (dist.files or []))
 assert any(str(path).endswith("licenses/NOTICE") for path in (dist.files or []))
 PY
-expected_version=$(python - <<'PY'
+expected_version=$(uv run python - <<'PY'
 import tomllib
 from pathlib import Path
 

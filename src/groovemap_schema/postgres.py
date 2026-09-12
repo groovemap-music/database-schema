@@ -5,10 +5,16 @@ All statements use IF NOT EXISTS — safe to run on every startup; subsequent
 runs are no-ops for already-created schema objects. Schema is never dropped.
 """
 
+from __future__ import annotations
+
 import logging
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from psycopg import sql
+
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Iterator
 
 
 logger = logging.getLogger(__name__)
@@ -812,6 +818,61 @@ _MUSICBRAINZ_INDEXES: list[tuple[str, str]] = [
 ]
 
 
+def _entity_schema_statements() -> Iterator[tuple[str, Any]]:
+    """Yield each Discogs entity table followed by its shared indexes."""
+    for table_name in _ENTITY_TABLES:
+        yield (
+            f"{table_name} table",
+            sql.SQL(
+                """
+                CREATE TABLE IF NOT EXISTS {table} (
+                    data_id    VARCHAR PRIMARY KEY,
+                    hash       VARCHAR NOT NULL,
+                    data       JSONB   NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            ).format(table=sql.Identifier(table_name)),
+        )
+        for column, template in (
+            ("hash", "CREATE INDEX IF NOT EXISTS {index} ON {table} (hash)"),
+            ("updated_at", "CREATE INDEX IF NOT EXISTS {index} ON {table} (updated_at)"),
+        ):
+            index_name = f"idx_{table_name}_{column}"
+            yield (
+                index_name,
+                sql.SQL(template).format(
+                    index=sql.Identifier(index_name),
+                    table=sql.Identifier(table_name),
+                ),
+            )
+
+
+def _schema_statements() -> Iterator[tuple[str, Any]]:
+    """Yield the complete PostgreSQL schema in compatibility-sensitive order."""
+    yield from _entity_schema_statements()
+    yield from _SPECIFIC_INDEXES
+    yield from _USER_TABLES
+    yield from _INSIGHTS_TABLES
+    yield from _MUSICBRAINZ_TABLES
+    yield from _MUSICBRAINZ_INDEXES
+
+
+async def _execute_schema_statements(cursor: Any, statements: Iterable[tuple[str, Any]]) -> tuple[int, int]:
+    """Execute every statement, returning success and failure counts."""
+    success_count = 0
+    failure_count = 0
+    for name, statement in statements:
+        try:
+            await cursor.execute(statement)
+            logger.info("✅ Schema: %s", name)
+            success_count += 1
+        except Exception as error:
+            logger.error("❌ Failed to create schema object '%s': %s", name, error)
+            failure_count += 1
+    return success_count, failure_count
+
+
 async def create_postgres_schema(pool: Any) -> int:
     """Create all PostgreSQL tables and indexes.
 
@@ -826,102 +887,14 @@ async def create_postgres_schema(pool: Any) -> int:
     """
     logger.info("🔧 Creating PostgreSQL schema (tables and indexes)...")
 
-    success_count = 0
-    failure_count = 0
-
     async with pool.connection() as conn:
         await conn.set_autocommit(True)
         # psycopg async cursor types are not fully inferred by mypy
         async with conn.cursor() as cursor_cm:
             cursor = cast("Any", cursor_cm)
+            statements = list(_schema_statements())
+            success_count, failure_count = await _execute_schema_statements(cursor, statements)
 
-            # ── Per-entity tables and shared indexes ──────────────────────────
-            for table_name in _ENTITY_TABLES:
-                per_table: list[tuple[str, Any]] = [
-                    (
-                        f"{table_name} table",
-                        sql.SQL(
-                            """
-                            CREATE TABLE IF NOT EXISTS {table} (
-                                data_id    VARCHAR PRIMARY KEY,
-                                hash       VARCHAR NOT NULL,
-                                data       JSONB   NOT NULL,
-                                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                            )
-                            """
-                        ).format(table=sql.Identifier(table_name)),
-                    ),
-                    (
-                        f"idx_{table_name}_hash",
-                        sql.SQL("CREATE INDEX IF NOT EXISTS {index} ON {table} (hash)").format(
-                            index=sql.Identifier(f"idx_{table_name}_hash"),
-                            table=sql.Identifier(table_name),
-                        ),
-                    ),
-                    (
-                        f"idx_{table_name}_updated_at",
-                        sql.SQL("CREATE INDEX IF NOT EXISTS {index} ON {table} (updated_at)").format(
-                            index=sql.Identifier(f"idx_{table_name}_updated_at"),
-                            table=sql.Identifier(table_name),
-                        ),
-                    ),
-                ]
-                for name, stmt in per_table:
-                    try:
-                        await cursor.execute(stmt)
-                        logger.info(f"✅ Schema: {name}")
-                        success_count += 1
-                    except Exception as e:
-                        logger.error(f"❌ Failed to create schema object '{name}': {e}")
-                        failure_count += 1
-
-            # ── Table-specific JSONB field indexes ────────────────────────────
-            for name, stmt in _SPECIFIC_INDEXES:
-                try:
-                    await cursor.execute(stmt)
-                    logger.info(f"✅ Schema: {name}")
-                    success_count += 1
-                except Exception as e:
-                    logger.error(f"❌ Failed to create schema object '{name}': {e}")
-                    failure_count += 1
-
-            # ── User-facing tables ────────────────────────────────────────────
-            for name, stmt in _USER_TABLES:
-                try:
-                    await cursor.execute(stmt)
-                    logger.info(f"✅ Schema: {name}")
-                    success_count += 1
-                except Exception as e:
-                    logger.error(f"❌ Failed to create schema object '{name}': {e}")
-                    failure_count += 1
-
-            # ── Insights tables ───────────────────────────────────────────
-            for name, stmt in _INSIGHTS_TABLES:
-                try:
-                    await cursor.execute(stmt)
-                    logger.info(f"✅ Schema: {name}")
-                    success_count += 1
-                except Exception as e:
-                    logger.error(f"❌ Failed to create schema object '{name}': {e}")
-                    failure_count += 1
-
-            # ── MusicBrainz tables ────────────────────────────────────────
-            for name, stmt in _MUSICBRAINZ_TABLES + _MUSICBRAINZ_INDEXES:
-                try:
-                    await cursor.execute(stmt)
-                    logger.info(f"✅ Schema: {name}")
-                    success_count += 1
-                except Exception as e:
-                    logger.error(f"❌ Failed to create schema object '{name}': {e}")
-                    failure_count += 1
-
-    total = (
-        len(_ENTITY_TABLES) * 3
-        + len(_SPECIFIC_INDEXES)
-        + len(_USER_TABLES)
-        + len(_INSIGHTS_TABLES)
-        + len(_MUSICBRAINZ_TABLES)
-        + len(_MUSICBRAINZ_INDEXES)
-    )
+    total = len(statements)
     logger.info(f"✅ PostgreSQL schema creation complete: {success_count} succeeded, {failure_count} failed (total: {total})")
     return failure_count

@@ -113,7 +113,7 @@ for fragment in (
     "language: python",
     "setup-command: just setup",
     "check-command: just check",
-    "coverage-command: just test",
+    "coverage-command: just coverage",
     "audit-command: just audit",
     "license-command: just license-check",
     "secret-scan-command: just secret-scan",
@@ -192,10 +192,17 @@ except RepositorySourceError as error:
 
 readme = (ROOT / "README.md").read_text()
 docs_index = (ROOT / "docs/README.md").read_text()
+contracts_readme = (ROOT / "contracts/README.md").read_text()
 require("docs/README.md" in readme, "README must link the repository documentation index")
 require("architecture.md" in docs_index and "runtime-configuration.md" in docs_index, "documentation index is incomplete")
 for stale in ("SimplicityGuy", retired_name, "schema-init"):
     require(stale not in readme and stale not in docs_index, f"published repository docs retain stale name: {stale}")
+for owner in ("discogs-ingestion", "musicbrainz-ingestion", "python-libraries", "deployment"):
+    require(owner in contracts_readme, f"persistence contract documentation is missing owner: {owner}")
+require(
+    "former combined `catalog-ingestion` repository" in contracts_readme,
+    "retired combined ingestion ownership must be explicitly historical",
+)
 
 for markdown in (ROOT / "README.md", *sorted((ROOT / "docs").rglob("*.md")), *sorted((ROOT / "contracts").rglob("*.md"))):
     for target in re.findall(r"(?<!!)\[[^]]+\]\(([^)]+)\)", markdown.read_text()):
