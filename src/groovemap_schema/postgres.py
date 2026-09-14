@@ -738,6 +738,234 @@ _INSIGHTS_TABLES: list[tuple[str, str]] = [
 ]
 
 
+# First-party activity (ADR 0010) — the append-only behavioural record.
+#
+# Both behavioural tables are range-partitioned by month on `occurred_at`, so
+# retention and archival act on whole partitions rather than on row deletes, and
+# both are immutable by construction: a BEFORE UPDATE OR DELETE trigger raises
+# unless the session-local `groovemap.erasure` setting is on, which only the
+# erasure procedure sets.  Events and impressions reference the pseudonymous
+# `subject_id` and never the user id, so the behavioural tables can be read and
+# joined without carrying account identity, and the link is one row to remove.
+#
+# Declared after the user-owned tables because `activity.user_subjects` and
+# `activity.consent_grants` reference `users(id)`.
+_ACTIVITY_STATEMENTS: list[tuple[str, str]] = [
+    (
+        "activity schema",
+        "CREATE SCHEMA IF NOT EXISTS activity",
+    ),
+    # The pseudonym link.  Removing this single row is what makes an erased
+    # subject unre-associable with the account it belonged to.
+    (
+        "activity.user_subjects table",
+        """
+        CREATE TABLE IF NOT EXISTS activity.user_subjects (
+            user_id    UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            subject_id UUID NOT NULL UNIQUE DEFAULT uuidv7(),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+    ),
+    # Per-purpose consent, drawn from exactly the two purposes published in
+    # taxonomy/events/v1.  A revocation sets `revoked_at` rather than deleting
+    # the grant, so the history stays reconstructible.
+    (
+        "activity.consent_grants table",
+        """
+        CREATE TABLE IF NOT EXISTS activity.consent_grants (
+            id         UUID PRIMARY KEY DEFAULT uuidv7(),
+            user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            purpose    TEXT NOT NULL CHECK (purpose IN ('product_analytics', 'model_training')),
+            granted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            revoked_at TIMESTAMPTZ
+        )
+        """,
+    ),
+    (
+        "idx_activity_consent_grants_user_purpose",
+        "CREATE INDEX IF NOT EXISTS idx_activity_consent_grants_user_purpose ON activity.consent_grants (user_id, purpose)",
+    ),
+    # The typed event envelope.  `occurred_at` and `recorded_at` are split so a
+    # late or replayed write stays honest, and the idempotency key is scoped to
+    # the occurrence time because the uniqueness of a partitioned table must
+    # include its partition key.  `consent_purposes` is snapshotted at write, so
+    # an old row stays interpretable without reconstructing the grant history.
+    (
+        "activity.events table",
+        """
+        CREATE TABLE IF NOT EXISTS activity.events (
+            event_id         UUID NOT NULL DEFAULT uuidv7(),
+            event_type       TEXT NOT NULL,
+            schema_version   SMALLINT NOT NULL,
+            subject_id       UUID NOT NULL,
+            session_id       UUID,
+            occurred_at      TIMESTAMPTZ NOT NULL,
+            recorded_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            producer         TEXT NOT NULL,
+            consent_purposes TEXT[] NOT NULL,
+            model_version    TEXT,
+            feature_version  TEXT,
+            idempotency_key  TEXT NOT NULL,
+            payload          JSONB NOT NULL DEFAULT '{}',
+            PRIMARY KEY (occurred_at, event_id),
+            UNIQUE (occurred_at, idempotency_key)
+        ) PARTITION BY RANGE (occurred_at)
+        """,
+    ),
+    # A DEFAULT partition means an insert never fails for a missing month; the
+    # writer calls ensure_month_partition() below to land the row in its own.
+    (
+        "activity.events_default partition",
+        "CREATE TABLE IF NOT EXISTS activity.events_default PARTITION OF activity.events DEFAULT",
+    ),
+    (
+        "idx_activity_events_subject_occurred_at",
+        "CREATE INDEX IF NOT EXISTS idx_activity_events_subject_occurred_at ON activity.events (subject_id, occurred_at DESC)",
+    ),
+    (
+        "idx_activity_events_type_occurred_at",
+        "CREATE INDEX IF NOT EXISTS idx_activity_events_type_occurred_at ON activity.events (event_type, occurred_at DESC)",
+    ),
+    # What a shown recommendation needs for later offline evaluation.
+    # `policy_id`, `candidate_set_id`, `position`, and `propensity` describe the
+    # decision as it was made and cannot be recovered afterwards from the
+    # catalog or from the outcome; everything else about an impression can.
+    # Outcomes are events carrying the impression id, never columns here, which
+    # is what keeps the row immutable while one impression accrues several.
+    (
+        "activity.impressions table",
+        """
+        CREATE TABLE IF NOT EXISTS activity.impressions (
+            impression_id    UUID NOT NULL DEFAULT uuidv7(),
+            subject_id       UUID NOT NULL,
+            surface          TEXT NOT NULL,
+            policy_id        TEXT NOT NULL,
+            candidate_set_id UUID NOT NULL,
+            position         INTEGER NOT NULL,
+            item_id          UUID NOT NULL,
+            score            REAL,
+            propensity       REAL,
+            request_id       UUID,
+            occurred_at      TIMESTAMPTZ NOT NULL,
+            recorded_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            consent_purposes TEXT[] NOT NULL,
+            PRIMARY KEY (occurred_at, impression_id)
+        ) PARTITION BY RANGE (occurred_at)
+        """,
+    ),
+    (
+        "activity.impressions_default partition",
+        "CREATE TABLE IF NOT EXISTS activity.impressions_default PARTITION OF activity.impressions DEFAULT",
+    ),
+    (
+        "idx_activity_impressions_subject_occurred_at",
+        "CREATE INDEX IF NOT EXISTS idx_activity_impressions_subject_occurred_at ON activity.impressions (subject_id, occurred_at DESC)",
+    ),
+    (
+        "idx_activity_impressions_candidate_set_id",
+        "CREATE INDEX IF NOT EXISTS idx_activity_impressions_candidate_set_id ON activity.impressions (candidate_set_id)",
+    ),
+    # Partition creation is owned here and invoked by the writer before insert,
+    # so a write into a month that has no partition creates it rather than
+    # failing.  The partition name is built with format()'s %I so the identifier
+    # is quoted rather than interpolated, and the bounds with %L.
+    (
+        "activity.ensure_month_partition function",
+        """
+        CREATE OR REPLACE FUNCTION activity.ensure_month_partition(table_name TEXT, month DATE)
+        RETURNS TEXT
+        LANGUAGE plpgsql
+        AS $ensure_month_partition$
+        DECLARE
+            month_start    DATE := date_trunc('month', month)::DATE;
+            month_end      DATE := (date_trunc('month', month) + INTERVAL '1 month')::DATE;
+            partition_name TEXT := format('%s_y%sm%s', table_name, to_char(month_start, 'YYYY'), to_char(month_start, 'MM'));
+        BEGIN
+            EXECUTE format(
+                'CREATE TABLE IF NOT EXISTS activity.%I PARTITION OF activity.%I FOR VALUES FROM (%L) TO (%L)',
+                partition_name,
+                table_name,
+                month_start,
+                month_end
+            );
+            RETURN partition_name;
+        END
+        $ensure_month_partition$
+        """,
+    ),
+    # Immutability is a property of the database, not a convention the
+    # application is trusted to keep: a mistaken migration or an ad hoc session
+    # cannot quietly rewrite history.  Only the erasure procedure sets
+    # `groovemap.erasure`, and it is session-local, so the bypass never leaks
+    # past the transaction that opened it.
+    (
+        "activity.reject_mutation function",
+        """
+        CREATE OR REPLACE FUNCTION activity.reject_mutation()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $reject_mutation$
+        BEGIN
+            IF current_setting('groovemap.erasure', true) = 'on' THEN
+                IF TG_OP = 'DELETE' THEN
+                    RETURN OLD;
+                END IF;
+                RETURN NEW;
+            END IF;
+            RAISE EXCEPTION
+                '%.% is append-only: % is rejected unless groovemap.erasure is on',
+                TG_TABLE_SCHEMA, TG_TABLE_NAME, TG_OP
+                USING ERRCODE = 'restrict_violation';
+        END
+        $reject_mutation$
+        """,
+    ),
+    # Row-level triggers declared on a partitioned table apply to every existing
+    # partition and are cloned onto partitions created later, so
+    # ensure_month_partition() cannot mint an unprotected month.
+    (
+        "activity.events reject_mutation trigger",
+        """
+        CREATE OR REPLACE TRIGGER activity_events_reject_mutation
+            BEFORE UPDATE OR DELETE ON activity.events
+            FOR EACH ROW EXECUTE FUNCTION activity.reject_mutation()
+        """,
+    ),
+    (
+        "activity.impressions reject_mutation trigger",
+        """
+        CREATE OR REPLACE TRIGGER activity_impressions_reject_mutation
+            BEFORE UPDATE OR DELETE ON activity.impressions
+            FOR EACH ROW EXECUTE FUNCTION activity.reject_mutation()
+        """,
+    ),
+    # The erasure record.  `model_versions_before` names the model versions that
+    # had already been trained when the erasure ran: deleting rows does not
+    # retrain a model, and naming the affected versions is what makes the
+    # residual question answerable rather than invisible.
+    (
+        "activity.erasures table",
+        """
+        CREATE TABLE IF NOT EXISTS activity.erasures (
+            id                    UUID PRIMARY KEY DEFAULT uuidv7(),
+            subject_id            UUID NOT NULL,
+            requested_at          TIMESTAMPTZ NOT NULL,
+            completed_at          TIMESTAMPTZ,
+            events_deleted        BIGINT,
+            impressions_deleted   BIGINT,
+            model_versions_before TEXT[],
+            notes                 JSONB
+        )
+        """,
+    ),
+    (
+        "idx_activity_erasures_subject_id",
+        "CREATE INDEX IF NOT EXISTS idx_activity_erasures_subject_id ON activity.erasures (subject_id)",
+    ),
+]
+
+
 # MusicBrainz tables — external music metadata and relationships
 # Stores artist, label, and release data from MusicBrainz with cross-references to Discogs IDs.
 _MUSICBRAINZ_TABLES: list[tuple[str, str]] = [
@@ -1074,6 +1302,7 @@ def _schema_statements() -> Iterator[tuple[str, Any]]:
     yield from _SPECIFIC_INDEXES
     yield from _USER_TABLES
     yield from _INSIGHTS_TABLES
+    yield from _ACTIVITY_STATEMENTS
     yield from _MUSICBRAINZ_TABLES
     yield from _MUSICBRAINZ_INDEXES
 

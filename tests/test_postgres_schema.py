@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from groovemap_schema.postgres import (
+    _ACTIVITY_STATEMENTS,
     _ENTITY_TABLES,
     _INSIGHTS_TABLES,
     _MUSICBRAINZ_INDEXES,
@@ -190,6 +191,7 @@ class TestCreatePostgresSchema:
             + len(_SPECIFIC_INDEXES)
             + len(_USER_TABLES)
             + len(_INSIGHTS_TABLES)
+            + len(_ACTIVITY_STATEMENTS)
             + len(_MUSICBRAINZ_TABLES)
             + len(_MUSICBRAINZ_INDEXES)
         )
@@ -217,6 +219,7 @@ class TestCreatePostgresSchema:
             + len(_SPECIFIC_INDEXES)
             + len(_USER_TABLES)
             + len(_INSIGHTS_TABLES)
+            + len(_ACTIVITY_STATEMENTS)
             + len(_MUSICBRAINZ_TABLES)
             + len(_MUSICBRAINZ_INDEXES)
         )
@@ -241,6 +244,11 @@ class TestCreatePostgresSchema:
             # target type is a no-op), so it needs no IF NOT EXISTS guard.
             if "ALTER COLUMN" in upper and "TYPE " in upper:
                 continue
+            # CREATE OR REPLACE is the idempotency form PostgreSQL offers for
+            # functions and triggers — there is no IF NOT EXISTS for either, and
+            # replacing a definition with the same definition is a no-op.
+            if "CREATE OR REPLACE" in upper:
+                continue
             assert "IF NOT EXISTS" in upper, f"Statement is not idempotent: {stmt[:80]}..."
             # A multi-statement blob could still hide an un-guarded DROP that would
             # not be idempotent — any DROP must be guarded with IF EXISTS.
@@ -261,6 +269,7 @@ class TestCreatePostgresSchema:
             + len(_SPECIFIC_INDEXES)
             + len(_USER_TABLES)
             + len(_INSIGHTS_TABLES)
+            + len(_ACTIVITY_STATEMENTS)
             + len(_MUSICBRAINZ_TABLES)
             + len(_MUSICBRAINZ_INDEXES)
         )
