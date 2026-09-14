@@ -11,11 +11,16 @@ orchestration.
 mise install
 just setup
 just check
+just test-integration
 ```
 
 The authoritative gate validates both schema families using in-memory fakes and static
 compatibility rules. It never connects to or mutates a live database. Use `just test`,
-`just build`, and `just install-check` separately as needed. `just audit` intentionally
+`just build`, and `just install-check` separately as needed. `just test-integration`
+requires Docker and starts disposable, loopback-only PostgreSQL and Neo4j containers. It
+applies both production schema initializers twice, compares the schema catalogs after each
+pass, and proves sentinel data survives; the containers and their volumes are removed on
+exit. CI runs this isolated integration tier on pull requests. `just audit` intentionally
 uses network vulnerability data and is outside the fast gate.
 
 `just check` expands to formatting, lint, type checking, coverage, compatibility and repository

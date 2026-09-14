@@ -22,7 +22,11 @@ typecheck:
     uv run mypy
 
 test:
-    uv run pytest --cov=groovemap_schema --cov-report=term-missing --cov-report=xml
+    uv run pytest -m "not integration" --cov=groovemap_schema --cov-report=term-missing --cov-report=xml
+
+# Starts and removes disposable PostgreSQL and Neo4j containers.
+test-integration:
+    bash scripts/test-integration.sh
 
 coverage: test
 
