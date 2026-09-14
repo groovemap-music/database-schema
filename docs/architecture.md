@@ -96,6 +96,116 @@ ingestion hashes, selected names and years, `Release.media_families`, genre/styl
 release, label, genre, style, and person text search. These are schema declarations, not node
 or relationship creation: the source-specific producers populate the graph.
 
+## Neo4j identity projection
+
+[ADR 0009](https://github.com/groovemap-music/design/blob/main/docs/adr/0009-native-identity-and-provider-aliases.md)
+introduces GrooveMap-minted native identity in PostgreSQL (see Identity below). Neo4j's
+share of that is four range indexes — `artist_gm_id`, `label_gm_id`, `master_gm_id`, and
+`release_gm_id` — on a `gm_id` property on `Artist`, `Label`, `Master`, and `Release`. Nodes
+keep their existing provider `id` and its unique constraint; `gm_id` carries no constraint of
+its own because the property is additive and null until a projection job backfills it from
+`provider_aliases`, and a uniqueness constraint cannot be declared over a property most nodes
+don't yet have. See `SCHEMA_STATEMENTS` in `src/groovemap_schema/neo4j.py` for the four
+statements.
+
+## Identity
+
+[ADR 0009](https://github.com/groovemap-music/design/blob/main/docs/adr/0009-native-identity-and-provider-aliases.md)
+adds GrooveMap-minted UUIDv7 identity for five entities in PostgreSQL, so every catalog row
+and physical copy has an id that does not depend on any one provider staying alive or
+consistent. Six new tables carry this, declared in `_USER_TABLES` in
+[`src/groovemap_schema/postgres.py`](../src/groovemap_schema/postgres.py) after `users`,
+`user_collections`, and `user_wantlists` because they reference those tables:
+
+- `catalog_items` — one row per native entity (`release`, `master`, `artist`, or `label`);
+  the id every other identity table and the additive `gm_item_id` columns point at.
+- `artifacts` — an edition of a catalog item, optionally attributed to the user who first
+  captured it.
+- `owned_copies` — the physical copy a user holds. It exists because a user says it does, not
+  because a provider listed it, and its optional `collection_row_id` back-link to
+  `user_collections` is set to `NULL` on delete rather than cascading, so the copy survives a
+  collection resync.
+- `collection_snapshots` — a point-in-time content hash and copy-id list for a user's
+  collection, for detecting drift between syncs.
+- `observations` — user-captured evidence about a copy or an edition (a matrix inscription, a
+  grading, a purchase price); a check constraint requires at least one of `owned_copy_id` or
+  `artifact_id` to be set.
+- `provider_aliases` — maps every external namespace (Discogs, MusicBrainz, Wikidata,
+  barcodes, catalogue numbers, ISRCs, matrix inscriptions, …) onto a native id, with a
+  validity interval so a provider merge or split is a new row rather than an in-place
+  rewrite.
+
+`provider_aliases` carries the lookup-or-create key: a unique index on
+`(provider, entity_kind, external_id)` scoped to `WHERE valid_to IS NULL`. Because the
+uniqueness holds only over the currently valid row rather than the whole table, any number of
+concurrent writers can run the same `SELECT` / `INSERT ... ON CONFLICT DO NOTHING` / re-`SELECT`
+sequence against the same external id and converge on one native id, instead of racing to
+insert two aliases for the same provider entity.
+
+Every provider-keyed table also gains an additive, nullable `gm_item_id UUID` column pointing
+at `catalog_items`, each with a plain index: the four Discogs entity tables (`artists`,
+`labels`, `masters`, `releases`, added in `_entity_schema_statements()`), the four
+`musicbrainz.*` entity tables (`artists`, `labels`, `releases`, `release_groups`, indexed by
+`idx_mb_artists_gm_item_id`, `idx_mb_labels_gm_item_id`, `idx_mb_releases_gm_item_id`, and
+`idx_mb_release_groups_gm_item_id`), and `user_collections` and `user_wantlists`. Discogs
+`data_id`/`release_id` and the `musicbrainz.*` `mbid` columns remain each table's primary key;
+`gm_item_id` is a pointer into the native identity graph, not a replacement key.
+`user_collections` also gains an additive, nullable `owned_copy_id UUID` column (indexed by
+`idx_user_collections_owned_copy_id`), the native counterpart to the provider `instance_id`
+that will eventually identify the physical copy. Both `release_id`/`instance_id` and the
+Discogs/MusicBrainz primary keys stay authoritative until a future contraction decision
+retires them.
+
+Every table and column above is additive within persistence contract v1 — see
+[the persistence compatibility contract](../contracts/persistence/).
+
+## Activity
+
+[ADR 0010](https://github.com/groovemap-music/design/blob/main/docs/adr/0010-first-party-events-consent-and-deletion.md)
+adds a first-party, append-only behavioural record in a new `activity` PostgreSQL schema,
+declared in `_ACTIVITY_STATEMENTS` in
+[`src/groovemap_schema/postgres.py`](../src/groovemap_schema/postgres.py) after the
+user-owned tables because `activity.user_subjects` and `activity.consent_grants` reference
+`users(id)`:
+
+- `activity.user_subjects` — the pseudonym link from a user id to a `subject_id`. Events and
+  impressions reference only `subject_id`, never the user id, so the behavioural tables can be
+  read and joined without carrying account identity, and removing this one row is what makes
+  an erased subject unre-associable with the account it belonged to.
+- `activity.consent_grants` — per-purpose consent (`product_analytics` or `model_training`); a
+  revocation sets `revoked_at` rather than deleting the grant, so history stays
+  reconstructible.
+- `activity.events` — the typed event envelope: event type, schema/feature/model versions, the
+  `subject_id`, and a `consent_purposes` snapshot taken at write time.
+- `activity.impressions` — what a shown recommendation needs for later offline evaluation
+  (`policy_id`, `candidate_set_id`, `position`, `propensity`); outcomes are recorded as
+  `activity.events` rows carrying the impression id, never as columns here, which is what
+  keeps an impression row immutable while one impression accrues several outcomes.
+
+`activity.events` and `activity.impressions` are both declared `PARTITION BY RANGE
+(occurred_at)` — month-range partitions — and each has a `_default` partition
+(`activity.events_default`, `activity.impressions_default`) so an insert into a month with no
+partition yet does not fail. The `activity.ensure_month_partition(table_name, month)` function
+is what a writer calls before insert to land the row in its own partition: it creates
+`<table>_yYYYYmMM` for that month if it doesn't already exist and returns the partition name.
+
+Both tables are immutable by construction, not by convention. The `activity.reject_mutation()`
+trigger function raises unless the session-local `groovemap.erasure` setting is `on`, and a
+`BEFORE UPDATE OR DELETE` trigger on each of `activity.events` and `activity.impressions`
+(`activity_events_reject_mutation`, `activity_impressions_reject_mutation`) invokes it —
+declared on the partitioned table, so the trigger applies to every existing partition and is
+cloned onto partitions `ensure_month_partition()` creates later. Only the erasure procedure
+sets `groovemap.erasure`, and because the setting is session-local the bypass never outlives
+the transaction that opened it.
+
+`activity.erasures` records each erasure run: `subject_id`, timing, the count of
+events/impressions deleted, and `model_versions_before` — the model versions that had already
+trained on the data before it was deleted, so the residual question ("which models saw this
+subject's data") stays answerable rather than invisible.
+
+Every table, function, and trigger above is additive within persistence contract v1 — see
+[the persistence compatibility contract](../contracts/persistence/).
+
 ## PostgreSQL media schema
 
 The PostgreSQL family gains an indexed `media JSONB` column, holding the canonical media
@@ -115,9 +225,13 @@ The executable PostgreSQL inventory is in
 - account and operational tables: `users`, `oauth_tokens`, `app_tokens`, `app_config`,
   `user_collections`, `user_wantlists`, `sync_history`, `extraction_history`, `queue_metrics`,
   `service_health_metrics`, and `admin_audit_log`;
+- native identity tables (see Identity above): `catalog_items`, `artifacts`, `owned_copies`,
+  `collection_snapshots`, `observations`, and `provider_aliases`;
 - insight tables in the `insights` schema: `artist_centrality`, `genre_trends`,
   `label_longevity`, `monthly_anniversaries`, `data_completeness`, `release_rarity`,
-  `community_counts`, and `computation_log`; and
+  `community_counts`, and `computation_log`;
+- activity tables in the `activity` schema (see Activity above): `user_subjects`,
+  `consent_grants`, `events`, `impressions`, and `erasures`; and
 - MusicBrainz tables in the `musicbrainz` schema: `artists`, `labels`, `releases`,
   `release_groups`, `relationships`, and `external_links`.
 
