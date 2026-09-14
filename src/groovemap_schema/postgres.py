@@ -232,6 +232,19 @@ _USER_TABLES: list[tuple[str, str]] = [
         "user_collections.media column",
         "ALTER TABLE user_collections ADD COLUMN IF NOT EXISTS media JSONB",
     ),
+    # Native identity (ADR 0009): the provider-keyed collection row gains the
+    # native catalog item it resolves to and the native owned copy that replaces
+    # the Discogs `instance_id` as the identity of the physical copy. Both are
+    # nullable and additive; `release_id` and `instance_id` stay authoritative
+    # until a future contraction decision retires them.
+    (
+        "user_collections.gm_item_id column",
+        "ALTER TABLE user_collections ADD COLUMN IF NOT EXISTS gm_item_id UUID",
+    ),
+    (
+        "user_collections.owned_copy_id column",
+        "ALTER TABLE user_collections ADD COLUMN IF NOT EXISTS owned_copy_id UUID",
+    ),
     (
         "idx_user_collections_user_id",
         "CREATE INDEX IF NOT EXISTS idx_user_collections_user_id ON user_collections (user_id)",
@@ -243,6 +256,14 @@ _USER_TABLES: list[tuple[str, str]] = [
     (
         "idx_user_collections_media_families",
         "CREATE INDEX IF NOT EXISTS idx_user_collections_media_families ON user_collections USING GIN ((media->'families'))",
+    ),
+    (
+        "idx_user_collections_gm_item_id",
+        "CREATE INDEX IF NOT EXISTS idx_user_collections_gm_item_id ON user_collections (gm_item_id)",
+    ),
+    (
+        "idx_user_collections_owned_copy_id",
+        "CREATE INDEX IF NOT EXISTS idx_user_collections_owned_copy_id ON user_collections (owned_copy_id)",
     ),
     (
         "user_wantlists table",
@@ -273,6 +294,11 @@ _USER_TABLES: list[tuple[str, str]] = [
         "user_wantlists.media column",
         "ALTER TABLE user_wantlists ADD COLUMN IF NOT EXISTS media JSONB",
     ),
+    # Native identity (ADR 0009): additive, nullable native catalog item.
+    (
+        "user_wantlists.gm_item_id column",
+        "ALTER TABLE user_wantlists ADD COLUMN IF NOT EXISTS gm_item_id UUID",
+    ),
     (
         "idx_user_wantlists_user_id",
         "CREATE INDEX IF NOT EXISTS idx_user_wantlists_user_id ON user_wantlists (user_id)",
@@ -280,6 +306,150 @@ _USER_TABLES: list[tuple[str, str]] = [
     (
         "idx_user_wantlists_release_id",
         "CREATE INDEX IF NOT EXISTS idx_user_wantlists_release_id ON user_wantlists (release_id)",
+    ),
+    (
+        "idx_user_wantlists_gm_item_id",
+        "CREATE INDEX IF NOT EXISTS idx_user_wantlists_gm_item_id ON user_wantlists (gm_item_id)",
+    ),
+    # ------------------------------------------------------------------
+    # Native identity (ADR 0009)
+    #
+    # GrooveMap mints its own UUID version 7 identifiers for five entities and
+    # demotes every provider identifier to evidence in `provider_aliases`.
+    # Deployment pins PostgreSQL 18, so `uuidv7()` is a standard facility and no
+    # application-side identifier library is introduced.  These tables are
+    # declared after `users`, `user_collections`, and `user_wantlists` because
+    # they reference them.
+    # ------------------------------------------------------------------
+    (
+        "catalog_items table",
+        """
+        CREATE TABLE IF NOT EXISTS catalog_items (
+            id         UUID PRIMARY KEY DEFAULT uuidv7(),
+            kind       TEXT NOT NULL CHECK (kind IN ('release', 'master', 'artist', 'label')),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+    ),
+    (
+        "artifacts table",
+        """
+        CREATE TABLE IF NOT EXISTS artifacts (
+            id         UUID PRIMARY KEY DEFAULT uuidv7(),
+            item_id    UUID NOT NULL REFERENCES catalog_items(id),
+            created_by UUID REFERENCES users(id),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+    ),
+    # owned_copies makes the physical copy first class: it exists because a user
+    # says it does, not because a provider listed it.  `collection_row_id` is the
+    # optional back-link to the provider-keyed collection row, set to NULL rather
+    # than cascading so the copy survives a collection resync.
+    (
+        "owned_copies table",
+        """
+        CREATE TABLE IF NOT EXISTS owned_copies (
+            id                UUID PRIMARY KEY DEFAULT uuidv7(),
+            user_id           UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            artifact_id       UUID REFERENCES artifacts(id),
+            item_id           UUID NOT NULL REFERENCES catalog_items(id),
+            collection_row_id UUID REFERENCES user_collections(id) ON DELETE SET NULL,
+            acquired_at       TIMESTAMPTZ,
+            created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+    ),
+    (
+        "idx_owned_copies_user_id",
+        "CREATE INDEX IF NOT EXISTS idx_owned_copies_user_id ON owned_copies (user_id)",
+    ),
+    # At most one owned copy per collection row.  `collection_row_id` is nullable
+    # and NULLs must stay distinct, so the uniqueness is a partial index rather
+    # than a table constraint.
+    (
+        "idx_owned_copies_collection_row_id",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_owned_copies_collection_row_id ON owned_copies (collection_row_id) WHERE collection_row_id IS NOT NULL",
+    ),
+    (
+        "collection_snapshots table",
+        """
+        CREATE TABLE IF NOT EXISTS collection_snapshots (
+            id           UUID PRIMARY KEY DEFAULT uuidv7(),
+            user_id      UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            taken_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            content_hash BYTEA NOT NULL,
+            item_count   INTEGER NOT NULL,
+            copy_ids     UUID[] NOT NULL
+        )
+        """,
+    ),
+    (
+        "idx_collection_snapshots_user_taken_at",
+        "CREATE INDEX IF NOT EXISTS idx_collection_snapshots_user_taken_at ON collection_snapshots (user_id, taken_at DESC)",
+    ),
+    # observations are user-captured evidence about a copy or an edition — a
+    # matrix inscription, a grading, a purchase price — so at least one of the
+    # two subjects must be present for the row to mean anything.
+    (
+        "observations table",
+        """
+        CREATE TABLE IF NOT EXISTS observations (
+            id            UUID PRIMARY KEY DEFAULT uuidv7(),
+            user_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            owned_copy_id UUID REFERENCES owned_copies(id) ON DELETE CASCADE,
+            artifact_id   UUID REFERENCES artifacts(id),
+            kind          TEXT NOT NULL,
+            value         TEXT NOT NULL,
+            source        TEXT NOT NULL,
+            confidence    REAL,
+            observed_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT observations_subject_present CHECK (owned_copy_id IS NOT NULL OR artifact_id IS NOT NULL)
+        )
+        """,
+    ),
+    (
+        "idx_observations_user_id",
+        "CREATE INDEX IF NOT EXISTS idx_observations_user_id ON observations (user_id)",
+    ),
+    (
+        "idx_observations_artifact_kind",
+        "CREATE INDEX IF NOT EXISTS idx_observations_artifact_kind ON observations (artifact_id, kind)",
+    ),
+    # provider_aliases maps every external namespace — Discogs, MusicBrainz,
+    # Wikidata, barcodes, catalogue numbers, ISRCs, matrix inscriptions — onto a
+    # native id, with a validity interval so a provider merge or split is a new
+    # row rather than an in-place rewrite.
+    (
+        "provider_aliases table",
+        """
+        CREATE TABLE IF NOT EXISTS provider_aliases (
+            id          UUID PRIMARY KEY DEFAULT uuidv7(),
+            provider    TEXT NOT NULL,
+            entity_kind TEXT NOT NULL,
+            external_id TEXT NOT NULL,
+            native_id   UUID NOT NULL,
+            valid_from  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            valid_to    TIMESTAMPTZ,
+            confidence  REAL NOT NULL DEFAULT 1.0,
+            source      TEXT NOT NULL DEFAULT 'catalog',
+            asserted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+    ),
+    # The lookup-or-create key.  Uniqueness holds only over the currently valid
+    # row, which is what makes a concurrent SELECT / INSERT ... ON CONFLICT DO
+    # NOTHING / re-SELECT converge on one native id under any number of writers.
+    (
+        "idx_provider_aliases_provider_entity_kind_external_id",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_provider_aliases_provider_entity_kind_external_id "
+        "ON provider_aliases (provider, entity_kind, external_id) WHERE valid_to IS NULL",
+    ),
+    (
+        "idx_provider_aliases_native_id",
+        "CREATE INDEX IF NOT EXISTS idx_provider_aliases_native_id ON provider_aliases (native_id)",
     ),
     (
         "sync_history table",
@@ -746,6 +916,25 @@ _MUSICBRAINZ_TABLES: list[tuple[str, str]] = [
     # now exceed 2.1B, causing "integer out of range" on INSERT. CREATE TABLE
     # IF NOT EXISTS above won't alter pre-existing tables, so widen explicitly.
     # ALTER COLUMN ... TYPE BIGINT is a no-op when the column is already BIGINT.
+    # Native identity (ADR 0009): additive, nullable native catalog item on each
+    # MusicBrainz entity table, so a second catalog becomes more aliases rather
+    # than a parallel schema joined by convention at read time.
+    (
+        "musicbrainz.artists.gm_item_id column",
+        "ALTER TABLE musicbrainz.artists ADD COLUMN IF NOT EXISTS gm_item_id UUID",
+    ),
+    (
+        "musicbrainz.labels.gm_item_id column",
+        "ALTER TABLE musicbrainz.labels ADD COLUMN IF NOT EXISTS gm_item_id UUID",
+    ),
+    (
+        "musicbrainz.releases.gm_item_id column",
+        "ALTER TABLE musicbrainz.releases ADD COLUMN IF NOT EXISTS gm_item_id UUID",
+    ),
+    (
+        "musicbrainz.release_groups.gm_item_id column",
+        "ALTER TABLE musicbrainz.release_groups ADD COLUMN IF NOT EXISTS gm_item_id UUID",
+    ),
     (
         "musicbrainz.artists.discogs_artist_id widen to BIGINT",
         "ALTER TABLE musicbrainz.artists ALTER COLUMN discogs_artist_id TYPE BIGINT",
@@ -815,6 +1004,22 @@ _MUSICBRAINZ_INDEXES: list[tuple[str, str]] = [
         "idx_mb_links_service",
         "CREATE INDEX IF NOT EXISTS idx_mb_links_service ON musicbrainz.external_links (service_name)",
     ),
+    (
+        "idx_mb_artists_gm_item_id",
+        "CREATE INDEX IF NOT EXISTS idx_mb_artists_gm_item_id ON musicbrainz.artists (gm_item_id)",
+    ),
+    (
+        "idx_mb_labels_gm_item_id",
+        "CREATE INDEX IF NOT EXISTS idx_mb_labels_gm_item_id ON musicbrainz.labels (gm_item_id)",
+    ),
+    (
+        "idx_mb_releases_gm_item_id",
+        "CREATE INDEX IF NOT EXISTS idx_mb_releases_gm_item_id ON musicbrainz.releases (gm_item_id)",
+    ),
+    (
+        "idx_mb_release_groups_gm_item_id",
+        "CREATE INDEX IF NOT EXISTS idx_mb_release_groups_gm_item_id ON musicbrainz.release_groups (gm_item_id)",
+    ),
 ]
 
 
@@ -846,6 +1051,21 @@ def _entity_schema_statements() -> Iterator[tuple[str, Any]]:
                     table=sql.Identifier(table_name),
                 ),
             )
+        # Native identity (ADR 0009): every provider-keyed entity row carries the
+        # native catalog item the loader minted for it, as an additive nullable
+        # column beside the Discogs `data_id` that remains the primary key.
+        yield (
+            f"{table_name} add gm_item_id column",
+            sql.SQL("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS gm_item_id UUID").format(table=sql.Identifier(table_name)),
+        )
+        gm_index_name = f"idx_{table_name}_gm_item_id"
+        yield (
+            gm_index_name,
+            sql.SQL("CREATE INDEX IF NOT EXISTS {index} ON {table} (gm_item_id)").format(
+                index=sql.Identifier(gm_index_name),
+                table=sql.Identifier(table_name),
+            ),
+        )
 
 
 def _schema_statements() -> Iterator[tuple[str, Any]]:

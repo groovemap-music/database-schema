@@ -181,10 +181,12 @@ class TestCreatePostgresSchema:
         await create_postgres_schema(mock_pool)
 
         cursor = mock_pool.connection.return_value.__aenter__.return_value.cursor.return_value
-        # 3 statements per entity table (CREATE TABLE + hash index + updated_at index)
-        # + specific indexes + user tables + insights tables + musicbrainz tables/indexes
+        # 5 statements per entity table (CREATE TABLE + hash index + updated_at
+        # index + the additive gm_item_id column and its index)
+        # + specific indexes + user tables + insights tables + activity statements
+        # + musicbrainz tables/indexes
         expected_calls = (
-            len(_ENTITY_TABLES) * 3
+            len(_ENTITY_TABLES) * 5
             + len(_SPECIFIC_INDEXES)
             + len(_USER_TABLES)
             + len(_INSIGHTS_TABLES)
@@ -211,7 +213,7 @@ class TestCreatePostgresSchema:
         await create_postgres_schema(mock_pool)
 
         expected_calls = (
-            len(_ENTITY_TABLES) * 3
+            len(_ENTITY_TABLES) * 5
             + len(_SPECIFIC_INDEXES)
             + len(_USER_TABLES)
             + len(_INSIGHTS_TABLES)
@@ -255,7 +257,7 @@ class TestCreatePostgresSchema:
         await create_postgres_schema(mock_pool)
 
         expected_calls = (
-            len(_ENTITY_TABLES) * 3
+            len(_ENTITY_TABLES) * 5
             + len(_SPECIFIC_INDEXES)
             + len(_USER_TABLES)
             + len(_INSIGHTS_TABLES)
