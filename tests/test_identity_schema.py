@@ -207,6 +207,8 @@ _ADDED_STATEMENT_NAMES = frozenset(
         "activity.impressions reject_mutation trigger",
         "activity.erasures table",
         "idx_activity_erasures_subject_id",
+        "insights.activity_summary table",
+        "idx_activity_summary_date",
     }
 )
 

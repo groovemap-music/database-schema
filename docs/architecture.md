@@ -229,7 +229,9 @@ The executable PostgreSQL inventory is in
   `collection_snapshots`, `observations`, and `provider_aliases`;
 - insight tables in the `insights` schema: `artist_centrality`, `genre_trends`,
   `label_longevity`, `monthly_anniversaries`, `data_completeness`, `release_rarity`,
-  `community_counts`, and `computation_log`;
+  `community_counts`, `computation_log`, and `activity_summary` (analytics-engine's
+  daily per-dimension rollup of `activity` events and impressions, keyed by
+  `summary_date`, `dimension`, and `dimension_key`);
 - activity tables in the `activity` schema (see Activity above): `user_subjects`,
   `consent_grants`, `events`, `impressions`, and `erasures`; and
 - MusicBrainz tables in the `musicbrainz` schema: `artists`, `labels`, `releases`,
