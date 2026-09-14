@@ -241,15 +241,13 @@ class TestCreatePostgresSchema:
         for stmt in captured:
             upper = stmt.upper()
             # ALTER COLUMN ... TYPE is inherently idempotent (re-applying the same
-            # target type is a no-op), so it needs no IF NOT EXISTS guard.
-            if "ALTER COLUMN" in upper and "TYPE " in upper:
-                continue
-            # CREATE OR REPLACE is the idempotency form PostgreSQL offers for
-            # functions and triggers — there is no IF NOT EXISTS for either, and
-            # replacing a definition with the same definition is a no-op.
-            if "CREATE OR REPLACE" in upper:
-                continue
-            assert "IF NOT EXISTS" in upper, f"Statement is not idempotent: {stmt[:80]}..."
+            # target type is a no-op), and CREATE OR REPLACE is the idempotency
+            # form PostgreSQL offers for a function or a trigger, neither of which
+            # has an IF NOT EXISTS spelling. Both still have to clear the DROP
+            # guard below.
+            exempt = ("ALTER COLUMN" in upper and "TYPE " in upper) or "CREATE OR REPLACE" in upper
+            if not exempt:
+                assert "IF NOT EXISTS" in upper, f"Statement is not idempotent: {stmt[:80]}..."
             # A multi-statement blob could still hide an un-guarded DROP that would
             # not be idempotent — any DROP must be guarded with IF EXISTS.
             if "DROP " in upper:
