@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from groovemap_schema.postgres import (
+    _ACTIVITY_STATEMENTS,
     _ENTITY_TABLES,
     _INSIGHTS_TABLES,
     _MUSICBRAINZ_INDEXES,
@@ -181,13 +182,16 @@ class TestCreatePostgresSchema:
         await create_postgres_schema(mock_pool)
 
         cursor = mock_pool.connection.return_value.__aenter__.return_value.cursor.return_value
-        # 3 statements per entity table (CREATE TABLE + hash index + updated_at index)
-        # + specific indexes + user tables + insights tables + musicbrainz tables/indexes
+        # 5 statements per entity table (CREATE TABLE + hash index + updated_at
+        # index + the additive gm_item_id column and its index)
+        # + specific indexes + user tables + insights tables + activity statements
+        # + musicbrainz tables/indexes
         expected_calls = (
-            len(_ENTITY_TABLES) * 3
+            len(_ENTITY_TABLES) * 5
             + len(_SPECIFIC_INDEXES)
             + len(_USER_TABLES)
             + len(_INSIGHTS_TABLES)
+            + len(_ACTIVITY_STATEMENTS)
             + len(_MUSICBRAINZ_TABLES)
             + len(_MUSICBRAINZ_INDEXES)
         )
@@ -211,10 +215,11 @@ class TestCreatePostgresSchema:
         await create_postgres_schema(mock_pool)
 
         expected_calls = (
-            len(_ENTITY_TABLES) * 3
+            len(_ENTITY_TABLES) * 5
             + len(_SPECIFIC_INDEXES)
             + len(_USER_TABLES)
             + len(_INSIGHTS_TABLES)
+            + len(_ACTIVITY_STATEMENTS)
             + len(_MUSICBRAINZ_TABLES)
             + len(_MUSICBRAINZ_INDEXES)
         )
@@ -236,10 +241,13 @@ class TestCreatePostgresSchema:
         for stmt in captured:
             upper = stmt.upper()
             # ALTER COLUMN ... TYPE is inherently idempotent (re-applying the same
-            # target type is a no-op), so it needs no IF NOT EXISTS guard.
-            if "ALTER COLUMN" in upper and "TYPE " in upper:
-                continue
-            assert "IF NOT EXISTS" in upper, f"Statement is not idempotent: {stmt[:80]}..."
+            # target type is a no-op), and CREATE OR REPLACE is the idempotency
+            # form PostgreSQL offers for a function or a trigger, neither of which
+            # has an IF NOT EXISTS spelling. Both still have to clear the DROP
+            # guard below.
+            exempt = ("ALTER COLUMN" in upper and "TYPE " in upper) or "CREATE OR REPLACE" in upper
+            if not exempt:
+                assert "IF NOT EXISTS" in upper, f"Statement is not idempotent: {stmt[:80]}..."
             # A multi-statement blob could still hide an un-guarded DROP that would
             # not be idempotent — any DROP must be guarded with IF EXISTS.
             if "DROP " in upper:
@@ -255,10 +263,11 @@ class TestCreatePostgresSchema:
         await create_postgres_schema(mock_pool)
 
         expected_calls = (
-            len(_ENTITY_TABLES) * 3
+            len(_ENTITY_TABLES) * 5
             + len(_SPECIFIC_INDEXES)
             + len(_USER_TABLES)
             + len(_INSIGHTS_TABLES)
+            + len(_ACTIVITY_STATEMENTS)
             + len(_MUSICBRAINZ_TABLES)
             + len(_MUSICBRAINZ_INDEXES)
         )
