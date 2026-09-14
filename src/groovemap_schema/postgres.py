@@ -709,6 +709,25 @@ _INSIGHTS_TABLES: list[tuple[str, str]] = [
         "CREATE INDEX IF NOT EXISTS idx_computation_log_type_started ON insights.computation_log (insight_type, started_at DESC)",
     ),
     (
+        "insights.activity_summary table",
+        """
+        CREATE TABLE IF NOT EXISTS insights.activity_summary (
+            summary_date        DATE NOT NULL,
+            dimension           TEXT NOT NULL CHECK (dimension IN ('event_type', 'policy_id')),
+            dimension_key       TEXT NOT NULL,
+            record_count        BIGINT NOT NULL,
+            subject_count       BIGINT NOT NULL,
+            candidate_set_count BIGINT,
+            computed_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (summary_date, dimension, dimension_key)
+        )
+        """,
+    ),
+    (
+        "idx_activity_summary_date",
+        "CREATE INDEX IF NOT EXISTS idx_activity_summary_date ON insights.activity_summary (summary_date DESC)",
+    ),
+    (
         "idx_anniversaries_month_year",
         "CREATE INDEX IF NOT EXISTS idx_anniversaries_month_year ON insights.monthly_anniversaries (computed_year, computed_month)",
     ),
