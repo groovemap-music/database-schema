@@ -75,6 +75,26 @@ SCHEMA_STATEMENTS: list[tuple[str, str]] = [
         "CREATE CONSTRAINT person_name IF NOT EXISTS FOR (p:Person) REQUIRE p.name IS UNIQUE",
     ),
     # ── Range indexes ─────────────────────────────────────────────────────────
+    # gm_id indexes (ADR 0009: native identity and provider aliases). Nodes keep
+    # their provider `id` and its uniqueness constraint above; `gm_id` is an
+    # additive property set by the catalog-api projection job and is null until
+    # projected, so it gets an explicit range index rather than a constraint.
+    (
+        "artist_gm_id",
+        "CREATE INDEX artist_gm_id IF NOT EXISTS FOR (a:Artist) ON (a.gm_id)",
+    ),
+    (
+        "label_gm_id",
+        "CREATE INDEX label_gm_id IF NOT EXISTS FOR (l:Label) ON (l.gm_id)",
+    ),
+    (
+        "master_gm_id",
+        "CREATE INDEX master_gm_id IF NOT EXISTS FOR (m:Master) ON (m.gm_id)",
+    ),
+    (
+        "release_gm_id",
+        "CREATE INDEX release_gm_id IF NOT EXISTS FOR (r:Release) ON (r.gm_id)",
+    ),
     # sha256 indexes retained for efficient MERGE operations during ingestion.
     (
         "artist_sha256",
