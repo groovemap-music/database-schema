@@ -124,8 +124,31 @@ class TestSchemaStatements:
         assert constraint_max < first_non_constraint, "All CONSTRAINT statements must appear before INDEX statements"
 
     def test_total_statement_count(self) -> None:
-        # 10 constraints + 12 range indexes + 4 MBID indexes + 6 fulltext = 32
-        assert len(SCHEMA_STATEMENTS) == 32
+        # 10 constraints + 4 gm_id indexes + 12 range indexes + 4 MBID indexes + 6 fulltext = 36
+        assert len(SCHEMA_STATEMENTS) == 36
+
+    def test_gm_id_indexes_present(self) -> None:
+        """ADR 0009: gm_id range indexes on the four catalog labels."""
+        statements = dict(SCHEMA_STATEMENTS)
+        assert statements["release_gm_id"] == "CREATE INDEX release_gm_id IF NOT EXISTS FOR (r:Release) ON (r.gm_id)"
+        assert statements["master_gm_id"] == "CREATE INDEX master_gm_id IF NOT EXISTS FOR (m:Master) ON (m.gm_id)"
+        assert statements["artist_gm_id"] == "CREATE INDEX artist_gm_id IF NOT EXISTS FOR (a:Artist) ON (a.gm_id)"
+        assert statements["label_gm_id"] == "CREATE INDEX label_gm_id IF NOT EXISTS FOR (l:Label) ON (l.gm_id)"
+
+    def test_gm_id_indexes_follow_constraints(self) -> None:
+        """The gm_id range indexes must appear after every constraint (ADR 0009:
+        no constraint on gm_id since it is null until the projection job runs)."""
+        positions = {n: i for i, (n, _) in enumerate(SCHEMA_STATEMENTS)}
+        constraint_names = {n for n, c in SCHEMA_STATEMENTS if "CONSTRAINT" in c}
+        last_constraint = max(positions[n] for n in constraint_names)
+        for name in ("artist_gm_id", "label_gm_id", "master_gm_id", "release_gm_id"):
+            assert positions[name] > last_constraint, f"{name} must be listed after all constraints"
+
+    def test_no_constraint_declared_on_gm_id(self) -> None:
+        """gm_id is additive and nullable until projected — it must never be constrained."""
+        for name, cypher in SCHEMA_STATEMENTS:
+            if "CONSTRAINT" in cypher:
+                assert "gm_id" not in cypher, f"Constraint '{name}' must not reference gm_id"
 
 
 class TestCreateNeo4jSchema:
