@@ -124,8 +124,9 @@ class TestSchemaStatements:
         assert constraint_max < first_non_constraint, "All CONSTRAINT statements must appear before INDEX statements"
 
     def test_total_statement_count(self) -> None:
-        # 10 constraints + 4 gm_id indexes + 12 range indexes + 4 MBID indexes + 6 fulltext = 36
-        assert len(SCHEMA_STATEMENTS) == 36
+        # 11 constraints (incl. company_id) + 4 gm_id indexes + 13 range indexes
+        # (incl. release_country) + 4 MBID indexes + 6 fulltext = 38
+        assert len(SCHEMA_STATEMENTS) == 38
 
     def test_gm_id_indexes_present(self) -> None:
         """ADR 0009: gm_id range indexes on the four catalog labels."""
@@ -149,6 +150,21 @@ class TestSchemaStatements:
         for name, cypher in SCHEMA_STATEMENTS:
             if "CONSTRAINT" in cypher:
                 assert "gm_id" not in cypher, f"Constraint '{name}' must not reference gm_id"
+
+    def test_company_constraint_present(self) -> None:
+        """ADR 0011: Company backs the CREDITED_TO manufacturing-credit edge."""
+        statements = dict(SCHEMA_STATEMENTS)
+        assert statements["company_id"] == "CREATE CONSTRAINT company_id IF NOT EXISTS FOR (c:Company) REQUIRE c.id IS UNIQUE"
+
+    def test_release_country_index_present(self) -> None:
+        """ADR 0011: Release.country closes the gap PostgreSQL already indexes."""
+        statements = dict(SCHEMA_STATEMENTS)
+        assert statements["release_country"] == "CREATE INDEX release_country IF NOT EXISTS FOR (r:Release) ON (r.country)"
+
+    def test_company_constraint_precedes_range_indexes(self) -> None:
+        names = [n for n, _ in SCHEMA_STATEMENTS]
+        assert names.index("company_id") < names.index("release_country")
+        assert names.index("company_id") < names.index("artist_gm_id")
 
 
 class TestCreateNeo4jSchema:
