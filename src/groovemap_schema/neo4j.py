@@ -74,6 +74,12 @@ SCHEMA_STATEMENTS: list[tuple[str, str]] = [
         "person_name",
         "CREATE CONSTRAINT person_name IF NOT EXISTS FOR (p:Person) REQUIRE p.name IS UNIQUE",
     ),
+    # Company backs the manufacturing-credit edge (ADR 0011):
+    # (:Release)-[:CREDITED_TO {role, role_category, source}]->(:Company).
+    (
+        "company_id",
+        "CREATE CONSTRAINT company_id IF NOT EXISTS FOR (c:Company) REQUIRE c.id IS UNIQUE",
+    ),
     # ── Range indexes ─────────────────────────────────────────────────────────
     # gm_id indexes (ADR 0009: native identity and provider aliases). Nodes keep
     # their provider `id` and its uniqueness constraint above; `gm_id` is an
@@ -136,6 +142,14 @@ SCHEMA_STATEMENTS: list[tuple[str, str]] = [
     (
         "release_media_families_index",
         "CREATE INDEX release_media_families_index IF NOT EXISTS FOR (r:Release) ON (r.media_families)",
+    ),
+    # Release.country (ADR 0011): additive property written by the Discogs graph
+    # enricher from the release's country, and by the MusicBrainz graph enricher
+    # as mb_country on releases it matches. PostgreSQL already indexes
+    # releases.data->>'country'; this closes the same gap in the graph.
+    (
+        "release_country",
+        "CREATE INDEX release_country IF NOT EXISTS FOR (r:Release) ON (r.country)",
     ),
     # first_year indexes for genre-emergence queries.  Pre-computed by
     # graphinator after release import; allows emergence lookups with
