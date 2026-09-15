@@ -245,6 +245,45 @@ attributes. These statements intentionally run with the table/index declarations
 `CREATE TABLE IF NOT EXISTS` cannot update an existing table. Do not translate them into an
 out-of-band migration or remove retained provenance fields.
 
+## Catalog identifiers, manufacturing credits, and release country
+
+[ADR 0011](https://github.com/groovemap-music/design/blob/main/docs/adr/0011-catalog-identifiers-and-manufacturing-credits.md)
+adds two PostgreSQL GIN indexes over the additive `identifiers` and `companies` blocks that
+`discogs-ingestion` attaches to every Discogs `releases` event, a Neo4j `Company` node, the
+`CREDITED_TO` manufacturing-credit edge, and a `Release.country` range index.
+
+PostgreSQL gains `idx_releases_identifiers` on `data->'identifiers'` and
+`idx_releases_companies` on `data->'companies'`, GIN indexes declared beside
+`idx_releases_genres`, `idx_releases_labels`, and `idx_releases_media_families` in
+`_SPECIFIC_INDEXES` in [`src/groovemap_schema/postgres.py`](../src/groovemap_schema/postgres.py).
+They serve analytical containment queries over the two blocks; exact barcode and
+catalogue-number lookup resolves through `provider_aliases` (see Identity above) instead.
+
+Neo4j gains `Company` — one manufacturing, mastering, or distribution credit party, unique on
+`id` (the `company_id` constraint) — alongside the existing Artist, Label, Master, Release,
+Genre, Style, Medium, MediaFamily, User, and Person nodes. The credit itself is a
+relationship:
+
+- `(:Release)-[:CREDITED_TO {role, role_category, source}]->(:Company)` — a manufacturing,
+  mastering, or rights credit a catalog asserts about a release. `role` is the raw credit
+  string and `role_category` its closed-vocabulary category, the same pattern
+  `(:Person)-[:CREDITED_ON {role}]->(:Release)` already uses for a person credit; `source`
+  names the asserting catalog, the same pattern `(:Release)-[:ISSUED_ON {qty, source}]->(:Medium)`
+  above already uses. Like those two edges, `CREDITED_TO` is documented here rather than
+  declared in `SCHEMA_STATEMENTS` — the source-specific graph enrichers write it, and this
+  repository declares only the `Company.id` constraint it depends on.
+
+`Release` also gains a `country` range index (`release_country`), backing an additive
+`Release.country` property that the Discogs graph enricher writes from the release's country,
+and an additive `Release.mb_country` property the MusicBrainz graph enricher writes on
+releases it matches. `releases.data->>'country'` is already indexed in PostgreSQL
+(`idx_releases_country`); this closes the same gap in the graph. See `SCHEMA_STATEMENTS` in
+[`src/groovemap_schema/neo4j.py`](../src/groovemap_schema/neo4j.py) for the `company_id`
+constraint and the `release_country` index.
+
+Every index and constraint above is additive within persistence contract v1 — see
+[the persistence compatibility contract](../contracts/persistence/).
+
 ## Media schema consumer promotion
 
 Downstream services do not track `database-schema` continuously; each pins

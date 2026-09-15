@@ -209,6 +209,8 @@ _ADDED_STATEMENT_NAMES = frozenset(
         "idx_activity_erasures_subject_id",
         "insights.activity_summary table",
         "idx_activity_summary_date",
+        "idx_releases_identifiers",
+        "idx_releases_companies",
     }
 )
 
