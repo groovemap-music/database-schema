@@ -70,6 +70,18 @@ _SPECIFIC_INDEXES: list[tuple[str, str]] = [
         "idx_releases_labels",
         "CREATE INDEX IF NOT EXISTS idx_releases_labels ON releases USING GIN ((data->'labels'))",
     ),
+    # Catalog identifiers and manufacturing credits (ADR 0011) — GIN indexes on
+    # the additive identifiers/companies blocks for containment queries. Exact
+    # lookup (barcode, catalogue number) resolves through provider_aliases
+    # instead; these serve analytical containment queries.
+    (
+        "idx_releases_identifiers",
+        "CREATE INDEX IF NOT EXISTS idx_releases_identifiers ON releases USING GIN ((data->'identifiers'))",
+    ),
+    (
+        "idx_releases_companies",
+        "CREATE INDEX IF NOT EXISTS idx_releases_companies ON releases USING GIN ((data->'companies'))",
+    ),
     # Canonical media block (ADR 0007) — additive column plus a GIN index on the
     # sorted family-id list for fast media-family filtering.
     (

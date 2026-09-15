@@ -95,6 +95,15 @@ class TestSpecificIndexes:
             assert "to_tsvector" in stmt, f"{name} missing to_tsvector"
             assert "english" in stmt, f"{name} missing language 'english'"
 
+    def test_identifiers_and_companies_gin_indexes_defined(self) -> None:
+        """ADR 0011: containment queries over the additive identifiers/companies
+        blocks need the same GIN index shape media families already has."""
+        indexes = dict(_SPECIFIC_INDEXES)
+        assert (
+            indexes["idx_releases_identifiers"] == "CREATE INDEX IF NOT EXISTS idx_releases_identifiers ON releases USING GIN ((data->'identifiers'))"
+        )
+        assert indexes["idx_releases_companies"] == "CREATE INDEX IF NOT EXISTS idx_releases_companies ON releases USING GIN ((data->'companies'))"
+
 
 class TestInsightsSchema:
     """Tests for insights schema tables."""
