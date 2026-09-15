@@ -2,6 +2,27 @@
 
 All notable changes to the GrooveMap database schema will be documented here.
 
+## v0.3.0 (2026-09-14)
+
+### Feat
+
+- add the insights.activity_summary table
+- add the partitioned activity schema with immutability and consent
+- add native identity tables and provider aliases
+- add gm_id range indexes to the Neo4j catalog labels
+- **telemetry**: trace store initialization and sample event-loop lag
+
+### Fix
+
+- **telemetry**: keep exception payloads off the schema_init spans
+- **ci**: accept commitizen's no-eligible-commits bump-preview state
+- **deps**: bump python to 3.14.7-slim and dockerfile frontend to 1.27 (#1)
+
+### Refactor
+
+- **automation**: normalize recipe dependency graph
+- **schema**: centralize statement execution
+
 ## v0.2.0 (2026-09-04)
 
 ### Feat
