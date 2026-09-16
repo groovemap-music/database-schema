@@ -62,7 +62,7 @@ allow-direct-references = true
 exclude-newer = "2 days"
 
 [tool.uv.sources]
-groovemap-runtime = { git = "https://github.com/groovemap-music/python-libraries.git", rev = "e372b6a7598ae31ee6578fdff39bc920bedd7136" }
+groovemap-runtime = { git = "https://github.com/groovemap-music/python-libraries.git", rev = "6e84fe9acfd9551bd3bba2f2e78fef0ec1ef38ef" }
 
 [tool.ruff]
 line-length = 150
