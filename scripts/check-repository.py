@@ -137,7 +137,34 @@ for forbidden in (
 ):
     require(forbidden not in ci.lower(), f"CI retains obsolete private-library credential configuration: {forbidden}")
 ci_jobs = ci.split("jobs:\n", 1)[1]
-require(len(re.findall(r"^  [a-zA-Z0-9_-]+:\s*$", ci_jobs, re.MULTILINE)) == 1, "CI must expose one required caller job for every event")
+require(
+    re.findall(r"^  ([a-zA-Z0-9_-]+):\s*$", ci_jobs, re.MULTILINE) == ["required", "postgres-19-beta"],
+    "CI must expose exactly the required caller job and the advisory PostgreSQL 19 beta tier",
+)
+required_job, advisory_job = ci_jobs.split("  postgres-19-beta:\n", 1)
+require(
+    "integration-command: just test-integration\n" in required_job,
+    "the required caller job must keep the PostgreSQL 18 tier as its integration gate",
+)
+require("continue-on-error" not in required_job, "the required caller job must fail the workflow")
+require(
+    "run: just test-integration-pg19" in advisory_job,
+    "the PostgreSQL 19 beta tier must run the parameterized integration recipe",
+)
+require(
+    "continue-on-error: true" in advisory_job,
+    "the PostgreSQL 19 beta tier stays advisory until PostgreSQL 19 general availability",
+)
+
+justfile = (ROOT / "Justfile").read_text()
+require(
+    "POSTGRES_INTEGRATION_IMAGE=postgres:19beta3-alpine@sha256:" in justfile,
+    "the PostgreSQL 19 beta tier must pin its engine image by digest",
+)
+require(
+    "NEO4J_INTEGRATION_IMAGE" not in justfile,
+    "the PostgreSQL 19 beta tier must reuse the shared Neo4j image",
+)
 
 require(re.search(r'on:\s*\n  push:\s*\n    tags: \["v\*"\]', release) is not None, "release must be restricted to pushed version tags")
 for fragment in (
@@ -194,6 +221,8 @@ readme = (ROOT / "README.md").read_text()
 docs_index = (ROOT / "docs/README.md").read_text()
 contracts_readme = (ROOT / "contracts/README.md").read_text()
 require("docs/README.md" in readme, "README must link the repository documentation index")
+for tier in ("just test-integration", "just test-integration-pg19"):
+    require(tier in readme, f"README must name both integration tiers: {tier}")
 require("architecture.md" in docs_index and "runtime-configuration.md" in docs_index, "documentation index is incomplete")
 for stale in ("SimplicityGuy", retired_name, "schema-init"):
     require(stale not in readme and stale not in docs_index, f"published repository docs retain stale name: {stale}")

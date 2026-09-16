@@ -59,6 +59,49 @@ healthy.
 The image runs as numeric user and group `1000:1000`, writes optional logs under `/logs`, and
 is named `ghcr.io/groovemap-music/database-schema` when released.
 
+## Integration tiers
+
+The real-engine proof runs twice over one script, `scripts/test-integration.sh`. The script
+takes its engine images from `POSTGRES_INTEGRATION_IMAGE` and `NEO4J_INTEGRATION_IMAGE`, so a
+tier is an image choice rather than a second copy of the test. Both tiers apply the production
+initializers twice, compare the PostgreSQL and Neo4j catalogs across the two passes, assert
+that the six native identity tables carry an engine `uuidv7()` default, and prove sentinel
+rows survive the second pass.
+
+| Tier | Recipe | PostgreSQL engine | CI status |
+| --- | --- | --- | --- |
+| Required | `just test-integration` | `postgres:18-alpine`, digest-pinned | Blocks merge |
+| Advisory | `just test-integration-pg19` | `postgres:19beta3-alpine`, digest-pinned | Reports only |
+
+The required tier is the gate. It pins the PostgreSQL major version deployment runs, and the
+shared reusable workflow executes it as `integration-command`. The advisory tier exists so the
+schema has a real PostgreSQL 19 engine to test on before general availability, and so a
+regression in a beta is visible here rather than on the day deployment upgrades. Because the
+reusable workflow accepts a single integration command, the advisory tier is a
+repository-local job in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) that calls
+the recipe directly and carries `continue-on-error: true`. A beta failure is therefore a
+signal, not a merge block. Both tiers share the same Neo4j image; only the PostgreSQL engine
+differs, so a divergence between them is attributable to the engine.
+
+### Promoting the beta tier at general availability
+
+When PostgreSQL 19 reaches general availability, promote the advisory tier in this order:
+
+1. Repoint `test-integration-pg19` in the [`Justfile`](../Justfile) at the digest of the
+   released `postgres:19-alpine` image and confirm the tier passes locally.
+2. Move the released digest onto `test-integration` so the required tier gates on
+   PostgreSQL 19, and coordinate that change with the deployment repository, which owns the
+   running engine version.
+3. Delete the `postgres-19-beta` job from `ci.yml`, drop the `test-integration-pg19` recipe,
+   and remove the two-tier assertions from
+   [`scripts/check-repository.py`](../scripts/check-repository.py), which enforces that the
+   required job stays free of `continue-on-error` and that the advisory job keeps it.
+4. Update this section and the README so the repository again documents a single required
+   integration tier.
+
+Until step 2 lands, the PostgreSQL 18 digest and recipe are the gate and must not be changed
+to accommodate a beta result.
+
 ## Neo4j media schema
 
 [ADR 0007](https://github.com/groovemap-music/design/blob/main/docs/adr/0007-canonical-media-taxonomy.md)

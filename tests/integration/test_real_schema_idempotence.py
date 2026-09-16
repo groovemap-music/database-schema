@@ -78,6 +78,17 @@ EXPECTED_COLUMNS = {
     ("musicbrainz", "releases", "media", "jsonb"),
 }
 
+# Native identity keys rely on the engine's built-in uuidv7(), which both the required
+# PostgreSQL 18 tier and the advisory PostgreSQL 19 beta tier must render identically.
+EXPECTED_UUIDV7_DEFAULTS = {
+    ("public", "artifacts", "id"),
+    ("public", "catalog_items", "id"),
+    ("public", "collection_snapshots", "id"),
+    ("public", "observations", "id"),
+    ("public", "owned_copies", "id"),
+    ("public", "provider_aliases", "id"),
+}
+
 
 # The schemas whose catalogs the snapshot and the expectations cover.
 SCHEMAS = ("public", "insights", "musicbrainz", "graph")
@@ -186,6 +197,16 @@ async def assert_expected_postgres_schema() -> None:
         """
     )
     assert set(column_rows) >= EXPECTED_COLUMNS
+    uuidv7_rows = await postgres_rows(
+        """
+        SELECT table_schema, table_name, column_name
+        FROM information_schema.columns
+        WHERE table_schema IN ('public', 'insights', 'musicbrainz')
+          AND column_default = 'uuidv7()'
+        """
+    )
+    assert set(uuidv7_rows) == EXPECTED_UUIDV7_DEFAULTS
+
     assert set(column_rows) >= EXPECTED_GRAPH_COLUMNS
 
     view_rows = await postgres_rows("SELECT viewname FROM pg_views WHERE schemaname = 'graph'")
