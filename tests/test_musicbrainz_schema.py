@@ -90,3 +90,61 @@ def test_relationships_natural_key_migration_present():
     assert "DROP CONSTRAINT" in migration_sql
     assert "ADD CONSTRAINT relationships_natural_key" in migration_sql
     assert "UNIQUE NULLS NOT DISTINCT" in migration_sql
+
+
+class TestWideningGuard:
+    """The BIGINT widening has to stay a no-op in every state it can meet.
+
+    `_execute_schema_statements` logs a failed statement and carries on, so a
+    single transient ALTER failure leaves an install whose column is still
+    narrow while the run goes on to create the graph views that read it. From
+    that point an unguarded ALTER raises `cannot alter type of a column used by
+    a view or rule` forever. The guard has to notice the dependency and skip.
+    """
+
+    def _guards(self) -> dict[str, str]:
+        return {name: sql for name, sql in _MUSICBRAINZ_TABLES if name.endswith("widen to BIGINT")}
+
+    def test_every_provider_id_column_has_a_guarded_widening(self) -> None:
+        assert set(self._guards()) == {
+            "musicbrainz.artists.discogs_artist_id widen to BIGINT",
+            "musicbrainz.labels.discogs_label_id widen to BIGINT",
+            "musicbrainz.releases.discogs_release_id widen to BIGINT",
+            "musicbrainz.release_groups.discogs_master_id widen to BIGINT",
+        }
+
+    def test_the_guard_skips_a_column_that_is_already_wide(self) -> None:
+        for name, sql in self._guards().items():
+            assert "current_type = 'bigint'" in sql, f"{name} does not gate on the column type"
+
+    def test_the_guard_consults_the_rewrite_rule_dependencies(self) -> None:
+        # A view reads a column through its _RETURN rewrite rule, and pg_depend
+        # records that rule's dependency on the exact attribute. Anything less
+        # specific (the table, or no check at all) is what the reviewer
+        # reproduced as a hard failure.
+        for name, sql in self._guards().items():
+            assert "pg_depend" in sql, f"{name} does not consult pg_depend"
+            assert "pg_rewrite" in sql, f"{name} does not consult pg_rewrite"
+            assert "dependency.refobjsubid" in sql, f"{name} does not narrow the dependency to one column"
+            assert "relkind IN ('v', 'm')" in sql, f"{name} does not restrict the dependents to views"
+
+    def test_the_guard_notices_and_returns_instead_of_altering(self) -> None:
+        for name, sql in self._guards().items():
+            assert "RAISE NOTICE" in sql, f"{name} fails silently instead of saying why it skipped"
+            notice_at = sql.index("RAISE NOTICE")
+            alter_at = sql.index("ALTER TABLE")
+            assert notice_at < alter_at, f"{name} reaches the ALTER before the dependency check"
+            # The NOTICE arm has to leave the block, not fall through to the ALTER.
+            assert "RETURN;" in sql[notice_at:alter_at], f"{name} does not return after the notice"
+
+    def test_the_guard_names_the_column_and_its_dependents_in_the_notice(self) -> None:
+        sql = self._guards()["musicbrainz.labels.discogs_label_id widen to BIGINT"]
+        assert "skipping widen of musicbrainz.labels.discogs_label_id" in sql
+        notice = sql[sql.index("RAISE NOTICE") : sql.index("current_type, dependent_views")]
+        # Two placeholders, two arguments: the type it is stuck at and what holds it there.
+        assert notice.count("%") == 2
+
+    def test_the_guard_still_widens_when_nothing_depends_on_the_column(self) -> None:
+        for name, sql in self._guards().items():
+            table, column = name.removeprefix("musicbrainz.").removesuffix(" widen to BIGINT").split(".")
+            assert f"ALTER TABLE musicbrainz.{table} ALTER COLUMN {column} TYPE BIGINT" in sql

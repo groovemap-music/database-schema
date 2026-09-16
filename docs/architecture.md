@@ -327,6 +327,208 @@ constraint and the `release_country` index.
 Every index and constraint above is additive within persistence contract v1 — see
 [the persistence compatibility contract](../contracts/persistence/).
 
+## Graph schema
+
+The `graph` schema re-presents the catalog tables as the vertex and edge relations of the
+property graph the Neo4j enrichers already build. Every object in it is a `CREATE OR REPLACE
+VIEW` over a table declared elsewhere in
+[`src/groovemap_schema/postgres.py`](../src/groovemap_schema/postgres.py); nothing is
+materialized, nothing is copied, and no base table changes. The schema is additive within
+persistence contract v1.
+
+Names are the contract. A vertex view is named for the Neo4j label it mirrors and an edge
+view for the relationship type, lowercased and de-reserved, so a later `CREATE PROPERTY
+GRAPH` can use the view name as the label verbatim: `:User` becomes `app_user`, the vertex
+label ADR 0012 records for it, because `user` is reserved; and the overloaded `[:BY]`,
+`[:ON]`, and `[:IS]` types become `by_artist`, `on_label`, `in_genre`, and `in_style`. Where
+ADR 0012 names a label, its mapping table is the contract and this schema follows it.
+
+That contract is enforced by the engine, not only by convention. `CREATE OR REPLACE VIEW`
+may only append columns to the end of an existing view: PostgreSQL refuses to drop, rename,
+reorder, or retype a column the view already exposes, and fails the statement outright rather
+than replacing it. So within this no-DROP schema, adding a column to a view is the only
+change that is safe to ship on its own. Renaming a view or a view column, removing one,
+changing its position, or widening its type is a breaking change to the published contract
+and needs a coordinated `DROP ... CASCADE` migration under the persistence contract's
+expand/migrate/contract rule — expand with the new shape alongside the old, migrate readers,
+then contract — not an edit to the statement list here.
+
+The same rule binds the base tables underneath. PostgreSQL will not retype a column a view
+reads, so once a graph view exposes a column, an `ALTER COLUMN ... TYPE` against it fails
+while the view exists. The MusicBrainz provider-id widenings in `_MUSICBRAINZ_TABLES` are
+gated on both the column still being narrow and no view depending on it, and emit a `NOTICE`
+naming the dependent view instead of failing when it is; reaching that state needs the same
+coordinated migration rather than a startup `ALTER`.
+
+Discogs ids live inside JSONB documents as numbers while the catalog tables key on `data_id
+VARCHAR`, so every id is read with `->>` and compared as text. Every unnest is guarded by a
+`jsonb_typeof(...) = 'array'` check, because a malformed document would otherwise fail the
+whole view rather than skip one row, and every element whose `id` is missing or `0` is
+dropped — exactly what `graphinator` does before it writes an edge.
+
+Two asymmetries in that projection are worth naming. The Discogs edge views unnest a JSONB
+array and do not inner-join the vertex view for their target, so an edge may reference an id
+no vertex row carries; the MusicBrainz relationship views do inner-join both entity tables,
+so an edge appears only once both endpoints are loaded. Both are faithful to the enrichers
+they mirror — `graphinator` merges a Discogs target node as it writes the edge, while the
+MusicBrainz enricher only relates entities it has already ingested. And `graph.company`
+resolves a company id that several credits spell differently by taking the lexicographically
+smallest name (`DISTINCT ON` with a matching `ORDER BY`), where Neo4j's last-write-wins merge
+would keep whichever credit was written last; the view's answer is stable and reproducible,
+which the graph's is not.
+
+One deliberate narrowness: these views trim with `btrim`, which removes spaces only, while
+the Python enrichers use `str.strip()`, which removes every kind of whitespace. A value padded
+with a tab or a newline — in `country`, in a normalized credit role, or in the fallback
+`name:` company key — is therefore trimmed by the enricher but not by the view. Discogs and
+MusicBrainz payloads pad with spaces in practice, so the two agree on real data; a document
+that pads otherwise is the known gap.
+
+### Neo4j type to view mapping
+
+Vertex views. The key column is what edge views join to.
+
+| Neo4j label | View | Key column | Other columns |
+| --- | --- | --- | --- |
+| `:Artist` | `graph.artist` | `artist_id` | `name`, `gm_item_id`, `hash`, `updated_at` |
+| `:Label` | `graph.label` | `label_id` | `name`, `gm_item_id`, `hash`, `updated_at` |
+| `:Master` | `graph.master` | `master_id` | `title`, `year`, `genres`, `styles`, `gm_item_id`, `hash`, `updated_at` |
+| `:Release` | `graph.release` | `release_id` | `title`, `year`, `country`, `genres`, `styles`, `media_families`, `gm_item_id`, `hash`, `updated_at` |
+| `:Genre` | `graph.genre` | `name` | — |
+| `:Style` | `graph.style` | `name` | — |
+| `:Person` | `graph.person` | `name` | — |
+| `:Company` | `graph.company` | `company_id` | `name`, `discogs_label_id` |
+| `:Medium` | `graph.medium` | `medium_id` | `family`, `label` |
+| `:MediaFamily` | `graph.media_family` | `name` | — |
+| `:User` | `graph.app_user` | `user_id` | `is_active`, `is_admin`, `created_at`, `updated_at` |
+| (native identity) | `graph.catalog_item` | `item_id` | `kind`, `created_at` |
+| (MusicBrainz artist) | `graph.mb_artist` | `mbid` | `name`, `sort_name`, `type`, `gender`, `begin_date`, `end_date`, `ended`, `area`, `begin_area`, `end_area`, `disambiguation`, `discogs_artist_id`, `updated_at` |
+| (MusicBrainz label) | `graph.mb_label` | `mbid` | `name`, `type`, `label_code`, `begin_date`, `end_date`, `ended`, `area`, `disambiguation`, `discogs_label_id`, `updated_at` |
+| (MusicBrainz release) | `graph.mb_release` | `mbid` | `name`, `barcode`, `status`, `release_group_mbid`, `discogs_release_id`, `media_families`, `updated_at` |
+| (MusicBrainz release group) | `graph.mb_release_group` | `mbid` | `name`, `type`, `secondary_types`, `first_release_date`, `disambiguation`, `discogs_master_id`, `updated_at` |
+
+`graph.app_user` deliberately omits `email` and every credential column: the Neo4j
+`:User` node carries only an id, and a graph relation is the wrong surface on which to widen
+personal data.
+
+Edge views. Every one exposes a stable key column set plus the source and target key columns
+that join the vertex views above.
+
+| Neo4j relationship | View | Key columns | Source → target | Source |
+| --- | --- | --- | --- | --- |
+| `(:Release)-[:BY]->(:Artist)` | `graph.by_artist` | `release_id`, `artist_id` | `release_id` → `artist_id` | `releases.data->'artists'` |
+| `(:Release)-[:ON]->(:Label)` | `graph.on_label` | `release_id`, `label_id` | `release_id` → `label_id` | `releases.data->'labels'` |
+| `(:Release)-[:DERIVED_FROM]->(:Master)` | `graph.derived_from` | `release_id`, `master_id` | `release_id` → `master_id` | `releases.data->>'master_id'` |
+| `(:Release)-[:IS]->(:Genre)` | `graph.in_genre` | `release_id`, `genre_name` | `release_id` → `genre_name` | `releases.data->'genres'` |
+| `(:Release)-[:IS]->(:Style)` | `graph.in_style` | `release_id`, `style_name` | `release_id` → `style_name` | `releases.data->'styles'` |
+| `(:Master)-[:BY]->(:Artist)` | `graph.master_by_artist` | `master_id`, `artist_id` | `master_id` → `artist_id` | `masters.data->'artists'` |
+| `(:Master)-[:IS]->(:Genre)` | `graph.master_in_genre` | `master_id`, `genre_name` | `master_id` → `genre_name` | `masters.data->'genres'` |
+| `(:Master)-[:IS]->(:Style)` | `graph.master_in_style` | `master_id`, `style_name` | `master_id` → `style_name` | `masters.data->'styles'` |
+| `(:Style)-[:PART_OF]->(:Genre)` | `graph.part_of` | `style_name`, `genre_name` | `style_name` → `genre_name` | releases and masters carrying exactly one genre |
+| `(:Artist)-[:MEMBER_OF]->(:Artist)` | `graph.member_of` | `member_artist_id`, `group_artist_id` | `member_artist_id` → `group_artist_id` | `artists.data->'members'` and `->'groups'` |
+| `(:Artist)-[:ALIAS_OF]->(:Artist)` | `graph.alias_of` | `alias_artist_id`, `artist_id` | `alias_artist_id` → `artist_id` | `artists.data->'aliases'` |
+| `(:Label)-[:SUBLABEL_OF]->(:Label)` | `graph.sublabel_of` | `sublabel_id`, `parent_label_id` | `sublabel_id` → `parent_label_id` | `labels.data->'parentLabel'` and `->'sublabels'` |
+| `(:Person)-[:CREDITED_ON]->(:Release)` | `graph.credited_on` | `person_name`, `release_id`, `role` | `person_name` → `release_id` | `releases.data->'extraartists'` |
+| `(:Person)-[:SAME_AS]->(:Artist)` | `graph.same_as` | `person_name`, `artist_id` | `person_name` → `artist_id` | `releases.data->'extraartists'` |
+| `(:Release)-[:CREDITED_TO]->(:Company)` | `graph.credited_to` | `release_id`, `company_id`, `role`, `source` | `release_id` → `company_id` | `releases.data->'companies'` |
+| `(:Release)-[:ISSUED_ON]->(:Medium)` | `graph.issued_on` | `release_id`, `medium_id`, `source` | `release_id` → `medium_id` | `releases.media` and `musicbrainz.releases.media` |
+| `(:Medium)-[:IN_FAMILY]->(:MediaFamily)` | `graph.in_family` | `medium_id`, `family_name` | `medium_id` → `family_name` | `releases.media` and `musicbrainz.releases.media` |
+| `(:User)-[:COLLECTED]->(:Release)` | `graph.collected` | `collection_id` | `user_id` → `release_id` | `user_collections` |
+| `(:User)-[:WANTS]->(:Release)` | `graph.wants` | `wantlist_id` | `user_id` → `release_id` | `user_wantlists` |
+| (native ownership) | `graph.owns` | `owned_copy_id` | `user_id` → `item_id` | `owned_copies` |
+| (MusicBrainz relationship) | `graph.mb_rel_<source>_<target>` | `relationship_id` | `source_mbid` → `target_mbid` | `musicbrainz.relationships` |
+
+`graph.collected` also exposes `instance_id`, `folder_id`, `condition`, `rating`, and
+`date_added`; its natural key is `(user_id, release_id, instance_id)`, and `collection_id` is
+the single-column key a property graph declaration should use. `graph.wants` exposes `rating`
+and `date_added` over a natural key of `(user_id, release_id)`. `graph.owns` also exposes
+`artifact_id`, `collection_row_id`, and `acquired_at`.
+
+`user_collections` and `user_wantlists` hold the raw Discogs release id as a `BIGINT` and
+carry no foreign key to `releases`, so both edge views cast it to text and inner-join the
+catalog. That cast is the join the whole graph turns on: `releases.data_id` is the Discogs id
+as a string.
+
+### MusicBrainz relationship edges
+
+`musicbrainz.relationships` is polymorphic — one table holding every (source type, target
+type) combination — and carries no foreign keys, so a row can name an mbid the loader has not
+stored yet. A property graph needs the opposite: one typed edge relation per endpoint pair,
+every row of which resolves to a vertex. The schema therefore declares all sixteen ordered
+pairs over the four modelled entity types, named `graph.mb_rel_<source>_<target>` with
+`release-group` spelled `release_group`:
+
+`mb_rel_artist_artist`, `mb_rel_artist_label`, `mb_rel_artist_release`,
+`mb_rel_artist_release_group`, `mb_rel_label_artist`, `mb_rel_label_label`,
+`mb_rel_label_release`, `mb_rel_label_release_group`, `mb_rel_release_artist`,
+`mb_rel_release_label`, `mb_rel_release_release`, `mb_rel_release_release_group`,
+`mb_rel_release_group_artist`, `mb_rel_release_group_label`, `mb_rel_release_group_release`,
+and `mb_rel_release_group_release_group`.
+
+Each one filters on its own `(source_entity_type, target_entity_type)` pair and inner-joins
+both endpoint tables, which is what drops the dangling rows. All sixteen are declared rather
+than only the pairs some catalog happens to hold today, so the set of relations is a property
+of the schema and not of the data loaded into it. Every one exposes `relationship_id`,
+`source_mbid`, `target_mbid`, `relationship_type`, `begin_date`, `end_date`, `ended`, and
+`attributes`.
+
+### Credits, companies, and media
+
+`graph.credited_on` carries `role` verbatim and `role_category` from the shared
+credit-role taxonomy in `groovemap-runtime` (`common.credit_roles`). A view cannot call
+Python, so the taxonomy is rendered into an `IMMUTABLE` SQL function,
+`graph.credit_role_category(text)`, at statement-build time, from the runtime's own
+`ROLE_CATEGORIES` data rather than a second copy of it. The rendered `CASE` reproduces
+`categorize_role` exactly: an exact match on the lowered, trimmed role first, then a
+fragment scan ordered longest-first globally across categories, so a generic fragment
+declared in an earlier category cannot pre-empt a longer, more specific one declared later.
+`graph.medium_label(text)` is rendered the same way from the vendored media taxonomy, and
+falls back to the id itself for a medium a newer producer taxonomy names. When the
+`groovemap-runtime` pin moves, both functions move with it; nothing in this repository
+restates a role or a label.
+
+`graph.credited_to` takes `role_category` from the canonical companies block instead: ADR
+0011 makes that the producer's mapping, fixed by conformance fixtures, and re-deriving it
+here would make this schema a second, unverified implementation of those rules. A
+pre-cutover record whose `companies` key still holds the raw Discogs list contributes
+nothing, which is the intended reading — such a record is silent about company credits
+rather than asserting it has none.
+
+A company's identity follows the producer's rule: a whole Discogs id of at least one when
+the source supplies one, otherwise `name:` followed by the name case-folded with inner
+whitespace collapsed. PostgreSQL's `lower` approximates Python's `casefold` — they differ
+for a handful of characters such as the German eszett — and punctuation is deliberately
+left alone, so two spellings differing by a comma stay two companies a later reconciliation
+can merge rather than one that cannot be taken apart again.
+
+`:Medium` and `:MediaFamily` are shared across catalogs and each provider writes its own
+`[:ISSUED_ON]` edge to them, so `source` is part of the `graph.issued_on` key rather than a
+property, and the MusicBrainz side joins down to the Discogs release id the enricher keys
+`:Release` on. Two format entries resolving to the same canonical medium — a 2xLP split
+across two Discogs entries — are one edge whose `qty` is their sum, and an absent,
+non-integer, or non-positive `qty` defaults to one.
+
+`:Person` is keyed on the credit name, verbatim: `Person.name` is the Neo4j key, so folding
+it here would key the vertex differently from the node it mirrors.
+
+### Fidelity notes
+
+- `PART_OF` is projected only from a record carrying exactly one genre, because with two,
+  nothing in the document says which genre a style sits under. This matches the enricher rule
+  and applies to release and master documents alike.
+- `member_of` and `sublabel_of` are `UNION`, not `UNION ALL`: Discogs states both relations
+  from each end, and a reciprocal pair would otherwise assert the same edge twice.
+- `DISTINCT` is used where a source array can repeat a reference — a release lists the same
+  label once per catalogue number — and omitted where the source is a scalar.
+- `year` is exposed as text because the indexes on `masters` and `releases` are on
+  `(data->>'year')`; casting it in the view would defeat them.
+- Base tables are schema-qualified so a view's meaning does not depend on the `search_path`
+  in force when it was created.
+- `ALTER COLUMN ... TYPE BIGINT` on the four `discogs_*_id` columns is now gated on the
+  column still being narrow. PostgreSQL refuses to retype a column a view reads even when the
+  requested type is the one it already has, and the graph schema exposes exactly those
+  columns as the bridge between the MusicBrainz and Discogs halves of the graph.
+
 ## Media schema consumer promotion
 
 Downstream services do not track `database-schema` continuously; each pins

@@ -11,6 +11,7 @@ Every assertion is made against the statement lists, never against a database.
 
 from groovemap_schema.postgres import (
     _ENTITY_TABLES,
+    _GRAPH_STATEMENTS,
     _MUSICBRAINZ_INDEXES,
     _MUSICBRAINZ_TABLES,
     _USER_TABLES,
@@ -211,6 +212,70 @@ _ADDED_STATEMENT_NAMES = frozenset(
         "idx_activity_summary_date",
         "idx_releases_identifiers",
         "idx_releases_companies",
+    }
+)
+
+# The graph schema adds one statement for the schema itself and one per vertex or
+# edge view. They are transcribed here for the same reason the names above are:
+# the snapshot test only proves that no LEGACY statement moved or changed, and it
+# can only do that if every new name is declared by hand.
+_GRAPH_STATEMENT_NAMES = frozenset(
+    {
+        "graph schema",
+        "graph.credit_role_category function",
+        "graph.medium_label function",
+        "graph.artist view",
+        "graph.label view",
+        "graph.master view",
+        "graph.release view",
+        "graph.genre view",
+        "graph.style view",
+        "graph.by_artist view",
+        "graph.on_label view",
+        "graph.derived_from view",
+        "graph.in_genre view",
+        "graph.in_style view",
+        "graph.master_by_artist view",
+        "graph.master_in_genre view",
+        "graph.master_in_style view",
+        "graph.part_of view",
+        "graph.member_of view",
+        "graph.alias_of view",
+        "graph.sublabel_of view",
+        "graph.mb_artist view",
+        "graph.mb_label view",
+        "graph.mb_release view",
+        "graph.mb_release_group view",
+        "graph.mb_rel_artist_artist view",
+        "graph.mb_rel_artist_label view",
+        "graph.mb_rel_artist_release view",
+        "graph.mb_rel_artist_release_group view",
+        "graph.mb_rel_label_artist view",
+        "graph.mb_rel_label_label view",
+        "graph.mb_rel_label_release view",
+        "graph.mb_rel_label_release_group view",
+        "graph.mb_rel_release_artist view",
+        "graph.mb_rel_release_label view",
+        "graph.mb_rel_release_release view",
+        "graph.mb_rel_release_release_group view",
+        "graph.mb_rel_release_group_artist view",
+        "graph.mb_rel_release_group_label view",
+        "graph.mb_rel_release_group_release view",
+        "graph.mb_rel_release_group_release_group view",
+        "graph.app_user view",
+        "graph.catalog_item view",
+        "graph.collected view",
+        "graph.wants view",
+        "graph.owns view",
+        "graph.person view",
+        "graph.company view",
+        "graph.medium view",
+        "graph.media_family view",
+        "graph.credited_on view",
+        "graph.same_as view",
+        "graph.credited_to view",
+        "graph.issued_on view",
+        "graph.in_family view",
     }
 )
 
@@ -610,11 +675,17 @@ class TestLegacyStatementsUnchanged:
 
     def test_legacy_names_are_intact_and_ordered(self) -> None:
         names = [name for name, _stmt in _schema_statements()]
-        surviving = [name for name in names if name not in _ADDED_STATEMENT_NAMES]
+        added = _ADDED_STATEMENT_NAMES | _GRAPH_STATEMENT_NAMES
+        surviving = [name for name in names if name not in added]
         assert surviving == _LEGACY_STATEMENT_NAMES
 
     def test_no_legacy_name_was_reused_for_a_new_statement(self) -> None:
-        assert not (_ADDED_STATEMENT_NAMES & set(_LEGACY_STATEMENT_NAMES))
+        added = _ADDED_STATEMENT_NAMES | _GRAPH_STATEMENT_NAMES
+        assert not (added & set(_LEGACY_STATEMENT_NAMES))
+
+    def test_declared_graph_names_match_the_schema(self) -> None:
+        """A new graph view has to be transcribed above before the snapshot passes."""
+        assert {name for name, _stmt in _GRAPH_STATEMENTS} == _GRAPH_STATEMENT_NAMES
 
     def test_statement_names_are_unique(self) -> None:
         names = [name for name, _stmt in _schema_statements()]
