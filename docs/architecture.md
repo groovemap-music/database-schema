@@ -15,6 +15,8 @@ flowchart LR
     DEP[deployment] -->|owns| OP[Credentials, configuration, ordering, image digest]
     PC -->|declares| PG[(PostgreSQL schema)]
     PC -->|declares| N[(Neo4j schema)]
+    PG -->|projects| GV[graph schema: 52 views]
+    GV -. "PostgreSQL 19 and SCHEMA_PROPERTY_GRAPH" .-> CAT["graph.catalog property graph"]
     PC -. uses .-> CL
     OP -. runs .-> PC
 ```
@@ -36,7 +38,12 @@ flowchart TD
     R --> F[Run schema families concurrently]
     F --> PG[Apply PostgreSQL tables and indexes]
     F --> N[Verify Neo4j and apply constraints and indexes]
-    PG --> G{Both succeeded?}
+    PG --> GV[Apply the graph schema views]
+    GV --> Q{"PostgreSQL 19, switch on, name free?"}
+    Q -->|yes| CAT["Declare graph.catalog property graph"]
+    Q -->|no| SK[Log the closed gate and continue]
+    CAT --> G{Both succeeded?}
+    SK --> G
     N --> G
     G -->|yes| Z[Exit 0]
     G -->|no| X[Exit 1]
@@ -45,6 +52,9 @@ flowchart TD
 
 The PostgreSQL administrative connection has a bounded connection timeout. Each schema
 statement is idempotent, and a partial statement failure is still fatal to the initializer.
+The property graph branch is the one place a statement is skipped rather than executed; a
+closed gate is logged and the run continues, and only a failure once every gate is open counts
+against the exit status. See [the property graph](#property-graph).
 The Neo4j path verifies connectivity before applying definitions. Both clients are closed on
 success or failure.
 
@@ -334,7 +344,15 @@ property graph the Neo4j enrichers already build. Every object in it is a `CREAT
 VIEW` over a table declared elsewhere in
 [`src/groovemap_schema/postgres.py`](../src/groovemap_schema/postgres.py); nothing is
 materialized, nothing is copied, and no base table changes. The schema is additive within
-persistence contract v1.
+persistence contract v1: [the persistence compatibility contract](../contracts/persistence/)
+records the views, the four appended key columns, and the property graph as additive objects
+of version 1.
+
+Read the section in two halves. The fifty-two views are unconditional — every supported
+engine gets all of them, on PostgreSQL 18 and 19 alike. The `CREATE PROPERTY GRAPH`
+declaration layered over them is not: it needs PostgreSQL 19 and an explicit switch, and
+[when it is applied](#when-it-is-applied) is the one place those gates are stated. A consumer
+reads the views and probes for the graph.
 
 Names are the contract. A vertex view is named for the Neo4j label it mirrors and an edge
 view for the relationship type, lowercased and de-reserved, so a later `CREATE PROPERTY
@@ -386,6 +404,14 @@ that pads otherwise is the known gap.
 
 ### Neo4j type to view mapping
 
+This is the whole mapping, and it carries three names per row rather than two. The Neo4j label
+or relationship type an enricher writes is the first; the view that re-presents it is the
+second; and on PostgreSQL 19 the SQL/PGQ label is the third — always the view name, verbatim,
+which is what the de-reserving rule in ADR 0012 buys. So `:Release` is `graph.release` is
+`MATCH (r IS release)`, and `[:BY]` out of a release is `graph.by_artist` is
+`-[IS by_artist]->`, with no second table to consult. See [labels](#labels) for the two
+keywords that were checked and for the shared label sixteen views carry on top of their own.
+
 Vertex views. The key column is what edge views join to.
 
 | Neo4j label | View | Key column | Other columns |
@@ -408,8 +434,10 @@ Vertex views. The key column is what edge views join to.
 | (MusicBrainz release group) | `graph.mb_release_group` | `mbid` | `name`, `type`, `secondary_types`, `first_release_date`, `disambiguation`, `discogs_master_id`, `updated_at` |
 
 The four Discogs entity views end with an appended `<entity>_key`: the same value as
-`<entity>_id`, typed `text` so the property graph can join on it. It is structural, not
-published — see [the property graph](#property-graph) below.
+`<entity>_id`, typed `text` so the property graph can join on it. It is structural rather than
+part of the mapping above — nothing but `CREATE PROPERTY GRAPH` reads it — but it is not
+gated, so it is there on PostgreSQL 18 and with the switch off as well. See
+[the four restated vertex keys](#the-four-restated-vertex-keys) for why it exists.
 
 `graph.app_user` deliberately omits `email` and every credential column: the Neo4j
 `:User` node carries only an id, and a graph relation is the wrong surface on which to widen
@@ -540,6 +568,12 @@ relations that a `GRAPH_TABLE` query pattern-matches. `graph.catalog` declares o
 view above — sixteen vertex tables and thirty-six edge tables, one element per view — so the
 same projection serves both a `SELECT` against a view and a graph pattern. Nothing is
 materialized and nothing is copied; each element is read from its view at query time.
+
+It is the one conditional object in this schema. On PostgreSQL 18, and on 19 with the switch
+off, `graph.catalog` does not exist while all fifty-two views do, so no consumer may assume it
+— [the persistence compatibility contract](../contracts/persistence/) records it as additive
+but conditional for exactly that reason. The gates are stated once, in
+[when it is applied](#when-it-is-applied) below.
 
 The statement is built by `_property_graph_statement()` in
 [`src/groovemap_schema/postgres.py`](../src/groovemap_schema/postgres.py) and exported as
@@ -856,7 +890,8 @@ restatement of the same value — the additive change the contract does allow, a
 `CREATE PROPERTY GRAPH` reads it.
 
 These four columns are not gated. `SCHEMA_PROPERTY_GRAPH` and the server version gate the
-`CREATE PROPERTY GRAPH` statement alone; the views are part of the unconditional schema, so a
+`CREATE PROPERTY GRAPH` statement alone — see [when it is applied](#when-it-is-applied) — and
+the views are part of the unconditional schema, so a
 PostgreSQL 18 server with the switch off still gets `artist_key`, `label_key`, `master_key`, and
 `release_key`. That is the one way the property graph shows up on an engine that cannot carry
 it, and it shows up by addition only: four columns appended after the published ones, no rename,
