@@ -295,9 +295,10 @@ persistence contract v1.
 
 Names are the contract. A vertex view is named for the Neo4j label it mirrors and an edge
 view for the relationship type, lowercased and de-reserved, so a later `CREATE PROPERTY
-GRAPH` can use the view name as the label verbatim: `:User` becomes `user_account` because
-`user` is reserved, and the overloaded `[:BY]`, `[:ON]`, and `[:IS]` types become
-`by_artist`, `on_label`, `in_genre`, and `in_style`.
+GRAPH` can use the view name as the label verbatim: `:User` becomes `app_user`, the vertex
+label ADR 0012 records for it, because `user` is reserved; and the overloaded `[:BY]`,
+`[:ON]`, and `[:IS]` types become `by_artist`, `on_label`, `in_genre`, and `in_style`. Where
+ADR 0012 names a label, its mapping table is the contract and this schema follows it.
 
 Discogs ids live inside JSONB documents as numbers while the catalog tables key on `data_id
 VARCHAR`, so every id is read with `->>` and compared as text. Every unnest is guarded by a
@@ -321,14 +322,14 @@ Vertex views. The key column is what edge views join to.
 | `:Company` | `graph.company` | `company_id` | `name`, `discogs_label_id` |
 | `:Medium` | `graph.medium` | `medium_id` | `family`, `label` |
 | `:MediaFamily` | `graph.media_family` | `name` | — |
-| `:User` | `graph.user_account` | `user_id` | `is_active`, `is_admin`, `created_at`, `updated_at` |
+| `:User` | `graph.app_user` | `user_id` | `is_active`, `is_admin`, `created_at`, `updated_at` |
 | (native identity) | `graph.catalog_item` | `item_id` | `kind`, `created_at` |
 | (MusicBrainz artist) | `graph.mb_artist` | `mbid` | `name`, `sort_name`, `type`, `gender`, `begin_date`, `end_date`, `ended`, `area`, `begin_area`, `end_area`, `disambiguation`, `discogs_artist_id`, `updated_at` |
 | (MusicBrainz label) | `graph.mb_label` | `mbid` | `name`, `type`, `label_code`, `begin_date`, `end_date`, `ended`, `area`, `disambiguation`, `discogs_label_id`, `updated_at` |
 | (MusicBrainz release) | `graph.mb_release` | `mbid` | `name`, `barcode`, `status`, `release_group_mbid`, `discogs_release_id`, `media_families`, `updated_at` |
 | (MusicBrainz release group) | `graph.mb_release_group` | `mbid` | `name`, `type`, `secondary_types`, `first_release_date`, `disambiguation`, `discogs_master_id`, `updated_at` |
 
-`graph.user_account` deliberately omits `email` and every credential column: the Neo4j
+`graph.app_user` deliberately omits `email` and every credential column: the Neo4j
 `:User` node carries only an id, and a graph relation is the wrong surface on which to widen
 personal data.
 

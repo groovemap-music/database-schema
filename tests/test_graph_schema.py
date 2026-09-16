@@ -26,7 +26,7 @@ VERTEX_KEYS = {
     "mb_label": ("mbid",),
     "mb_release": ("mbid",),
     "mb_release_group": ("mbid",),
-    "user_account": ("user_id",),
+    "app_user": ("user_id",),
     "catalog_item": ("item_id",),
     "person": ("name",),
     "company": ("company_id",),
@@ -209,7 +209,7 @@ class TestRelationNames:
 
     def test_the_account_vertex_avoids_the_reserved_user_spelling(self) -> None:
         assert "user" not in view_names()
-        assert "user_account" in view_names()
+        assert "app_user" in view_names()
 
 
 class TestVertexViews:
@@ -247,7 +247,7 @@ class TestVertexViews:
             assert statement.count("SELECT DISTINCT") == 1
 
     def test_account_view_exposes_no_personal_or_credential_column(self) -> None:
-        statement = statement_for("user_account").lower()
+        statement = statement_for("app_user").lower()
         for column in ("email", "hashed_password", "totp_secret", "totp_recovery_codes"):
             assert column not in statement
 

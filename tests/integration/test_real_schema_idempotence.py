@@ -115,7 +115,7 @@ EXPECTED_GRAPH_COLUMNS = {
     ("graph", "mb_rel_artist_artist", "source_mbid", "uuid"),
     ("graph", "mb_rel_artist_artist", "target_mbid", "uuid"),
     ("graph", "mb_rel_artist_artist", "attributes", "jsonb"),
-    ("graph", "user_account", "user_id", "uuid"),
+    ("graph", "app_user", "user_id", "uuid"),
     ("graph", "catalog_item", "item_id", "uuid"),
     ("graph", "collected", "user_id", "uuid"),
     ("graph", "collected", "release_id", "character varying"),

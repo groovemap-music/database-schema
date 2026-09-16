@@ -262,7 +262,7 @@ _GRAPH_STATEMENT_NAMES = frozenset(
         "graph.mb_rel_release_group_label view",
         "graph.mb_rel_release_group_release view",
         "graph.mb_rel_release_group_release_group view",
-        "graph.user_account view",
+        "graph.app_user view",
         "graph.catalog_item view",
         "graph.collected view",
         "graph.wants view",

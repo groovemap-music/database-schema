@@ -1321,9 +1321,11 @@ _MUSICBRAINZ_INDEXES: list[tuple[str, str]] = [
 # Naming is the contract. A vertex view is named for the Neo4j label it mirrors
 # (`graph.artist` for `:Artist`) and an edge view for the relationship type
 # (`graph.by_artist` for `[:BY]`), lowercased and de-reserved — `:User` becomes
-# `graph.user_account` because `user` is a reserved word, and `[:BY]`, `[:ON]`
-# and `[:IS]` become `by_artist`, `on_label`, `in_genre` and `in_style` so a
-# later CREATE PROPERTY GRAPH can use the view name as the label verbatim.
+# `graph.app_user`, the label ADR 0012 records for it, because `user` is a
+# reserved word, and `[:BY]`, `[:ON]` and `[:IS]` become `by_artist`,
+# `on_label`, `in_genre` and `in_style` so a later CREATE PROPERTY GRAPH can
+# use the view name as the label verbatim. Where ADR 0012 names a label, its
+# mapping table is the contract and this schema follows it.
 #
 # Every edge view exposes a stable key column set, catalogued in
 # docs/architecture.md, plus the source and target key columns that join to the
@@ -1724,13 +1726,14 @@ def _collection_views() -> list[tuple[str, str]]:
     text and inner-join the catalog. That cast is the join the whole graph turns
     on: `releases.data_id` is the Discogs id as a string.
 
-    `graph.user_account` deliberately omits `email` and every credential column.
-    The Neo4j `:User` node carries only an id, and a graph relation is the wrong
-    surface on which to widen personal data.
+    `graph.app_user` is named for the vertex label ADR 0012 records for the Neo4j
+    `:User` node; `user` itself is reserved. It deliberately omits `email` and
+    every credential column. The `:User` node carries only an id, and a graph
+    relation is the wrong surface on which to widen personal data.
     """
     return [
         _view(
-            "user_account",
+            "app_user",
             """
 SELECT users.id         AS user_id,
        users.is_active  AS is_active,
