@@ -20,8 +20,17 @@ compatibility rules. It never connects to or mutates a live database. Use `just 
 requires Docker and starts disposable, loopback-only PostgreSQL and Neo4j containers. It
 applies both production schema initializers twice, compares the schema catalogs after each
 pass, and proves sentinel data survives; the containers and their volumes are removed on
-exit. CI runs this isolated integration tier on pull requests. `just audit` intentionally
-uses network vulnerability data and is outside the fast gate.
+exit. `just audit` intentionally uses network vulnerability data and is outside the fast
+gate.
+
+The real-engine proof runs as two tiers over one parameterized script. `just test-integration`
+is the required tier and pins PostgreSQL 18; it must pass for a change to merge.
+`just test-integration-pg19` is the advisory tier and pins a digest-identified
+PostgreSQL 19 beta engine, reusing the same Neo4j image and the same test. CI runs the
+required tier through the shared reusable workflow and the advisory tier as a separate,
+non-required job that reports without blocking. See the
+[integration tiers](docs/architecture.md#integration-tiers) for what each tier proves and
+how the beta tier is promoted at PostgreSQL 19 general availability.
 
 `just check` expands to formatting, lint, type checking, coverage, compatibility and repository
 checks, package/install verification, license checks, secret scanning, and a non-mutating
