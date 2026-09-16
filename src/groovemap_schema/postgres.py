@@ -8,7 +8,8 @@ runs are no-ops for already-created schema objects. Schema is never dropped.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, cast
+import os
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 from common.credit_roles import ROLE_CATEGORIES
 from common.media import medium_ids, medium_label
@@ -1447,7 +1448,15 @@ _TAGGED_DOCUMENTS = """
 
 
 def _discogs_vertex_views() -> list[tuple[str, str]]:
-    """Return the vertex views over the Discogs entity tables, genres, and styles."""
+    """Return the vertex views over the Discogs entity tables, genres, and styles.
+
+    Each of the four entity views ends with a `text` restatement of its key —
+    `artist_key`, `label_key`, `master_key`, `release_key` — appended after the
+    published columns, which is the one shape `CREATE OR REPLACE VIEW` accepts.
+    It exists because PostgreSQL 19 cannot resolve an equality operator for a
+    `character varying` property-graph vertex key; see `_DISCOGS_VERTEX_KEYS`.
+    Nothing but `CREATE PROPERTY GRAPH` reads it, and it is not a property.
+    """
     return [
         _view(
             "artist",
@@ -1456,7 +1465,8 @@ SELECT artists.data_id         AS artist_id,
        artists.data ->> 'name' AS name,
        artists.gm_item_id      AS gm_item_id,
        artists.hash            AS hash,
-       artists.updated_at      AS updated_at
+       artists.updated_at      AS updated_at,
+       artists.data_id::text   AS artist_key
 FROM public.artists AS artists
 """,
         ),
@@ -1467,7 +1477,8 @@ SELECT labels.data_id         AS label_id,
        labels.data ->> 'name' AS name,
        labels.gm_item_id      AS gm_item_id,
        labels.hash            AS hash,
-       labels.updated_at      AS updated_at
+       labels.updated_at      AS updated_at,
+       labels.data_id::text   AS label_key
 FROM public.labels AS labels
 """,
         ),
@@ -1481,7 +1492,8 @@ SELECT masters.data_id          AS master_id,
        {_text_array("masters.data -> 'styles'")} AS styles,
        masters.gm_item_id       AS gm_item_id,
        masters.hash             AS hash,
-       masters.updated_at       AS updated_at
+       masters.updated_at       AS updated_at,
+       masters.data_id::text    AS master_key
 FROM public.masters AS masters
 """,  # noqa: S608
         ),
@@ -1497,7 +1509,8 @@ SELECT releases.data_id          AS release_id,
        {_text_array("releases.media -> 'families'")} AS media_families,
        releases.gm_item_id       AS gm_item_id,
        releases.hash             AS hash,
-       releases.updated_at       AS updated_at
+       releases.updated_at       AS updated_at,
+       releases.data_id::text    AS release_key
 FROM public.releases AS releases
 """,  # noqa: S608
         ),
@@ -2135,6 +2148,357 @@ def _build_graph_statements() -> list[tuple[str, str]]:
 _GRAPH_STATEMENTS: list[tuple[str, str]] = _build_graph_statements()
 
 
+# ── The catalog property graph (SQL/PGQ, PostgreSQL 19) ──────────────────────
+# `CREATE PROPERTY GRAPH` re-presents the graph schema's views as one named
+# graph a `GRAPH_TABLE` query can pattern-match over. It is a declaration, not
+# a materialization: every vertex and edge is read from the view underneath it
+# at query time, so the graph costs nothing to hold and nothing to refresh.
+#
+# The statement is applied only on a PostgreSQL 19 server and only when the
+# `SCHEMA_PROPERTY_GRAPH` switch is enabled, so production on 18 is untouched
+# and the cutover is a configuration change. See `_property_graph_skip_reason`.
+
+PROPERTY_GRAPH_SWITCH = "SCHEMA_PROPERTY_GRAPH"
+PROPERTY_GRAPH_SCHEMA = "graph"
+PROPERTY_GRAPH_RELATION = "catalog"
+PROPERTY_GRAPH_NAME = f"{PROPERTY_GRAPH_SCHEMA}.{PROPERTY_GRAPH_RELATION}"
+PROPERTY_GRAPH_STATEMENT_NAME = f"{PROPERTY_GRAPH_NAME} property graph"
+
+# SQL/PGQ landed in PostgreSQL 19. 190000 is `server_version_num` for 19beta1
+# onward, which is what the advisory integration tier runs.
+PROPERTY_GRAPH_MINIMUM_SERVER_VERSION = 190000
+
+# The shared label the sixteen `mb_rel_<source>_<target>` edge relations carry in
+# addition to their own. SQL/PGQ allows one label across several element tables
+# only when every one of them exposes the same property names and types, which
+# these sixteen do: each projects the same eight columns of
+# `musicbrainz.relationships`. The shared label is what lets a query ask for any
+# MusicBrainz relationship without spelling out all sixteen endpoint pairs.
+MUSICBRAINZ_RELATIONSHIP_LABEL = "mb_related"
+
+
+class _PropertyGraphVertex(NamedTuple):
+    """One vertex element table: a graph schema view, its key, and its properties."""
+
+    view: str
+    key: tuple[str, ...]
+    # None means PROPERTIES ALL COLUMNS.
+    properties: tuple[str, ...] | None = None
+
+
+class _PropertyGraphEdge(NamedTuple):
+    """One edge element table, with the vertex aliases its endpoints resolve to."""
+
+    view: str
+    key: tuple[str, ...]
+    source_key: tuple[str, ...]
+    source: str
+    source_columns: tuple[str, ...]
+    destination_key: tuple[str, ...]
+    destination: str
+    destination_columns: tuple[str, ...]
+    properties: tuple[str, ...] | None = None
+    extra_labels: tuple[str, ...] = ()
+
+
+# The key column each Discogs vertex view exposes for the property graph to join
+# on. `artists.data_id` and its three siblings are `VARCHAR`, and PostgreSQL 19
+# beta3 rejects an edge whose SOURCE or DESTINATION resolves to a `character
+# varying` vertex key: it looks the equality operator up against the referenced
+# column's own type, and `varchar` registers none of its own — every `varchar =
+# varchar` comparison in PostgreSQL runs through a binary coercion to `text`.
+# `uuid`, `bigint`, `text`, and even `bpchar` all work; `varchar` and
+# `varchar(n)` do not. Retyping a published view column is a breaking change the
+# persistence contract forbids, and `CREATE OR REPLACE VIEW` refuses it outright,
+# so each of the four views instead *appends* a `text` restatement of its key —
+# the additive change the contract does allow. `<entity>_id` keeps its published
+# type and stays the property; `<entity>_key` is structural and is deliberately
+# left out of every property list.
+_DISCOGS_VERTEX_KEYS = {
+    "artist": "artist_key",
+    "label": "label_key",
+    "master": "master_key",
+    "release": "release_key",
+}
+
+
+def _property_graph_vertices() -> tuple[_PropertyGraphVertex, ...]:
+    """Return every vertex element table of `graph.catalog`.
+
+    The explicit property lists are not decoration. SQL/PGQ requires every
+    property of a given name to have one data type across the whole graph, and
+    four names are spelled two ways by the views: `artist_id`, `label_id`, and
+    `master_id` are `character varying` where they are read from a catalog
+    table's `data_id` and `text` where they are read out of a JSONB document,
+    and `discogs_label_id` is `bigint` on the MusicBrainz side and `text` on the
+    Discogs side. Each is unified on `text`: the cast is total, it never
+    overflows the way `text -> bigint` can, and it is the type the JSONB half of
+    the graph already produces. `release_id` needs no cast — it is `character
+    varying` in all eleven views that expose it — so it keeps its published type,
+    and the asymmetry with `artist_id` is the price of casting only what the
+    rules force.
+    """
+    return (
+        _PropertyGraphVertex(
+            "artist",
+            ("artist_key",),
+            ("artist_id::text AS artist_id", "name", "gm_item_id", "hash", "updated_at"),
+        ),
+        _PropertyGraphVertex(
+            "label",
+            ("label_key",),
+            ("label_id::text AS label_id", "name", "gm_item_id", "hash", "updated_at"),
+        ),
+        _PropertyGraphVertex(
+            "master",
+            ("master_key",),
+            ("master_id::text AS master_id", "title", "year", "genres", "styles", "gm_item_id", "hash", "updated_at"),
+        ),
+        # No cast: `release_id` is `character varying` everywhere. The list exists
+        # only to keep the structural `release_key` column out of the properties.
+        _PropertyGraphVertex(
+            "release",
+            ("release_key",),
+            ("release_id", "title", "year", "country", "genres", "styles", "media_families", "gm_item_id", "hash", "updated_at"),
+        ),
+        _PropertyGraphVertex("genre", ("name",)),
+        _PropertyGraphVertex("style", ("name",)),
+        _PropertyGraphVertex("person", ("name",)),
+        _PropertyGraphVertex("company", ("company_id",)),
+        _PropertyGraphVertex("medium", ("medium_id",)),
+        _PropertyGraphVertex("media_family", ("name",)),
+        _PropertyGraphVertex("app_user", ("user_id",)),
+        _PropertyGraphVertex("catalog_item", ("item_id",)),
+        _PropertyGraphVertex("mb_artist", ("mbid",)),
+        _PropertyGraphVertex(
+            "mb_label",
+            ("mbid",),
+            (
+                "mbid",
+                "name",
+                "type",
+                "label_code",
+                "begin_date",
+                "end_date",
+                "ended",
+                "area",
+                "disambiguation",
+                "discogs_label_id::text AS discogs_label_id",
+                "updated_at",
+            ),
+        ),
+        _PropertyGraphVertex("mb_release", ("mbid",)),
+        _PropertyGraphVertex("mb_release_group", ("mbid",)),
+    )
+
+
+def _musicbrainz_relationship_edges() -> list[_PropertyGraphEdge]:
+    """Return the sixteen MusicBrainz relationship edge tables.
+
+    Each is keyed on the surrogate `relationship_id` — `musicbrainz.relationships`
+    has one row per relationship and both endpoint joins are to a unique mbid, so
+    the id stays unique through the view.
+    """
+    edges: list[_PropertyGraphEdge] = []
+    for _source_type, _source_table, source_name in _MUSICBRAINZ_GRAPH_ENTITIES:
+        for _target_type, _target_table, target_name in _MUSICBRAINZ_GRAPH_ENTITIES:
+            edges.append(
+                _PropertyGraphEdge(
+                    view=f"mb_rel_{source_name}_{target_name}",
+                    key=("relationship_id",),
+                    source_key=("source_mbid",),
+                    source=f"mb_{source_name}",
+                    source_columns=("mbid",),
+                    destination_key=("target_mbid",),
+                    destination=f"mb_{target_name}",
+                    destination_columns=("mbid",),
+                    extra_labels=(MUSICBRAINZ_RELATIONSHIP_LABEL,),
+                )
+            )
+    return edges
+
+
+def _property_graph_edges() -> tuple[_PropertyGraphEdge, ...]:
+    """Return every edge element table of `graph.catalog`.
+
+    Every key is the column set docs/architecture.md publishes for that view, and
+    every endpoint resolves to the `<entity>_key` restatement on the four Discogs
+    vertex views and to the published key column everywhere else.
+    """
+    artist_key = _DISCOGS_VERTEX_KEYS["artist"]
+    label_key = _DISCOGS_VERTEX_KEYS["label"]
+    master_key = _DISCOGS_VERTEX_KEYS["master"]
+    release_key = _DISCOGS_VERTEX_KEYS["release"]
+    return (
+        _PropertyGraphEdge(
+            "by_artist", ("release_id", "artist_id"), ("release_id",), "release", (release_key,), ("artist_id",), "artist", (artist_key,)
+        ),
+        _PropertyGraphEdge("on_label", ("release_id", "label_id"), ("release_id",), "release", (release_key,), ("label_id",), "label", (label_key,)),
+        _PropertyGraphEdge(
+            "derived_from", ("release_id", "master_id"), ("release_id",), "release", (release_key,), ("master_id",), "master", (master_key,)
+        ),
+        _PropertyGraphEdge("in_genre", ("release_id", "genre_name"), ("release_id",), "release", (release_key,), ("genre_name",), "genre", ("name",)),
+        _PropertyGraphEdge("in_style", ("release_id", "style_name"), ("release_id",), "release", (release_key,), ("style_name",), "style", ("name",)),
+        _PropertyGraphEdge(
+            "master_by_artist",
+            ("master_id", "artist_id"),
+            ("master_id",),
+            "master",
+            (master_key,),
+            ("artist_id",),
+            "artist",
+            (artist_key,),
+            ("master_id::text AS master_id", "artist_id"),
+        ),
+        _PropertyGraphEdge(
+            "master_in_genre",
+            ("master_id", "genre_name"),
+            ("master_id",),
+            "master",
+            (master_key,),
+            ("genre_name",),
+            "genre",
+            ("name",),
+            ("master_id::text AS master_id", "genre_name"),
+        ),
+        _PropertyGraphEdge(
+            "master_in_style",
+            ("master_id", "style_name"),
+            ("master_id",),
+            "master",
+            (master_key,),
+            ("style_name",),
+            "style",
+            ("name",),
+            ("master_id::text AS master_id", "style_name"),
+        ),
+        _PropertyGraphEdge("part_of", ("style_name", "genre_name"), ("style_name",), "style", ("name",), ("genre_name",), "genre", ("name",)),
+        _PropertyGraphEdge(
+            "member_of",
+            ("member_artist_id", "group_artist_id"),
+            ("member_artist_id",),
+            "artist",
+            (artist_key,),
+            ("group_artist_id",),
+            "artist",
+            (artist_key,),
+        ),
+        _PropertyGraphEdge(
+            "alias_of",
+            ("alias_artist_id", "artist_id"),
+            ("alias_artist_id",),
+            "artist",
+            (artist_key,),
+            ("artist_id",),
+            "artist",
+            (artist_key,),
+            ("alias_artist_id", "artist_id::text AS artist_id"),
+        ),
+        _PropertyGraphEdge(
+            "sublabel_of",
+            ("sublabel_id", "parent_label_id"),
+            ("sublabel_id",),
+            "label",
+            (label_key,),
+            ("parent_label_id",),
+            "label",
+            (label_key,),
+        ),
+        _PropertyGraphEdge(
+            "credited_on",
+            ("person_name", "release_id", "role"),
+            ("person_name",),
+            "person",
+            ("name",),
+            ("release_id",),
+            "release",
+            (release_key,),
+        ),
+        _PropertyGraphEdge("same_as", ("person_name", "artist_id"), ("person_name",), "person", ("name",), ("artist_id",), "artist", (artist_key,)),
+        _PropertyGraphEdge(
+            "credited_to",
+            ("release_id", "company_id", "role", "source"),
+            ("release_id",),
+            "release",
+            (release_key,),
+            ("company_id",),
+            "company",
+            ("company_id",),
+        ),
+        _PropertyGraphEdge(
+            "issued_on",
+            ("release_id", "medium_id", "source"),
+            ("release_id",),
+            "release",
+            (release_key,),
+            ("medium_id",),
+            "medium",
+            ("medium_id",),
+        ),
+        _PropertyGraphEdge(
+            "in_family",
+            ("medium_id", "family_name"),
+            ("medium_id",),
+            "medium",
+            ("medium_id",),
+            ("family_name",),
+            "media_family",
+            ("name",),
+        ),
+        _PropertyGraphEdge("collected", ("collection_id",), ("user_id",), "app_user", ("user_id",), ("release_id",), "release", (release_key,)),
+        _PropertyGraphEdge("wants", ("wantlist_id",), ("user_id",), "app_user", ("user_id",), ("release_id",), "release", (release_key,)),
+        _PropertyGraphEdge("owns", ("owned_copy_id",), ("user_id",), "app_user", ("user_id",), ("item_id",), "catalog_item", ("item_id",)),
+        *_musicbrainz_relationship_edges(),
+    )
+
+
+def _columns(names: Iterable[str]) -> str:
+    """Return NAMES as a parenthesized SQL column list."""
+    return "(" + ", ".join(names) + ")"
+
+
+def _labels_and_properties(view: str, properties: tuple[str, ...] | None, extra_labels: tuple[str, ...] = ()) -> str:
+    """Return the LABEL and PROPERTIES clauses for one element table.
+
+    The label is the view name verbatim. That is the whole point of the naming
+    rule ADR 0012 records and docs/architecture.md restates: `:User` is projected
+    as `graph.app_user` and the overloaded `[:BY]`, `[:ON]`, and `[:IS]` types as
+    `by_artist`, `on_label`, `in_genre`, and `in_style`, so no label here needs
+    quoting and none collides with a SQL reserved word.
+    """
+    rendered = "PROPERTIES ALL COLUMNS" if properties is None else "PROPERTIES (" + ", ".join(properties) + ")"
+    clauses = [f"LABEL {view} {rendered}"]
+    clauses.extend(f"LABEL {label} {rendered}" for label in extra_labels)
+    return " ".join(clauses)
+
+
+def _property_graph_statement() -> str:
+    """Render CREATE PROPERTY GRAPH graph.catalog over the graph schema views."""
+    vertices = [
+        f"        {PROPERTY_GRAPH_SCHEMA}.{vertex.view} AS {vertex.view} KEY {_columns(vertex.key)} {_labels_and_properties(vertex.view, vertex.properties)}"
+        for vertex in _property_graph_vertices()
+    ]
+    edges = [
+        f"        {PROPERTY_GRAPH_SCHEMA}.{edge.view} AS {edge.view} KEY {_columns(edge.key)}\n"
+        f"            SOURCE KEY {_columns(edge.source_key)} REFERENCES {edge.source} {_columns(edge.source_columns)}\n"
+        f"            DESTINATION KEY {_columns(edge.destination_key)} REFERENCES {edge.destination} {_columns(edge.destination_columns)}\n"
+        f"            {_labels_and_properties(edge.view, edge.properties, edge.extra_labels)}"
+        for edge in _property_graph_edges()
+    ]
+    return (
+        f"CREATE PROPERTY GRAPH {PROPERTY_GRAPH_NAME}\n"
+        "    VERTEX TABLES (\n" + ",\n".join(vertices) + "\n    )\n"
+        "    EDGE TABLES (\n" + ",\n".join(edges) + "\n    )"
+    )
+
+
+# The (name, statement) pair, in the same shape as every entry of
+# `_schema_statements()`. It is deliberately not yielded from there: the
+# statement is conditional on the server and on an operator switch, and
+# `_schema_statements()` is the unconditional schema every supported engine gets.
+PROPERTY_GRAPH_STATEMENT: tuple[str, str] = (PROPERTY_GRAPH_STATEMENT_NAME, _property_graph_statement())
+
+
 def _entity_schema_statements() -> Iterator[tuple[str, Any]]:
     """Yield each Discogs entity table followed by its shared indexes."""
     for table_name in _ENTITY_TABLES:
@@ -2208,11 +2572,101 @@ async def _execute_schema_statements(cursor: Any, statements: Iterable[tuple[str
     return success_count, failure_count
 
 
+# The spellings that turn the switch on. `enabled` is the documented value; the
+# rest are the usual truthy spellings an operator is likely to reach for, so a
+# deployment that writes `true` does not silently get the default.
+_PROPERTY_GRAPH_ENABLED_VALUES = frozenset({"1", "enable", "enabled", "on", "true", "yes"})
+
+
+def property_graph_enabled() -> bool:
+    """Return whether the SCHEMA_PROPERTY_GRAPH switch is on. Defaults to off."""
+    return os.environ.get(PROPERTY_GRAPH_SWITCH, "").strip().lower() in _PROPERTY_GRAPH_ENABLED_VALUES
+
+
+def _property_graph_skip_reason(*, enabled: bool, server_version_num: int | None, already_exists: bool) -> str | None:
+    """Return why `graph.catalog` is not being created, or None to create it.
+
+    The three gates are ordered by cost. The switch is read from the environment
+    and settles the common case without a round trip; the server version is one
+    query; the catalog check is the last one and is what makes a second apply a
+    no-op. `CREATE PROPERTY GRAPH` has no `IF NOT EXISTS` spelling and nothing in
+    this schema ever drops a relation a consumer may be reading, so an existing
+    relation of that name is left exactly as it is.
+    """
+    if not enabled:
+        return f"{PROPERTY_GRAPH_SWITCH} is not enabled"
+    if server_version_num is None or server_version_num < PROPERTY_GRAPH_MINIMUM_SERVER_VERSION:
+        return f"server_version_num {server_version_num} is below {PROPERTY_GRAPH_MINIMUM_SERVER_VERSION}"
+    if already_exists:
+        return f"{PROPERTY_GRAPH_NAME} already exists"
+    return None
+
+
+# A property graph is a relation, so an existing one shows up in `pg_class` under
+# its own relkind. Checking `pg_class` rather than a version-specific catalog view
+# also catches a table or view squatting the name, which is the conservative
+# answer: this schema never drops what it did not just create.
+_PROPERTY_GRAPH_EXISTS_QUERY = """
+SELECT EXISTS (
+    SELECT 1
+    FROM pg_class AS relation
+    JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+    WHERE namespace.nspname = %s AND relation.relname = %s
+)
+"""
+
+_SERVER_VERSION_QUERY = "SELECT current_setting('server_version_num')::int"
+
+
+async def _server_version_num(cursor: Any) -> int | None:
+    """Return the connected server's `server_version_num`, or None if unreadable."""
+    try:
+        await cursor.execute(_SERVER_VERSION_QUERY)
+        row = await cursor.fetchone()
+    except Exception as error:
+        logger.error("❌ Could not read server_version_num: %s", error)
+        return None
+    return None if row is None else int(row[0])
+
+
+async def _property_graph_exists(cursor: Any) -> bool:
+    """Return whether a relation named `catalog` already exists in schema `graph`."""
+    await cursor.execute(_PROPERTY_GRAPH_EXISTS_QUERY, (PROPERTY_GRAPH_SCHEMA, PROPERTY_GRAPH_RELATION))
+    row = await cursor.fetchone()
+    return bool(row is not None and row[0])
+
+
+async def _apply_property_graph(cursor: Any) -> int:
+    """Create `graph.catalog` when the server and the switch both allow it.
+
+    Returns the number of failed statements, so the caller adds it to the same
+    count every other schema statement contributes to. A skip is not a failure:
+    running on PostgreSQL 18, or with the switch off, is the supported default
+    and logs one line saying which gate closed.
+    """
+    enabled = property_graph_enabled()
+    server_version_num = await _server_version_num(cursor) if enabled else None
+    already_exists = (
+        await _property_graph_exists(cursor)
+        if enabled and server_version_num is not None and server_version_num >= PROPERTY_GRAPH_MINIMUM_SERVER_VERSION
+        else False
+    )
+    reason = _property_graph_skip_reason(enabled=enabled, server_version_num=server_version_num, already_exists=already_exists)
+    if reason is not None:
+        logger.info("⏭️  Skipped %s: %s", PROPERTY_GRAPH_NAME, reason)
+        return 0
+    _success, failures = await _execute_schema_statements(cursor, [PROPERTY_GRAPH_STATEMENT])
+    return failures
+
+
 async def create_postgres_schema(pool: Any) -> int:
     """Create all PostgreSQL tables and indexes.
 
     Safe to call on every startup; all statements use IF NOT EXISTS so
-    subsequent calls are no-ops for already-created schema objects.
+    subsequent calls are no-ops for already-created schema objects. The catalog
+    property graph is applied after them, and only when the server is
+    PostgreSQL 19 or later and the SCHEMA_PROPERTY_GRAPH switch is enabled; see
+    `_apply_property_graph`.
 
     Args:
         pool: An AsyncPostgreSQLPool instance (from common.postgres_resilient).
@@ -2229,6 +2683,8 @@ async def create_postgres_schema(pool: Any) -> int:
             cursor = cast("Any", cursor_cm)
             statements = list(_schema_statements())
             success_count, failure_count = await _execute_schema_statements(cursor, statements)
+            # Last, and only when the server and the operator both allow it.
+            failure_count += await _apply_property_graph(cursor)
 
     total = len(statements)
     logger.info(f"✅ PostgreSQL schema creation complete: {success_count} succeeded, {failure_count} failed (total: {total})")
