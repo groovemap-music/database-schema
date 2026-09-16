@@ -999,6 +999,35 @@ _ACTIVITY_STATEMENTS: list[tuple[str, str]] = [
 
 # MusicBrainz tables — external music metadata and relationships
 # Stores artist, label, and release data from MusicBrainz with cross-references to Discogs IDs.
+def _widen_to_bigint(table: str, column: str) -> str:
+    """Return a re-runnable widening of one MusicBrainz provider-id column.
+
+    A bare `ALTER COLUMN ... TYPE BIGINT` is only idempotent while nothing
+    depends on the column: PostgreSQL refuses to retype a column a view reads,
+    even when the requested type is the one it already has. The `graph` schema
+    exposes exactly these columns as the bridge between the MusicBrainz and
+    Discogs halves of the property graph, so the rewrite is gated on the column
+    still being narrow. A fresh install declares BIGINT in CREATE TABLE and
+    skips it; an install predating the widening runs it once, before any graph
+    view exists to depend on it.
+    """
+    return f"""
+        DO $widen$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'musicbrainz'
+                  AND table_name = '{table}'
+                  AND column_name = '{column}'
+                  AND data_type <> 'bigint'
+            ) THEN
+                ALTER TABLE musicbrainz.{table} ALTER COLUMN {column} TYPE BIGINT;
+            END IF;
+        END
+        $widen$
+        """  # noqa: S608 — `table` and `column` are module constants, never input
+
+
 _MUSICBRAINZ_TABLES: list[tuple[str, str]] = [
     (
         "musicbrainz schema",
@@ -1196,19 +1225,19 @@ _MUSICBRAINZ_TABLES: list[tuple[str, str]] = [
     ),
     (
         "musicbrainz.artists.discogs_artist_id widen to BIGINT",
-        "ALTER TABLE musicbrainz.artists ALTER COLUMN discogs_artist_id TYPE BIGINT",
+        _widen_to_bigint("artists", "discogs_artist_id"),
     ),
     (
         "musicbrainz.labels.discogs_label_id widen to BIGINT",
-        "ALTER TABLE musicbrainz.labels ALTER COLUMN discogs_label_id TYPE BIGINT",
+        _widen_to_bigint("labels", "discogs_label_id"),
     ),
     (
         "musicbrainz.releases.discogs_release_id widen to BIGINT",
-        "ALTER TABLE musicbrainz.releases ALTER COLUMN discogs_release_id TYPE BIGINT",
+        _widen_to_bigint("releases", "discogs_release_id"),
     ),
     (
         "musicbrainz.release_groups.discogs_master_id widen to BIGINT",
-        "ALTER TABLE musicbrainz.release_groups ALTER COLUMN discogs_master_id TYPE BIGINT",
+        _widen_to_bigint("release_groups", "discogs_master_id"),
     ),
 ]
 
