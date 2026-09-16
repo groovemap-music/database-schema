@@ -729,7 +729,8 @@ CREATE PROPERTY GRAPH graph.catalog
             SOURCE KEY (source_mbid) REFERENCES mb_release_group (mbid)
             DESTINATION KEY (target_mbid) REFERENCES mb_release_group (mbid)
             LABEL mb_rel_release_group_release_group PROPERTIES ALL COLUMNS LABEL mb_related PROPERTIES ALL COLUMNS
-    );```
+    );
+```
 
 #### When it is applied
 
@@ -776,14 +777,20 @@ rather than a restatement of it. The integration suite asserts it directly.
 `pg_dump --schema-only` on 19beta3 does emit the property graph: a `CREATE PROPERTY GRAPH`
 block followed by `ALTER PROPERTY GRAPH graph.catalog OWNER TO ...`, placed after the views it
 reads. The round trip is faithful but not textual — `PROPERTIES ALL COLUMNS` comes back expanded
-into an explicit alphabetized column list, a label matching its element alias comes back as
-`DEFAULT LABEL`, and the shared `mb_related` label survives as a second `LABEL` clause. A dump
-taken from a 19 server therefore restores onto another 19 server and fails on an 18 one, which
-is the same boundary the switch draws.
+into an explicit alphabetized column list, and a label matching its element alias is dropped
+rather than written out, because it is what the grammar already defaults to. Thirty-six of the
+fifty-two elements therefore dump with no label clause at all. The sixteen carrying a second
+label keep both, as `DEFAULT LABEL` for their own and `LABEL mb_related` for the shared one,
+since dropping the first would silently change which labels the element has. A dump taken from
+a 19 server therefore restores onto another 19 server and fails on an 18 one, which is the same
+boundary the switch draws.
 
-On PostgreSQL 18 none of this exists: no `graph.catalog`, no relation of relkind `g` in schema
-`graph`, and the `pg_propgraph_*` catalogs are absent. The required tier's catalog comparison
-covers the rest of the schema unchanged.
+On PostgreSQL 18 the property graph object does not exist: no `graph.catalog`, no relation of
+relkind `g` in schema `graph`, and the `pg_propgraph_*` catalogs are absent. The views it would
+have been declared over are all still there, and so are the four columns added for it — see
+[the four restated vertex keys](#the-four-restated-vertex-keys) below. The 18 schema is
+therefore not identical to its pre-property-graph state; it differs by exactly those four
+additive columns and by nothing else.
 
 #### Labels
 
@@ -847,6 +854,14 @@ restatement of the same value — the additive change the contract does allow, a
 `CREATE OR REPLACE VIEW` accepts. `<entity>_id` keeps its published type and stays the property;
 `<entity>_key` is structural, is not declared as a property, and nothing but
 `CREATE PROPERTY GRAPH` reads it.
+
+These four columns are not gated. `SCHEMA_PROPERTY_GRAPH` and the server version gate the
+`CREATE PROPERTY GRAPH` statement alone; the views are part of the unconditional schema, so a
+PostgreSQL 18 server with the switch off still gets `artist_key`, `label_key`, `master_key`, and
+`release_key`. That is the one way the property graph shows up on an engine that cannot carry
+it, and it shows up by addition only: four columns appended after the published ones, no rename,
+no removal, no type change, nothing dropped. Adding a column to a view is the change this schema is built to ship on
+its own, and a consumer selecting named columns from these views does not see it at all.
 
 Whether this survives to 19 GA is not something this schema depends on. If a later beta accepts
 a `varchar` vertex key, the four `KEY` clauses can point back at `<entity>_id` and the appended
