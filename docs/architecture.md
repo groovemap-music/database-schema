@@ -343,11 +343,46 @@ label ADR 0012 records for it, because `user` is reserved; and the overloaded `[
 `[:ON]`, and `[:IS]` types become `by_artist`, `on_label`, `in_genre`, and `in_style`. Where
 ADR 0012 names a label, its mapping table is the contract and this schema follows it.
 
+That contract is enforced by the engine, not only by convention. `CREATE OR REPLACE VIEW`
+may only append columns to the end of an existing view: PostgreSQL refuses to drop, rename,
+reorder, or retype a column the view already exposes, and fails the statement outright rather
+than replacing it. So within this no-DROP schema, adding a column to a view is the only
+change that is safe to ship on its own. Renaming a view or a view column, removing one,
+changing its position, or widening its type is a breaking change to the published contract
+and needs a coordinated `DROP ... CASCADE` migration under the persistence contract's
+expand/migrate/contract rule — expand with the new shape alongside the old, migrate readers,
+then contract — not an edit to the statement list here.
+
+The same rule binds the base tables underneath. PostgreSQL will not retype a column a view
+reads, so once a graph view exposes a column, an `ALTER COLUMN ... TYPE` against it fails
+while the view exists. The MusicBrainz provider-id widenings in `_MUSICBRAINZ_TABLES` are
+gated on both the column still being narrow and no view depending on it, and emit a `NOTICE`
+naming the dependent view instead of failing when it is; reaching that state needs the same
+coordinated migration rather than a startup `ALTER`.
+
 Discogs ids live inside JSONB documents as numbers while the catalog tables key on `data_id
 VARCHAR`, so every id is read with `->>` and compared as text. Every unnest is guarded by a
 `jsonb_typeof(...) = 'array'` check, because a malformed document would otherwise fail the
 whole view rather than skip one row, and every element whose `id` is missing or `0` is
 dropped — exactly what `graphinator` does before it writes an edge.
+
+Two asymmetries in that projection are worth naming. The Discogs edge views unnest a JSONB
+array and do not inner-join the vertex view for their target, so an edge may reference an id
+no vertex row carries; the MusicBrainz relationship views do inner-join both entity tables,
+so an edge appears only once both endpoints are loaded. Both are faithful to the enrichers
+they mirror — `graphinator` merges a Discogs target node as it writes the edge, while the
+MusicBrainz enricher only relates entities it has already ingested. And `graph.company`
+resolves a company id that several credits spell differently by taking the lexicographically
+smallest name (`DISTINCT ON` with a matching `ORDER BY`), where Neo4j's last-write-wins merge
+would keep whichever credit was written last; the view's answer is stable and reproducible,
+which the graph's is not.
+
+One deliberate narrowness: these views trim with `btrim`, which removes spaces only, while
+the Python enrichers use `str.strip()`, which removes every kind of whitespace. A value padded
+with a tab or a newline — in `country`, in a normalized credit role, or in the fallback
+`name:` company key — is therefore trimmed by the enricher but not by the view. Discogs and
+MusicBrainz payloads pad with spaces in practice, so the two agree on real data; a document
+that pads otherwise is the known gap.
 
 ### Neo4j type to view mapping
 

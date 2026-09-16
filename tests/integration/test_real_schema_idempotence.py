@@ -14,7 +14,7 @@ from psycopg.types.json import Jsonb
 
 from groovemap_schema import initializer
 from groovemap_schema.neo4j import SCHEMA_STATEMENTS
-from groovemap_schema.postgres import _GRAPH_STATEMENTS
+from groovemap_schema.postgres import _GRAPH_STATEMENTS, _widen_to_bigint
 
 
 pytestmark = pytest.mark.integration
@@ -247,9 +247,18 @@ async def assert_expected_postgres_schema() -> None:
     # body when it is read. Selecting from every relation proves each one is
     # executable on this engine, which is the whole point of running the suite
     # against two major versions.
+    #
+    # Executability is the claim, not emptiness. A sibling test seeds fixture
+    # rows into the same disposable database, so asserting a zero count here
+    # would make this test pass or fail on which of the two pytest happened to
+    # run first. Counting and requiring a non-negative answer proves the view
+    # planned and ran without borrowing an ordering guarantee the suite does
+    # not give.
     for view in sorted(EXPECTED_GRAPH_VIEWS):
         # `view` comes from the initializer's own statement list, not from input.
-        assert await postgres_rows(f"SELECT count(*) FROM graph.{view}") == [(0,)]  # noqa: S608
+        counted = await postgres_rows(f"SELECT count(*) FROM graph.{view}")  # noqa: S608
+        assert len(counted) == 1
+        assert counted[0][0] >= 0
 
     relationship_key = await postgres_rows(
         """
@@ -591,3 +600,105 @@ async def test_graph_views_project_the_enricher_rules() -> None:
     await apply_schema()
     await seed_graph_fixtures()
     await assert_graph_views_project_the_enricher_rules()
+
+
+# The widening guard is proved against one column; the four are generated from
+# the same helper, so what holds for this one holds for all of them.
+WIDENED_TABLE = "labels"
+WIDENED_COLUMN = "discogs_label_id"
+WIDENED_VIEW = "graph.mb_label"
+
+
+async def dependent_views_on(table: str, column: str) -> list[str]:
+    """Return the views reading one MusicBrainz column, by the catalog's own account."""
+    rows = await postgres_rows(
+        """
+        SELECT DISTINCT dependent.relnamespace::regnamespace::text || '.' || dependent.relname
+        FROM pg_depend AS dependency
+        JOIN pg_rewrite AS rule ON rule.oid = dependency.objid
+        JOIN pg_class AS dependent ON dependent.oid = rule.ev_class
+        WHERE dependency.classid = 'pg_rewrite'::regclass
+          AND dependency.refclassid = 'pg_class'::regclass
+          AND dependency.refobjid = ('musicbrainz.' || %s)::regclass
+          AND dependency.refobjsubid = (
+              SELECT attribute.attnum
+              FROM pg_attribute AS attribute
+              WHERE attribute.attrelid = ('musicbrainz.' || %s)::regclass
+                AND attribute.attname = %s
+          )
+          AND dependent.relkind IN ('v', 'm')
+          AND dependent.oid <> ('musicbrainz.' || %s)::regclass
+        ORDER BY 1
+        """,
+        (table, table, column, table),
+    )
+    return [row[0] for row in rows]
+
+
+async def column_type(table: str, column: str) -> str:
+    rows = await postgres_rows(
+        """
+        SELECT data_type FROM information_schema.columns
+        WHERE table_schema = 'musicbrainz' AND table_name = %s AND column_name = %s
+        """,
+        (table, column),
+    )
+    return str(rows[0][0])
+
+
+@pytest.mark.asyncio
+async def test_the_widening_skips_a_narrow_column_a_view_already_reads() -> None:
+    """The guard survives the one state that used to be unrecoverable.
+
+    `_execute_schema_statements` logs a failed statement and continues, so a run
+    whose ALTER failed transiently still goes on to create the graph views over
+    the column it failed to widen. This reconstructs exactly that state — narrow
+    column, dependent view — and proves the widening now says why it is skipping
+    instead of raising `cannot alter type of a column used by a view or rule` on
+    this and every later startup.
+
+    Restores the schema before it returns; the widening is re-run with the view
+    dropped, which is the path that does widen.
+    """
+    await apply_schema()
+    assert await column_type(WIDENED_TABLE, WIDENED_COLUMN) == "bigint"
+    assert await dependent_views_on(WIDENED_TABLE, WIDENED_COLUMN) == [WIDENED_VIEW]
+
+    definition_rows = await postgres_rows("SELECT pg_get_viewdef(%s::regclass, true)", (WIDENED_VIEW,))
+    definition = str(definition_rows[0][0]).rstrip().rstrip(";")
+
+    notices: list[str] = []
+    connection = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params())
+    await connection.set_autocommit(True)
+    connection.add_notice_handler(lambda diagnostic: notices.append(diagnostic.message_primary or ""))
+    try:
+        async with connection.cursor() as cursor:
+            await cursor.execute(f"DROP VIEW {WIDENED_VIEW} CASCADE")
+            await cursor.execute(f"ALTER TABLE musicbrainz.{WIDENED_TABLE} ALTER COLUMN {WIDENED_COLUMN} TYPE INTEGER")
+            await cursor.execute(f"CREATE VIEW {WIDENED_VIEW} AS {definition}")
+
+            # The state the reviewer reproduced, now established on purpose.
+            assert await column_type(WIDENED_TABLE, WIDENED_COLUMN) == "integer"
+            assert await dependent_views_on(WIDENED_TABLE, WIDENED_COLUMN) == [WIDENED_VIEW]
+
+            notices.clear()
+            # Must not raise. Before the dependency check this was
+            # `cannot alter type of a column used by a view or rule`.
+            await cursor.execute(_widen_to_bigint(WIDENED_TABLE, WIDENED_COLUMN))
+
+        assert any(f"skipping widen of musicbrainz.{WIDENED_TABLE}.{WIDENED_COLUMN}" in notice for notice in notices), notices
+        assert any(WIDENED_VIEW in notice for notice in notices), notices
+        # Skipped, not silently half-applied.
+        assert await column_type(WIDENED_TABLE, WIDENED_COLUMN) == "integer"
+    finally:
+        async with connection.cursor() as cursor:
+            await cursor.execute(f"DROP VIEW IF EXISTS {WIDENED_VIEW} CASCADE")
+        await connection.close()
+        await apply_schema()
+
+    # With nothing depending on it the same statement does widen, and the run
+    # that widens it rebuilds every view the reproduction dropped.
+    assert await column_type(WIDENED_TABLE, WIDENED_COLUMN) == "bigint"
+    assert await dependent_views_on(WIDENED_TABLE, WIDENED_COLUMN) == [WIDENED_VIEW]
+    view_rows = await postgres_rows("SELECT viewname FROM pg_views WHERE schemaname = 'graph'")
+    assert {row[0] for row in view_rows} == EXPECTED_GRAPH_VIEWS

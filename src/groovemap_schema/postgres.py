@@ -1008,23 +1008,73 @@ def _widen_to_bigint(table: str, column: str) -> str:
     depends on the column: PostgreSQL refuses to retype a column a view reads,
     even when the requested type is the one it already has. The `graph` schema
     exposes exactly these columns as the bridge between the MusicBrainz and
-    Discogs halves of the property graph, so the rewrite is gated on the column
-    still being narrow. A fresh install declares BIGINT in CREATE TABLE and
-    skips it; an install predating the widening runs it once, before any graph
-    view exists to depend on it.
+    Discogs halves of the property graph, so the rewrite is gated twice — on
+    the column still being narrow, and on no view depending on it.
+
+    The second gate is not theoretical. `_execute_schema_statements` logs a
+    failing statement and continues, so an install whose column was still
+    `integer` when a single earlier run failed transiently goes on to create
+    the graph views in that same run. From then on the column is narrow *and*
+    depended upon, and an unguarded ALTER raises `cannot alter type of a column
+    used by a view or rule` on every subsequent startup — a permanent, noisy
+    failure this path can never clear. Reaching that state is a migration
+    problem, not a startup problem: retyping a column under a view needs a
+    coordinated DROP ... CASCADE under the persistence contract's
+    expand/migrate/contract rule. So the statement says so once, as a NOTICE,
+    and succeeds.
     """
+    qualified = f"musicbrainz.{table}"
     return f"""
         DO $widen$
+        DECLARE
+            current_type    text;
+            dependent_views text;
         BEGIN
-            IF EXISTS (
-                SELECT 1 FROM information_schema.columns
-                WHERE table_schema = 'musicbrainz'
-                  AND table_name = '{table}'
-                  AND column_name = '{column}'
-                  AND data_type <> 'bigint'
-            ) THEN
-                ALTER TABLE musicbrainz.{table} ALTER COLUMN {column} TYPE BIGINT;
+            SELECT data_type INTO current_type
+            FROM information_schema.columns
+            WHERE table_schema = 'musicbrainz'
+              AND table_name = '{table}'
+              AND column_name = '{column}';
+
+            -- Absent (a fresh install has not created the table yet) or already
+            -- wide: nothing to do, and nothing to say about it.
+            IF current_type IS NULL OR current_type = 'bigint' THEN
+                RETURN;
             END IF;
+
+            -- A view reads the column through a rewrite rule, so pg_depend
+            -- records the dependency from the rule to this exact attribute.
+            SELECT string_agg(view_name, ', ' ORDER BY view_name)
+            INTO dependent_views
+            FROM (
+                SELECT DISTINCT
+                    dependent.relnamespace::regnamespace::text || '.' || dependent.relname AS view_name
+                FROM pg_depend AS dependency
+                JOIN pg_rewrite AS rule ON rule.oid = dependency.objid
+                JOIN pg_class AS dependent ON dependent.oid = rule.ev_class
+                WHERE dependency.classid = 'pg_rewrite'::regclass
+                  AND dependency.refclassid = 'pg_class'::regclass
+                  AND dependency.refobjid = '{qualified}'::regclass
+                  AND dependency.refobjsubid = (
+                      SELECT attribute.attnum
+                      FROM pg_attribute AS attribute
+                      WHERE attribute.attrelid = '{qualified}'::regclass
+                        AND attribute.attname = '{column}'
+                  )
+                  AND dependent.relkind IN ('v', 'm')
+                  AND dependent.oid <> '{qualified}'::regclass
+            ) AS dependents;
+
+            IF dependent_views IS NOT NULL THEN
+                RAISE NOTICE
+                    'skipping widen of {qualified}.{column}: still %, and % reads it. '
+                    'Retyping a column a view depends on needs a coordinated '
+                    'migration that recreates the dependent views, not a startup ALTER.',
+                    current_type, dependent_views;
+                RETURN;
+            END IF;
+
+            ALTER TABLE {qualified} ALTER COLUMN {column} TYPE BIGINT;
         END
         $widen$
         """  # noqa: S608 — `table` and `column` are module constants, never input
