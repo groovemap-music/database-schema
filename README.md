@@ -32,6 +32,14 @@ non-required job that reports without blocking. See the
 [integration tiers](docs/architecture.md#integration-tiers) for what each tier proves and
 how the beta tier is promoted at PostgreSQL 19 general availability.
 
+The PostgreSQL schema includes a `graph` schema: fifty-two read-only views re-presenting the
+catalog as the vertex and edge relations the Neo4j enrichers build. Those views are applied on
+every engine. The `graph.catalog` SQL/PGQ property graph declared over them is not —
+`SCHEMA_PROPERTY_GRAPH` is off by default and, even when enabled, the declaration is skipped
+with a logged reason on a server below PostgreSQL 19, so a consumer must probe for it rather
+than assume it. See the [graph schema](docs/architecture.md#graph-schema) and
+[the property graph](docs/architecture.md#property-graph).
+
 `just check` expands to formatting, lint, type checking, coverage, compatibility and repository
 checks, package/install verification, license checks, secret scanning, and a non-mutating
 version-bump preview. `just image` builds and then verifies the local one-shot image;
@@ -67,7 +75,9 @@ constraint changes, or changed relationship semantics require a new major contra
 explicit migration. Rollouts follow expand, migrate consumers, then contract.
 
 [`contracts/persistence/v1/compatibility.json`](contracts/persistence/v1/compatibility.json)
-records the tested `groovemap-runtime` version and source revision. The lockfile is the
+records the tested `groovemap-runtime` version and source revision, and records the `graph`
+schema, its views, and the conditional `graph.catalog` property graph as additive objects of
+contract version 1. The lockfile is the
 machine-readable dependency authority. A deployment repository owns rollout and rollback.
 
 ## Versioning and release safety
