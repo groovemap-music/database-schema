@@ -8,12 +8,18 @@ import pytest
 from groovemap_schema.postgres import (
     _ACTIVITY_STATEMENTS,
     _ENTITY_TABLES,
+    _GRAPH_STATEMENTS,
     _INSIGHTS_TABLES,
     _MUSICBRAINZ_INDEXES,
     _MUSICBRAINZ_TABLES,
     _SPECIFIC_INDEXES,
     _USER_TABLES,
+    PROPERTY_GRAPH_STATEMENT,
+    PROPERTY_GRAPH_SWITCH,
+    _apply_property_graph,
+    _property_graph_skip_reason,
     create_postgres_schema,
+    property_graph_enabled,
 )
 
 
@@ -203,6 +209,7 @@ class TestCreatePostgresSchema:
             + len(_ACTIVITY_STATEMENTS)
             + len(_MUSICBRAINZ_TABLES)
             + len(_MUSICBRAINZ_INDEXES)
+            + len(_GRAPH_STATEMENTS)
         )
         assert cursor.execute.await_count == expected_calls
 
@@ -231,6 +238,7 @@ class TestCreatePostgresSchema:
             + len(_ACTIVITY_STATEMENTS)
             + len(_MUSICBRAINZ_TABLES)
             + len(_MUSICBRAINZ_INDEXES)
+            + len(_GRAPH_STATEMENTS)
         )
         assert cursor.execute.await_count == expected_calls
 
@@ -279,6 +287,7 @@ class TestCreatePostgresSchema:
             + len(_ACTIVITY_STATEMENTS)
             + len(_MUSICBRAINZ_TABLES)
             + len(_MUSICBRAINZ_INDEXES)
+            + len(_GRAPH_STATEMENTS)
         )
         assert cursor.execute.await_count == expected_calls
 
@@ -308,3 +317,134 @@ class TestCreatePostgresSchema:
     async def test_pool_connection_used(self, mock_pool: MagicMock) -> None:
         await create_postgres_schema(mock_pool)
         mock_pool.connection.assert_called_once()
+
+
+class TestPropertyGraphSwitch:
+    """The environment switch that has to be on before anything is emitted."""
+
+    def test_the_switch_defaults_to_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv(PROPERTY_GRAPH_SWITCH, raising=False)
+        assert property_graph_enabled() is False
+
+    @pytest.mark.parametrize("value", ["enabled", "ENABLED", " enabled ", "true", "1", "yes", "on", "enable"])
+    def test_the_documented_and_the_usual_truthy_spellings_turn_it_on(self, monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+        monkeypatch.setenv(PROPERTY_GRAPH_SWITCH, value)
+        assert property_graph_enabled() is True
+
+    @pytest.mark.parametrize("value", ["", "disabled", "false", "0", "no", "off", "maybe"])
+    def test_everything_else_leaves_it_off(self, monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+        monkeypatch.setenv(PROPERTY_GRAPH_SWITCH, value)
+        assert property_graph_enabled() is False
+
+
+class TestPropertyGraphSkipReason:
+    """The three gates, in the order they are evaluated."""
+
+    def test_a_disabled_switch_is_the_first_reason(self) -> None:
+        reason = _property_graph_skip_reason(enabled=False, server_version_num=190000, already_exists=False)
+        assert reason == "SCHEMA_PROPERTY_GRAPH is not enabled"
+
+    def test_an_older_server_is_the_second_reason(self) -> None:
+        reason = _property_graph_skip_reason(enabled=True, server_version_num=180004, already_exists=False)
+        assert reason == "server_version_num 180004 is below 190000"
+
+    def test_an_unreadable_server_version_skips_rather_than_guesses(self) -> None:
+        reason = _property_graph_skip_reason(enabled=True, server_version_num=None, already_exists=False)
+        assert reason == "server_version_num None is below 190000"
+
+    def test_an_existing_relation_is_the_third_reason(self) -> None:
+        """There is no IF NOT EXISTS, and nothing here ever drops a relation."""
+        reason = _property_graph_skip_reason(enabled=True, server_version_num=190000, already_exists=True)
+        assert reason == "graph.catalog already exists"
+
+    def test_an_enabled_switch_on_a_fresh_postgresql_19_creates_the_graph(self) -> None:
+        assert _property_graph_skip_reason(enabled=True, server_version_num=190000, already_exists=False) is None
+
+
+class TestApplyPropertyGraph:
+    """The gate as the initializer runs it, against the shared cursor fake."""
+
+    @staticmethod
+    def _cursor(rows: list[Any]) -> AsyncMock:
+        cursor = AsyncMock()
+        cursor.execute = AsyncMock()
+        cursor.fetchone = AsyncMock(side_effect=rows)
+        return cursor
+
+    @staticmethod
+    def _statements(cursor: AsyncMock) -> list[str]:
+        return [str(call.args[0]) for call in cursor.execute.await_args_list]
+
+    @pytest.mark.asyncio
+    async def test_a_disabled_switch_asks_the_server_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv(PROPERTY_GRAPH_SWITCH, raising=False)
+        cursor = self._cursor([])
+
+        assert await _apply_property_graph(cursor) == 0
+        assert cursor.execute.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_postgresql_18_reads_the_version_and_stops(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(PROPERTY_GRAPH_SWITCH, "enabled")
+        cursor = self._cursor([(180004,)])
+
+        assert await _apply_property_graph(cursor) == 0
+        statements = self._statements(cursor)
+        assert len(statements) == 1
+        assert "server_version_num" in statements[0]
+
+    @pytest.mark.asyncio
+    async def test_postgresql_19_with_the_switch_on_creates_the_graph(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(PROPERTY_GRAPH_SWITCH, "enabled")
+        cursor = self._cursor([(190000,), (False,)])
+
+        assert await _apply_property_graph(cursor) == 0
+        statements = self._statements(cursor)
+        assert len(statements) == 3
+        assert statements[-1] == PROPERTY_GRAPH_STATEMENT[1]
+
+    @pytest.mark.asyncio
+    async def test_a_second_apply_is_a_no_op_without_dropping_anything(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(PROPERTY_GRAPH_SWITCH, "enabled")
+        cursor = self._cursor([(190000,), (True,)])
+
+        assert await _apply_property_graph(cursor) == 0
+        statements = self._statements(cursor)
+        assert len(statements) == 2
+        assert not any("CREATE PROPERTY GRAPH" in statement for statement in statements)
+
+    @pytest.mark.asyncio
+    async def test_a_failing_statement_is_counted_rather_than_raised(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(PROPERTY_GRAPH_SWITCH, "enabled")
+        cursor = self._cursor([(190000,), (False,)])
+
+        async def fail_on_the_ddl(statement: Any, *_: Any, **__: Any) -> None:
+            if "CREATE PROPERTY GRAPH" in str(statement):
+                raise RuntimeError("Simulated PostgreSQL error")
+
+        cursor.execute = AsyncMock(side_effect=fail_on_the_ddl)
+        assert await _apply_property_graph(cursor) == 1
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_server_version_skips_rather_than_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(PROPERTY_GRAPH_SWITCH, "enabled")
+        cursor = AsyncMock()
+        cursor.execute = AsyncMock(side_effect=Exception("PostgreSQL unavailable"))
+
+        assert await _apply_property_graph(cursor) == 0
+
+    @pytest.mark.asyncio
+    async def test_the_full_run_leaves_the_graph_alone_by_default(self, mock_pool: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The default schema run is byte-identical to the one before this bead."""
+        monkeypatch.delenv(PROPERTY_GRAPH_SWITCH, raising=False)
+        cursor = mock_pool.connection.return_value.__aenter__.return_value.cursor.return_value
+        captured: list[str] = []
+
+        async def capture(stmt: Any, *_: Any, **__: Any) -> None:
+            captured.append(str(stmt))
+
+        cursor.execute = AsyncMock(side_effect=capture)
+        await create_postgres_schema(mock_pool)
+
+        assert not any("PROPERTY GRAPH" in statement for statement in captured)
+        assert not any("server_version_num" in statement for statement in captured)

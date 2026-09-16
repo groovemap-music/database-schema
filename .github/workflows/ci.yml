@@ -32,3 +32,28 @@ jobs:
       upload-codecov: true
     secrets:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  postgres-19-beta:
+    name: Advisory PostgreSQL 19 beta integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up pinned repository tools
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          install: true
+          cache: true
+
+      - name: Install locked dependencies
+        shell: bash
+        run: just setup
+
+      - name: Run the advisory PostgreSQL 19 beta integration tier
+        shell: bash
+        run: just test-integration-pg19
