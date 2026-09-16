@@ -1311,6 +1311,501 @@ _MUSICBRAINZ_INDEXES: list[tuple[str, str]] = [
 ]
 
 
+# ── Graph schema (vertex and edge views) ──────────────────────────────────────
+# The `graph` schema re-presents the catalog tables as the vertex and edge
+# relations of the property graph the Neo4j enrichers already build, without
+# copying a byte: every object here is a view over a table defined above.
+#
+# Naming is the contract. A vertex view is named for the Neo4j label it mirrors
+# (`graph.artist` for `:Artist`) and an edge view for the relationship type
+# (`graph.by_artist` for `[:BY]`), lowercased and de-reserved — `:User` becomes
+# `graph.user_account` because `user` is a reserved word, and `[:BY]`, `[:ON]`
+# and `[:IS]` become `by_artist`, `on_label`, `in_genre` and `in_style` so a
+# later CREATE PROPERTY GRAPH can use the view name as the label verbatim.
+#
+# Every edge view exposes a stable key column set, catalogued in
+# docs/architecture.md, plus the source and target key columns that join to the
+# corresponding vertex views. Discogs ids live inside JSONB documents as numbers
+# while the catalog tables key on `data_id VARCHAR`, so every id is read with
+# `->>` and compared as text. Base tables are schema-qualified so a view's
+# meaning does not depend on the search_path in force when it was created.
+#
+# Several bodies are composed with f-strings and carry an S608 suppression. Every
+# interpolated value is a module-level constant — a table name, a JSON key, a
+# fragment built by the helpers below — and none of it reaches this module from
+# a caller, a request, or a row. There is no runtime input to inject.
+_GRAPH_SCHEMA_STATEMENT = ("graph schema", "CREATE SCHEMA IF NOT EXISTS graph")
+
+
+def _jsonb_array(expression: str) -> str:
+    """Return the JSONB array at EXPRESSION, or an empty array when it is not one.
+
+    Discogs documents are not schema-checked, so `data->'artists'` can be absent,
+    null, or — for a malformed record — a scalar. `jsonb_array_elements` raises on
+    all three, which would take down a whole view rather than skip one row, so
+    every unnest in this schema goes through this guard.
+    """
+    return f"CASE WHEN jsonb_typeof({expression}) = 'array' THEN {expression} ELSE '[]'::jsonb END"
+
+
+def _text_array(expression: str) -> str:
+    """Return the JSONB string array at EXPRESSION as `text[]`, empty when absent.
+
+    The guard is the subquery's own WHERE rather than a surrounding CASE: with no
+    row qualifying, the set-returning function in the target list is never
+    reached, and `ARRAY()` over zero rows is an empty array rather than NULL.
+    """
+    return f"ARRAY(SELECT jsonb_array_elements_text({expression}) WHERE jsonb_typeof({expression}) = 'array')"
+
+
+def _usable_id(expression: str) -> str:
+    """Return the predicate keeping the ids the graph enricher keeps.
+
+    `graphinator` drops every array element whose `id` is falsy, so a missing id
+    and the Discogs "no entity" sentinel `0` both drop the element rather than
+    producing an edge to a vertex that does not exist.
+    """
+    return f"NULLIF(btrim({expression}), '') IS NOT NULL AND btrim({expression}) <> '0'"
+
+
+def _non_empty(expression: str) -> str:
+    """Return the predicate keeping a non-null, non-empty text value."""
+    return f"NULLIF({expression}, '') IS NOT NULL"
+
+
+def _view(name: str, body: str) -> tuple[str, str]:
+    """Return the named CREATE OR REPLACE VIEW statement for one graph relation.
+
+    CREATE OR REPLACE is the idempotency spelling PostgreSQL offers for a view:
+    re-running it against an identical definition is a no-op, and nothing here
+    ever drops a relation a consumer may be reading.
+    """
+    return (f"graph.{name} view", f"CREATE OR REPLACE VIEW graph.{name} AS\n{body.strip()}")
+
+
+# Genre and Style vertices are the distinct tag names across both documents that
+# carry them; the enricher MERGEs the same node from a release and from a master.
+_TAGGED_DOCUMENTS = """
+    SELECT releases.data AS document FROM public.releases AS releases
+    UNION ALL
+    SELECT masters.data AS document FROM public.masters AS masters
+"""
+
+
+def _discogs_vertex_views() -> list[tuple[str, str]]:
+    """Return the vertex views over the Discogs entity tables, genres, and styles."""
+    return [
+        _view(
+            "artist",
+            """
+SELECT artists.data_id         AS artist_id,
+       artists.data ->> 'name' AS name,
+       artists.gm_item_id      AS gm_item_id,
+       artists.hash            AS hash,
+       artists.updated_at      AS updated_at
+FROM public.artists AS artists
+""",
+        ),
+        _view(
+            "label",
+            """
+SELECT labels.data_id         AS label_id,
+       labels.data ->> 'name' AS name,
+       labels.gm_item_id      AS gm_item_id,
+       labels.hash            AS hash,
+       labels.updated_at      AS updated_at
+FROM public.labels AS labels
+""",
+        ),
+        _view(
+            "master",
+            f"""
+SELECT masters.data_id          AS master_id,
+       masters.data ->> 'title' AS title,
+       masters.data ->> 'year'  AS year,
+       {_text_array("masters.data -> 'genres'")} AS genres,
+       {_text_array("masters.data -> 'styles'")} AS styles,
+       masters.gm_item_id       AS gm_item_id,
+       masters.hash             AS hash,
+       masters.updated_at       AS updated_at
+FROM public.masters AS masters
+""",  # noqa: S608
+        ),
+        _view(
+            "release",
+            f"""
+SELECT releases.data_id          AS release_id,
+       releases.data ->> 'title' AS title,
+       releases.data ->> 'year'  AS year,
+       NULLIF(btrim(releases.data ->> 'country'), '') AS country,
+       {_text_array("releases.data -> 'genres'")} AS genres,
+       {_text_array("releases.data -> 'styles'")} AS styles,
+       {_text_array("releases.media -> 'families'")} AS media_families,
+       releases.gm_item_id       AS gm_item_id,
+       releases.hash             AS hash,
+       releases.updated_at       AS updated_at
+FROM public.releases AS releases
+""",  # noqa: S608
+        ),
+        _view(
+            "genre",
+            f"""
+SELECT DISTINCT genre.value AS name
+FROM ({_TAGGED_DOCUMENTS.strip()}) AS source
+CROSS JOIN LATERAL jsonb_array_elements_text({_jsonb_array("source.document -> 'genres'")}) AS genre(value)
+WHERE {_non_empty("genre.value")}
+""",  # noqa: S608
+        ),
+        _view(
+            "style",
+            f"""
+SELECT DISTINCT style.value AS name
+FROM ({_TAGGED_DOCUMENTS.strip()}) AS source
+CROSS JOIN LATERAL jsonb_array_elements_text({_jsonb_array("source.document -> 'styles'")}) AS style(value)
+WHERE {_non_empty("style.value")}
+""",  # noqa: S608
+        ),
+    ]
+
+
+def _reference_edge_view(view_name: str, table: str, source_column: str, json_key: str, target_column: str) -> tuple[str, str]:
+    """Return an edge view unnesting one JSONB array of entity references.
+
+    DISTINCT is not decoration: a Discogs release lists the same label once per
+    catalogue number and the same artist once per join phrase, so the raw unnest
+    repeats a pair the composite key has to hold exactly once.
+    """
+    return _view(
+        view_name,
+        f"""
+SELECT DISTINCT entity.data_id            AS {source_column},
+       btrim(element.value ->> 'id')      AS {target_column}
+FROM public.{table} AS entity
+CROSS JOIN LATERAL jsonb_array_elements({_jsonb_array(f"entity.data -> '{json_key}'")}) AS element(value)
+WHERE {_usable_id("element.value ->> 'id'")}
+""",  # noqa: S608
+    )
+
+
+def _tag_edge_view(view_name: str, table: str, source_column: str, json_key: str, target_column: str) -> tuple[str, str]:
+    """Return an edge view unnesting one JSONB array of genre or style names."""
+    return _view(
+        view_name,
+        f"""
+SELECT DISTINCT entity.data_id AS {source_column},
+       tag.value               AS {target_column}
+FROM public.{table} AS entity
+CROSS JOIN LATERAL jsonb_array_elements_text({_jsonb_array(f"entity.data -> '{json_key}'")}) AS tag(value)
+WHERE {_non_empty("tag.value")}
+""",  # noqa: S608
+    )
+
+
+def _discogs_edge_views() -> list[tuple[str, str]]:
+    """Return the edge views over the Discogs entity documents."""
+    genres = "source.document -> 'genres'"
+    styles = "source.document -> 'styles'"
+    return [
+        _reference_edge_view("by_artist", "releases", "release_id", "artists", "artist_id"),
+        _reference_edge_view("on_label", "releases", "release_id", "labels", "label_id"),
+        _view(
+            "derived_from",
+            f"""
+SELECT releases.data_id                     AS release_id,
+       btrim(releases.data ->> 'master_id')  AS master_id
+FROM public.releases AS releases
+WHERE {_usable_id("releases.data ->> 'master_id'")}
+""",  # noqa: S608
+        ),
+        _tag_edge_view("in_genre", "releases", "release_id", "genres", "genre_name"),
+        _tag_edge_view("in_style", "releases", "release_id", "styles", "style_name"),
+        _reference_edge_view("master_by_artist", "masters", "master_id", "artists", "artist_id"),
+        _tag_edge_view("master_in_genre", "masters", "master_id", "genres", "genre_name"),
+        _tag_edge_view("master_in_style", "masters", "master_id", "styles", "style_name"),
+        # PART_OF is unambiguous only when the source record carries exactly one
+        # genre: with two, nothing in the document says which genre a style sits
+        # under. Release and master documents both assert it and the enricher
+        # projects both, so both are unioned here.
+        _view(
+            "part_of",
+            f"""
+SELECT DISTINCT style.value   AS style_name,
+       genre.genre_name       AS genre_name
+FROM ({_TAGGED_DOCUMENTS.strip()}) AS source
+CROSS JOIN LATERAL (
+    SELECT single.value AS genre_name
+    FROM jsonb_array_elements_text({_jsonb_array(genres)}) AS single(value)
+) AS genre
+CROSS JOIN LATERAL jsonb_array_elements_text({_jsonb_array(styles)}) AS style(value)
+WHERE jsonb_array_length({_jsonb_array(genres)}) = 1
+  AND {_non_empty("genre.genre_name")}
+  AND {_non_empty("style.value")}
+""",  # noqa: S608
+        ),
+        # Discogs states band membership from both ends — the band lists
+        # `members`, the member lists `groups` — so the two unnests become one
+        # directed edge and UNION collapses the duplicate a reciprocal pair makes.
+        _view(
+            "member_of",
+            f"""
+SELECT btrim(element.value ->> 'id') AS member_artist_id,
+       artists.data_id               AS group_artist_id
+FROM public.artists AS artists
+CROSS JOIN LATERAL jsonb_array_elements({_jsonb_array("artists.data -> 'members'")}) AS element(value)
+WHERE {_usable_id("element.value ->> 'id'")}
+UNION
+SELECT artists.data_id               AS member_artist_id,
+       btrim(element.value ->> 'id') AS group_artist_id
+FROM public.artists AS artists
+CROSS JOIN LATERAL jsonb_array_elements({_jsonb_array("artists.data -> 'groups'")}) AS element(value)
+WHERE {_usable_id("element.value ->> 'id'")}
+""",  # noqa: S608
+        ),
+        _view(
+            "alias_of",
+            f"""
+SELECT DISTINCT btrim(element.value ->> 'id') AS alias_artist_id,
+       artists.data_id                        AS artist_id
+FROM public.artists AS artists
+CROSS JOIN LATERAL jsonb_array_elements({_jsonb_array("artists.data -> 'aliases'")}) AS element(value)
+WHERE {_usable_id("element.value ->> 'id'")}
+""",  # noqa: S608
+        ),
+        # A label hierarchy is likewise stated from both ends: `parentLabel` on
+        # the child and `sublabels` on the parent.
+        _view(
+            "sublabel_of",
+            f"""
+SELECT labels.data_id                                  AS sublabel_id,
+       btrim(labels.data -> 'parentLabel' ->> 'id')    AS parent_label_id
+FROM public.labels AS labels
+WHERE {_usable_id("labels.data -> 'parentLabel' ->> 'id'")}
+UNION
+SELECT btrim(element.value ->> 'id') AS sublabel_id,
+       labels.data_id                AS parent_label_id
+FROM public.labels AS labels
+CROSS JOIN LATERAL jsonb_array_elements({_jsonb_array("labels.data -> 'sublabels'")}) AS element(value)
+WHERE {_usable_id("element.value ->> 'id'")}
+""",  # noqa: S608
+        ),
+    ]
+
+
+# The MusicBrainz entity types the loader writes into `musicbrainz.relationships`,
+# each paired with the table keyed on that type's mbid and the fragment used in
+# view names. `release-group` is the spelling the loader normalizes onto, so it is
+# matched verbatim and spelled `release_group` in identifiers.
+_MUSICBRAINZ_GRAPH_ENTITIES: list[tuple[str, str, str]] = [
+    ("artist", "musicbrainz.artists", "artist"),
+    ("label", "musicbrainz.labels", "label"),
+    ("release", "musicbrainz.releases", "release"),
+    ("release-group", "musicbrainz.release_groups", "release_group"),
+]
+
+
+def _musicbrainz_vertex_views() -> list[tuple[str, str]]:
+    """Return the vertex views over the four MusicBrainz catalog tables."""
+    return [
+        _view(
+            "mb_artist",
+            """
+SELECT artists.mbid              AS mbid,
+       artists.name              AS name,
+       artists.sort_name         AS sort_name,
+       artists.type              AS type,
+       artists.gender            AS gender,
+       artists.begin_date        AS begin_date,
+       artists.end_date          AS end_date,
+       artists.ended             AS ended,
+       artists.area              AS area,
+       artists.begin_area        AS begin_area,
+       artists.end_area          AS end_area,
+       artists.disambiguation    AS disambiguation,
+       artists.discogs_artist_id AS discogs_artist_id,
+       artists.updated_at        AS updated_at
+FROM musicbrainz.artists AS artists
+""",
+        ),
+        _view(
+            "mb_label",
+            """
+SELECT labels.mbid             AS mbid,
+       labels.name             AS name,
+       labels.type             AS type,
+       labels.label_code       AS label_code,
+       labels.begin_date       AS begin_date,
+       labels.end_date         AS end_date,
+       labels.ended            AS ended,
+       labels.area             AS area,
+       labels.disambiguation   AS disambiguation,
+       labels.discogs_label_id AS discogs_label_id,
+       labels.updated_at       AS updated_at
+FROM musicbrainz.labels AS labels
+""",
+        ),
+        _view(
+            "mb_release",
+            f"""
+SELECT releases.mbid               AS mbid,
+       releases.name               AS name,
+       releases.barcode            AS barcode,
+       releases.status             AS status,
+       releases.release_group_mbid AS release_group_mbid,
+       releases.discogs_release_id AS discogs_release_id,
+       {_text_array("releases.media -> 'families'")} AS media_families,
+       releases.updated_at         AS updated_at
+FROM musicbrainz.releases AS releases
+""",  # noqa: S608
+        ),
+        _view(
+            "mb_release_group",
+            """
+SELECT release_groups.mbid               AS mbid,
+       release_groups.name               AS name,
+       release_groups.type               AS type,
+       release_groups.secondary_types    AS secondary_types,
+       release_groups.first_release_date AS first_release_date,
+       release_groups.disambiguation     AS disambiguation,
+       release_groups.discogs_master_id  AS discogs_master_id,
+       release_groups.updated_at         AS updated_at
+FROM musicbrainz.release_groups AS release_groups
+""",
+        ),
+    ]
+
+
+def _musicbrainz_edge_views() -> list[tuple[str, str]]:
+    """Return one edge view per ordered MusicBrainz endpoint-type pair.
+
+    `musicbrainz.relationships` is polymorphic — one table holding every
+    (source type, target type) combination — and carries no foreign keys, so a
+    row can name an mbid the loader has not stored yet. A property graph needs
+    the opposite: one typed edge relation per endpoint pair, every row of which
+    resolves to a vertex. Each view therefore filters on its pair and inner-joins
+    both endpoint tables, which is what drops the dangling rows.
+
+    All sixteen ordered pairs over the four modelled entity types are declared
+    rather than only the pairs some catalog happens to hold today, so the set of
+    relations is a property of the schema and not of the data loaded into it.
+    """
+    views: list[tuple[str, str]] = []
+    for source_type, source_table, source_name in _MUSICBRAINZ_GRAPH_ENTITIES:
+        for target_type, target_table, target_name in _MUSICBRAINZ_GRAPH_ENTITIES:
+            views.append(
+                _view(
+                    f"mb_rel_{source_name}_{target_name}",
+                    f"""
+SELECT relationship.id                AS relationship_id,
+       relationship.source_mbid       AS source_mbid,
+       relationship.target_mbid       AS target_mbid,
+       relationship.relationship_type AS relationship_type,
+       relationship.begin_date        AS begin_date,
+       relationship.end_date          AS end_date,
+       relationship.ended             AS ended,
+       relationship.attributes        AS attributes
+FROM musicbrainz.relationships AS relationship
+JOIN {source_table} AS source_entity ON source_entity.mbid = relationship.source_mbid
+JOIN {target_table} AS target_entity ON target_entity.mbid = relationship.target_mbid
+WHERE relationship.source_entity_type = '{source_type}'
+  AND relationship.target_entity_type = '{target_type}'
+""",  # noqa: S608
+                )
+            )
+    return views
+
+
+def _collection_views() -> list[tuple[str, str]]:
+    """Return the account, catalog-item, and personal-collection graph relations.
+
+    `user_collections` and `user_wantlists` hold the raw Discogs release id as a
+    BIGINT and carry no foreign key to `releases`, so both edge views cast it to
+    text and inner-join the catalog. That cast is the join the whole graph turns
+    on: `releases.data_id` is the Discogs id as a string.
+
+    `graph.user_account` deliberately omits `email` and every credential column.
+    The Neo4j `:User` node carries only an id, and a graph relation is the wrong
+    surface on which to widen personal data.
+    """
+    return [
+        _view(
+            "user_account",
+            """
+SELECT users.id         AS user_id,
+       users.is_active  AS is_active,
+       users.is_admin   AS is_admin,
+       users.created_at AS created_at,
+       users.updated_at AS updated_at
+FROM public.users AS users
+""",
+        ),
+        _view(
+            "catalog_item",
+            """
+SELECT catalog_items.id         AS item_id,
+       catalog_items.kind       AS kind,
+       catalog_items.created_at AS created_at
+FROM public.catalog_items AS catalog_items
+""",
+        ),
+        _view(
+            "collected",
+            """
+SELECT collection.id          AS collection_id,
+       collection.user_id     AS user_id,
+       releases.data_id       AS release_id,
+       collection.instance_id AS instance_id,
+       collection.folder_id   AS folder_id,
+       collection.condition   AS condition,
+       collection.rating      AS rating,
+       collection.date_added  AS date_added
+FROM public.user_collections AS collection
+JOIN public.releases AS releases ON releases.data_id = collection.release_id::text
+""",
+        ),
+        _view(
+            "wants",
+            """
+SELECT wantlist.id         AS wantlist_id,
+       wantlist.user_id    AS user_id,
+       releases.data_id    AS release_id,
+       wantlist.rating     AS rating,
+       wantlist.date_added AS date_added
+FROM public.user_wantlists AS wantlist
+JOIN public.releases AS releases ON releases.data_id = wantlist.release_id::text
+""",
+        ),
+        # `owned_copies` is foreign-keyed to both endpoints, so no join is needed
+        # to prove the edge resolves.
+        _view(
+            "owns",
+            """
+SELECT owned_copies.id                AS owned_copy_id,
+       owned_copies.user_id           AS user_id,
+       owned_copies.item_id           AS item_id,
+       owned_copies.artifact_id       AS artifact_id,
+       owned_copies.collection_row_id AS collection_row_id,
+       owned_copies.acquired_at       AS acquired_at
+FROM public.owned_copies AS owned_copies
+""",
+        ),
+    ]
+
+
+def _build_graph_statements() -> list[tuple[str, str]]:
+    """Return the ordered graph-schema statements: the schema, then its views."""
+    return [
+        _GRAPH_SCHEMA_STATEMENT,
+        *_discogs_vertex_views(),
+        *_discogs_edge_views(),
+        *_musicbrainz_vertex_views(),
+        *_musicbrainz_edge_views(),
+        *_collection_views(),
+    ]
+
+
+_GRAPH_STATEMENTS: list[tuple[str, str]] = _build_graph_statements()
+
+
 def _entity_schema_statements() -> Iterator[tuple[str, Any]]:
     """Yield each Discogs entity table followed by its shared indexes."""
     for table_name in _ENTITY_TABLES:
@@ -1365,6 +1860,8 @@ def _schema_statements() -> Iterator[tuple[str, Any]]:
     yield from _ACTIVITY_STATEMENTS
     yield from _MUSICBRAINZ_TABLES
     yield from _MUSICBRAINZ_INDEXES
+    # Last: every view in the graph schema reads a table declared above.
+    yield from _GRAPH_STATEMENTS
 
 
 async def _execute_schema_statements(cursor: Any, statements: Iterable[tuple[str, Any]]) -> tuple[int, int]:

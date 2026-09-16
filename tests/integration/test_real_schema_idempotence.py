@@ -11,6 +11,7 @@ from neo4j import AsyncGraphDatabase
 
 from groovemap_schema import initializer
 from groovemap_schema.neo4j import SCHEMA_STATEMENTS
+from groovemap_schema.postgres import _GRAPH_STATEMENTS
 
 
 pytestmark = pytest.mark.integration
@@ -20,11 +21,17 @@ EXPECTED_POSTGRES_TABLES = {
         "admin_audit_log",
         "app_config",
         "app_tokens",
+        "artifacts",
         "artists",
+        "catalog_items",
+        "collection_snapshots",
         "extraction_history",
         "labels",
         "masters",
         "oauth_tokens",
+        "observations",
+        "owned_copies",
+        "provider_aliases",
         "queue_metrics",
         "releases",
         "service_health_metrics",
@@ -34,6 +41,7 @@ EXPECTED_POSTGRES_TABLES = {
         "users",
     },
     "insights": {
+        "activity_summary",
         "artist_centrality",
         "community_counts",
         "computation_log",
@@ -68,6 +76,47 @@ EXPECTED_COLUMNS = {
 }
 
 
+# The schemas whose catalogs the snapshot and the expectations cover.
+SCHEMAS = ("public", "insights", "musicbrainz", "graph")
+
+# Every graph relation the initializer declares, by view name.
+EXPECTED_GRAPH_VIEWS = {name.removeprefix("graph.").removesuffix(" view") for name, _statement in _GRAPH_STATEMENTS if name != "graph schema"}
+
+# The key columns the property graph joins on, with the type each must resolve
+# to on a real engine. A Discogs id read out of JSONB has to land as text so it
+# joins `releases.data_id`; a MusicBrainz key has to stay a uuid; a collection
+# edge has to have cast its BIGINT release id down to text.
+EXPECTED_GRAPH_COLUMNS = {
+    ("graph", "artist", "artist_id", "character varying"),
+    ("graph", "release", "release_id", "character varying"),
+    ("graph", "release", "media_families", "ARRAY"),
+    ("graph", "genre", "name", "text"),
+    ("graph", "style", "name", "text"),
+    ("graph", "by_artist", "release_id", "character varying"),
+    ("graph", "by_artist", "artist_id", "text"),
+    ("graph", "on_label", "label_id", "text"),
+    ("graph", "derived_from", "master_id", "text"),
+    ("graph", "in_genre", "genre_name", "text"),
+    ("graph", "part_of", "style_name", "text"),
+    ("graph", "part_of", "genre_name", "text"),
+    ("graph", "member_of", "member_artist_id", "text"),
+    ("graph", "member_of", "group_artist_id", "character varying"),
+    ("graph", "sublabel_of", "parent_label_id", "text"),
+    ("graph", "mb_artist", "mbid", "uuid"),
+    ("graph", "mb_release", "mbid", "uuid"),
+    ("graph", "mb_rel_artist_artist", "source_mbid", "uuid"),
+    ("graph", "mb_rel_artist_artist", "target_mbid", "uuid"),
+    ("graph", "mb_rel_artist_artist", "attributes", "jsonb"),
+    ("graph", "user_account", "user_id", "uuid"),
+    ("graph", "catalog_item", "item_id", "uuid"),
+    ("graph", "collected", "user_id", "uuid"),
+    ("graph", "collected", "release_id", "character varying"),
+    ("graph", "collected", "instance_id", "bigint"),
+    ("graph", "wants", "release_id", "character varying"),
+    ("graph", "owns", "item_id", "uuid"),
+}
+
+
 async def postgres_rows(query: str, parameters: tuple[Any, ...] = ()) -> list[tuple[Any, ...]]:
     """Query the disposable target database through the production connection settings."""
     connection = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params())
@@ -83,7 +132,7 @@ async def postgres_snapshot() -> tuple[tuple[Any, ...], ...]:
         SELECT 'column', table_schema, table_name, column_name,
                data_type, is_nullable, COALESCE(column_default, '')
         FROM information_schema.columns
-        WHERE table_schema IN ('public', 'insights', 'musicbrainz')
+        WHERE table_schema IN ('public', 'insights', 'musicbrainz', 'graph')
         UNION ALL
         SELECT 'constraint', namespace.nspname, table_class.relname,
                constraint_row.conname, constraint_row.contype::text,
@@ -96,6 +145,10 @@ async def postgres_snapshot() -> tuple[tuple[Any, ...], ...]:
         SELECT 'index', schemaname, tablename, indexname, indexdef, '', ''
         FROM pg_indexes
         WHERE schemaname IN ('public', 'insights', 'musicbrainz')
+        UNION ALL
+        SELECT 'view', schemaname, viewname, definition, '', '', ''
+        FROM pg_views
+        WHERE schemaname = 'graph'
         ORDER BY 1, 2, 3, 4
         """
     )
@@ -121,10 +174,22 @@ async def assert_expected_postgres_schema() -> None:
         """
         SELECT table_schema, table_name, column_name, data_type
         FROM information_schema.columns
-        WHERE table_schema IN ('public', 'insights', 'musicbrainz')
+        WHERE table_schema IN ('public', 'insights', 'musicbrainz', 'graph')
         """
     )
     assert set(column_rows) >= EXPECTED_COLUMNS
+    assert set(column_rows) >= EXPECTED_GRAPH_COLUMNS
+
+    view_rows = await postgres_rows("SELECT viewname FROM pg_views WHERE schemaname = 'graph'")
+    assert {row[0] for row in view_rows} == EXPECTED_GRAPH_VIEWS
+
+    # A view that parses is not yet a view that runs: PostgreSQL only plans the
+    # body when it is read. Selecting from every relation proves each one is
+    # executable on this engine, which is the whole point of running the suite
+    # against two major versions.
+    for view in sorted(EXPECTED_GRAPH_VIEWS):
+        # `view` comes from the initializer's own statement list, not from input.
+        assert await postgres_rows(f"SELECT count(*) FROM graph.{view}") == [(0,)]  # noqa: S608
 
     relationship_key = await postgres_rows(
         """

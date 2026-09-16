@@ -8,6 +8,7 @@ import pytest
 from groovemap_schema.postgres import (
     _ACTIVITY_STATEMENTS,
     _ENTITY_TABLES,
+    _GRAPH_STATEMENTS,
     _INSIGHTS_TABLES,
     _MUSICBRAINZ_INDEXES,
     _MUSICBRAINZ_TABLES,
@@ -203,6 +204,7 @@ class TestCreatePostgresSchema:
             + len(_ACTIVITY_STATEMENTS)
             + len(_MUSICBRAINZ_TABLES)
             + len(_MUSICBRAINZ_INDEXES)
+            + len(_GRAPH_STATEMENTS)
         )
         assert cursor.execute.await_count == expected_calls
 
@@ -231,6 +233,7 @@ class TestCreatePostgresSchema:
             + len(_ACTIVITY_STATEMENTS)
             + len(_MUSICBRAINZ_TABLES)
             + len(_MUSICBRAINZ_INDEXES)
+            + len(_GRAPH_STATEMENTS)
         )
         assert cursor.execute.await_count == expected_calls
 
@@ -279,6 +282,7 @@ class TestCreatePostgresSchema:
             + len(_ACTIVITY_STATEMENTS)
             + len(_MUSICBRAINZ_TABLES)
             + len(_MUSICBRAINZ_INDEXES)
+            + len(_GRAPH_STATEMENTS)
         )
         assert cursor.execute.await_count == expected_calls
 
