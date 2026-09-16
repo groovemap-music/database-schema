@@ -24,9 +24,13 @@ typecheck:
 test:
     uv run pytest -m "not integration" --cov=groovemap_schema --cov-report=term-missing --cov-report=xml
 
-# Starts and removes disposable PostgreSQL and Neo4j containers.
+# Required tier. Starts and removes disposable PostgreSQL 18 and Neo4j containers.
 test-integration:
     bash scripts/test-integration.sh
+
+# Advisory tier. Same script and Neo4j image against the PostgreSQL 19 beta engine.
+test-integration-pg19:
+    POSTGRES_INTEGRATION_IMAGE=postgres:19beta3-alpine@sha256:b1692e50613a21e61c424859f943b9e193ae73e5a8c68abd5382dfb235bf15fc bash scripts/test-integration.sh
 
 coverage: test
 

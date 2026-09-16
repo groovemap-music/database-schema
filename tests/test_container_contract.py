@@ -197,7 +197,7 @@ def test_dependabot_pull_requests_run_the_ordinary_required_ci_graph() -> None:
     assert "schedule:" in workflow
     assert "workflow_dispatch:" in workflow
     jobs = workflow.split("jobs:\n", 1)[1]
-    assert len(re.findall(r"^  [a-zA-Z0-9_-]+:\s*$", jobs, re.MULTILINE)) == 1
+    assert re.findall(r"^  ([a-zA-Z0-9_-]+):\s*$", jobs, re.MULTILINE) == ["required", "postgres-19-beta"]
     assert "jobs:\n  required:" in workflow
     assert "github.actor" not in workflow.lower()
     assert "dependabot" not in workflow.lower()
@@ -234,6 +234,33 @@ def test_dependabot_pull_requests_run_the_ordinary_required_ci_graph() -> None:
     pyproject = (ROOT / "pyproject.toml").read_text()
     assert "https://github.com/groovemap-music/python-libraries.git" in pyproject
     assert PYTHON_LIBRARIES_REVISION in pyproject
+
+
+def test_integration_runs_a_required_and_an_advisory_engine_tier() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+    justfile = (ROOT / "Justfile").read_text()
+
+    required_job, advisory_job = workflow.split("  postgres-19-beta:\n", 1)
+
+    # PostgreSQL 18 is the gate: the reusable caller runs it and must fail the workflow.
+    assert "integration-command: just test-integration\n" in required_job
+    assert "continue-on-error" not in required_job
+
+    # PostgreSQL 19 beta reports without blocking until general availability.
+    assert "run: just test-integration-pg19" in advisory_job
+    assert "continue-on-error: true" in advisory_job
+
+    # One parameterized script serves both tiers; only the PostgreSQL image differs.
+    script = (ROOT / "scripts" / "test-integration.sh").read_text()
+    assert "POSTGRES_INTEGRATION_IMAGE" in script
+    assert "NEO4J_INTEGRATION_IMAGE" in script
+    assert re.search(
+        r"test-integration-pg19:\n    POSTGRES_INTEGRATION_IMAGE="
+        r"postgres:19beta3-alpine@sha256:[0-9a-f]{64} bash scripts/test-integration\.sh\n",
+        justfile,
+    )
+    assert re.search(r"\ntest-integration:\n    bash scripts/test-integration\.sh\n", justfile)
+    assert "NEO4J_INTEGRATION_IMAGE" not in justfile
 
 
 def test_release_is_tag_only_and_uses_repository_named_image() -> None:
