@@ -14,10 +14,34 @@ from psycopg.types.json import Jsonb
 
 from groovemap_schema import initializer
 from groovemap_schema.neo4j import SCHEMA_STATEMENTS
-from groovemap_schema.postgres import _GRAPH_STATEMENTS, _widen_to_bigint
+from groovemap_schema.postgres import (
+    _GRAPH_STATEMENTS,
+    PROPERTY_GRAPH_MINIMUM_SERVER_VERSION,
+    PROPERTY_GRAPH_RELATION,
+    PROPERTY_GRAPH_SCHEMA,
+    PROPERTY_GRAPH_SWITCH,
+    _widen_to_bigint,
+)
 
 
 pytestmark = pytest.mark.integration
+
+
+@pytest.fixture(autouse=True)
+def _enable_the_property_graph(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run both tiers with the switch on, so only the server version decides.
+
+    The PostgreSQL 18 tier proving the graph absent is then a statement about
+    the version gate rather than about which environment the suite happened to
+    inherit, and the PostgreSQL 19 tier gets the graph without the integration
+    script having to know the difference.
+    """
+    monkeypatch.setenv(PROPERTY_GRAPH_SWITCH, "enabled")
+
+
+# The relkind PostgreSQL 19 beta3 gives a property graph in `pg_class`. It is its
+# own kind, beside `r` for a table and `v` for a view.
+PROPERTY_GRAPH_RELKIND = "g"
 
 EXPECTED_POSTGRES_TABLES = {
     "public": {
@@ -133,6 +157,13 @@ EXPECTED_GRAPH_COLUMNS = {
     ("graph", "collected", "instance_id", "bigint"),
     ("graph", "wants", "release_id", "character varying"),
     ("graph", "owns", "item_id", "uuid"),
+    # The text restatements of the four VARCHAR Discogs keys. PostgreSQL 19
+    # beta3 rejects an edge whose endpoint resolves to a `character varying`
+    # vertex key, so these are what the property graph joins on.
+    ("graph", "artist", "artist_key", "text"),
+    ("graph", "label", "label_key", "text"),
+    ("graph", "master", "master_key", "text"),
+    ("graph", "release", "release_key", "text"),
 }
 
 
@@ -290,6 +321,124 @@ async def assert_expected_postgres_schema() -> None:
     ]
 
 
+# ── The catalog property graph ───────────────────────────────────────────────
+
+
+async def server_version_num() -> int:
+    """Return the connected engine's `server_version_num`."""
+    rows = await postgres_rows("SELECT current_setting('server_version_num')::int")
+    return int(rows[0][0])
+
+
+async def property_graph_relkind() -> str | None:
+    """Return the relkind of `graph.catalog`, or None when nothing carries the name."""
+    rows = await postgres_rows(
+        """
+        SELECT relation.relkind
+        FROM pg_class AS relation
+        JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+        WHERE namespace.nspname = %s AND relation.relname = %s
+        """,
+        (PROPERTY_GRAPH_SCHEMA, PROPERTY_GRAPH_RELATION),
+    )
+    return None if not rows else str(rows[0][0])
+
+
+async def property_graph_snapshot() -> tuple[tuple[Any, ...], ...]:
+    """Capture every element, label, and property of `graph.catalog`.
+
+    Empty on PostgreSQL 18, where the `pg_propgraph_*` catalogs do not exist and
+    the gate has closed on the server version anyway. On 19 this is what proves a
+    second apply changed nothing: the property graph has no `IF NOT EXISTS`, so
+    the initializer skips it on the catalog check rather than re-running it.
+    """
+    if await server_version_num() < PROPERTY_GRAPH_MINIMUM_SERVER_VERSION:
+        return ()
+    rows = await postgres_rows(
+        """
+        SELECT element.pgealias,
+               element.pgerelid::regclass::text,
+               element.pgekind::text,
+               label.pgllabel,
+               property.pgpname,
+               format_type(property.pgptypid, property.pgptypmod)
+        FROM pg_propgraph_element AS element
+        JOIN pg_propgraph_element_label AS element_label ON element_label.pgelelid = element.oid
+        JOIN pg_propgraph_label AS label ON label.oid = element_label.pgellabelid
+        JOIN pg_propgraph_label_property AS label_property ON label_property.plpellabelid = element_label.oid
+        JOIN pg_propgraph_property AS property ON property.oid = label_property.plppropid
+        WHERE element.pgepgid = (%s || '.' || %s)::regclass
+        ORDER BY 1, 4, 5
+        """,
+        (PROPERTY_GRAPH_SCHEMA, PROPERTY_GRAPH_RELATION),
+    )
+    return tuple(rows)
+
+
+async def assert_the_property_graph_matches_the_server() -> None:
+    """Assert `graph.catalog` exists on PostgreSQL 19 and nowhere else."""
+    relkind = await property_graph_relkind()
+    if await server_version_num() < PROPERTY_GRAPH_MINIMUM_SERVER_VERSION:
+        assert relkind is None, "PostgreSQL 18 must carry no graph.catalog relation"
+        assert await property_graph_snapshot() == ()
+        return
+    assert relkind == PROPERTY_GRAPH_RELKIND
+
+    # Every element table is one of the graph schema's own views, and every one
+    # of them is declared: the graph covers the schema rather than a subset of it.
+    elements = await postgres_rows(
+        """
+        SELECT element.pgealias, element.pgerelid::regclass::text, element.pgekind::text
+        FROM pg_propgraph_element AS element
+        WHERE element.pgepgid = (%s || '.' || %s)::regclass
+        """,
+        (PROPERTY_GRAPH_SCHEMA, PROPERTY_GRAPH_RELATION),
+    )
+    assert {alias for alias, _relation, _kind in elements} == EXPECTED_GRAPH_VIEWS
+    assert {relation for _alias, relation, _kind in elements} == {f"graph.{view}" for view in EXPECTED_GRAPH_VIEWS}
+    assert {kind for _alias, _relation, kind in elements} == {"e", "v"}
+
+    # SQL/PGQ requires one data type per property name across the whole graph.
+    # `pg_propgraph_property` is the engine's own register of that, so a single
+    # row per name is the rule holding rather than a restatement of it.
+    duplicates = await postgres_rows(
+        """
+        SELECT property.pgpname
+        FROM pg_propgraph_property AS property
+        WHERE property.pgppgid = (%s || '.' || %s)::regclass
+        GROUP BY property.pgpname
+        HAVING count(*) > 1
+        """,
+        (PROPERTY_GRAPH_SCHEMA, PROPERTY_GRAPH_RELATION),
+    )
+    assert duplicates == []
+
+    # The four names the views spell two ways, unified on text.
+    unified = await postgres_rows(
+        """
+        SELECT property.pgpname, format_type(property.pgptypid, property.pgptypmod)
+        FROM pg_propgraph_property AS property
+        WHERE property.pgppgid = (%s || '.' || %s)::regclass
+          AND property.pgpname IN ('artist_id', 'label_id', 'master_id', 'discogs_label_id')
+        ORDER BY 1
+        """,
+        (PROPERTY_GRAPH_SCHEMA, PROPERTY_GRAPH_RELATION),
+    )
+    assert unified == [("artist_id", "text"), ("discogs_label_id", "text"), ("label_id", "text"), ("master_id", "text")]
+
+    # The structural key columns stay out of the published properties.
+    structural = await postgres_rows(
+        """
+        SELECT property.pgpname
+        FROM pg_propgraph_property AS property
+        WHERE property.pgppgid = (%s || '.' || %s)::regclass
+          AND property.pgpname LIKE '%%\\_key'
+        """,
+        (PROPERTY_GRAPH_SCHEMA, PROPERTY_GRAPH_RELATION),
+    )
+    assert structural == []
+
+
 async def neo4j_rows(query: str) -> list[tuple[Any, ...]]:
     """Query the disposable Neo4j through the production connection settings."""
     driver = AsyncGraphDatabase.driver(
@@ -377,16 +526,20 @@ async def test_both_schema_initializers_are_real_engine_idempotent() -> None:
     await apply_schema()
     await assert_expected_postgres_schema()
     await assert_expected_neo4j_schema()
+    await assert_the_property_graph_matches_the_server()
     first_postgres = await postgres_snapshot()
     first_neo4j = await neo4j_snapshot()
+    first_property_graph = await property_graph_snapshot()
     await seed_sentinels()
 
     await apply_schema()
     await assert_expected_postgres_schema()
     await assert_expected_neo4j_schema()
+    await assert_the_property_graph_matches_the_server()
 
     assert await postgres_snapshot() == first_postgres
     assert await neo4j_snapshot() == first_neo4j
+    assert await property_graph_snapshot() == first_property_graph
     await assert_sentinels_survive()
 
 
@@ -702,3 +855,75 @@ async def test_the_widening_skips_a_narrow_column_a_view_already_reads() -> None
     assert await dependent_views_on(WIDENED_TABLE, WIDENED_COLUMN) == [WIDENED_VIEW]
     view_rows = await postgres_rows("SELECT viewname FROM pg_views WHERE schemaname = 'graph'")
     assert {row[0] for row in view_rows} == EXPECTED_GRAPH_VIEWS
+
+
+# ── GRAPH_TABLE smoke queries ────────────────────────────────────────────────
+# Pattern matching over the same sentinel rows the view projections are checked
+# against, so a passing query is a statement about the declared graph rather
+# than about a second fixture written to suit it.
+
+# The bead's own two-hop shape. Release 111 carries one usable artist — the
+# document repeats `{"id": 7}` and the enricher's filters drop the `0` sentinel
+# and the element with no id — so `a` and `b` bind to the same artist. The
+# traversal is still two hops through two edge bindings, which is what is being
+# proved; the query below it walks the same two hops between distinct vertices.
+TWO_HOP_RELEASE_ARTIST = """
+SELECT * FROM GRAPH_TABLE (graph.catalog
+    MATCH (a IS artist)<-[IS by_artist]-(r IS release)-[IS by_artist]->(b IS artist)
+    COLUMNS (r.release_id AS release_id, a.artist_id AS left_artist_id, b.artist_id AS right_artist_id, a.name AS artist_name)
+) ORDER BY 1, 2, 3
+"""
+
+# Release to artist through the master, over three vertex labels and two of the
+# restated text keys.
+TWO_HOP_RELEASE_MASTER_ARTIST = """
+SELECT * FROM GRAPH_TABLE (graph.catalog
+    MATCH (r IS release)-[IS derived_from]->(m IS master)-[IS master_by_artist]->(a IS artist)
+    COLUMNS (r.release_id AS release_id, m.master_id AS master_id, a.artist_id AS artist_id, a.name AS artist_name)
+) ORDER BY 1, 2, 3
+"""
+
+MUSICBRAINZ_RELATIONSHIP = """
+SELECT * FROM GRAPH_TABLE (graph.catalog
+    MATCH (s IS mb_artist)-[e IS mb_rel_artist_artist]->(t IS mb_artist)
+    COLUMNS (s.name AS source_name, e.relationship_type AS relationship_type, t.name AS target_name)
+) ORDER BY 1, 2, 3
+"""
+
+# The same edges reached through the label all sixteen endpoint pairs share.
+MUSICBRAINZ_RELATIONSHIP_SHARED_LABEL = """
+SELECT * FROM GRAPH_TABLE (graph.catalog
+    MATCH (s IS mb_artist)-[e IS mb_related]->(t IS mb_artist)
+    COLUMNS (s.name AS source_name, e.relationship_type AS relationship_type, t.name AS target_name)
+) ORDER BY 1, 2, 3
+"""
+
+
+@pytest.mark.asyncio
+async def test_graph_table_queries_run_over_the_sentinel_rows() -> None:
+    """Pattern matching resolves on the engine, not only in the statement text."""
+    await apply_schema()
+    if await server_version_num() < PROPERTY_GRAPH_MINIMUM_SERVER_VERSION:
+        pytest.skip("CREATE PROPERTY GRAPH needs PostgreSQL 19")
+    await seed_graph_fixtures()
+
+    assert await postgres_rows(TWO_HOP_RELEASE_ARTIST) == [("111", "7", "7", "Alice")]
+    assert await postgres_rows(TWO_HOP_RELEASE_MASTER_ARTIST) == [("111", "55", "7", "Alice")]
+
+    # The dangling relationship — a target mbid the loader never stored — is
+    # absent, because the edge view inner-joins both endpoint tables.
+    assert await postgres_rows(MUSICBRAINZ_RELATIONSHIP) == [("Alice", "member of band", "The Band")]
+    assert await postgres_rows(MUSICBRAINZ_RELATIONSHIP_SHARED_LABEL) == [("Alice", "member of band", "The Band")]
+
+
+@pytest.mark.asyncio
+async def test_the_property_graph_is_absent_below_postgresql_19() -> None:
+    """The required tier must be untouched by a feature it cannot carry."""
+    await apply_schema()
+    if await server_version_num() >= PROPERTY_GRAPH_MINIMUM_SERVER_VERSION:
+        pytest.skip("this engine is PostgreSQL 19 or later")
+    assert await property_graph_relkind() is None
+    assert await postgres_rows(
+        "SELECT count(*) FROM pg_class WHERE relnamespace = 'graph'::regnamespace AND relkind = %s",
+        (PROPERTY_GRAPH_RELKIND,),
+    ) == [(0,)]
