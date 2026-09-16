@@ -10,6 +10,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, cast
 
+from common.credit_roles import ROLE_CATEGORIES
+from common.media import medium_ids, medium_label
 from psycopg import sql
 
 
@@ -1791,15 +1793,289 @@ FROM public.owned_copies AS owned_copies
     ]
 
 
+# ── Credit, company, and media graph relations (ADR 0007, ADR 0011) ───────────
+# The remaining Neo4j projections read structure the catalog stores but the
+# entity tables do not key on: the person credits in `releases.data->'extraartists'`,
+# the manufacturing credits in the canonical `companies` block, and the canonical
+# `media` block on both providers' release tables.
+#
+# Two vocabularies live in `groovemap-runtime` and are owned there: the credit-role
+# taxonomy behind `common.credit_roles.categorize_role`, and the media taxonomy
+# behind `common.media.medium_label`. A view cannot call Python, so each is
+# rendered into an IMMUTABLE SQL function at statement-build time, from the
+# runtime's own data rather than a second copy of it. When the runtime pin moves,
+# the rendered CASE moves with it; nothing here restates a role or a label.
+
+
+def _sql_literal(value: str) -> str:
+    """Return VALUE as a single-quoted SQL string literal."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _role_category_branches() -> list[tuple[str, str]]:
+    """Return every (role fragment, category) in the order `categorize_role` scans.
+
+    `categorize_role` tries an exact match on the lowered, stripped role and then
+    scans fragments longest-first — globally, across categories, so a generic
+    fragment declared in an earlier category cannot pre-empt a longer, more
+    specific one declared later. The same ordering is reproduced here so the
+    rendered CASE resolves a compound credit ("Recorded By, Mastered By") the way
+    the Python does.
+    """
+    fragments = {role: category for category, roles in ROLE_CATEGORIES.items() for role in roles}
+    return sorted(fragments.items(), key=lambda pair: (-len(pair[0]), pair[0]))
+
+
+def _credit_role_category_function() -> str:
+    """Return the IMMUTABLE function rendering the shared credit-role taxonomy."""
+    branches = _role_category_branches()
+    exact = "\n".join(f"        WHEN normalized.role = {_sql_literal(fragment)} THEN {_sql_literal(category)}" for fragment, category in branches)
+    contained = "\n".join(
+        f"        WHEN strpos(normalized.role, {_sql_literal(fragment)}) > 0 THEN {_sql_literal(category)}" for fragment, category in branches
+    )
+    return f"""
+        CREATE OR REPLACE FUNCTION graph.credit_role_category(raw_role text)
+        RETURNS text
+        LANGUAGE sql
+        IMMUTABLE
+        PARALLEL SAFE
+        RETURNS NULL ON NULL INPUT
+        AS $credit_role_category$
+        SELECT CASE
+{exact}
+{contained}
+            ELSE 'other'
+        END
+        FROM (SELECT btrim(lower(raw_role)) AS role) AS normalized
+        $credit_role_category$
+        """  # noqa: S608
+
+
+def _medium_label_function() -> str:
+    """Return the IMMUTABLE function rendering the vendored media taxonomy's labels.
+
+    An id the vendored vocabulary does not carry falls back to the id itself,
+    which is what the enricher does: a release whose producer ran a newer taxonomy
+    keeps its media in the graph, with a cosmetic label a later pass corrects.
+    """
+    branches = "\n".join(f"            WHEN {_sql_literal(medium)} THEN {_sql_literal(medium_label(medium))}" for medium in sorted(medium_ids()))
+    return f"""
+        CREATE OR REPLACE FUNCTION graph.medium_label(medium_id text)
+        RETURNS text
+        LANGUAGE sql
+        IMMUTABLE
+        PARALLEL SAFE
+        RETURNS NULL ON NULL INPUT
+        AS $medium_label$
+        SELECT CASE medium_id
+{branches}
+            ELSE medium_id
+        END
+        $medium_label$
+        """
+
+
+# One row per `extraartists` credit that names both a person and a role — the two
+# the enricher requires before it MERGEs a `:Person` or a `[:CREDITED_ON]`. Names
+# are read verbatim, not normalized: `Person.name` is the Neo4j key, so folding it
+# here would key the vertex differently from the node it mirrors.
+_CREDIT_SOURCE = f"""
+    SELECT releases.data_id              AS release_id,
+           credit.value ->> 'name'       AS person_name,
+           credit.value ->> 'role'       AS role,
+           btrim(credit.value ->> 'id')  AS artist_id
+    FROM public.releases AS releases
+    CROSS JOIN LATERAL jsonb_array_elements({_jsonb_array("releases.data -> 'extraartists'")}) AS credit(value)
+    WHERE {_non_empty("credit.value ->> 'name'")}
+      AND {_non_empty("credit.value ->> 'role'")}
+"""  # noqa: S608
+
+# One row per entry of the canonical companies block (ADR 0011). A pre-cutover
+# record whose `companies` key still holds the RAW Discogs list contributes
+# nothing: subscripting a JSON array by a text key yields NULL, so the guard
+# resolves it to an empty array. That is the intended reading — such a record is
+# silent about company credits rather than asserting it has none.
+#
+# The identity rule is the producer's: a whole Discogs id of at least one when the
+# source supplies one, otherwise `name:` followed by the name case-folded with
+# inner whitespace collapsed. PostgreSQL's `lower` is an approximation of Python's
+# `casefold` — they differ for a handful of characters such as the German eszett —
+# and punctuation is deliberately left alone, so two spellings differing by a comma
+# stay two companies a later reconciliation can merge.
+_COMPANY_SOURCE = f"""
+    SELECT releases.data_id AS release_id,
+           item.ordinality  AS entry_position,
+           CASE
+               WHEN btrim(item.value ->> 'discogs_id') ~ '^0*[1-9][0-9]*$' THEN btrim(item.value ->> 'discogs_id')
+               WHEN {_non_empty("btrim(item.value ->> 'name')")}
+                   THEN 'name:' || lower(regexp_replace(btrim(item.value ->> 'name'), '\\s+', ' ', 'g'))
+           END AS company_id,
+           NULLIF(btrim(item.value ->> 'name'), '') AS company_name,
+           NULLIF(btrim(item.value ->> 'role'), '') AS role,
+           COALESCE(NULLIF(btrim(item.value ->> 'role_category'), ''), 'other') AS role_category
+    FROM public.releases AS releases
+    CROSS JOIN LATERAL jsonb_array_elements({_jsonb_array("releases.data -> 'companies' -> 'items'")}) WITH ORDINALITY AS item(value, ordinality)
+"""  # noqa: S608
+
+# A medium entry's unit count, defaulting to one exactly as the enricher does for
+# an absent, non-integer, boolean, or non-positive `qty`. The digit bound keeps a
+# pathological value from overflowing the cast rather than defaulting.
+_MEDIUM_QUANTITY = (
+    "CASE WHEN jsonb_typeof(item.value -> 'qty') = 'number' "
+    "AND (item.value ->> 'qty') ~ '^[0-9]{1,9}$' "
+    "AND (item.value ->> 'qty')::bigint >= 1 "
+    "THEN (item.value ->> 'qty')::bigint ELSE 1 END"
+)
+
+# One row per canonical media item, from both providers' release tables. `:Medium`
+# and `:MediaFamily` nodes are shared across catalogs and each provider writes its
+# own `[:ISSUED_ON]` edge to them, so `source` is part of the edge key rather than
+# a property, and the MusicBrainz side joins down to the Discogs release id the
+# enricher keys `:Release` on.
+_MEDIA_SOURCE = f"""
+    SELECT releases.data_id          AS release_id,
+           'discogs'::text           AS provider,
+           item.value ->> 'medium'   AS medium_id,
+           item.value ->> 'family'   AS family_name,
+           {_MEDIUM_QUANTITY}        AS qty
+    FROM public.releases AS releases
+    CROSS JOIN LATERAL jsonb_array_elements({_jsonb_array("releases.media -> 'items'")}) AS item(value)
+    WHERE {_non_empty("item.value ->> 'medium'")}
+      AND {_non_empty("item.value ->> 'family'")}
+    UNION ALL
+    SELECT releases.data_id          AS release_id,
+           'musicbrainz'::text       AS provider,
+           item.value ->> 'medium'   AS medium_id,
+           item.value ->> 'family'   AS family_name,
+           {_MEDIUM_QUANTITY}        AS qty
+    FROM musicbrainz.releases AS mb_release
+    JOIN public.releases AS releases ON releases.data_id = mb_release.discogs_release_id::text
+    CROSS JOIN LATERAL jsonb_array_elements({_jsonb_array("mb_release.media -> 'items'")}) AS item(value)
+    WHERE {_non_empty("item.value ->> 'medium'")}
+      AND {_non_empty("item.value ->> 'family'")}
+"""  # noqa: S608
+
+
+def _credit_views() -> list[tuple[str, str]]:
+    """Return the person, company, and media vertex and edge views."""
+    return [
+        _view(
+            "person",
+            f"""
+SELECT DISTINCT credit.person_name AS name
+FROM ({_CREDIT_SOURCE.strip()}) AS credit
+""",  # noqa: S608
+        ),
+        # A company appears on many releases and the source spells its name
+        # inconsistently, so one representative is picked deterministically rather
+        # than left to whichever row the planner reaches last.
+        _view(
+            "company",
+            f"""
+SELECT DISTINCT ON (credit.company_id)
+       credit.company_id                                      AS company_id,
+       COALESCE(credit.company_name, credit.company_id)       AS name,
+       CASE WHEN credit.company_id ~ '^[0-9]+$' THEN credit.company_id END AS discogs_label_id
+FROM ({_COMPANY_SOURCE.strip()}) AS credit
+WHERE credit.company_id IS NOT NULL
+  AND credit.role IS NOT NULL
+ORDER BY credit.company_id, COALESCE(credit.company_name, credit.company_id)
+""",  # noqa: S608
+        ),
+        _view(
+            "medium",
+            f"""
+SELECT DISTINCT ON (media.medium_id)
+       media.medium_id                       AS medium_id,
+       media.family_name                     AS family,
+       graph.medium_label(media.medium_id)   AS label
+FROM ({_MEDIA_SOURCE.strip()}) AS media
+ORDER BY media.medium_id, media.family_name
+""",  # noqa: S608
+        ),
+        _view(
+            "media_family",
+            f"""
+SELECT DISTINCT media.family_name AS name
+FROM ({_MEDIA_SOURCE.strip()}) AS media
+""",  # noqa: S608
+        ),
+        # CREDITED_ON is keyed on (person, release, role): one person credited
+        # twice on a release under two roles is two edges.
+        _view(
+            "credited_on",
+            f"""
+SELECT DISTINCT credit.person_name                          AS person_name,
+       credit.release_id                                    AS release_id,
+       credit.role                                          AS role,
+       graph.credit_role_category(credit.role)              AS role_category
+FROM ({_CREDIT_SOURCE.strip()}) AS credit
+""",  # noqa: S608
+        ),
+        _view(
+            "same_as",
+            f"""
+SELECT DISTINCT credit.person_name AS person_name,
+       credit.artist_id            AS artist_id
+FROM ({_CREDIT_SOURCE.strip()}) AS credit
+WHERE {_usable_id("credit.artist_id")}
+""",  # noqa: S608
+        ),
+        # CREDITED_TO is keyed on (release, company, role, source); the same entry
+        # repeated in the document is one edge, and the first occurrence wins so
+        # the row reads the way the release does.
+        _view(
+            "credited_to",
+            f"""
+SELECT DISTINCT ON (credit.release_id, credit.company_id, credit.role)
+       credit.release_id    AS release_id,
+       credit.company_id    AS company_id,
+       credit.role          AS role,
+       credit.role_category AS role_category,
+       'discogs'::text      AS source
+FROM ({_COMPANY_SOURCE.strip()}) AS credit
+WHERE credit.company_id IS NOT NULL
+  AND credit.role IS NOT NULL
+ORDER BY credit.release_id, credit.company_id, credit.role, credit.entry_position
+""",  # noqa: S608
+        ),
+        # Two format entries resolving to the same canonical medium — a 2xLP split
+        # across two Discogs entries — are one edge whose qty is their sum.
+        _view(
+            "issued_on",
+            f"""
+SELECT media.release_id    AS release_id,
+       media.medium_id     AS medium_id,
+       media.provider      AS source,
+       SUM(media.qty)::bigint AS qty
+FROM ({_MEDIA_SOURCE.strip()}) AS media
+GROUP BY media.release_id, media.medium_id, media.provider
+""",  # noqa: S608
+        ),
+        _view(
+            "in_family",
+            f"""
+SELECT DISTINCT media.medium_id AS medium_id,
+       media.family_name         AS family_name
+FROM ({_MEDIA_SOURCE.strip()}) AS media
+""",  # noqa: S608
+        ),
+    ]
+
+
 def _build_graph_statements() -> list[tuple[str, str]]:
-    """Return the ordered graph-schema statements: the schema, then its views."""
+    """Return the ordered graph-schema statements: schema, functions, then views."""
     return [
         _GRAPH_SCHEMA_STATEMENT,
+        # The rendered taxonomy functions precede the views that call them.
+        ("graph.credit_role_category function", _credit_role_category_function()),
+        ("graph.medium_label function", _medium_label_function()),
         *_discogs_vertex_views(),
         *_discogs_edge_views(),
         *_musicbrainz_vertex_views(),
         *_musicbrainz_edge_views(),
         *_collection_views(),
+        *_credit_views(),
     ]
 
 

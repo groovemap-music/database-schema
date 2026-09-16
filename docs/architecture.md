@@ -317,6 +317,10 @@ Vertex views. The key column is what edge views join to.
 | `:Release` | `graph.release` | `release_id` | `title`, `year`, `country`, `genres`, `styles`, `media_families`, `gm_item_id`, `hash`, `updated_at` |
 | `:Genre` | `graph.genre` | `name` | — |
 | `:Style` | `graph.style` | `name` | — |
+| `:Person` | `graph.person` | `name` | — |
+| `:Company` | `graph.company` | `company_id` | `name`, `discogs_label_id` |
+| `:Medium` | `graph.medium` | `medium_id` | `family`, `label` |
+| `:MediaFamily` | `graph.media_family` | `name` | — |
 | `:User` | `graph.user_account` | `user_id` | `is_active`, `is_admin`, `created_at`, `updated_at` |
 | (native identity) | `graph.catalog_item` | `item_id` | `kind`, `created_at` |
 | (MusicBrainz artist) | `graph.mb_artist` | `mbid` | `name`, `sort_name`, `type`, `gender`, `begin_date`, `end_date`, `ended`, `area`, `begin_area`, `end_area`, `disambiguation`, `discogs_artist_id`, `updated_at` |
@@ -345,6 +349,11 @@ that join the vertex views above.
 | `(:Artist)-[:MEMBER_OF]->(:Artist)` | `graph.member_of` | `member_artist_id`, `group_artist_id` | `member_artist_id` → `group_artist_id` | `artists.data->'members'` and `->'groups'` |
 | `(:Artist)-[:ALIAS_OF]->(:Artist)` | `graph.alias_of` | `alias_artist_id`, `artist_id` | `alias_artist_id` → `artist_id` | `artists.data->'aliases'` |
 | `(:Label)-[:SUBLABEL_OF]->(:Label)` | `graph.sublabel_of` | `sublabel_id`, `parent_label_id` | `sublabel_id` → `parent_label_id` | `labels.data->'parentLabel'` and `->'sublabels'` |
+| `(:Person)-[:CREDITED_ON]->(:Release)` | `graph.credited_on` | `person_name`, `release_id`, `role` | `person_name` → `release_id` | `releases.data->'extraartists'` |
+| `(:Person)-[:SAME_AS]->(:Artist)` | `graph.same_as` | `person_name`, `artist_id` | `person_name` → `artist_id` | `releases.data->'extraartists'` |
+| `(:Release)-[:CREDITED_TO]->(:Company)` | `graph.credited_to` | `release_id`, `company_id`, `role`, `source` | `release_id` → `company_id` | `releases.data->'companies'` |
+| `(:Release)-[:ISSUED_ON]->(:Medium)` | `graph.issued_on` | `release_id`, `medium_id`, `source` | `release_id` → `medium_id` | `releases.media` and `musicbrainz.releases.media` |
+| `(:Medium)-[:IN_FAMILY]->(:MediaFamily)` | `graph.in_family` | `medium_id`, `family_name` | `medium_id` → `family_name` | `releases.media` and `musicbrainz.releases.media` |
 | `(:User)-[:COLLECTED]->(:Release)` | `graph.collected` | `collection_id` | `user_id` → `release_id` | `user_collections` |
 | `(:User)-[:WANTS]->(:Release)` | `graph.wants` | `wantlist_id` | `user_id` → `release_id` | `user_wantlists` |
 | (native ownership) | `graph.owns` | `owned_copy_id` | `user_id` → `item_id` | `owned_copies` |
@@ -383,6 +392,45 @@ than only the pairs some catalog happens to hold today, so the set of relations 
 of the schema and not of the data loaded into it. Every one exposes `relationship_id`,
 `source_mbid`, `target_mbid`, `relationship_type`, `begin_date`, `end_date`, `ended`, and
 `attributes`.
+
+### Credits, companies, and media
+
+`graph.credited_on` carries `role` verbatim and `role_category` from the shared
+credit-role taxonomy in `groovemap-runtime` (`common.credit_roles`). A view cannot call
+Python, so the taxonomy is rendered into an `IMMUTABLE` SQL function,
+`graph.credit_role_category(text)`, at statement-build time, from the runtime's own
+`ROLE_CATEGORIES` data rather than a second copy of it. The rendered `CASE` reproduces
+`categorize_role` exactly: an exact match on the lowered, trimmed role first, then a
+fragment scan ordered longest-first globally across categories, so a generic fragment
+declared in an earlier category cannot pre-empt a longer, more specific one declared later.
+`graph.medium_label(text)` is rendered the same way from the vendored media taxonomy, and
+falls back to the id itself for a medium a newer producer taxonomy names. When the
+`groovemap-runtime` pin moves, both functions move with it; nothing in this repository
+restates a role or a label.
+
+`graph.credited_to` takes `role_category` from the canonical companies block instead: ADR
+0011 makes that the producer's mapping, fixed by conformance fixtures, and re-deriving it
+here would make this schema a second, unverified implementation of those rules. A
+pre-cutover record whose `companies` key still holds the raw Discogs list contributes
+nothing, which is the intended reading — such a record is silent about company credits
+rather than asserting it has none.
+
+A company's identity follows the producer's rule: a whole Discogs id of at least one when
+the source supplies one, otherwise `name:` followed by the name case-folded with inner
+whitespace collapsed. PostgreSQL's `lower` approximates Python's `casefold` — they differ
+for a handful of characters such as the German eszett — and punctuation is deliberately
+left alone, so two spellings differing by a comma stay two companies a later reconciliation
+can merge rather than one that cannot be taken apart again.
+
+`:Medium` and `:MediaFamily` are shared across catalogs and each provider writes its own
+`[:ISSUED_ON]` edge to them, so `source` is part of the `graph.issued_on` key rather than a
+property, and the MusicBrainz side joins down to the Discogs release id the enricher keys
+`:Release` on. Two format entries resolving to the same canonical medium — a 2xLP split
+across two Discogs entries — are one edge whose `qty` is their sum, and an absent,
+non-integer, or non-positive `qty` defaults to one.
+
+`:Person` is keyed on the credit name, verbatim: `Person.name` is the Neo4j key, so folding
+it here would key the vertex differently from the node it mirrors.
 
 ### Fidelity notes
 

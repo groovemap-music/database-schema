@@ -222,6 +222,8 @@ _ADDED_STATEMENT_NAMES = frozenset(
 _GRAPH_STATEMENT_NAMES = frozenset(
     {
         "graph schema",
+        "graph.credit_role_category function",
+        "graph.medium_label function",
         "graph.artist view",
         "graph.label view",
         "graph.master view",
@@ -265,6 +267,15 @@ _GRAPH_STATEMENT_NAMES = frozenset(
         "graph.collected view",
         "graph.wants view",
         "graph.owns view",
+        "graph.person view",
+        "graph.company view",
+        "graph.medium view",
+        "graph.media_family view",
+        "graph.credited_on view",
+        "graph.same_as view",
+        "graph.credited_to view",
+        "graph.issued_on view",
+        "graph.in_family view",
     }
 )
 

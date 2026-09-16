@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import re
 
-from groovemap_schema.postgres import _GRAPH_STATEMENTS, _schema_statements
+from common.credit_roles import ROLE_CATEGORIES, categorize_role
+from common.media import medium_ids, medium_label
+
+from groovemap_schema.postgres import _GRAPH_STATEMENTS, _role_category_branches, _schema_statements
 
 
 GRAPH_STATEMENTS = dict(_GRAPH_STATEMENTS)
@@ -25,6 +28,10 @@ VERTEX_KEYS = {
     "mb_release_group": ("mbid",),
     "user_account": ("user_id",),
     "catalog_item": ("item_id",),
+    "person": ("name",),
+    "company": ("company_id",),
+    "medium": ("medium_id",),
+    "media_family": ("name",),
 }
 
 # Every edge view, with its key column set and the (source, target) columns that
@@ -45,7 +52,15 @@ EDGE_KEYS = {
     "collected": (("collection_id",), "user_id", "release_id"),
     "wants": (("wantlist_id",), "user_id", "release_id"),
     "owns": (("owned_copy_id",), "user_id", "item_id"),
+    "credited_on": (("person_name", "release_id", "role"), "person_name", "release_id"),
+    "same_as": (("person_name", "artist_id"), "person_name", "artist_id"),
+    "credited_to": (("release_id", "company_id", "role", "source"), "release_id", "company_id"),
+    "issued_on": (("release_id", "medium_id", "source"), "release_id", "medium_id"),
+    "in_family": (("medium_id", "family_name"), "medium_id", "family_name"),
 }
+
+# The functions rendered from the runtime's shared vocabularies.
+EXPECTED_FUNCTIONS = {"credit_role_category", "medium_label"}
 
 MUSICBRAINZ_PAIRS = [
     (source, target) for source in ("artist", "label", "release", "release_group") for target in ("artist", "label", "release", "release_group")
@@ -121,7 +136,12 @@ RESERVED_WORDS = frozenset(
 
 def view_names() -> set[str]:
     """Return every relation name the graph schema declares."""
-    return {name.removeprefix("graph.").removesuffix(" view") for name in GRAPH_STATEMENTS if name != "graph schema"}
+    return {name.removeprefix("graph.").removesuffix(" view") for name in GRAPH_STATEMENTS if name.endswith(" view")}
+
+
+def function_names() -> set[str]:
+    """Return every function name the graph schema declares."""
+    return {name.removeprefix("graph.").removesuffix(" function") for name in GRAPH_STATEMENTS if name.endswith(" function")}
 
 
 def statement_for(view: str) -> str:
@@ -150,10 +170,23 @@ class TestGraphSchemaStatement:
 
     def test_every_view_uses_create_or_replace(self) -> None:
         for name, statement in _GRAPH_STATEMENTS:
-            if name == "graph schema":
+            if not name.endswith(" view"):
                 continue
             view = name.removeprefix("graph.").removesuffix(" view")
             assert statement.startswith(f"CREATE OR REPLACE VIEW graph.{view} AS\n")
+
+    def test_every_function_uses_create_or_replace(self) -> None:
+        for name, statement in _GRAPH_STATEMENTS:
+            if not name.endswith(" function"):
+                continue
+            function = name.removeprefix("graph.").removesuffix(" function")
+            assert f"CREATE OR REPLACE FUNCTION graph.{function}(" in statement
+
+    def test_functions_precede_the_views_that_call_them(self) -> None:
+        names = [name for name, _statement in _GRAPH_STATEMENTS]
+        last_function = max(index for index, name in enumerate(names) if name.endswith(" function"))
+        for view in ("credited_on", "medium"):
+            assert names.index(f"graph.{view} view") > last_function
 
     def test_statement_names_are_unique(self) -> None:
         names = [name for name, _statement in _GRAPH_STATEMENTS]
@@ -335,10 +368,185 @@ class TestSchemaQualification:
 
     def test_every_base_relation_is_schema_qualified(self) -> None:
         for name, statement in _GRAPH_STATEMENTS:
-            if name == "graph schema":
+            if not name.endswith(" view"):
                 continue
             for match in re.finditer(r"\b(?:FROM|JOIN)\s+([a-z_][a-z_0-9.]*)(\()?", statement):
                 if match.group(2) is not None:
                     continue  # a set-returning function, not a stored relation
                 relation = match.group(1)
                 assert "." in relation, f"{name} reads unqualified relation {relation}"
+
+
+def statement_for_function(function: str) -> str:
+    """Return the CREATE OR REPLACE FUNCTION statement for one rendered vocabulary."""
+    return GRAPH_STATEMENTS[f"graph.{function} function"]
+
+
+def rendered_role_branches() -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """Return the (exact, contained) branch lists the rendered CASE actually carries."""
+    statement = statement_for_function("credit_role_category")
+    exact = re.findall(r"WHEN normalized\.role = '(.*?)' THEN '(.*?)'", statement)
+    contained = re.findall(r"WHEN strpos\(normalized\.role, '(.*?)'\) > 0 THEN '(.*?)'", statement)
+    return exact, contained
+
+
+def resolve_like_the_rendered_case(raw_role: str) -> str:
+    """Resolve a role the way the rendered CASE does, branch order included."""
+    normalized = raw_role.lower().strip()
+    exact, contained = rendered_role_branches()
+    for fragment, category in exact:
+        if normalized == fragment:
+            return category
+    for fragment, category in contained:
+        if fragment in normalized:
+            return category
+    return "other"
+
+
+class TestRenderedVocabularies:
+    """The SQL functions are rendered from the runtime's taxonomies, not restated."""
+
+    def test_both_functions_are_declared(self) -> None:
+        assert function_names() == EXPECTED_FUNCTIONS
+
+    def test_functions_are_immutable_and_strict(self) -> None:
+        for function in EXPECTED_FUNCTIONS:
+            statement = statement_for_function(function)
+            assert "IMMUTABLE" in statement
+            assert "PARALLEL SAFE" in statement
+            assert "RETURNS NULL ON NULL INPUT" in statement
+
+    def test_every_role_fragment_is_rendered_with_its_category(self) -> None:
+        expected = {role: category for category, roles in ROLE_CATEGORIES.items() for role in roles}
+        exact, contained = rendered_role_branches()
+        assert dict(exact) == expected
+        assert dict(contained) == expected
+
+    def test_substring_branches_are_globally_longest_first(self) -> None:
+        """A generic fragment must never pre-empt a longer one from another category."""
+        _exact, contained = rendered_role_branches()
+        lengths = [len(fragment) for fragment, _category in contained]
+        assert lengths == sorted(lengths, reverse=True)
+
+    def test_rendered_order_matches_the_declared_scan_order(self) -> None:
+        exact, contained = rendered_role_branches()
+        declared = _role_category_branches()
+        assert exact == declared
+        assert contained == declared
+
+    def test_the_rendered_case_agrees_with_categorize_role(self) -> None:
+        """The drift guard: every fragment, plus compounds that cross categories."""
+        samples = [role for _category, roles in ROLE_CATEGORIES.items() for role in roles]
+        samples += [
+            "Producer",
+            "  RECORDED BY  ",
+            "Recorded By, Mixed By",
+            "Recorded By, Mastering Engineer",
+            "Executive-Producer",
+            "Lacquer Cut By",
+            "Backing Vocals",
+            "A&R",
+            "Interpretive Dance",
+            "",
+        ]
+        for sample in samples:
+            assert resolve_like_the_rendered_case(sample) == categorize_role(sample), sample
+
+    def test_every_medium_id_is_rendered_with_its_label(self) -> None:
+        statement = statement_for_function("medium_label")
+        rendered = dict(re.findall(r"WHEN '(.*?)' THEN '(.*?)'", statement))
+        assert rendered == {medium: medium_label(medium).replace("'", "''") for medium in medium_ids()}
+
+    def test_an_unknown_medium_falls_back_to_its_own_id(self) -> None:
+        assert "ELSE medium_id" in statement_for_function("medium_label")
+
+    def test_single_quotes_in_a_label_are_escaped(self) -> None:
+        statement = statement_for_function("medium_label")
+        for medium in medium_ids():
+            assert f"WHEN '{medium}' THEN '{medium_label(medium).replace(chr(39), chr(39) * 2)}'" in statement
+
+
+class TestCreditAndCompanyViews:
+    """Person and company relations follow the projections, not a second reading."""
+
+    def test_person_is_keyed_on_the_credit_name(self) -> None:
+        statement = statement_for("person")
+        assert "credit.person_name AS name" in statement
+        assert "SELECT DISTINCT" in statement
+
+    def test_a_credit_needs_both_a_name_and_a_role(self) -> None:
+        for view in ("person", "credited_on", "same_as"):
+            statement = statement_for(view)
+            assert "credit.value ->> 'name'" in statement
+            assert "credit.value ->> 'role'" in statement
+
+    def test_credited_on_derives_its_category_from_the_rendered_taxonomy(self) -> None:
+        assert "graph.credit_role_category(credit.role)" in statement_for("credited_on")
+
+    def test_same_as_only_fires_when_the_credit_carries_an_artist_id(self) -> None:
+        statement = statement_for("same_as")
+        assert "NULLIF(btrim(credit.artist_id)" in statement
+        assert "<> '0'" in statement
+
+    def test_company_identity_prefers_a_positive_discogs_id(self) -> None:
+        statement = statement_for("company")
+        assert "'^0*[1-9][0-9]*$'" in statement
+        assert "'name:' || lower(regexp_replace(" in statement
+
+    def test_company_picks_one_representative_name_deterministically(self) -> None:
+        statement = statement_for("company")
+        assert "SELECT DISTINCT ON (credit.company_id)" in statement
+        assert "ORDER BY credit.company_id" in statement
+
+    def test_credited_to_keeps_the_first_entry_in_source_order(self) -> None:
+        statement = statement_for("credited_to")
+        assert "DISTINCT ON (credit.release_id, credit.company_id, credit.role)" in statement
+        assert "credit.entry_position" in statement
+
+    def test_credited_to_defaults_an_absent_category_rather_than_nulling_it(self) -> None:
+        assert "COALESCE(NULLIF(btrim(item.value ->> 'role_category'), ''), 'other')" in statement_for("credited_to")
+
+    def test_company_rows_need_both_an_identity_and_a_role(self) -> None:
+        for view in ("company", "credited_to"):
+            statement = statement_for(view)
+            assert "credit.company_id IS NOT NULL" in statement
+            assert "credit.role IS NOT NULL" in statement
+
+
+class TestMediaViews:
+    """Media relations span both providers over one shared medium vocabulary."""
+
+    def test_media_views_read_both_providers(self) -> None:
+        for view in ("medium", "media_family", "issued_on", "in_family"):
+            statement = statement_for(view)
+            assert "public.releases" in statement
+            assert "musicbrainz.releases" in statement
+
+    def test_the_musicbrainz_side_joins_down_to_the_discogs_release_key(self) -> None:
+        assert "JOIN public.releases AS releases ON releases.data_id = mb_release.discogs_release_id::text" in statement_for("issued_on")
+
+    def test_medium_labels_come_from_the_rendered_taxonomy(self) -> None:
+        assert "graph.medium_label(media.medium_id)" in statement_for("medium")
+
+    def test_issued_on_sums_the_quantity_per_medium_and_source(self) -> None:
+        statement = statement_for("issued_on")
+        assert "SUM(media.qty)::bigint AS qty" in statement
+        assert "GROUP BY media.release_id, media.medium_id, media.provider" in statement
+
+    def test_source_is_part_of_the_issued_on_key(self) -> None:
+        """Each provider writes its own edge to a Medium node they share."""
+        statement = statement_for("issued_on")
+        assert "'discogs'::text" in statement
+        assert "'musicbrainz'::text" in statement
+        assert "AS source" in statement
+
+    def test_an_unusable_quantity_defaults_to_one(self) -> None:
+        statement = statement_for("issued_on")
+        assert "jsonb_typeof(item.value -> 'qty') = 'number'" in statement
+        assert "ELSE 1 END" in statement
+
+    def test_a_media_item_needs_both_a_medium_and_a_family(self) -> None:
+        for view in ("medium", "issued_on", "in_family"):
+            statement = statement_for(view)
+            assert "item.value ->> 'medium'" in statement
+            assert "item.value ->> 'family'" in statement
