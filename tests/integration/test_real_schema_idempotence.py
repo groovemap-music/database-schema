@@ -20,11 +20,17 @@ EXPECTED_POSTGRES_TABLES = {
         "admin_audit_log",
         "app_config",
         "app_tokens",
+        "artifacts",
         "artists",
+        "catalog_items",
+        "collection_snapshots",
         "extraction_history",
         "labels",
         "masters",
         "oauth_tokens",
+        "observations",
+        "owned_copies",
+        "provider_aliases",
         "queue_metrics",
         "releases",
         "service_health_metrics",
@@ -34,6 +40,7 @@ EXPECTED_POSTGRES_TABLES = {
         "users",
     },
     "insights": {
+        "activity_summary",
         "artist_centrality",
         "community_counts",
         "computation_log",
@@ -65,6 +72,17 @@ EXPECTED_COLUMNS = {
     ("musicbrainz", "release_groups", "discogs_master_id", "bigint"),
     ("musicbrainz", "releases", "discogs_release_id", "bigint"),
     ("musicbrainz", "releases", "media", "jsonb"),
+}
+
+# Native identity keys rely on the engine's built-in uuidv7(), which both the required
+# PostgreSQL 18 tier and the advisory PostgreSQL 19 beta tier must render identically.
+EXPECTED_UUIDV7_DEFAULTS = {
+    ("public", "artifacts", "id"),
+    ("public", "catalog_items", "id"),
+    ("public", "collection_snapshots", "id"),
+    ("public", "observations", "id"),
+    ("public", "owned_copies", "id"),
+    ("public", "provider_aliases", "id"),
 }
 
 
@@ -125,6 +143,16 @@ async def assert_expected_postgres_schema() -> None:
         """
     )
     assert set(column_rows) >= EXPECTED_COLUMNS
+
+    uuidv7_rows = await postgres_rows(
+        """
+        SELECT table_schema, table_name, column_name
+        FROM information_schema.columns
+        WHERE table_schema IN ('public', 'insights', 'musicbrainz')
+          AND column_default = 'uuidv7()'
+        """
+    )
+    assert set(uuidv7_rows) == EXPECTED_UUIDV7_DEFAULTS
 
     relationship_key = await postgres_rows(
         """
