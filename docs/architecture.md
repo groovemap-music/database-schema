@@ -390,10 +390,10 @@ Vertex views. The key column is what edge views join to.
 
 | Neo4j label | View | Key column | Other columns |
 | --- | --- | --- | --- |
-| `:Artist` | `graph.artist` | `artist_id` | `name`, `gm_item_id`, `hash`, `updated_at` |
-| `:Label` | `graph.label` | `label_id` | `name`, `gm_item_id`, `hash`, `updated_at` |
-| `:Master` | `graph.master` | `master_id` | `title`, `year`, `genres`, `styles`, `gm_item_id`, `hash`, `updated_at` |
-| `:Release` | `graph.release` | `release_id` | `title`, `year`, `country`, `genres`, `styles`, `media_families`, `gm_item_id`, `hash`, `updated_at` |
+| `:Artist` | `graph.artist` | `artist_id` | `name`, `gm_item_id`, `hash`, `updated_at`, `artist_key` |
+| `:Label` | `graph.label` | `label_id` | `name`, `gm_item_id`, `hash`, `updated_at`, `label_key` |
+| `:Master` | `graph.master` | `master_id` | `title`, `year`, `genres`, `styles`, `gm_item_id`, `hash`, `updated_at`, `master_key` |
+| `:Release` | `graph.release` | `release_id` | `title`, `year`, `country`, `genres`, `styles`, `media_families`, `gm_item_id`, `hash`, `updated_at`, `release_key` |
 | `:Genre` | `graph.genre` | `name` | — |
 | `:Style` | `graph.style` | `name` | — |
 | `:Person` | `graph.person` | `name` | — |
@@ -406,6 +406,10 @@ Vertex views. The key column is what edge views join to.
 | (MusicBrainz label) | `graph.mb_label` | `mbid` | `name`, `type`, `label_code`, `begin_date`, `end_date`, `ended`, `area`, `disambiguation`, `discogs_label_id`, `updated_at` |
 | (MusicBrainz release) | `graph.mb_release` | `mbid` | `name`, `barcode`, `status`, `release_group_mbid`, `discogs_release_id`, `media_families`, `updated_at` |
 | (MusicBrainz release group) | `graph.mb_release_group` | `mbid` | `name`, `type`, `secondary_types`, `first_release_date`, `disambiguation`, `discogs_master_id`, `updated_at` |
+
+The four Discogs entity views end with an appended `<entity>_key`: the same value as
+`<entity>_id`, typed `text` so the property graph can join on it. It is structural, not
+published — see [the property graph](#property-graph) below.
 
 `graph.app_user` deliberately omits `email` and every credential column: the Neo4j
 `:User` node carries only an id, and a graph relation is the wrong surface on which to widen
@@ -528,6 +532,344 @@ it here would key the vertex differently from the node it mirrors.
   column still being narrow. PostgreSQL refuses to retype a column a view reads even when the
   requested type is the one it already has, and the graph schema exposes exactly those
   columns as the bridge between the MusicBrainz and Discogs halves of the graph.
+
+### Property graph
+
+PostgreSQL 19 adds SQL/PGQ, and with it `CREATE PROPERTY GRAPH`: a named, read-only graph over
+relations that a `GRAPH_TABLE` query pattern-matches. `graph.catalog` declares one over every
+view above — sixteen vertex tables and thirty-six edge tables, one element per view — so the
+same projection serves both a `SELECT` against a view and a graph pattern. Nothing is
+materialized and nothing is copied; each element is read from its view at query time.
+
+The statement is built by `_property_graph_statement()` in
+[`src/groovemap_schema/postgres.py`](../src/groovemap_schema/postgres.py) and exported as
+`PROPERTY_GRAPH_STATEMENT`, the same `(name, statement)` pair every other schema statement is.
+It is deliberately not part of `_schema_statements()`: that list is the unconditional schema
+every supported engine gets, and this one is conditional. It is rendered here in full so a
+`catalog-api` rewrite can cite an exact label, key, or property without running a 19 server.
+
+```sql
+CREATE PROPERTY GRAPH graph.catalog
+    VERTEX TABLES (
+        graph.artist AS artist KEY (artist_key)
+            LABEL artist PROPERTIES (artist_id::text AS artist_id, name, gm_item_id, hash, updated_at),
+        graph.label AS label KEY (label_key)
+            LABEL label PROPERTIES (label_id::text AS label_id, name, gm_item_id, hash, updated_at),
+        graph.master AS master KEY (master_key)
+            LABEL master PROPERTIES (master_id::text AS master_id, title, year, genres, styles, gm_item_id, hash, updated_at),
+        graph.release AS release KEY (release_key)
+            LABEL release PROPERTIES (release_id, title, year, country, genres, styles, media_families, gm_item_id, hash, updated_at),
+        graph.genre AS genre KEY (name)
+            LABEL genre PROPERTIES ALL COLUMNS,
+        graph.style AS style KEY (name)
+            LABEL style PROPERTIES ALL COLUMNS,
+        graph.person AS person KEY (name)
+            LABEL person PROPERTIES ALL COLUMNS,
+        graph.company AS company KEY (company_id)
+            LABEL company PROPERTIES ALL COLUMNS,
+        graph.medium AS medium KEY (medium_id)
+            LABEL medium PROPERTIES ALL COLUMNS,
+        graph.media_family AS media_family KEY (name)
+            LABEL media_family PROPERTIES ALL COLUMNS,
+        graph.app_user AS app_user KEY (user_id)
+            LABEL app_user PROPERTIES ALL COLUMNS,
+        graph.catalog_item AS catalog_item KEY (item_id)
+            LABEL catalog_item PROPERTIES ALL COLUMNS,
+        graph.mb_artist AS mb_artist KEY (mbid)
+            LABEL mb_artist PROPERTIES ALL COLUMNS,
+        graph.mb_label AS mb_label KEY (mbid)
+            LABEL mb_label PROPERTIES (mbid, name, type, label_code, begin_date, end_date, ended, area, disambiguation, discogs_label_id::text AS discogs_label_id, updated_at),
+        graph.mb_release AS mb_release KEY (mbid)
+            LABEL mb_release PROPERTIES ALL COLUMNS,
+        graph.mb_release_group AS mb_release_group KEY (mbid)
+            LABEL mb_release_group PROPERTIES ALL COLUMNS
+    )
+    EDGE TABLES (
+        graph.by_artist AS by_artist KEY (release_id, artist_id)
+            SOURCE KEY (release_id) REFERENCES release (release_key)
+            DESTINATION KEY (artist_id) REFERENCES artist (artist_key)
+            LABEL by_artist PROPERTIES ALL COLUMNS,
+        graph.on_label AS on_label KEY (release_id, label_id)
+            SOURCE KEY (release_id) REFERENCES release (release_key)
+            DESTINATION KEY (label_id) REFERENCES label (label_key)
+            LABEL on_label PROPERTIES ALL COLUMNS,
+        graph.derived_from AS derived_from KEY (release_id, master_id)
+            SOURCE KEY (release_id) REFERENCES release (release_key)
+            DESTINATION KEY (master_id) REFERENCES master (master_key)
+            LABEL derived_from PROPERTIES ALL COLUMNS,
+        graph.in_genre AS in_genre KEY (release_id, genre_name)
+            SOURCE KEY (release_id) REFERENCES release (release_key)
+            DESTINATION KEY (genre_name) REFERENCES genre (name)
+            LABEL in_genre PROPERTIES ALL COLUMNS,
+        graph.in_style AS in_style KEY (release_id, style_name)
+            SOURCE KEY (release_id) REFERENCES release (release_key)
+            DESTINATION KEY (style_name) REFERENCES style (name)
+            LABEL in_style PROPERTIES ALL COLUMNS,
+        graph.master_by_artist AS master_by_artist KEY (master_id, artist_id)
+            SOURCE KEY (master_id) REFERENCES master (master_key)
+            DESTINATION KEY (artist_id) REFERENCES artist (artist_key)
+            LABEL master_by_artist PROPERTIES (master_id::text AS master_id, artist_id),
+        graph.master_in_genre AS master_in_genre KEY (master_id, genre_name)
+            SOURCE KEY (master_id) REFERENCES master (master_key)
+            DESTINATION KEY (genre_name) REFERENCES genre (name)
+            LABEL master_in_genre PROPERTIES (master_id::text AS master_id, genre_name),
+        graph.master_in_style AS master_in_style KEY (master_id, style_name)
+            SOURCE KEY (master_id) REFERENCES master (master_key)
+            DESTINATION KEY (style_name) REFERENCES style (name)
+            LABEL master_in_style PROPERTIES (master_id::text AS master_id, style_name),
+        graph.part_of AS part_of KEY (style_name, genre_name)
+            SOURCE KEY (style_name) REFERENCES style (name)
+            DESTINATION KEY (genre_name) REFERENCES genre (name)
+            LABEL part_of PROPERTIES ALL COLUMNS,
+        graph.member_of AS member_of KEY (member_artist_id, group_artist_id)
+            SOURCE KEY (member_artist_id) REFERENCES artist (artist_key)
+            DESTINATION KEY (group_artist_id) REFERENCES artist (artist_key)
+            LABEL member_of PROPERTIES ALL COLUMNS,
+        graph.alias_of AS alias_of KEY (alias_artist_id, artist_id)
+            SOURCE KEY (alias_artist_id) REFERENCES artist (artist_key)
+            DESTINATION KEY (artist_id) REFERENCES artist (artist_key)
+            LABEL alias_of PROPERTIES (alias_artist_id, artist_id::text AS artist_id),
+        graph.sublabel_of AS sublabel_of KEY (sublabel_id, parent_label_id)
+            SOURCE KEY (sublabel_id) REFERENCES label (label_key)
+            DESTINATION KEY (parent_label_id) REFERENCES label (label_key)
+            LABEL sublabel_of PROPERTIES ALL COLUMNS,
+        graph.credited_on AS credited_on KEY (person_name, release_id, role)
+            SOURCE KEY (person_name) REFERENCES person (name)
+            DESTINATION KEY (release_id) REFERENCES release (release_key)
+            LABEL credited_on PROPERTIES ALL COLUMNS,
+        graph.same_as AS same_as KEY (person_name, artist_id)
+            SOURCE KEY (person_name) REFERENCES person (name)
+            DESTINATION KEY (artist_id) REFERENCES artist (artist_key)
+            LABEL same_as PROPERTIES ALL COLUMNS,
+        graph.credited_to AS credited_to KEY (release_id, company_id, role, source)
+            SOURCE KEY (release_id) REFERENCES release (release_key)
+            DESTINATION KEY (company_id) REFERENCES company (company_id)
+            LABEL credited_to PROPERTIES ALL COLUMNS,
+        graph.issued_on AS issued_on KEY (release_id, medium_id, source)
+            SOURCE KEY (release_id) REFERENCES release (release_key)
+            DESTINATION KEY (medium_id) REFERENCES medium (medium_id)
+            LABEL issued_on PROPERTIES ALL COLUMNS,
+        graph.in_family AS in_family KEY (medium_id, family_name)
+            SOURCE KEY (medium_id) REFERENCES medium (medium_id)
+            DESTINATION KEY (family_name) REFERENCES media_family (name)
+            LABEL in_family PROPERTIES ALL COLUMNS,
+        graph.collected AS collected KEY (collection_id)
+            SOURCE KEY (user_id) REFERENCES app_user (user_id)
+            DESTINATION KEY (release_id) REFERENCES release (release_key)
+            LABEL collected PROPERTIES ALL COLUMNS,
+        graph.wants AS wants KEY (wantlist_id)
+            SOURCE KEY (user_id) REFERENCES app_user (user_id)
+            DESTINATION KEY (release_id) REFERENCES release (release_key)
+            LABEL wants PROPERTIES ALL COLUMNS,
+        graph.owns AS owns KEY (owned_copy_id)
+            SOURCE KEY (user_id) REFERENCES app_user (user_id)
+            DESTINATION KEY (item_id) REFERENCES catalog_item (item_id)
+            LABEL owns PROPERTIES ALL COLUMNS,
+        graph.mb_rel_artist_artist AS mb_rel_artist_artist KEY (relationship_id)
+            SOURCE KEY (source_mbid) REFERENCES mb_artist (mbid)
+            DESTINATION KEY (target_mbid) REFERENCES mb_artist (mbid)
+            LABEL mb_rel_artist_artist PROPERTIES ALL COLUMNS LABEL mb_related PROPERTIES ALL COLUMNS,
+        graph.mb_rel_artist_label AS mb_rel_artist_label KEY (relationship_id)
+            SOURCE KEY (source_mbid) REFERENCES mb_artist (mbid)
+            DESTINATION KEY (target_mbid) REFERENCES mb_label (mbid)
+            LABEL mb_rel_artist_label PROPERTIES ALL COLUMNS LABEL mb_related PROPERTIES ALL COLUMNS,
+        graph.mb_rel_artist_release AS mb_rel_artist_release KEY (relationship_id)
+            SOURCE KEY (source_mbid) REFERENCES mb_artist (mbid)
+            DESTINATION KEY (target_mbid) REFERENCES mb_release (mbid)
+            LABEL mb_rel_artist_release PROPERTIES ALL COLUMNS LABEL mb_related PROPERTIES ALL COLUMNS,
+        graph.mb_rel_artist_release_group AS mb_rel_artist_release_group KEY (relationship_id)
+            SOURCE KEY (source_mbid) REFERENCES mb_artist (mbid)
+            DESTINATION KEY (target_mbid) REFERENCES mb_release_group (mbid)
+            LABEL mb_rel_artist_release_group PROPERTIES ALL COLUMNS LABEL mb_related PROPERTIES ALL COLUMNS,
+        graph.mb_rel_label_artist AS mb_rel_label_artist KEY (relationship_id)
+            SOURCE KEY (source_mbid) REFERENCES mb_label (mbid)
+            DESTINATION KEY (target_mbid) REFERENCES mb_artist (mbid)
+            LABEL mb_rel_label_artist PROPERTIES ALL COLUMNS LABEL mb_related PROPERTIES ALL COLUMNS,
+        graph.mb_rel_label_label AS mb_rel_label_label KEY (relationship_id)
+            SOURCE KEY (source_mbid) REFERENCES mb_label (mbid)
+            DESTINATION KEY (target_mbid) REFERENCES mb_label (mbid)
+            LABEL mb_rel_label_label PROPERTIES ALL COLUMNS LABEL mb_related PROPERTIES ALL COLUMNS,
+        graph.mb_rel_label_release AS mb_rel_label_release KEY (relationship_id)
+            SOURCE KEY (source_mbid) REFERENCES mb_label (mbid)
+            DESTINATION KEY (target_mbid) REFERENCES mb_release (mbid)
+            LABEL mb_rel_label_release PROPERTIES ALL COLUMNS LABEL mb_related PROPERTIES ALL COLUMNS,
+        graph.mb_rel_label_release_group AS mb_rel_label_release_group KEY (relationship_id)
+            SOURCE KEY (source_mbid) REFERENCES mb_label (mbid)
+            DESTINATION KEY (target_mbid) REFERENCES mb_release_group (mbid)
+            LABEL mb_rel_label_release_group PROPERTIES ALL COLUMNS LABEL mb_related PROPERTIES ALL COLUMNS,
+        graph.mb_rel_release_artist AS mb_rel_release_artist KEY (relationship_id)
+            SOURCE KEY (source_mbid) REFERENCES mb_release (mbid)
+            DESTINATION KEY (target_mbid) REFERENCES mb_artist (mbid)
+            LABEL mb_rel_release_artist PROPERTIES ALL COLUMNS LABEL mb_related PROPERTIES ALL COLUMNS,
+        graph.mb_rel_release_label AS mb_rel_release_label KEY (relationship_id)
+            SOURCE KEY (source_mbid) REFERENCES mb_release (mbid)
+            DESTINATION KEY (target_mbid) REFERENCES mb_label (mbid)
+            LABEL mb_rel_release_label PROPERTIES ALL COLUMNS LABEL mb_related PROPERTIES ALL COLUMNS,
+        graph.mb_rel_release_release AS mb_rel_release_release KEY (relationship_id)
+            SOURCE KEY (source_mbid) REFERENCES mb_release (mbid)
+            DESTINATION KEY (target_mbid) REFERENCES mb_release (mbid)
+            LABEL mb_rel_release_release PROPERTIES ALL COLUMNS LABEL mb_related PROPERTIES ALL COLUMNS,
+        graph.mb_rel_release_release_group AS mb_rel_release_release_group KEY (relationship_id)
+            SOURCE KEY (source_mbid) REFERENCES mb_release (mbid)
+            DESTINATION KEY (target_mbid) REFERENCES mb_release_group (mbid)
+            LABEL mb_rel_release_release_group PROPERTIES ALL COLUMNS LABEL mb_related PROPERTIES ALL COLUMNS,
+        graph.mb_rel_release_group_artist AS mb_rel_release_group_artist KEY (relationship_id)
+            SOURCE KEY (source_mbid) REFERENCES mb_release_group (mbid)
+            DESTINATION KEY (target_mbid) REFERENCES mb_artist (mbid)
+            LABEL mb_rel_release_group_artist PROPERTIES ALL COLUMNS LABEL mb_related PROPERTIES ALL COLUMNS,
+        graph.mb_rel_release_group_label AS mb_rel_release_group_label KEY (relationship_id)
+            SOURCE KEY (source_mbid) REFERENCES mb_release_group (mbid)
+            DESTINATION KEY (target_mbid) REFERENCES mb_label (mbid)
+            LABEL mb_rel_release_group_label PROPERTIES ALL COLUMNS LABEL mb_related PROPERTIES ALL COLUMNS,
+        graph.mb_rel_release_group_release AS mb_rel_release_group_release KEY (relationship_id)
+            SOURCE KEY (source_mbid) REFERENCES mb_release_group (mbid)
+            DESTINATION KEY (target_mbid) REFERENCES mb_release (mbid)
+            LABEL mb_rel_release_group_release PROPERTIES ALL COLUMNS LABEL mb_related PROPERTIES ALL COLUMNS,
+        graph.mb_rel_release_group_release_group AS mb_rel_release_group_release_group KEY (relationship_id)
+            SOURCE KEY (source_mbid) REFERENCES mb_release_group (mbid)
+            DESTINATION KEY (target_mbid) REFERENCES mb_release_group (mbid)
+            LABEL mb_rel_release_group_release_group PROPERTIES ALL COLUMNS LABEL mb_related PROPERTIES ALL COLUMNS
+    );```
+
+#### When it is applied
+
+Three gates, evaluated in that order, and every one of them must open:
+
+1. `SCHEMA_PROPERTY_GRAPH` is enabled. It defaults to off and is read from the environment, so
+   the common case settles without a round trip. See
+   [the runtime configuration](runtime-configuration.md).
+2. `current_setting('server_version_num')::int` is at least `190000`. On PostgreSQL 18 the
+   statement is a syntax error, so the version is asked before it is sent.
+3. No relation named `catalog` already exists in schema `graph`.
+
+A closed gate logs one line naming which gate closed and is not a failure: running on 18, or
+with the switch off, is the supported default. A statement that fails once all three are open
+is counted like any other failed schema statement and makes the initializer exit nonzero.
+
+The third gate is what makes a second apply a no-op. `CREATE PROPERTY GRAPH` has no
+`IF NOT EXISTS` spelling, and this schema never drops a relation a consumer may be reading, so
+an existing `graph.catalog` is left exactly as it is — including one an operator edited by
+hand. The check is against `pg_class` rather than a property-graph-specific catalog, so a table
+or a view squatting the name also closes the gate, which is the conservative answer.
+
+Changing the declaration therefore does not roll out on its own. A property graph is replaced
+with `CREATE OR REPLACE PROPERTY GRAPH` or dropped and recreated, both of which this
+initializer refuses to do; moving an already-created `graph.catalog` to a new shape is a
+deliberate operator action, the same coordinated migration a view rename would need.
+
+#### How it appears in the catalog
+
+A property graph is a relation with its own `relkind`:
+
+| Catalog | Value |
+| --- | --- |
+| `pg_class.relkind` for `graph.catalog` | `g` |
+| Elements, labels, and properties | `pg_propgraph_element`, `pg_propgraph_label`, `pg_propgraph_element_label`, `pg_propgraph_property`, `pg_propgraph_label_property` |
+| Elements declared | 52, matching the 52 views one for one |
+| Labels declared | 53 — one per view, plus the shared `mb_related` |
+| Distinct property names | 74, each with exactly one data type |
+
+`pg_propgraph_property` is the engine's own register of the SQL/PGQ rule that one property name
+carries one data type across a whole graph, so a single row per name is that rule holding
+rather than a restatement of it. The integration suite asserts it directly.
+
+`pg_dump --schema-only` on 19beta3 does emit the property graph: a `CREATE PROPERTY GRAPH`
+block followed by `ALTER PROPERTY GRAPH graph.catalog OWNER TO ...`, placed after the views it
+reads. The round trip is faithful but not textual — `PROPERTIES ALL COLUMNS` comes back expanded
+into an explicit alphabetized column list, a label matching its element alias comes back as
+`DEFAULT LABEL`, and the shared `mb_related` label survives as a second `LABEL` clause. A dump
+taken from a 19 server therefore restores onto another 19 server and fails on an 18 one, which
+is the same boundary the switch draws.
+
+On PostgreSQL 18 none of this exists: no `graph.catalog`, no relation of relkind `g` in schema
+`graph`, and the `pg_propgraph_*` catalogs are absent. The required tier's catalog comparison
+covers the rest of the schema unchanged.
+
+#### Labels
+
+Every element carries its view name as its label, verbatim. That is what the naming rule in ADR
+0012 buys: `:User` is projected as `graph.app_user` because `user` is reserved, and the
+overloaded `[:BY]`, `[:ON]`, and `[:IS]` types as `by_artist`, `on_label`, `in_genre`, and
+`in_style`. Checked against `pg_get_keywords()` on 19beta3, only `label` and `release` are
+keywords at all and both are unreserved, so no label here needs quoting.
+
+The sixteen `mb_rel_<source>_<target>` views carry a second, shared label, `mb_related`. SQL/PGQ
+allows one label across several element tables only when every one of them exposes the same
+property names and types, and these sixteen do: each projects the same eight columns of
+`musicbrainz.relationships`. Keeping the per-pair label as well costs nothing and loses nothing,
+so a query picks its own altitude — `[IS mb_rel_artist_label]` for one endpoint pair, or
+`[IS mb_related]` for any MusicBrainz relationship without spelling out all sixteen.
+
+#### Properties, and the four names that had to be cast
+
+`PROPERTIES ALL COLUMNS` is the default here; nine elements carry an explicit list instead.
+
+SQL/PGQ requires every property of a given name to have one data type across the whole graph,
+and four names are spelled two ways by the views. `artist_id`, `label_id`, and `master_id` are
+`character varying` where they are read from a catalog table's `data_id` and `text` where they
+are read out of a JSONB document with `->>`; `discogs_label_id` is `bigint` on the MusicBrainz
+side and `text` on the Discogs side. Each is unified on `text`: the cast is total, it never
+overflows the way `text` to `bigint` can on an unbounded digit string, and it is the type the
+JSONB half of the graph already produces.
+
+| Property | Cast in | Left alone in |
+| --- | --- | --- |
+| `artist_id` | `artist`, `alias_of` | `by_artist`, `master_by_artist`, `same_as` |
+| `label_id` | `label` | `on_label` |
+| `master_id` | `master`, `master_by_artist`, `master_in_genre`, `master_in_style` | `derived_from` |
+| `discogs_label_id` | `mb_label` | `company` |
+
+Nothing else is cast. `release_id` is `character varying` in all eleven views that expose it, so
+no rule forces one, and it keeps its published type — which is why `release_id` is `character
+varying` while `artist_id` is `text`. The other three provider bridges, `discogs_artist_id`,
+`discogs_master_id`, and `discogs_release_id`, stay `bigint` for the same reason; joining one to
+the Discogs half of the graph needs an explicit cast in the query. The remaining seventy
+property names were already consistent across every view that exposes them.
+
+#### The four restated vertex keys
+
+`graph.artist`, `graph.label`, `graph.master`, and `graph.release` are each keyed on an appended
+`text` column — `artist_key`, `label_key`, `master_key`, `release_key` — rather than on the
+`<entity>_id` the mapping table above publishes.
+
+PostgreSQL 19beta3 resolves the equality operator for an edge endpoint against the referenced
+vertex column's own type, and `character varying` registers none of its own: every
+`varchar = varchar` comparison in PostgreSQL runs through a binary coercion to `text`. An edge
+whose `SOURCE` or `DESTINATION` resolves to a `varchar` vertex key is therefore rejected with
+`no equality operator exists for SOURCE key comparison of edge "..."`. `text`, `uuid`, `bigint`,
+and even `bpchar` are all accepted; `varchar` and `varchar(n)` are not. Only the vertex side is
+checked, so an edge column may stay `character varying` — and all of them do.
+
+The four Discogs entity tables key on `data_id VARCHAR`, so all four vertex views inherited it.
+Retyping a published view column is a breaking change the persistence contract forbids, and
+`CREATE OR REPLACE VIEW` refuses it outright, so each view instead *appends* a `text`
+restatement of the same value — the additive change the contract does allow, and the one shape
+`CREATE OR REPLACE VIEW` accepts. `<entity>_id` keeps its published type and stays the property;
+`<entity>_key` is structural, is not declared as a property, and nothing but
+`CREATE PROPERTY GRAPH` reads it.
+
+Whether this survives to 19 GA is not something this schema depends on. If a later beta accepts
+a `varchar` vertex key, the four `KEY` clauses can point back at `<entity>_id` and the appended
+columns become dead weight rather than a migration.
+
+#### Querying it
+
+```sql
+-- Two hops from a release to the artists credited on it.
+SELECT * FROM GRAPH_TABLE (graph.catalog
+    MATCH (a IS artist)<-[IS by_artist]-(r IS release)-[IS by_artist]->(b IS artist)
+    COLUMNS (r.release_id AS release_id, a.name AS left_name, b.name AS right_name)
+);
+
+-- Any MusicBrainz relationship between two artists, through the shared label.
+SELECT * FROM GRAPH_TABLE (graph.catalog
+    MATCH (s IS mb_artist)-[e IS mb_related]->(t IS mb_artist)
+    COLUMNS (s.name AS source_name, e.relationship_type AS relationship_type, t.name AS target_name)
+);
+```
+
+Access is checked against the querying user's permissions on the base relations, not the
+property graph's owner, so the graph grants nothing the views do not already grant.
 
 ## Media schema consumer promotion
 

@@ -2475,7 +2475,8 @@ def _labels_and_properties(view: str, properties: tuple[str, ...] | None, extra_
 def _property_graph_statement() -> str:
     """Render CREATE PROPERTY GRAPH graph.catalog over the graph schema views."""
     vertices = [
-        f"        {PROPERTY_GRAPH_SCHEMA}.{vertex.view} AS {vertex.view} KEY {_columns(vertex.key)} {_labels_and_properties(vertex.view, vertex.properties)}"
+        f"        {PROPERTY_GRAPH_SCHEMA}.{vertex.view} AS {vertex.view} KEY {_columns(vertex.key)}\n"
+        f"            {_labels_and_properties(vertex.view, vertex.properties)}"
         for vertex in _property_graph_vertices()
     ]
     edges = [
