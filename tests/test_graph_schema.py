@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 from common.credit_roles import ROLE_CATEGORIES, categorize_role
 from common.media import medium_ids, medium_label
@@ -717,3 +718,31 @@ class TestPropertyGraph:
     def labels() -> set[str]:
         """Return every label the statement declares."""
         return set(re.findall(r"LABEL (\w+) ", PROPERTY_GRAPH_STATEMENT[1]))
+
+
+# docs/architecture.md carries the rendered statement in full so a catalog-api
+# rewrite can cite an exact label, key, or property without running a
+# PostgreSQL 19 server. That only holds while the two agree.
+ARCHITECTURE_DOC = Path(__file__).resolve().parents[1] / "docs" / "architecture.md"
+
+
+def documented_property_graph_ddl() -> str:
+    """Return the fenced SQL block in the architecture doc holding the statement."""
+    blocks = re.findall(r"```sql\n(.*?)```", ARCHITECTURE_DOC.read_text(), re.DOTALL)
+    declarations = [block for block in blocks if block.startswith("CREATE PROPERTY GRAPH")]
+    assert len(declarations) == 1, f"expected one CREATE PROPERTY GRAPH block, found {len(declarations)}"
+    return declarations[0]
+
+
+class TestPropertyGraphDocumentation:
+    """The documented DDL is the generated DDL, not a copy that drifted from it."""
+
+    def test_the_documented_ddl_is_byte_identical_to_the_generator_output(self) -> None:
+        assert documented_property_graph_ddl() == PROPERTY_GRAPH_STATEMENT[1] + ";\n"
+
+    def test_the_documented_ddl_is_the_whole_statement(self) -> None:
+        """A truncated paste would still start with CREATE PROPERTY GRAPH."""
+        documented = documented_property_graph_ddl()
+        assert documented.rstrip().endswith(");")
+        for element in (*_property_graph_vertices(), *_property_graph_edges()):
+            assert f"graph.{element.view} AS {element.view} " in documented, element.view
