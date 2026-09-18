@@ -156,7 +156,7 @@ render() { # template from_label from_prop to_label to_prop depth
         -e "s/@TO_LABEL@/$4/g"   -e "s/@TO_PROP@/$5/g" -e "s/@DEPTH@/$6/g" "$1"
 }
 
-printf 'query\tcase\tdepth_cap\trun\tms\n' > "$outdir/timings.tsv"
+printf 'query\tcase\tdepth_cap\trun\tms\n' > "$outdir/timings-neo4j.tsv"
 
 # `:param` lines and the query are kept apart, because `PROFILE` has to prefix
 # the QUERY and cypher-shell would reject it in front of a parameter assignment.
@@ -181,7 +181,10 @@ measure() { # query_name case cap params body iterations
     # both start when the statement is submitted and both end when the last row
     # is out. This is the rule gm-database-schema-9c8.1 used, so the two spikes'
     # PostgreSQL-to-Neo4j ratios mean the same thing.
-    grep 'ready to start consuming' "$target" | tail -n +2 | awk -v q="$qname" -v c="$case_name" -v cap="$cap" '
+    # Two lines are dropped, not one. The file opens with the PROFILE run's own
+    # timing line and the warm-up follows it; the timed runs are what comes after
+    # both.
+    grep 'ready to start consuming' "$target" | tail -n +3 | awk -v q="$qname" -v c="$case_name" -v cap="$cap" '
         {
             ready = ""; consumed = ""
             for (i = 1; i <= NF; i++) {
@@ -189,7 +192,7 @@ measure() { # query_name case cap params body iterations
                 else if ($i == "another") { consumed = $(i + 1) + 0 }
             }
             printf "%s\t%s\t%s\t%d\t%.3f\n", q, c, cap, ++n, ready + consumed
-        }' | tee -a "$outdir/timings.tsv"
+        }' | tee -a "$outdir/timings-neo4j.tsv"
 }
 
 # Table A — every case at the product's own cap of 10.

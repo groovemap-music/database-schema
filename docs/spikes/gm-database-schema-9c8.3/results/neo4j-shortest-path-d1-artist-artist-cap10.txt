@@ -26,7 +26,7 @@ RETURN [node IN nodes(p) | {
 +-------------------------------------------------------------------------------------------------+
 | Plan      | Statement   | Version | Planner | Runtime   | Time | DbHits | Rows | Memory (Bytes) |
 +-------------------------------------------------------------------------------------------------+
-| "PROFILE" | "READ_ONLY" | "25"    | "COST"  | "SLOTTED" | 319  | 13     | 1    | 3040           |
+| "PROFILE" | "READ_ONLY" | "25"    | "COST"  | "SLOTTED" | 270  | 13     | 1    | 3040           |
 +-------------------------------------------------------------------------------------------------+
 
 
@@ -59,9 +59,9 @@ Runtime version 2026.07.1
 Total database accesses: 13, total allocated memory: 3040
 
 1 row
-ready to start consuming query after 304 ms, results consumed after another 15 ms
+ready to start consuming query after 254 ms, results consumed after another 16 ms
 -- wall clock, one discarded warm-up then 3 timed runs
-ready to start consuming query after 40 ms, results consumed after another 1 ms
-ready to start consuming query after 2 ms, results consumed after another 2 ms
-ready to start consuming query after 1 ms, results consumed after another 3 ms
-ready to start consuming query after 2 ms, results consumed after another 1 ms
+ready to start consuming query after 39 ms, results consumed after another 1 ms
+ready to start consuming query after 3 ms, results consumed after another 2 ms
+ready to start consuming query after 2 ms, results consumed after another 3 ms
+ready to start consuming query after 1 ms, results consumed after another 1 ms

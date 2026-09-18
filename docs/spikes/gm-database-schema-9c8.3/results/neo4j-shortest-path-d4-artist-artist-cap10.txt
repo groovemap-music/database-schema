@@ -18,15 +18,15 @@ RETURN [node IN nodes(p) | {
        [rel IN relationships(p) | type(rel)] AS rels;
 -- PROFILE
 +-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| nodes                                                                                                                                                                                                                                                                                                    | rels                     |
+| nodes                                                                                                                                                                                                                                                                                       | rels                                  |
 +-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| [{name: "Willow Union", id: "5665", labels: ["Artist"]}, {name: "Interlude Reissue", id: "816039", labels: ["Release"]}, {name: "Non-Music", id: "Non-Music", labels: ["Genre"]}, {name: "Resonance Remixes", id: "247669", labels: ["Master"]}, {name: "Marble Junction", id: "9", labels: ["Artist"]}] | ["BY", "IS", "IS", "BY"] |
+| [{name: "Willow Union", id: "5665", labels: ["Artist"]}, {name: "Horizons EP", id: "399384", labels: ["Release"]}, {name: "Tundra Laboratory", id: "177", labels: ["Artist"]}, {name: "Onyx Kiosk", id: "169", labels: ["Artist"]}, {name: "Marble Junction", id: "9", labels: ["Artist"]}] | ["BY", "BY", "MEMBER_OF", "ALIAS_OF"] |
 +-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 
 +-------------------------------------------------------------------------------------------------+
 | Plan      | Statement   | Version | Planner | Runtime   | Time | DbHits | Rows | Memory (Bytes) |
 +-------------------------------------------------------------------------------------------------+
-| "PROFILE" | "READ_ONLY" | "25"    | "COST"  | "SLOTTED" | 6    | 3178   | 1    | 216576         |
+| "PROFILE" | "READ_ONLY" | "25"    | "COST"  | "SLOTTED" | 4    | 3120   | 1    | 216576         |
 +-------------------------------------------------------------------------------------------------+
 
 
@@ -43,11 +43,11 @@ Runtime version 2026.07.1
 +-------------------+----+------------------------------------------------------------------------------------------------------+----------------+------+---------+----------------+------------------------+--------------+
 | +ProduceResults   |  0 | nodes, rels                                                                                          |              1 |    1 |       0 |              0 |                    0/0 |              |
 | |                 +----+------------------------------------------------------------------------------------------------------+----------------+------+---------+----------------+------------------------+--------------+
-| +Projection       |  1 | [node IN nodes(p) | {id: coalesce(node.id, cache[node.name]), name: coalesce(cache[node.name], node. |              1 |    1 |      18 |                |                    0/0 |              |
+| +Projection       |  1 | [node IN nodes(p) | {id: coalesce(node.id, cache[node.name]), name: coalesce(cache[node.name], node. |              1 |    1 |      16 |                |                    0/0 |              |
 | |                 |    | title, $autostring_0), labels: labels(node)}] AS nodes,                                              |                |      |         |                |                        |              |
 | |                 |    | [rel IN relationships(p) | type(rel)] AS rels                                                        |                |      |         |                |                        |              |
 | |                 +----+------------------------------------------------------------------------------------------------------+----------------+------+---------+----------------+------------------------+--------------+
-| +ShortestPath     |  2 | p = (a)-[anon_0:BY|ON|IS|ALIAS_OF|MEMBER_OF|DERIVED_FROM*..10]-(b)                                   |              1 |    1 |    3156 |         216512 |                    0/0 |              |
+| +ShortestPath     |  2 | p = (a)-[anon_0:BY|ON|IS|ALIAS_OF|MEMBER_OF|DERIVED_FROM*..10]-(b)                                   |              1 |    1 |    3100 |         216512 |                    0/0 |              |
 | |                 +----+------------------------------------------------------------------------------------------------------+----------------+------+---------+----------------+------------------------+--------------+
 | +CartesianProduct |  3 |                                                                                                      |              1 |    1 |       0 |                |                    0/0 |              |
 | |\                +----+------------------------------------------------------------------------------------------------------+----------------+------+---------+----------------+------------------------+--------------+
@@ -56,12 +56,12 @@ Runtime version 2026.07.1
 | +NodeIndexSeek    |  5 | RANGE INDEX a:Artist(id) WHERE id = $from_id                                                         |              1 |    1 |       2 |                |                    0/0 | artist_id: 1 |
 +-------------------+----+------------------------------------------------------------------------------------------------------+----------------+------+---------+----------------+------------------------+--------------+
 
-Total database accesses: 3178, total allocated memory: 216576
+Total database accesses: 3120, total allocated memory: 216576
 
 1 row
-ready to start consuming query after 2 ms, results consumed after another 4 ms
+ready to start consuming query after 2 ms, results consumed after another 2 ms
 -- wall clock, one discarded warm-up then 3 timed runs
-ready to start consuming query after 1 ms, results consumed after another 2 ms
-ready to start consuming query after 1 ms, results consumed after another 3 ms
-ready to start consuming query after 10 ms, results consumed after another 3 ms
+ready to start consuming query after 2 ms, results consumed after another 4 ms
 ready to start consuming query after 2 ms, results consumed after another 3 ms
+ready to start consuming query after 13 ms, results consumed after another 4 ms
+ready to start consuming query after 2 ms, results consumed after another 2 ms

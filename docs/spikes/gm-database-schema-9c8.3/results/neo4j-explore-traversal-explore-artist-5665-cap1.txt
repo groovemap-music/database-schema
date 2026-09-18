@@ -36,7 +36,7 @@ LIMIT 100;
 +-------------------------------------------------------------------------------------------------+
 | Plan      | Statement   | Version | Planner | Runtime   | Time | DbHits | Rows | Memory (Bytes) |
 +-------------------------------------------------------------------------------------------------+
-| "PROFILE" | "READ_ONLY" | "25"    | "COST"  | "SLOTTED" | 287  | 123    | 2    | 4616           |
+| "PROFILE" | "READ_ONLY" | "25"    | "COST"  | "SLOTTED" | 255  | 123    | 2    | 4616           |
 +-------------------------------------------------------------------------------------------------+
 
 
@@ -89,9 +89,9 @@ Runtime version 2026.07.1
 Total database accesses: 123, total allocated memory: 4616
 
 2 rows
-ready to start consuming query after 272 ms, results consumed after another 15 ms
+ready to start consuming query after 243 ms, results consumed after another 12 ms
 -- wall clock, one discarded warm-up then 3 timed runs
-ready to start consuming query after 51 ms, results consumed after another 2 ms
-ready to start consuming query after 2 ms, results consumed after another 1 ms
+ready to start consuming query after 28 ms, results consumed after another 1 ms
+ready to start consuming query after 1 ms, results consumed after another 1 ms
 ready to start consuming query after 1 ms, results consumed after another 2 ms
-ready to start consuming query after 2 ms, results consumed after another 1 ms
+ready to start consuming query after 2 ms, results consumed after another 3 ms

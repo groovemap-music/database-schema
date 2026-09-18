@@ -252,29 +252,48 @@ ones are quoted below.
 `statement_timeout` was 900 s for p2 through p5 and **120 s for p1**, because 120
 s is the product's own budget and "did not finish inside it" is the measurement.
 
-### What the disk allowed
+### Two bounds worth stating
 
-The host volume had about 12 GiB free at the start and this spike had to fit
-inside it. Two things had to change as a result, and both are reported rather
-than smoothed over.
-
-**p1 needed a `temp_file_limit`.** `WITH RECURSIVE` materializes its entire
-result before the outer `ORDER BY depth LIMIT 1` can look at it, and p1's result
-is every simple path up to the cap. Left unbounded it writes that to disk until
-the volume fills: the first attempt took the host from 6.0 GiB free to 2.6 GiB in
-under two minutes on **one statement**. Bounded at 512 MB the backend raises
+**p1 runs under a `temp_file_limit`, and for p1 that is the measurement rather
+than a guard.** `WITH RECURSIVE` materializes its entire result before the outer
+`ORDER BY depth LIMIT 1` can look at it, and p1's result is every simple path up
+to the cap. Left unbounded it writes that to disk without limit: on an earlier
+attempt at this spike one such statement took the host from 6.0 GiB free to 2.6
+GiB in under two minutes. Bounded at 512 MB the backend raises
 `temporary file size exceeds temp_file_limit` instead. That is a stricter test
 than the 120 s timeout and p1 fails it earlier, so where the table below says
 "over temp limit" it means the statement's intermediate exceeded 512 MB of temp
-files, not that it ran out of time.
+files, not that it ran out of time. The bound is held at 512 MB whether or not
+the host has room, so the result is reproducible rather than a function of the
+free space on the day.
 
 **The two engines were measured one after the other, not side by side.** The
-PostgreSQL container and volume were destroyed before Neo4j was built. 9c8.1
-stopped its PostgreSQL container for the same reason — neither engine competing
-for the other's page cache — so the protocol is the same; only the reason for the
-teardown is different.
+PostgreSQL container and volume were destroyed before Neo4j was built, for the
+reason gm-database-schema-9c8.1 stopped its PostgreSQL container: neither engine
+competing for the other's page cache.
 
-The full synthetic scale fit. Nothing was measured at a reduced scale.
+The full synthetic scale fit both times. Nothing was measured at a reduced scale.
+
+### Reproducibility
+
+The whole measurement was run twice on the same machine, from the same seed,
+about ninety minutes apart. The second run is the one reported here and retained
+under
+[`gm-database-schema-9c8.3/results/`](gm-database-schema-9c8.3/results/).
+
+Everything structural reproduced **exactly**: the 9,492,662 edges the sibling
+spike counted, the 18,637,908 directed rows of `path.edge` and their breakdown by
+relationship type, the 1,390,455 vertices, and every row of `answers.csv` —
+every distance, every visited count, every per-level frontier size, byte for
+byte. So did the shape of every plan: the level-4 expansion scans the same
+18,637,908 rows, produces the same 11,006,163 candidates, discards the same
+10,867,975, and touches the same 44,978,636 buffers.
+
+Only wall clock moved, by a few percent either way, and one thing that is not
+wall clock: `shortestPath` returns one shortest path and breaks ties arbitrarily,
+so the particular path it hands back for a given pair is not stable between runs.
+The Evidence section shows both of the distance-4 paths it returned and does not
+rest any argument on either.
 
 ## Evidence
 
@@ -286,14 +305,14 @@ which is the correctness check.
 
 | Case | d | p1 naive CTE | p2 one-ended BFS | p3 bidirectional | p4 bi + adjacency | **Neo4j** |
 | --- | --- | --- | --- | --- | --- | --- |
-| `d1-artist-artist` | 1 | over temp limit | 11.7 | 12.4 | 7.1 | **4** |
-| `d1-artist-release` | 1 | — | 11.7 | 12.5 | 7.0 | **2** |
-| `d2-artist-artist` | 2 | over temp limit | 21.5 | 180.0 | 138.3 | **8** |
-| `d3-artist-artist` | 3 | — | 24,096 | 92.1 | 57.3 | **7** |
-| `d4-artist-artist` | 4 | — | 97,828 | 22,603 | 18,851 | **5** |
-| `d5-artist-artist` | 5 | — | 99,473 | 1,617 | 1,254 | **34** |
-| `d6-artist-artist` | 6 | — | 137,208 | 12,111 | 8,569 | **39** |
-| `unreachable` | — | — | 135,274 | 12.9 | 8.2 | **3** |
+| `d1-artist-artist` | 1 | over temp limit | 11.8 | 12.8 | 7.1 | **5** |
+| `d1-artist-release` | 1 | — | 11.5 | 12.6 | 7.1 | **3** |
+| `d2-artist-artist` | 2 | over temp limit | 20.5 | 162.4 | 131.9 | **9** |
+| `d3-artist-artist` | 3 | — | 22,739 | 78.1 | 54.3 | **9** |
+| `d4-artist-artist` | 4 | — | 96,130 | 24,654 | 18,798 | **5** |
+| `d5-artist-artist` | 5 | — | 101,969 | 1,656 | 1,270 | **36** |
+| `d6-artist-artist` | 6 | — | 139,672 | 12,199 | 8,585 | **35** |
+| `unreachable` | — | — | 135,829 | 13.3 | 8.2 | **3** |
 
 Work done, from the same runs — vertices visited on the PostgreSQL side, database
 accesses from Cypher `PROFILE` on the Neo4j side:
@@ -301,44 +320,44 @@ accesses from Cypher `PROFILE` on the Neo4j side:
 | Case | p2 visited | p3 visited | Neo4j DbHits |
 | --- | --- | --- | --- |
 | `d1-artist-artist` | 56 | 57 | 13 |
-| `d2-artist-artist` | 423 | 18,927 | 8,036 |
-| `d3-artist-artist` | 1,252,262 | 6,760 | 6,649 |
-| `d4-artist-artist` | 1,390,450 | 1,254,448 | 3,178 |
-| `d5-artist-artist` | 1,389,893 | 170,359 | 150,129 |
-| `d6-artist-artist` | 1,390,450 | 963,879 | 150,163 |
+| `d2-artist-artist` | 423 | 18,927 | 6,795 |
+| `d3-artist-artist` | 1,252,262 | 6,760 | 6,484 |
+| `d4-artist-artist` | 1,390,450 | 1,254,448 | 3,120 |
+| `d5-artist-artist` | 1,389,893 | 170,359 | 150,138 |
+| `d6-artist-artist` | 1,390,450 | 963,879 | 150,158 |
 | `unreachable` | 1,390,450 | 57 | 66 |
 
 Every run, so the spread stays visible:
 
 ```
-p2-bfs-uni  d1-artist-artist   10   11.7      13.477 11.595 11.361 13.475 11.695
-p2-bfs-uni  d2-artist-artist   10   21.5      21.490 21.436 21.559 22.458 20.958
-p2-bfs-uni  d3-artist-artist   10   24095.5   24247.041 23975.960 24095.487
-p2-bfs-uni  d4-artist-artist   10   97828.1   98216.162 97440.048
-p2-bfs-uni  d5-artist-artist   10   99473.4   99488.754 99458.115
-p2-bfs-uni  d6-artist-artist   10  137208.0   136529.082 137886.867
-p2-bfs-uni  unreachable        10  135274.2   134120.911 136427.481
-p3-bfs-bi   d1-artist-artist   10   12.4      13.065 11.909 11.755 13.205 12.448
-p3-bfs-bi   d2-artist-artist   10  180.0      175.995 180.004 180.321 181.291 177.290
-p3-bfs-bi   d3-artist-artist   10   92.1      90.754 92.500 90.823 92.088 92.079
-p3-bfs-bi   d4-artist-artist   10  22603.3    22308.422 22778.100 22603.261
-p3-bfs-bi   d5-artist-artist   10   1616.7    1616.664 1614.862 1622.205 1625.063 1610.847
-p3-bfs-bi   d6-artist-artist   10  12110.6    12110.571 12255.927 11989.399
-p3-bfs-bi   unreachable        10   12.9      12.950 12.207 12.268 13.137 13.001
-p4-adj-bi   d1-artist-artist   10    7.1      7.108 7.787 6.535 7.900 7.098
-p4-adj-bi   d2-artist-artist   10  138.3      138.252 138.166 143.414 146.890 137.633
-p4-adj-bi   d3-artist-artist   10   57.3      58.195 56.020 57.289 59.837 56.412
-p4-adj-bi   d4-artist-artist   10  18851.5    19040.946 18795.940 18851.461
-p4-adj-bi   d5-artist-artist   10   1254.1    1237.976 1254.771 1228.928 1254.119 1256.857
-p4-adj-bi   d6-artist-artist   10   8569.2    8436.317 8569.169 8643.520
-p4-adj-bi   unreachable        10    8.2      8.216 8.238 7.458 8.244 7.231
-neo4j       d1-artist-artist   10    4.0      4 4 3
-neo4j       d2-artist-artist   10    8.0      6 11 8
-neo4j       d3-artist-artist   10    7.0      7 11 5
-neo4j       d4-artist-artist   10    5.0      4 13 5
-neo4j       d5-artist-artist   10   34.0      33 34 34
-neo4j       d6-artist-artist   10   39.0      39 39 35
-neo4j       unreachable        10    3.0      4 3 2
+p2-bfs-uni  d1-artist-artist   10      11.8   12.523 11.845 10.707 11.143 12.292
+p2-bfs-uni  d2-artist-artist   10      20.5   20.945 20.494 20.280 20.533 20.657
+p2-bfs-uni  d3-artist-artist   10   22739.3   21554.056 22739.308 22845.615
+p2-bfs-uni  d4-artist-artist   10   96129.7   96060.941 96198.466
+p2-bfs-uni  d5-artist-artist   10  101968.5   101706.865 102230.074
+p2-bfs-uni  d6-artist-artist   10  139672.1   139551.133 139793.028
+p2-bfs-uni  unreachable        10  135829.1   135785.291 135872.946
+p3-bfs-bi   d1-artist-artist   10      12.8   12.122 12.548 12.843 13.271 12.805
+p3-bfs-bi   d2-artist-artist   10     162.4   162.167 162.810 162.421 160.434 162.539
+p3-bfs-bi   d3-artist-artist   10      78.1   86.633 78.153 78.047 75.141 78.122
+p3-bfs-bi   d4-artist-artist   10   24654.4   24113.114 24654.377 24684.186
+p3-bfs-bi   d5-artist-artist   10    1655.7   1713.693 1655.674 1643.607 1637.939 1668.628
+p3-bfs-bi   d6-artist-artist   10   12199.4   12228.874 12199.445 12128.454
+p3-bfs-bi   unreachable        10      13.3   17.732 13.356 13.314 12.942 12.883
+p4-adj-bi   d1-artist-artist   10       7.1   8.353 7.138 6.881 7.511 7.066
+p4-adj-bi   d2-artist-artist   10     131.9   130.816 131.942 130.202 132.614 132.607
+p4-adj-bi   d3-artist-artist   10      54.3   55.445 54.318 54.818 51.799 52.820
+p4-adj-bi   d4-artist-artist   10   18797.9   18797.921 18666.226 18983.030
+p4-adj-bi   d5-artist-artist   10    1270.2   1281.467 1357.247 1267.517 1270.216 1270.130
+p4-adj-bi   d6-artist-artist   10    8584.6   8606.339 8584.610 8536.095
+p4-adj-bi   unreachable        10       8.2   8.592 8.115 8.212 7.587 8.599
+neo4j       d1-artist-artist   10       5.0   5 5 2
+neo4j       d2-artist-artist   10       9.0   9 8 9
+neo4j       d3-artist-artist   10       9.0   9 10 9
+neo4j       d4-artist-artist   10       5.0   5 17 4
+neo4j       d5-artist-artist   10      36.0   42 36 34
+neo4j       d6-artist-artist   10      35.0   35 41 34
+neo4j       unreachable        10       3.0   3 2 3
 ```
 
 ### The naive recursive CTE never reaches depth 3
@@ -347,21 +366,21 @@ p1 against the depth cap, on the easiest artist-to-artist case:
 
 | Cap | p1 |
 | --- | --- |
-| 1 | 5.0 ms |
-| 2 | 9.5 ms |
+| 1 | 4.7 ms |
+| 2 | 8.9 ms |
 | 3 | **over temp limit** |
 | 4–10 | not attempted; the recursion is monotone in the cap |
 
 The plan at cap 2 shows exactly where it goes:
 
 ```
- Limit (actual time=4.998..5.001 rows=1.00 loops=1)
+ Limit (actual time=5.021..5.024 rows=1.00 loops=1)
    CTE walk
-     ->  Recursive Union (actual time=0.002..4.778 rows=511.00 loops=1)
-           ->  Nested Loop (actual time=0.022..1.523 rows=170.00 loops=3)
+     ->  Recursive Union (actual time=0.002..4.781 rows=511.00 loops=1)
+           ->  Nested Loop (actual time=0.023..1.539 rows=170.00 loops=3)
                  ->  WorkTable Scan on walk w (rows=18.67 loops=3)
                        Filter: (depth < 2)
-                 ->  Append (actual time=0.010..0.078 rows=9.11 loops=56)
+                 ->  Append (actual time=0.007..0.079 rows=9.11 loops=56)
                        ->  Index Only Scan using by_artist_pkey on by_artist
                              Index Cond: (release_id = w.key)
                              Filter: ((w.kind = 'r') AND ((('a' || ':') || artist_id) <> ALL (w.seen)))
@@ -389,18 +408,18 @@ The p2 expansion at level 4 of the `d4` case, captured through `auto_explain`
 with `log_nested_statements`:
 
 ```
-duration: 80250.938 ms  plan:
-  Insert on frontier (actual time=80250.925..80250.935 rows=0.00 loops=1)
+duration: 76247.697 ms  plan:
+  Insert on frontier (actual time=76247.685..76247.694 rows=0.00 loops=1)
     Buffers: shared hit=44978636 dirtied=2490 written=2490
     CTE nxt
-      ->  Insert on visited (actual time=297.775..80112.219 rows=138188.00 loops=1)
+      ->  Insert on visited (actual time=276.052..76119.201 rows=138188.00 loops=1)
             Conflict Resolution: NOTHING
             Tuples Inserted: 138188
             Conflicting Tuples: 10867975
             Buffers: shared hit=44696173
-            ->  Hash Join (actual time=297.703..8387.036 rows=11006163.00 loops=1)
+            ->  Hash Join (actual time=275.987..8277.414 rows=11006163.00 loops=1)
                   Hash Cond: ((('r') = f.kind) AND (by_artist.release_id = f.key))
-                  ->  Append (actual time=0.009..2625.882 rows=18637908.00 loops=1)
+                  ->  Append (actual time=0.008..2743.510 rows=18637908.00 loops=1)
                         ->  Seq Scan on by_artist (rows=1920257.00 loops=1)
                         ->  Seq Scan on by_artist by_artist_1 (rows=1920257.00 loops=1)
                         ->  Seq Scan on master_by_artist (rows=400205.00 loops=1)
@@ -409,7 +428,7 @@ duration: 80250.938 ms  plan:
 
 One level: a full sequential scan of **all 18,637,908 edge rows**, 11,006,163
 candidate arrivals produced, 10,867,975 of them discarded as already visited, and
-**138,188 new vertices** to show for it. 44.7 million buffers, 80 seconds, a 1.3%
+**138,188 new vertices** to show for it. 44.7 million buffers, 76 seconds, a 1.3%
 yield.
 
 That is the whole of the PostgreSQL side of the timing table, and it has two
@@ -419,8 +438,8 @@ The **fixable** one is the access path. The frontier at level 3 holds 1.25 milli
 vertices, so the planner stops probing indexes and hash-joins the entire edge
 surface instead, which is the right choice for a frontier that size. p4 measures
 what removing that costs: a dense `bigint` adjacency with a covering index cuts
-`d4` from 22,603 ms to 18,851 ms and `d6` from 12,111 ms to 8,569 ms. Real, worth
-having, and **nowhere near enough** — about 1.2 to 1.4 times, against a gap of
+`d4` from 24,654 ms to 18,798 ms and `d6` from 12,199 ms to 8,585 ms. Real, worth
+having, and **nowhere near enough** — about 1.3 to 1.4 times, against a gap of
 three orders of magnitude.
 
 The **unfixable** one is that a SQL statement cannot stop in the middle. p3 and
@@ -430,14 +449,14 @@ produced and **returns the moment the two searches touch**; it never finishes th
 level. A level-synchronous implementation has no way to do that, because the unit
 of work is a statement and the statement's result is a set. So p3 pays for all
 1,254,448 vertices of the level in which the answer was found, and Neo4j pays for
-3,178 database accesses.
+3,120 database accesses.
 
-This is why `d4` is the worst case in the table and `d5` is sixty times better
+This is why `d4` is the worst case in the table and `d5` is fifteen times better
 despite being further: from artist 55563 the frontier stays small for four levels
 and the search meets before either side crosses a Genre vertex.
 
 It is also why the bidirectional search is sometimes *worse* than the one-ended
-one. At `d2` p3 takes 180 ms against p2's 21.5 ms, because artist 1's
+one. At `d2` p3 takes 162 ms against p2's 20.5 ms, because artist 1's
 neighbourhood is 18,870 vertices and the one-ended search found the target before
 it had any reason to look at them.
 
@@ -448,33 +467,41 @@ it had any reason to look at them.
 
 ```
 | Plan      | Statement   | Version | Planner | Runtime   | Time | DbHits | Rows |
-| "PROFILE" | "READ_ONLY" | "25"    | "COST"  | "SLOTTED" | 6    | 3178   | 1    |
+| "PROFILE" | "READ_ONLY" | "25"    | "COST"  | "SLOTTED" | 4    | 3120   | 1    |
 
 | Operator          | Details                                                            | Rows | DB Hits |
 | +ProduceResults   | nodes, rels                                                        |    1 |       0 |
-| +Projection       | [node IN nodes(p) | {id: ..., name: ..., labels: labels(node)}]    |    1 |      18 |
-| +ShortestPath     | p = (a)-[anon_0:BY|ON|IS|ALIAS_OF|MEMBER_OF|DERIVED_FROM*..10]-(b) |    1 |    3156 |
+| +Projection       | [node IN nodes(p) | {id: ..., name: ..., labels: labels(node)}]    |    1 |      16 |
+| +ShortestPath     | p = (a)-[anon_0:BY|ON|IS|ALIAS_OF|MEMBER_OF|DERIVED_FROM*..10]-(b) |    1 |    3100 |
 | +CartesianProduct |                                                                    |    1 |       0 |
 | | +NodeIndexSeek  | RANGE INDEX b:Artist(id) WHERE id = $to_id                         |    1 |       2 |
 | +NodeIndexSeek    | RANGE INDEX a:Artist(id) WHERE id = $from_id                       |    1 |       2 |
 
-Total database accesses: 3178, total allocated memory: 216576
+Total database accesses: 3120, total allocated memory: 216576
 ```
 
-The path it returned, which is also the clearest single illustration of the
-degree table:
+The path it returned:
 
 ```
 Willow Union (Artist 5665)
-  -BY->   Interlude Reissue (Release 816039)
-  -IS->   Non-Music (Genre)
-  -IS->   Resonance Remixes (Master 247669)
-  -BY->   Marble Junction (Artist 9)
+  -BY->        Horizons EP (Release 399384)
+  -BY->        Tundra Laboratory (Artist 177)
+  -MEMBER_OF-> Onyx Kiosk (Artist 169)
+  -ALIAS_OF->  Marble Junction (Artist 9)
 ```
 
-Four hops between two arbitrary artists, and the middle of it is a Genre vertex
-of degree 137,193. Every artist-to-artist path in this catalog that is not a
-direct alias or a shared release looks like this.
+Which particular path comes back is not stable, and that is worth recording
+rather than hiding. `shortestPath` returns one shortest path and breaks ties
+arbitrarily; an earlier run of this identical query returned a different path of
+the same length —
+`5665 -BY-> Release 816039 -IS-> Genre "Non-Music" -IS-> Master 247669 -BY-> Artist 9`
+— routed through a Genre vertex of degree 137,193. Both are four hops and both
+are correct answers.
+
+So the hub claim in this document does not rest on any one returned path. It
+rests on the level profiles: an expansion out of artist 5665 goes 55, 367,
+**1,251,839**, 138,188. The third level is where the Genre vertices are reached,
+and it is three and a half orders of magnitude larger than the second.
 
 ### Depth cap against a miss
 
@@ -483,13 +510,13 @@ to find. Median milliseconds:
 
 | Cap | p2 one-ended | p3 bidirectional | p4 bi + adjacency | Neo4j |
 | --- | --- | --- | --- | --- |
-| 1 | 11.1 | 12.2 | 7.5 | 2 |
-| 2 | 20.4 | 13.4 | 7.7 | 3 |
-| 3 | **23,666** | 13.0 | 7.5 | 3 |
-| 4 | **100,785** | 12.6 | 8.5 | 3 |
-| 6 | — | — | — | 3 |
-| 8 | — | — | — | 3 |
-| 10 | **135,274** | 13.4 | 7.6 | 2 |
+| 1 | 11.8 | 12.0 | 7.6 | 2 |
+| 2 | 21.3 | 13.9 | 8.8 | 2 |
+| 3 | **23,738** | 13.8 | 8.1 | 3 |
+| 4 | **96,224** | 13.2 | 7.8 | 1 |
+| 6 | — | — | — | 2 |
+| 8 | — | — | — | 2 |
+| 10 | **135,829** | 13.1 | 7.7 | 2 |
 
 Caps 5 and above are one measurement for the one-ended search, not four: the
 component is exhausted at level 5, so the loop leaves at the same place whether
@@ -508,17 +535,17 @@ measure.
 
 | Hops | PostgreSQL (p5) | Neo4j | Neo4j DbHits |
 | --- | --- | --- | --- |
-| `*1..1` | 11.7 ms | 3 ms | 123 |
-| `*1..2` | 23.2 ms | 10 ms | 3,007 |
-| `*1..3` | **22,908 ms** | **3,356 ms** | **24,902,813** |
+| `*1..1` | 11.8 ms | 3 ms | 123 |
+| `*1..2` | 22.1 ms | 13 ms | 3,007 |
+| `*1..3` | **21,404 ms** | **3,435 ms** | **24,902,813** |
 
 ```
-p5-traverse  explore-artist-5665  1      11.7   12.021 11.609 11.611 11.842 11.725
-p5-traverse  explore-artist-5665  2      23.2   24.449 22.988 23.193 22.682 23.278
-p5-traverse  explore-artist-5665  3   22908.5   22997.570 22908.464 22717.489
-neo4j        explore-artist-5665  1       3.0   3 3 3
-neo4j        explore-artist-5665  2      10.0   23 10 7
-neo4j        explore-artist-5665  3    3356.0   3356 3404 3270
+p5-traverse  explore-artist-5665  1      11.8   11.871 11.777 11.306 11.766 11.663
+p5-traverse  explore-artist-5665  2      22.1   22.353 22.137 21.723 22.534 22.057
+p5-traverse  explore-artist-5665  3   21404.4   21404.354 21328.829 21433.830
+neo4j        explore-artist-5665  1       3.0   2 3 5
+neo4j        explore-artist-5665  2      13.0   13 12 15
+neo4j        explore-artist-5665  3    3435.0   3435 3458 3251
 ```
 
 This read has no early exit on either engine. `LIMIT 100` cannot rescue it,
@@ -526,7 +553,7 @@ because the Cypher orders by distance and takes the best path per discovered
 node, which is an aggregate over the whole traversal. Both engines must exhaust
 level `n`, and level 3 is where the Genre vertices are. Neo4j's 24.9 million
 database accesses for a hundred rows say the same thing PostgreSQL's 23 seconds
-do; Neo4j is seven times faster at being unusable.
+do; Neo4j is six times faster at being unusable.
 
 `*1..1` and `*1..2` are comfortable on both. `*1..2` is the function's default.
 
@@ -564,9 +591,9 @@ prototype measured (p4, bidirectional over a precomputed dense adjacency):
 | Distance found | Best PostgreSQL | Inside 120 s? | Inside the MCP 30 s? | Usable interactively? |
 | --- | --- | --- | --- | --- |
 | 1 | 7 ms | yes | yes | **yes** |
-| 2 | 138 ms | yes | yes | **yes** |
-| 3 | 57 ms | yes | yes | yes, but see below |
-| 4 | 18.9 s | yes | barely, and it shares the budget | **no** |
+| 2 | 132 ms | yes | yes | **yes** |
+| 3 | 54 ms | yes | yes | yes, but see below |
+| 4 | 18.8 s | yes | barely, and it shares the budget | **no** |
 | 5 | 1.3 s | yes | yes | marginal |
 | 6 | 8.6 s | yes | no, with two lookups to pay for | **no** |
 | no path | 8 ms | yes | yes | yes, for an isolated endpoint only |
@@ -582,19 +609,19 @@ not the one that hurts.
 What can be promised is bounded by the worst case at each distance, not the
 measured one, and the worst case at distance 3 or more is a hub expansion. So:
 
-- **Depth 2 is servable.** 138 ms worst measured, and a two-hop neighbourhood
+- **Depth 2 is servable.** 132 ms worst measured, and a two-hop neighbourhood
   cannot reach a Genre vertex from an Artist without passing through a Release,
   which is one level of at most a few hundred.
-- **Depth 3 and 4 are not servable interactively.** Measured at 57 ms and 18.9 s
+- **Depth 3 and 4 are not servable interactively.** Measured at 54 ms and 18.8 s
   for the same cap, on the same engine, four hops apart.
 - **Depth 5 and above is not servable at all**, and there is nothing at depth 7
   or beyond to serve.
 
 ### Is bidirectional search needed?
 
-**Yes, and it is not optional.** It is the difference between 135 s and 13 ms on
-a miss, and between 99 s and 1.6 s at distance 5. A one-ended search cannot serve
-this workload at any cap above 2 — at cap 3 it already costs 24 s.
+**Yes, and it is not optional.** It is the difference between 136 s and 13 ms on
+a miss, and between 102 s and 1.7 s at distance 5. A one-ended search cannot
+serve this workload at any cap above 2 — at cap 3 it already costs 24 s.
 
 But it is not sufficient. Bidirectional search still pays for the whole of the
 level in which it finds the answer, and one level here is 1.25 million vertices.
@@ -602,22 +629,22 @@ level in which it finds the answer, and one level here is 1.25 million vertices.
 ### Is precomputed adjacency needed?
 
 **It is worth building and it does not change the verdict.** A dense `bigint`
-adjacency with a covering index is 1.2 to 1.4 times faster than the same search
-over the twenty-two-branch view — 18.9 s against 22.6 s at distance 4, 8.6 s
-against 12.1 s at distance 6. It costs 1,649 MB at this scale, a second copy of
+adjacency with a covering index is 1.3 to 1.4 times faster than the same search
+over the twenty-two-branch view — 18.8 s against 24.7 s at distance 4, 8.6 s
+against 12.2 s at distance 6. It costs 1,649 MB at this scale, a second copy of
 the edge set to keep current, and a stable node numbering across a growing
 catalog.
 
 That is a reasonable trade for the cases that are servable, and it does not
 rescue the cases that are not. Anyone reading this table hoping that the right
 index makes depth 6 work should read the ratio column instead: the gap to Neo4j
-at distance 4 is 3,770-fold, and precomputed adjacency closes 1.2 of it.
+at distance 4 is 3,760-fold, and precomputed adjacency closes 1.3 of it.
 
 ### The thing that actually separates the two engines
 
 It is not storage and it is not the index. It is that **Neo4j's shortest-path
 expander can stop in the middle of a level and a SQL statement cannot.** Neo4j
-answers `d4` in 3,178 database accesses because it returns the instant the two
+answers `d4` in 3,120 database accesses because it returns the instant the two
 searches touch. PostgreSQL visits 1,254,448 vertices to answer the same question,
 because the unit of work in SQL is a statement and the result of a statement is a
 set. Nothing about PostgreSQL 19, `GRAPH_TABLE`, or the shape of the edge tables
@@ -627,7 +654,7 @@ unless it came with an operator that terminates early.
 This is the opposite result from the sibling spike, and the two are consistent.
 gm-database-schema-9c8.1 found PostgreSQL **33 times faster** than Neo4j on the
 depth-2 collaborator read, because that read is a fixed-length join and set-at-a-
-time evaluation is exactly what a join wants. This spike finds Neo4j **3,770
+time evaluation is exactly what a join wants. This spike finds Neo4j **3,760
 times faster** on variable-length shortest path, because set-at-a-time evaluation
 is exactly what an early-terminating search does not want. The migration's
 read-family classification is the right axis; the fixed-length families cross and
@@ -648,10 +675,10 @@ are **lower than what the product advertises today**.
 
 | Surface | Current | Recommended relational cap | Why |
 | --- | --- | --- | --- |
-| `GET /api/path` | `ge=1, le=10`, default 6 | **`le=2`, default 2** | 138 ms at depth 2; 18.9 s at depth 4 on the same engine |
+| `GET /api/path` | `ge=1, le=10`, default 6 | **`le=2`, default 2** | 132 ms at depth 2; 18.8 s at depth 4 on the same engine |
 | NLQ `find_path` | clamped `[1, 10]`, default 6 | **clamp `[1, 2]`, default 2** | Model-steerable. The clamp is the only thing between a tool call and a 20 s query |
 | MCP `find_path` | `[1, 10]`, **default 10** | **clamp `[1, 2]`, default 2** | Tightest budget, 30 s shared with two lookups, and the deepest default of the three |
-| `explore` traversal | `1 <= hops <= 3`, default 2 | **`1 <= hops <= 2`, default 2** | 23 ms at `*1..2`; 22.9 s at `*1..3` |
+| `explore` traversal | `1 <= hops <= 3`, default 2 | **`1 <= hops <= 2`, default 2** | 22 ms at `*1..2`; 21.4 s at `*1..3` |
 
 Two of these are worth calling out on their own.
 
@@ -662,8 +689,9 @@ today that default is survivable because `shortestPath` terminates early; it is
 survivable by luck rather than by design.
 
 **Dropping the explore traversal from 3 hops to 2 costs almost nothing.** The
-default is already 2, `*1..3` is a thousand times more expensive than `*1..2` on
-PostgreSQL and 330 times more on Neo4j, and it returns the same 100 rows. This is
+default is already 2, `*1..3` is nearly a thousand times more expensive than
+`*1..2` on PostgreSQL and 260 times more on Neo4j, and it returns the same 100
+rows. This is
 the one recommendation that applies to the current Neo4j deployment immediately
 and does not wait for any migration.
 

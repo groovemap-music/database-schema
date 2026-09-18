@@ -14,6 +14,10 @@
 # Three tables come out of this, because three different questions are being
 # asked and one grid over (case x cap x variant) would answer none of them well:
 #
+# The results file is named for its engine. Both harnesses used to write
+# `timings.tsv`; Neo4j ran second and silently overwrote the PostgreSQL rows
+# with rows carrying a different header and different case names.
+#
 #   A  cost against the distance actually found, at the product's own cap of 10
 #   B  cost against the DEPTH CAP when there is nothing to find, which is the
 #      only case in which the cap is what decides the work
@@ -92,13 +96,13 @@ timed() {
     local warm runs ms i
     warm="$(one_run "$sql" "$budget")"
     if [[ "$warm" == "timeout" || "$warm" == "over-temp-limit" ]]; then
-        printf '%s\t%s\t%s\t-\t%s\n' "$variant" "$case_name" "$cap" "$warm" | tee -a "$out/timings.tsv"
+        printf '%s\t%s\t%s\t-\t%s\n' "$variant" "$case_name" "$cap" "$warm" | tee -a "$out/timings-postgres.tsv"
         return 1
     fi
     runs="$(awk -v w="$warm" 'BEGIN { print (w < 3000 ? 5 : (w < 30000 ? 3 : 2)) }')"
     for ((i = 1; i <= runs; i++)); do
         ms="$(one_run "$sql" "$budget")"
-        printf '%s\t%s\t%s\t%d\t%s\n' "$variant" "$case_name" "$cap" "$i" "$ms" | tee -a "$out/timings.tsv"
+        printf '%s\t%s\t%s\t%d\t%s\n' "$variant" "$case_name" "$cap" "$i" "$ms" | tee -a "$out/timings-postgres.tsv"
     done
     return 0
 }
@@ -110,7 +114,7 @@ p1_sql() { # sk skey tk tkey cap
         -e "s/:'tkey'/'$4'/g" -e "s/:depth/$5/g" "$here/queries/p1-naive-recursive-cte.sql"
 }
 
-printf 'variant\tcase\tdepth_cap\trun\tms\n' > "$out/timings.tsv"
+printf 'variant\tcase\tdepth_cap\trun\tms\n' > "$out/timings-postgres.tsv"
 
 # ---------------------------------------------------------------------------
 # Table A — cost against the distance found, at the product's own cap of 10
@@ -189,4 +193,4 @@ echo "== answers =="
     done
 } > "$out/answers.csv"
 
-echo "wrote $out/timings.tsv and $out/answers.csv"
+echo "wrote $out/timings-postgres.tsv and $out/answers.csv"

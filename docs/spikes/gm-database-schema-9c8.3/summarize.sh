@@ -8,7 +8,7 @@ set -euo pipefail
 
 out="${1:?usage: summarize.sh <results-dir>}"
 
-for file in "$out"/timings.tsv; do
+for file in "$out"/timings-postgres.tsv "$out"/timings-neo4j.tsv; do
     [[ -f "$file" ]] || continue
     echo "== $file"
     awk -F'\t' '

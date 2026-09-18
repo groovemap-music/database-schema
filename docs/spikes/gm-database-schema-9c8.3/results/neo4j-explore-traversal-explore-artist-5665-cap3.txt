@@ -31,24 +31,36 @@ LIMIT 100;
 +---------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | "15972"                   | "Xenon Assembly"              | "artist" | ["Willow Union", "Xenon Assembly"]                                    | ["MEMBER_OF"] | 1    |
 | "9458"                    | "Saffron Network"             | "artist" | ["Willow Union", "Saffron Network"]                                   | ["MEMBER_OF"] | 1    |
-| "50141"                   | "Yarrow Kiosk"                | "artist" | ["Willow Union", "Resonance Sessions", "Yarrow Kiosk"]                | ["BY", "BY"]  | 2    |
-| "Children's"              | "Children's"                  | "genre"  | ["Willow Union", "Resonance Sessions", "Children's"]                  | ["BY", "IS"]  | 2    |
-| "Reggae"                  | "Reggae"                      | "genre"  | ["Willow Union", "Resonance Sessions", "Reggae"]                      | ["BY", "IS"]  | 2    |
-| "Darkwave Funk"           | "Darkwave Funk"               | "style"  | ["Willow Union", "Resonance Sessions", "Darkwave Funk"]               | ["BY", "IS"]  | 2    |
 | "842"                     | "Vellum Machine"              | "artist" | ["Willow Union", "Horizons Demos", "Vellum Machine"]                  | ["BY", "BY"]  | 2    |
-| "Post Pop"                | "Post Pop"                    | "style"  | ["Willow Union", "Jetstream Reissue", "Post Pop"]                     | ["BY", "IS"]  | 2    |
 | "Electronic"              | "Electronic"                  | "genre"  | ["Willow Union", "Horizons Demos", "Electronic"]                      | ["BY", "IS"]  | 2    |
 | "Psychedelic Pop"         | "Psychedelic Pop"             | "style"  | ["Willow Union", "Horizons Demos", "Psychedelic Pop"]                 | ["BY", "IS"]  | 2    |
 | "371"                     | "Umber Circuit Records"       | "label"  | ["Willow Union", "Horizons Demos", "Umber Circuit Records"]           | ["BY", "ON"]  | 2    |
+| "Folk, World, & Country"  | "Folk, World, & Country"      | "genre"  | ["Willow Union", "Nightshift Sessions", "Folk, World, & Country"]     | ["BY", "IS"]  | 2    |
+| "Pop"                     | "Pop"                         | "genre"  | ["Willow Union", "Dispatches Sessions", "Pop"]                        | ["BY", "IS"]  | 2    |
+| "Jazz"                    | "Jazz"                        | "genre"  | ["Willow Union", "Nightshift Sessions", "Jazz"]                       | ["BY", "IS"]  | 2    |
+| "Stage & Screen"          | "Stage & Screen"              | "genre"  | ["Willow Union", "Nightshift Sessions", "Stage & Screen"]             | ["BY", "IS"]  | 2    |
+| "Abstract Jazz"           | "Abstract Jazz"               | "style"  | ["Willow Union", "Nightshift Sessions", "Abstract Jazz"]              | ["BY", "IS"]  | 2    |
+| "Bop Rock"                | "Bop Rock"                    | "style"  | ["Willow Union", "Nightshift Sessions", "Bop Rock"]                   | ["BY", "IS"]  | 2    |
+| "Dancehall Soul"          | "Dancehall Soul"              | "style"  | ["Willow Union", "Nightshift Sessions", "Dancehall Soul"]             | ["BY", "IS"]  | 2    |
+| "2387"                    | "Quarry Kiosk Records"        | "label"  | ["Willow Union", "Nightshift Sessions", "Quarry Kiosk Records"]       | ["BY", "ON"]  | 2    |
+| "Classical"               | "Classical"                   | "genre"  | ["Willow Union", "Groundwork Vol. 2", "Classical"]                    | ["BY", "IS"]  | 2    |
+| "146"                     | "Onyx Transmission"           | "artist" | ["Willow Union", "Horizons Sessions", "Onyx Transmission"]            | ["BY", "BY"]  | 2    |
+| "Soul-Jazz Jazz"          | "Soul-Jazz Jazz"              | "style"  | ["Willow Union", "Dispatches Sessions", "Soul-Jazz Jazz"]             | ["BY", "IS"]  | 2    |
+| "734"                     | "Kestrel Workshop Records"    | "label"  | ["Willow Union", "Dispatches Sessions", "Kestrel Workshop Records"]   | ["BY", "ON"]  | 2    |
+| "50141"                   | "Yarrow Kiosk"                | "artist" | ["Willow Union", "Resonance Sessions", "Yarrow Kiosk"]                | ["BY", "BY"]  | 2    |
+| "14"                      | "Pallas Network"              | "artist" | ["Willow Union", "Resonance Sessions", "Pallas Network"]              | ["BY", "BY"]  | 2    |
+| "Reggae"                  | "Reggae"                      | "genre"  | ["Willow Union", "Resonance Sessions", "Reggae"]                      | ["BY", "IS"]  | 2    |
+| "Darkwave Funk"           | "Darkwave Funk"               | "style"  | ["Willow Union", "Resonance Sessions", "Darkwave Funk"]               | ["BY", "IS"]  | 2    |
+| "423"                     | "Pallas Transmission Records" | "label"  | ["Willow Union", "Resonance Sessions", "Pallas Transmission Records"] | ["BY", "ON"]  | 2    |
 | "32948"                   | "Glass Union"                 | "artist" | ["Willow Union", "Jetstream Reissue", "Glass Union"]                  | ["BY", "BY"]  | 2    |
 | "7290"                    | "Glass Laboratory"            | "artist" | ["Willow Union", "Jetstream Reissue", "Glass Laboratory"]             | ["BY", "BY"]  | 2    |
 | "Non-Music"               | "Non-Music"                   | "genre"  | ["Willow Union", "Jetstream Reissue", "Non-Music"]                    | ["BY", "IS"]  | 2    |
-| "44297"                   | "Onyx Machine"                | "artist" | ["Willow Union", "Cartography Demos", "Onyx Machine"]                 | ["BY", "BY"]  | 2    |
-| "2387"                    | "Quarry Kiosk Records"        | "label"  | ["Willow Union", "Nightshift Sessions", "Quarry Kiosk Records"]       | ["BY", "ON"]  | 2    |
+| "New Wave Techno"         | "New Wave Techno"             | "style"  | ["Willow Union", "Jetstream Reissue", "New Wave Techno"]              | ["BY", "IS"]  | 2    |
+| "Post Pop"                | "Post Pop"                    | "style"  | ["Willow Union", "Jetstream Reissue", "Post Pop"]                     | ["BY", "IS"]  | 2    |
 | "5531"                    | "Umber Junction Records"      | "label"  | ["Willow Union", "Jetstream Reissue", "Umber Junction Records"]       | ["BY", "ON"]  | 2    |
 | "37516"                   | "Basalt Junction"             | "artist" | ["Willow Union", "Groundwork Vol. 2", "Basalt Junction"]              | ["BY", "BY"]  | 2    |
+| "45857"                   | "Fathom Bureau"               | "artist" | ["Willow Union", "Horizons Sessions", "Fathom Bureau"]                | ["BY", "BY"]  | 2    |
 | "108016"                  | "Saffron Registry"            | "artist" | ["Willow Union", "Groundwork Vol. 2", "Saffron Registry"]             | ["BY", "BY"]  | 2    |
-| "Classical"               | "Classical"                   | "genre"  | ["Willow Union", "Groundwork Vol. 2", "Classical"]                    | ["BY", "IS"]  | 2    |
 | "Bop Funk"                | "Bop Funk"                    | "style"  | ["Willow Union", "Groundwork Vol. 2", "Bop Funk"]                     | ["BY", "IS"]  | 2    |
 | "Breakbeat Soul"          | "Breakbeat Soul"              | "style"  | ["Willow Union", "Groundwork Vol. 2", "Breakbeat Soul"]               | ["BY", "IS"]  | 2    |
 | "Chiptune Techno"         | "Chiptune Techno"             | "style"  | ["Willow Union", "Groundwork Vol. 2", "Chiptune Techno"]              | ["BY", "IS"]  | 2    |
@@ -59,10 +71,8 @@ LIMIT 100;
 | "Honky Tonk Pop"          | "Honky Tonk Pop"              | "style"  | ["Willow Union", "Kinetics EP", "Honky Tonk Pop"]                     | ["BY", "IS"]  | 2    |
 | "Modal Pop"               | "Modal Pop"                   | "style"  | ["Willow Union", "Kinetics EP", "Modal Pop"]                          | ["BY", "IS"]  | 2    |
 | "723"                     | "Willow Gallery Records"      | "label"  | ["Willow Union", "Kinetics EP", "Willow Gallery Records"]             | ["BY", "ON"]  | 2    |
-| "Dancehall Soul"          | "Dancehall Soul"              | "style"  | ["Willow Union", "Nightshift Sessions", "Dancehall Soul"]             | ["BY", "IS"]  | 2    |
 | "7381"                    | "Vellum Assembly"             | "artist" | ["Willow Union", "Cartography Demos", "Vellum Assembly"]              | ["BY", "BY"]  | 2    |
-| "Pop"                     | "Pop"                         | "genre"  | ["Willow Union", "Cartography Demos", "Pop"]                          | ["BY", "IS"]  | 2    |
-| "Stage & Screen"          | "Stage & Screen"              | "genre"  | ["Willow Union", "Cartography Demos", "Stage & Screen"]               | ["BY", "IS"]  | 2    |
+| "44297"                   | "Onyx Machine"                | "artist" | ["Willow Union", "Cartography Demos", "Onyx Machine"]                 | ["BY", "BY"]  | 2    |
 | "Chanson Folk"            | "Chanson Folk"                | "style"  | ["Willow Union", "Cartography Demos", "Chanson Folk"]                 | ["BY", "IS"]  | 2    |
 | "Honky Tonk Funk"         | "Honky Tonk Funk"             | "style"  | ["Willow Union", "Cartography Demos", "Honky Tonk Funk"]              | ["BY", "IS"]  | 2    |
 | "Shoegaze House"          | "Shoegaze House"              | "style"  | ["Willow Union", "Cartography Demos", "Shoegaze House"]               | ["BY", "IS"]  | 2    |
@@ -75,8 +85,14 @@ LIMIT 100;
 | "Britpop Soul"            | "Britpop Soul"                | "style"  | ["Willow Union", "Passages Vol. 1", "Britpop Soul"]                   | ["BY", "IS"]  | 2    |
 | "Punk Funk"               | "Punk Funk"                   | "style"  | ["Willow Union", "Passages Vol. 1", "Punk Funk"]                      | ["BY", "IS"]  | 2    |
 | "7104"                    | "Umber Union Records"         | "label"  | ["Willow Union", "Passages Vol. 1", "Umber Union Records"]            | ["BY", "ON"]  | 2    |
-| "45857"                   | "Fathom Bureau"               | "artist" | ["Willow Union", "Horizons Sessions", "Fathom Bureau"]                | ["BY", "BY"]  | 2    |
-| "146"                     | "Onyx Transmission"           | "artist" | ["Willow Union", "Horizons Sessions", "Onyx Transmission"]            | ["BY", "BY"]  | 2    |
+| "1262"                    | "Tundra Ensemble"             | "artist" | ["Willow Union", "Interlude Demos", "Tundra Ensemble"]                | ["BY", "BY"]  | 2    |
+| "117877"                  | "Glass Laboratory"            | "artist" | ["Willow Union", "Interlude Demos", "Glass Laboratory"]               | ["BY", "BY"]  | 2    |
+| "Britpop Jazz"            | "Britpop Jazz"                | "style"  | ["Willow Union", "Interlude Demos", "Britpop Jazz"]                   | ["BY", "IS"]  | 2    |
+| "House Jazz"              | "House Jazz"                  | "style"  | ["Willow Union", "Interlude Demos", "House Jazz"]                     | ["BY", "IS"]  | 2    |
+| "6631"                    | "Harbour Assembly Records"    | "label"  | ["Willow Union", "Interlude Demos", "Harbour Assembly Records"]       | ["BY", "ON"]  | 2    |
+| "5010"                    | "Willow Network Records"      | "label"  | ["Willow Union", "Interlude Demos", "Willow Network Records"]         | ["BY", "ON"]  | 2    |
+| "40371"                   | "Lantern Parade"              | "artist" | ["Willow Union", "Dispatches Sessions", "Lantern Parade"]             | ["BY", "BY"]  | 2    |
+| "44513"                   | "Ember Institute"             | "artist" | ["Willow Union", "Nightshift Sessions", "Ember Institute"]            | ["BY", "BY"]  | 2    |
 | "Darkwave Folk"           | "Darkwave Folk"               | "style"  | ["Willow Union", "Horizons Sessions", "Darkwave Folk"]                | ["BY", "IS"]  | 2    |
 | "Fusion Folk"             | "Fusion Folk"                 | "style"  | ["Willow Union", "Horizons Sessions", "Fusion Folk"]                  | ["BY", "IS"]  | 2    |
 | "Minimal Folk"            | "Minimal Folk"                | "style"  | ["Willow Union", "Horizons Sessions", "Minimal Folk"]                 | ["BY", "IS"]  | 2    |
@@ -86,55 +102,39 @@ LIMIT 100;
 | "Chiptune Pop"            | "Chiptune Pop"                | "style"  | ["Willow Union", "Blueprint Remixes", "Chiptune Pop"]                 | ["BY", "IS"]  | 2    |
 | "Noise Folk"              | "Noise Folk"                  | "style"  | ["Willow Union", "Blueprint Remixes", "Noise Folk"]                   | ["BY", "IS"]  | 2    |
 | "8792"                    | "Saffron Machine Records"     | "label"  | ["Willow Union", "Blueprint Remixes", "Saffron Machine Records"]      | ["BY", "ON"]  | 2    |
-| "44513"                   | "Ember Institute"             | "artist" | ["Willow Union", "Nightshift Sessions", "Ember Institute"]            | ["BY", "BY"]  | 2    |
-| "Folk, World, & Country"  | "Folk, World, & Country"      | "genre"  | ["Willow Union", "Nightshift Sessions", "Folk, World, & Country"]     | ["BY", "IS"]  | 2    |
-| "Jazz"                    | "Jazz"                        | "genre"  | ["Willow Union", "Nightshift Sessions", "Jazz"]                       | ["BY", "IS"]  | 2    |
-| "Abstract Jazz"           | "Abstract Jazz"               | "style"  | ["Willow Union", "Nightshift Sessions", "Abstract Jazz"]              | ["BY", "IS"]  | 2    |
-| "Bop Rock"                | "Bop Rock"                    | "style"  | ["Willow Union", "Nightshift Sessions", "Bop Rock"]                   | ["BY", "IS"]  | 2    |
-| "New Wave Techno"         | "New Wave Techno"             | "style"  | ["Willow Union", "Jetstream Reissue", "New Wave Techno"]              | ["BY", "IS"]  | 2    |
-| "423"                     | "Pallas Transmission Records" | "label"  | ["Willow Union", "Resonance Sessions", "Pallas Transmission Records"] | ["BY", "ON"]  | 2    |
 | "18539"                   | "Fathom Highway"              | "artist" | ["Willow Union", "Resonance LP", "Fathom Highway"]                    | ["BY", "BY"]  | 2    |
 | "2514"                    | "Yarrow Registry"             | "artist" | ["Willow Union", "Resonance LP", "Yarrow Registry"]                   | ["BY", "BY"]  | 2    |
 | "83884"                   | "Umber Transmission"          | "artist" | ["Willow Union", "Resonance LP", "Umber Transmission"]                | ["BY", "BY"]  | 2    |
 | "Post Jazz"               | "Post Jazz"                   | "style"  | ["Willow Union", "Resonance LP", "Post Jazz"]                         | ["BY", "IS"]  | 2    |
 | "19868"                   | "Rivet Ensemble Records"      | "label"  | ["Willow Union", "Resonance LP", "Rivet Ensemble Records"]            | ["BY", "ON"]  | 2    |
 | "10190"                   | "Yarrow Assembly Records"     | "label"  | ["Willow Union", "Resonance LP", "Yarrow Assembly Records"]           | ["BY", "ON"]  | 2    |
+| "277"                     | "Quarry Division"             | "artist" | ["Willow Union", "Sediment Sessions", "Quarry Division"]              | ["BY", "BY"]  | 2    |
+| "Lo-Fi Rock"              | "Lo-Fi Rock"                  | "style"  | ["Willow Union", "Sediment Sessions", "Lo-Fi Rock"]                   | ["BY", "IS"]  | 2    |
+| "11701"                   | "Cinder Institute Records"    | "label"  | ["Willow Union", "Sediment Sessions", "Cinder Institute Records"]     | ["BY", "ON"]  | 2    |
 | "9917"                    | "Umber Foundry"               | "artist" | ["Willow Union", "Dispatches Demos", "Umber Foundry"]                 | ["BY", "BY"]  | 2    |
 | "Acoustic Rock"           | "Acoustic Rock"               | "style"  | ["Willow Union", "Dispatches Demos", "Acoustic Rock"]                 | ["BY", "IS"]  | 2    |
 | "Fusion Soul"             | "Fusion Soul"                 | "style"  | ["Willow Union", "Dispatches Demos", "Fusion Soul"]                   | ["BY", "IS"]  | 2    |
 | "14474"                   | "Nectar Vanguard Records"     | "label"  | ["Willow Union", "Dispatches Demos", "Nectar Vanguard Records"]       | ["BY", "ON"]  | 2    |
 | "8"                       | "Cinder Circuit Records"      | "label"  | ["Willow Union", "Dispatches Demos", "Cinder Circuit Records"]        | ["BY", "ON"]  | 2    |
-| "40371"                   | "Lantern Parade"              | "artist" | ["Willow Union", "Dispatches Sessions", "Lantern Parade"]             | ["BY", "BY"]  | 2    |
-| "Soul-Jazz Jazz"          | "Soul-Jazz Jazz"              | "style"  | ["Willow Union", "Dispatches Sessions", "Soul-Jazz Jazz"]             | ["BY", "IS"]  | 2    |
-| "734"                     | "Kestrel Workshop Records"    | "label"  | ["Willow Union", "Dispatches Sessions", "Kestrel Workshop Records"]   | ["BY", "ON"]  | 2    |
-| "1262"                    | "Tundra Ensemble"             | "artist" | ["Willow Union", "Interlude Demos", "Tundra Ensemble"]                | ["BY", "BY"]  | 2    |
-| "117877"                  | "Glass Laboratory"            | "artist" | ["Willow Union", "Interlude Demos", "Glass Laboratory"]               | ["BY", "BY"]  | 2    |
-| "Britpop Jazz"            | "Britpop Jazz"                | "style"  | ["Willow Union", "Interlude Demos", "Britpop Jazz"]                   | ["BY", "IS"]  | 2    |
-| "House Jazz"              | "House Jazz"                  | "style"  | ["Willow Union", "Interlude Demos", "House Jazz"]                     | ["BY", "IS"]  | 2    |
-| "6631"                    | "Harbour Assembly Records"    | "label"  | ["Willow Union", "Interlude Demos", "Harbour Assembly Records"]       | ["BY", "ON"]  | 2    |
-| "5010"                    | "Willow Network Records"      | "label"  | ["Willow Union", "Interlude Demos", "Willow Network Records"]         | ["BY", "ON"]  | 2    |
-| "177"                     | "Tundra Laboratory"           | "artist" | ["Willow Union", "Horizons EP", "Tundra Laboratory"]                  | ["BY", "BY"]  | 2    |
-| "Rock"                    | "Rock"                        | "genre"  | ["Willow Union", "Horizons EP", "Rock"]                               | ["BY", "IS"]  | 2    |
-| "Techno Funk"             | "Techno Funk"                 | "style"  | ["Willow Union", "Horizons EP", "Techno Funk"]                        | ["BY", "IS"]  | 2    |
-| "19465"                   | "Nectar Institute Records"    | "label"  | ["Willow Union", "Horizons EP", "Nectar Institute Records"]           | ["BY", "ON"]  | 2    |
-| "277"                     | "Quarry Division"             | "artist" | ["Willow Union", "Sediment Sessions", "Quarry Division"]              | ["BY", "BY"]  | 2    |
-| "Lo-Fi Rock"              | "Lo-Fi Rock"                  | "style"  | ["Willow Union", "Sediment Sessions", "Lo-Fi Rock"]                   | ["BY", "IS"]  | 2    |
-| "11701"                   | "Cinder Institute Records"    | "label"  | ["Willow Union", "Sediment Sessions", "Cinder Institute Records"]     | ["BY", "ON"]  | 2    |
 | "625"                     | "Rivet Registry"              | "artist" | ["Willow Union", "Threshold Vol. 2", "Rivet Registry"]                | ["BY", "BY"]  | 2    |
 | "36151"                   | "Saffron Ensemble"            | "artist" | ["Willow Union", "Threshold Vol. 2", "Saffron Ensemble"]              | ["BY", "BY"]  | 2    |
 | "Hip Hop"                 | "Hip Hop"                     | "genre"  | ["Willow Union", "Threshold Vol. 2", "Hip Hop"]                       | ["BY", "IS"]  | 2    |
+| "Rock"                    | "Rock"                        | "genre"  | ["Willow Union", "Threshold Vol. 2", "Rock"]                          | ["BY", "IS"]  | 2    |
 | "Free Improvisation Jazz" | "Free Improvisation Jazz"     | "style"  | ["Willow Union", "Threshold Vol. 2", "Free Improvisation Jazz"]       | ["BY", "IS"]  | 2    |
 | "House Pop"               | "House Pop"                   | "style"  | ["Willow Union", "Threshold Vol. 2", "House Pop"]                     | ["BY", "IS"]  | 2    |
 | "Krautrock Folk"          | "Krautrock Folk"              | "style"  | ["Willow Union", "Threshold Vol. 2", "Krautrock Folk"]                | ["BY", "IS"]  | 2    |
 | "2482"                    | "Juniper Society Records"     | "label"  | ["Willow Union", "Threshold Vol. 2", "Juniper Society Records"]       | ["BY", "ON"]  | 2    |
 | "1199"                    | "Delta Division"              | "artist" | ["Willow Union", "Jetstream Demos", "Delta Division"]                 | ["BY", "BY"]  | 2    |
-| "14"                      | "Pallas Network"              | "artist" | ["Willow Union", "Resonance Sessions", "Pallas Network"]              | ["BY", "BY"]  | 2    |
+| "Swing Folk"              | "Swing Folk"                  | "style"  | ["Willow Union", "Jetstream Demos", "Swing Folk"]                     | ["BY", "IS"]  | 2    |
+| "3497"                    | "Vellum Institute Records"    | "label"  | ["Willow Union", "Jetstream Demos", "Vellum Institute Records"]       | ["BY", "ON"]  | 2    |
+| "113657"                  | "Amber Registry"              | "artist" | ["Willow Union", "Longitude Vol. 1", "Amber Registry"]                | ["BY", "BY"]  | 2    |
+| "Children's"              | "Children's"                  | "genre"  | ["Willow Union", "Horizons Demos", "Children's"]                      | ["BY", "IS"]  | 2    |
 +---------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 
 +---------------------------------------------------------------------------------------------------+
 | Plan      | Statement   | Version | Planner | Runtime   | Time | DbHits   | Rows | Memory (Bytes) |
 +---------------------------------------------------------------------------------------------------+
-| "PROFILE" | "READ_ONLY" | "25"    | "COST"  | "SLOTTED" | 3995 | 24902813 | 100  | 6472632        |
+| "PROFILE" | "READ_ONLY" | "25"    | "COST"  | "SLOTTED" | 3876 | 24902813 | 100  | 6472632        |
 +---------------------------------------------------------------------------------------------------+
 
 
@@ -162,13 +162,13 @@ Runtime version 2026.07.1
 | |                     +----+-----------------------------------------------------------------------------------------------+----------------+----------+----------+----------------+------------------------+            +--------------+
 | +CacheProperties      |  2 | cache[discovered.id], cache[discovered.name]                                                  |             37 |      100 |      200 |                |                    0/0 |            |              |
 | |                     +----+-----------------------------------------------------------------------------------------------+----------------+----------+----------+----------------+------------------------+            +--------------+
-| +Top                  |  3 | dist ASC LIMIT 100                                                                            |             37 |      100 |        0 |         451736 |                    0/0 | dist ASC   |              |
+| +Top                  |  3 | dist ASC LIMIT 100                                                                            |             37 |      100 |        0 |         453544 |                    0/0 | dist ASC   |              |
 | |                     +----+-----------------------------------------------------------------------------------------------+----------------+----------+----------+----------------+------------------------+------------+--------------+
 | +Projection           |  4 | best.dist AS dist                                                                             |             37 |     2261 |        0 |                |                    0/0 |            |              |
 | |                     +----+-----------------------------------------------------------------------------------------------+----------------+----------+----------+----------------+------------------------+------------+--------------+
 | +Projection           |  5 | anon_7[$autoint_0] AS best                                                                    |             37 |     2261 |        0 |                |                    0/0 |            |              |
 | |                     +----+-----------------------------------------------------------------------------------------------+----------------+----------+----------+----------------+------------------------+------------+--------------+
-| +EagerAggregation     |  6 | discovered, collect({path_names: path_names, rel_types: rel_types, dist: dist}) AS anon_7     |             37 |     2261 |        0 |        1002936 |                    0/0 |            |              |
+| +EagerAggregation     |  6 | discovered, collect({path_names: path_names, rel_types: rel_types, dist: dist}) AS anon_7     |             37 |     2261 |        0 |        1006608 |                    0/0 |            |              |
 | |                     +----+-----------------------------------------------------------------------------------------------+----------------+----------+----------+----------------+------------------------+------------+--------------+
 | +Projection           |  7 | [n IN nodes((start)-[anon_0*]-(discovered)) | coalesce(n.name, n.title, n.id)] AS path_names, |           1374 |     2723 |    13416 |                |                    0/0 |            |              |
 | |                     |    | [r IN relationships((start)-[anon_0*]-(discovered)) | type(r)] AS rel_types                   |                |          |          |                |                        |            |              |
@@ -179,7 +179,7 @@ Runtime version 2026.07.1
 | |                     +----+-----------------------------------------------------------------------------------------------+----------------+----------+----------+----------------+------------------------+------------+--------------+
 | +Filter               | 10 | discovered:Artist|Label|Genre|Style AND NOT discovered = start                                |           1374 |     2723 | 12443956 |                |                    0/0 |            |              |
 | |                     +----+-----------------------------------------------------------------------------------------------+----------------+----------+----------+----------------+------------------------+------------+--------------+
-| +VarLengthExpand(All) | 11 | (start)-[anon_0:BY|ON|IS|ALIAS_OF|MEMBER_OF|DERIVED_FROM*..3]-(discovered)                    |           3902 | 12443956 | 12444977 |        5507480 |                    0/0 |            |              |
+| +VarLengthExpand(All) | 11 | (start)-[anon_0:BY|ON|IS|ALIAS_OF|MEMBER_OF|DERIVED_FROM*..3]-(discovered)                    |           3902 | 12443956 | 12444977 |        5507512 |                    0/0 |            |              |
 | |                     +----+-----------------------------------------------------------------------------------------------+----------------+----------+----------+----------------+------------------------+------------+--------------+
 | +NodeIndexSeek        | 12 | RANGE INDEX start:Artist(id) WHERE id = $entity_id                                            |              1 |        1 |        2 |                |                    0/0 |            | artist_id: 1 |
 +-----------------------+----+-----------------------------------------------------------------------------------------------+----------------+----------+----------+----------------+------------------------+------------+--------------+
@@ -187,9 +187,9 @@ Runtime version 2026.07.1
 Total database accesses: 24902813, total allocated memory: 6472632
 
 100 rows
-ready to start consuming query after 149 ms, results consumed after another 3846 ms
+ready to start consuming query after 83 ms, results consumed after another 3793 ms
 -- wall clock, one discarded warm-up then 3 timed runs
-ready to start consuming query after 40 ms, results consumed after another 3458 ms
-ready to start consuming query after 1 ms, results consumed after another 3355 ms
-ready to start consuming query after 3 ms, results consumed after another 3401 ms
-ready to start consuming query after 1 ms, results consumed after another 3269 ms
+ready to start consuming query after 43 ms, results consumed after another 3382 ms
+ready to start consuming query after 2 ms, results consumed after another 3433 ms
+ready to start consuming query after 1 ms, results consumed after another 3457 ms
+ready to start consuming query after 1 ms, results consumed after another 3250 ms

@@ -60,7 +60,7 @@ Total database accesses: 66, total allocated memory: 5376
 0 rows
 ready to start consuming query after 1 ms, results consumed after another 1 ms
 -- wall clock, one discarded warm-up then 3 timed runs
-ready to start consuming query after 2 ms, results consumed after another 0 ms
-ready to start consuming query after 2 ms, results consumed after another 2 ms
+ready to start consuming query after 1 ms, results consumed after another 1 ms
 ready to start consuming query after 2 ms, results consumed after another 1 ms
 ready to start consuming query after 2 ms, results consumed after another 0 ms
+ready to start consuming query after 3 ms, results consumed after another 0 ms
