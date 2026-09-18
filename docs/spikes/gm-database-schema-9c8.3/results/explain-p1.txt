@@ -1,0 +1,360 @@
+== p1-naive-cte  a:5665 -> a:1  cap 1
+                                                                                            QUERY PLAN                                                                                             
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=203491.01..203491.01 rows=1 width=68) (actual time=0.488..0.490 rows=0.00 loops=1)
+   Buffers: shared hit=77
+   CTE walk
+     ->  Recursive Union  (cost=0.00..203158.47 rows=13301 width=101) (actual time=0.002..0.438 rows=56.00 loops=1)
+           Storage: Memory  Maximum Storage: 39kB
+           Buffers: shared hit=74
+           ->  Result  (cost=0.00..0.01 rows=1 width=101) (actual time=0.001..0.001 rows=1.00 loops=1)
+           ->  Nested Loop  (cost=0.43..20302.55 rows=1330 width=76) (actual time=0.031..0.211 rows=27.50 loops=2)
+                 Buffers: shared hit=74
+                 ->  WorkTable Scan on walk w  (cost=0.00..0.22 rows=3 width=101) (actual time=0.001..0.001 rows=0.50 loops=2)
+                       Filter: (depth < 1)
+                       Rows Removed by Filter: 28
+                 ->  Append  (cost=0.43..6753.80 rows=699 width=48) (actual time=0.055..0.398 rows=55.00 loops=1)
+                       Buffers: shared hit=74
+                       ->  Index Only Scan using by_artist_pkey on by_artist  (cost=0.43..1.61 rows=1 width=45) (actual time=0.032..0.032 rows=0.00 loops=1)
+                             Index Cond: (release_id = w.key)
+                             Filter: ((w.kind = 'r'::"char") AND (((('a'::"char")::text || ':'::text) || artist_id) <> ALL (w.seen)))
+                             Rows Removed by Filter: 2
+                             Heap Fetches: 0
+                             Index Searches: 1
+                             Buffers: shared hit=4
+                       ->  Index Only Scan using by_artist_reverse on by_artist by_artist_1  (cost=0.43..2.77 rows=1 width=45) (actual time=0.021..0.027 rows=46.00 loops=1)
+                             Index Cond: (artist_id = w.key)
+                             Filter: ((w.kind = 'a'::"char") AND (((('r'::"char")::text || ':'::text) || release_id) <> ALL (w.seen)))
+                             Heap Fetches: 0
+                             Index Searches: 1
+                             Buffers: shared hit=4
+                       ->  Index Only Scan using master_by_artist_pkey on master_by_artist  (cost=0.42..1.60 rows=1 width=45) (actual time=0.019..0.019 rows=0.00 loops=1)
+                             Index Cond: (master_id = w.key)
+                             Filter: ((w.kind = 'm'::"char") AND (((('a'::"char")::text || ':'::text) || artist_id) <> ALL (w.seen)))
+                             Rows Removed by Filter: 1
+                             Heap Fetches: 0
+                             Index Searches: 1
+                             Buffers: shared hit=4
+                       ->  Index Only Scan using master_by_artist_reverse on master_by_artist master_by_artist_1  (cost=0.42..1.80 rows=1 width=45) (actual time=0.011..0.012 rows=7.00 loops=1)
+                             Index Cond: (artist_id = w.key)
+                             Filter: ((w.kind = 'a'::"char") AND (((('m'::"char")::text || ':'::text) || master_id) <> ALL (w.seen)))
+                             Heap Fetches: 0
+                             Index Searches: 1
+                             Buffers: shared hit=4
+                       ->  Index Only Scan using on_label_pkey on on_label  (cost=0.43..1.61 rows=1 width=45) (actual time=0.015..0.015 rows=0.00 loops=1)
+                             Index Cond: (release_id = w.key)
+                             Filter: ((w.kind = 'r'::"char") AND (((('l'::"char")::text || ':'::text) || label_id) <> ALL (w.seen)))
+                             Rows Removed by Filter: 1
+                             Heap Fetches: 0
+                             Index Searches: 1
+                             Buffers: shared hit=4
+                       ->  Index Only Scan using on_label_reverse on on_label on_label_1  (cost=0.43..4.49 rows=1 width=45) (actual time=0.015..0.015 rows=0.00 loops=1)
+                             Index Cond: (label_id = w.key)
+                             Filter: ((w.kind = 'l'::"char") AND (((('r'::"char")::text || ':'::text) || release_id) <> ALL (w.seen)))
+                             Rows Removed by Filter: 61
+                             Heap Fetches: 0
+                             Index Searches: 1
+                             Buffers: shared hit=4
+                       ->  Index Only Scan using in_genre_pkey on in_genre  (cost=0.43..1.61 rows=1 width=49) (actual time=0.023..0.023 rows=0.00 loops=1)
+                             Index Cond: (release_id = w.key)
+                             Filter: ((w.kind = 'r'::"char") AND (((('g'::"char")::text || ':'::text) || genre_name) <> ALL (w.seen)))
+                             Rows Removed by Filter: 2
+                             Heap Fetches: 0
+                             Index Searches: 1
+                             Buffers: shared hit=4
+                       ->  Index Only Scan using in_genre_reverse on in_genre in_genre_1  (cost=0.43..5115.94 rows=521 width=49) (actual time=0.010..0.010 rows=0.00 loops=1)
+                             Index Cond: (genre_name = w.key)
+                             Filter: ((w.kind = 'g'::"char") AND (((('r'::"char")::text || ':'::text) || release_id) <> ALL (w.seen)))
+                             Heap Fetches: 0
+                             Index Searches: 1
+                             Buffers: shared hit=3
+                       ->  Index Only Scan using in_style_pkey on in_style  (cost=0.43..1.65 rows=1 width=53) (actual time=0.012..0.012 rows=0.00 loops=1)
+                             Index Cond: (release_id = w.key)
+                             Filter: ((w.kind = 'r'::"char") AND (((('s'::"char")::text || ':'::text) || style_name) <> ALL (w.seen)))
+                             Rows Removed by Filter: 3
+                             Heap Fetches: 0
+                             Index Searches: 1
+                             Buffers: shared hit=4
+                       ->  Index Only Scan using in_style_reverse on in_style in_style_1  (cost=0.43..255.85 rows=24 width=53) (actual time=0.007..0.007 rows=0.00 loops=1)
+                             Index Cond: (style_name = w.key)
+                             Filter: ((w.kind = 's'::"char") AND (((('r'::"char")::text || ':'::text) || release_id) <> ALL (w.seen)))
+                             Heap Fetches: 0
+                             Index Searches: 1
+                             Buffers: shared hit=3
+                       ->  Index Only Scan using master_in_genre_pkey on master_in_genre  (cost=0.42..1.60 rows=1 width=50) (actual time=0.023..0.023 rows=0.00 loops=1)
+                             Index Cond: (master_id = w.key)
+                             Filter: ((w.kind = 'm'::"char") AND (((('g'::"char")::text || ':'::text) || genre_name) <> ALL (w.seen)))
+                             Rows Removed by Filter: 2
+                             Heap Fetches: 0
+                             Index Searches: 1
+                             Buffers: shared hit=4
+                       ->  Index Only Scan using master_in_genre_reverse on master_in_genre master_in_genre_1  (cost=0.42..1280.89 rows=130 width=50) (actual time=0.016..0.016 rows=0.00 loops=1)
+                             Index Cond: (genre_name = w.key)
+                             Filter: ((w.kind = 'g'::"char") AND (((('m'::"char")::text || ':'::text) || master_id) <> ALL (w.seen)))
+                             Heap Fetches: 0
+                             Index Searches: 1
+                             Buffers: shared hit=3
+                       ->  Index Only Scan using master_in_style_pkey on master_in_style  (cost=0.42..1.65 rows=1 width=53) (actual time=0.023..0.023 rows=0.00 loops=1)
+                             Index Cond: (master_id = w.key)
+                             Filter: ((w.kind = 'm'::"char") AND (((('s'::"char")::text || ':'::text) || style_name) <> ALL (w.seen)))
+                             Rows Removed by Filter: 2
+                             Heap Fetches: 0
+                             Index Searches: 1
+                             Buffers: shared hit=4
+                       ->  Index Only Scan using master_in_style_reverse on master_in_style master_in_style_1  (cost=0.42..64.08 rows=6 width=53) (actual time=0.012..0.012 rows=0.00 loops=1)
+                             Index Cond: (style_name = w.key)
+                             Filter: ((w.kind = 's'::"char") AND (((('m'::"char")::text || ':'::text) || master_id) <> ALL (w.seen)))
+                             Heap Fetches: 0
+                             Index Searches: 1
+                             Buffers: shared hit=3
+                       ->  Index Scan using derived_from_pkey on derived_from  (cost=0.42..2.67 rows=1 width=46) (actual time=0.028..0.028 rows=0.00 loops=1)
+                             Index Cond: (release_id = w.key)
+                             Filter: ((w.kind = 'r'::"char") AND (((('m'::"char")::text || ':'::text) || master_id) <> ALL (w.seen)))
+                             Rows Removed by Filter: 1
+                             Index Searches: 1
+                             Buffers: shared hit=4
+                       ->  Index Only Scan using derived_from_reverse on derived_from derived_from_1  (cost=0.42..1.69 rows=1 width=46) (actual time=0.019..0.019 rows=0.00 loops=1)
+                             Index Cond: (master_id = w.key)
+                             Filter: ((w.kind = 'm'::"char") AND (((('r'::"char")::text || ':'::text) || release_id) <> ALL (w.seen)))
+                             Rows Removed by Filter: 6
+                             Heap Fetches: 0
+                             Index Searches: 1
+                             Buffers: shared hit=4
+                       ->  Index Only Scan using alias_of_pkey on alias_of  (cost=0.29..1.47 rows=1 width=44) (actual time=0.011..0.011 rows=0.00 loops=1)
+                             Index Cond: (alias_artist_id = w.key)
+                             Filter: ((w.kind = 'a'::"char") AND (((('a'::"char")::text || ':'::text) || artist_id) <> ALL (w.seen)))
+                             Heap Fetches: 0
+                             Index Searches: 1
+                             Buffers: shared hit=2
+                       ->  Index Only Scan using alias_of_reverse on alias_of alias_of_1  (cost=0.29..1.47 rows=1 width=44) (actual time=0.010..0.010 rows=0.00 loops=1)
+                             Index Cond: (artist_id = w.key)
+                             Filter: ((w.kind = 'a'::"char") AND (((('a'::"char")::text || ':'::text) || alias_artist_id) <> ALL (w.seen)))
+                             Heap Fetches: 0
+                             Index Searches: 1
+                             Buffers: shared hit=2
+                       ->  Index Only Scan using member_of_pkey on member_of  (cost=0.29..1.47 rows=1 width=44) (actual time=0.019..0.019 rows=0.00 loops=1)
+                             Index Cond: (member_artist_id = w.key)
+                             Filter: ((w.kind = 'a'::"char") AND (((('a'::"char")::text || ':'::text) || group_artist_id) <> ALL (w.seen)))
+                             Heap Fetches: 0
+                             Index Searches: 1
+                             Buffers: shared hit=2
+                       ->  Index Only Scan using member_of_reverse on member_of member_of_1  (cost=0.29..1.47 rows=1 width=44) (actual time=0.020..0.020 rows=1.00 loops=1)
+                             Index Cond: (group_artist_id = w.key)
+                             Filter: ((w.kind = 'a'::"char") AND (((('a'::"char")::text || ':'::text) || member_artist_id) <> ALL (w.seen)))
+                             Heap Fetches: 0
+                             Index Searches: 1
+                             Buffers: shared hit=3
+                       ->  Index Only Scan using mb_member_of_pkey on mb_member_of  (cost=0.29..1.47 rows=1 width=44) (actual time=0.018..0.018 rows=1.00 loops=1)
+                             Index Cond: (member_artist_id = w.key)
+                             Filter: ((w.kind = 'a'::"char") AND (((('a'::"char")::text || ':'::text) || group_artist_id) <> ALL (w.seen)))
+                             Heap Fetches: 0
+                             Index Searches: 1
+                             Buffers: shared hit=3
+                       ->  Index Only Scan using mb_member_of_reverse on mb_member_of mb_member_of_1  (cost=0.29..1.47 rows=1 width=44) (actual time=0.011..0.011 rows=0.00 loops=1)
+                             Index Cond: (group_artist_id = w.key)
+                             Filter: ((w.kind = 'a'::"char") AND (((('a'::"char")::text || ':'::text) || member_artist_id) <> ALL (w.seen)))
+                             Heap Fetches: 0
+                             Index Searches: 1
+                             Buffers: shared hit=2
+   ->  Sort  (cost=332.54..332.54 rows=1 width=68) (actual time=0.486..0.487 rows=0.00 loops=1)
+         Sort Key: walk.depth
+         Sort Method: quicksort  Memory: 25kB
+         Buffers: shared hit=77
+         ->  CTE Scan on walk  (cost=0.00..332.53 rows=1 width=68) (actual time=0.457..0.457 rows=0.00 loops=1)
+               Filter: ((kind = 'a'::"char") AND (key = '1'::text))
+               Rows Removed by Filter: 56
+               Storage: Memory  Maximum Storage: 23kB
+               Buffers: shared hit=74
+ Planning:
+   Buffers: shared hit=680 dirtied=2
+ Planning Time: 2.351 ms
+ Execution Time: 0.694 ms
+(168 rows)
+
+
+== p1-naive-cte  a:5665 -> a:1  cap 2
+                                                                                             QUERY PLAN                                                                                             
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=203491.01..203491.01 rows=1 width=68) (actual time=5.021..5.024 rows=1.00 loops=1)
+   Buffers: shared hit=3422
+   CTE walk
+     ->  Recursive Union  (cost=0.00..203158.47 rows=13301 width=101) (actual time=0.002..4.781 rows=511.00 loops=1)
+           Storage: Memory  Maximum Storage: 103kB
+           Buffers: shared hit=3419
+           ->  Result  (cost=0.00..0.01 rows=1 width=101) (actual time=0.001..0.002 rows=1.00 loops=1)
+           ->  Nested Loop  (cost=0.43..20302.55 rows=1330 width=76) (actual time=0.023..1.539 rows=170.00 loops=3)
+                 Buffers: shared hit=3419
+                 ->  WorkTable Scan on walk w  (cost=0.00..0.22 rows=3 width=101) (actual time=0.004..0.006 rows=18.67 loops=3)
+                       Filter: (depth < 2)
+                       Rows Removed by Filter: 152
+                 ->  Append  (cost=0.43..6753.80 rows=699 width=48) (actual time=0.007..0.079 rows=9.11 loops=56)
+                       Buffers: shared hit=3419
+                       ->  Index Only Scan using by_artist_pkey on by_artist  (cost=0.43..1.61 rows=1 width=45) (actual time=0.004..0.004 rows=1.18 loops=56)
+                             Index Cond: (release_id = w.key)
+                             Filter: ((w.kind = 'r'::"char") AND (((('a'::"char")::text || ':'::text) || artist_id) <> ALL (w.seen)))
+                             Rows Removed by Filter: 1
+                             Heap Fetches: 0
+                             Index Searches: 56
+                             Buffers: shared hit=169
+                       ->  Index Only Scan using by_artist_reverse on by_artist by_artist_1  (cost=0.43..2.77 rows=1 width=45) (actual time=0.004..0.004 rows=1.55 loops=56)
+                             Index Cond: (artist_id = w.key)
+                             Filter: ((w.kind = 'a'::"char") AND (((('r'::"char")::text || ':'::text) || release_id) <> ALL (w.seen)))
+                             Rows Removed by Filter: 2
+                             Heap Fetches: 0
+                             Index Searches: 56
+                             Buffers: shared hit=169
+                       ->  Index Only Scan using master_by_artist_pkey on master_by_artist  (cost=0.42..1.60 rows=1 width=45) (actual time=0.003..0.003 rows=0.18 loops=56)
+                             Index Cond: (master_id = w.key)
+                             Filter: ((w.kind = 'm'::"char") AND (((('a'::"char")::text || ':'::text) || artist_id) <> ALL (w.seen)))
+                             Rows Removed by Filter: 1
+                             Heap Fetches: 0
+                             Index Searches: 56
+                             Buffers: shared hit=169
+                       ->  Index Only Scan using master_by_artist_reverse on master_by_artist master_by_artist_1  (cost=0.42..1.80 rows=1 width=45) (actual time=0.003..0.003 rows=0.29 loops=56)
+                             Index Cond: (artist_id = w.key)
+                             Filter: ((w.kind = 'a'::"char") AND (((('m'::"char")::text || ':'::text) || master_id) <> ALL (w.seen)))
+                             Rows Removed by Filter: 0
+                             Heap Fetches: 0
+                             Index Searches: 56
+                             Buffers: shared hit=169
+                       ->  Index Only Scan using on_label_pkey on on_label  (cost=0.43..1.61 rows=1 width=45) (actual time=0.004..0.004 rows=1.09 loops=56)
+                             Index Cond: (release_id = w.key)
+                             Filter: ((w.kind = 'r'::"char") AND (((('l'::"char")::text || ':'::text) || label_id) <> ALL (w.seen)))
+                             Rows Removed by Filter: 0
+                             Heap Fetches: 0
+                             Index Searches: 56
+                             Buffers: shared hit=169
+                       ->  Index Only Scan using on_label_reverse on on_label on_label_1  (cost=0.43..4.49 rows=1 width=45) (actual time=0.004..0.004 rows=0.00 loops=56)
+                             Index Cond: (label_id = w.key)
+                             Filter: ((w.kind = 'l'::"char") AND (((('r'::"char")::text || ':'::text) || release_id) <> ALL (w.seen)))
+                             Rows Removed by Filter: 4
+                             Heap Fetches: 0
+                             Index Searches: 56
+                             Buffers: shared hit=169
+                       ->  Index Only Scan using in_genre_pkey on in_genre  (cost=0.43..1.61 rows=1 width=49) (actual time=0.004..0.004 rows=1.34 loops=56)
+                             Index Cond: (release_id = w.key)
+                             Filter: ((w.kind = 'r'::"char") AND (((('g'::"char")::text || ':'::text) || genre_name) <> ALL (w.seen)))
+                             Rows Removed by Filter: 0
+                             Heap Fetches: 0
+                             Index Searches: 56
+                             Buffers: shared hit=169
+                       ->  Index Only Scan using in_genre_reverse on in_genre in_genre_1  (cost=0.43..5115.94 rows=521 width=49) (actual time=0.001..0.001 rows=0.00 loops=56)
+                             Index Cond: (genre_name = w.key)
+                             Filter: ((w.kind = 'g'::"char") AND (((('r'::"char")::text || ':'::text) || release_id) <> ALL (w.seen)))
+                             Heap Fetches: 0
+                             Index Searches: 56
+                             Buffers: shared hit=168
+                       ->  Index Only Scan using in_style_pkey on in_style  (cost=0.43..1.65 rows=1 width=53) (actual time=0.004..0.004 rows=1.88 loops=56)
+                             Index Cond: (release_id = w.key)
+                             Filter: ((w.kind = 'r'::"char") AND (((('s'::"char")::text || ':'::text) || style_name) <> ALL (w.seen)))
+                             Rows Removed by Filter: 0
+                             Heap Fetches: 0
+                             Index Searches: 56
+                             Buffers: shared hit=169
+                       ->  Index Only Scan using in_style_reverse on in_style in_style_1  (cost=0.43..255.85 rows=24 width=53) (actual time=0.001..0.001 rows=0.00 loops=56)
+                             Index Cond: (style_name = w.key)
+                             Filter: ((w.kind = 's'::"char") AND (((('r'::"char")::text || ':'::text) || release_id) <> ALL (w.seen)))
+                             Heap Fetches: 0
+                             Index Searches: 56
+                             Buffers: shared hit=168
+                       ->  Index Only Scan using master_in_genre_pkey on master_in_genre  (cost=0.42..1.60 rows=1 width=50) (actual time=0.004..0.004 rows=0.18 loops=56)
+                             Index Cond: (master_id = w.key)
+                             Filter: ((w.kind = 'm'::"char") AND (((('g'::"char")::text || ':'::text) || genre_name) <> ALL (w.seen)))
+                             Rows Removed by Filter: 1
+                             Heap Fetches: 0
+                             Index Searches: 56
+                             Buffers: shared hit=169
+                       ->  Index Only Scan using master_in_genre_reverse on master_in_genre master_in_genre_1  (cost=0.42..1280.89 rows=130 width=50) (actual time=0.001..0.001 rows=0.00 loops=56)
+                             Index Cond: (genre_name = w.key)
+                             Filter: ((w.kind = 'g'::"char") AND (((('m'::"char")::text || ':'::text) || master_id) <> ALL (w.seen)))
+                             Heap Fetches: 0
+                             Index Searches: 56
+                             Buffers: shared hit=168
+                       ->  Index Only Scan using master_in_style_pkey on master_in_style  (cost=0.42..1.65 rows=1 width=53) (actual time=0.003..0.004 rows=0.23 loops=56)
+                             Index Cond: (master_id = w.key)
+                             Filter: ((w.kind = 'm'::"char") AND (((('s'::"char")::text || ':'::text) || style_name) <> ALL (w.seen)))
+                             Rows Removed by Filter: 1
+                             Heap Fetches: 0
+                             Index Searches: 56
+                             Buffers: shared hit=169
+                       ->  Index Only Scan using master_in_style_reverse on master_in_style master_in_style_1  (cost=0.42..64.08 rows=6 width=53) (actual time=0.001..0.001 rows=0.00 loops=56)
+                             Index Cond: (style_name = w.key)
+                             Filter: ((w.kind = 's'::"char") AND (((('m'::"char")::text || ':'::text) || master_id) <> ALL (w.seen)))
+                             Heap Fetches: 0
+                             Index Searches: 56
+                             Buffers: shared hit=168
+                       ->  Index Scan using derived_from_pkey on derived_from  (cost=0.42..2.67 rows=1 width=46) (actual time=0.010..0.010 rows=0.59 loops=56)
+                             Index Cond: (release_id = w.key)
+                             Filter: ((w.kind = 'r'::"char") AND (((('m'::"char")::text || ':'::text) || master_id) <> ALL (w.seen)))
+                             Rows Removed by Filter: 0
+                             Index Searches: 56
+                             Buffers: shared hit=210
+                       ->  Index Only Scan using derived_from_reverse on derived_from derived_from_1  (cost=0.42..1.69 rows=1 width=46) (actual time=0.004..0.004 rows=0.29 loops=56)
+                             Index Cond: (master_id = w.key)
+                             Filter: ((w.kind = 'm'::"char") AND (((('r'::"char")::text || ':'::text) || release_id) <> ALL (w.seen)))
+                             Rows Removed by Filter: 1
+                             Heap Fetches: 0
+                             Index Searches: 56
+                             Buffers: shared hit=169
+                       ->  Index Only Scan using alias_of_pkey on alias_of  (cost=0.29..1.47 rows=1 width=44) (actual time=0.003..0.003 rows=0.05 loops=56)
+                             Index Cond: (alias_artist_id = w.key)
+                             Filter: ((w.kind = 'a'::"char") AND (((('a'::"char")::text || ':'::text) || artist_id) <> ALL (w.seen)))
+                             Rows Removed by Filter: 0
+                             Heap Fetches: 0
+                             Index Searches: 56
+                             Buffers: shared hit=113
+                       ->  Index Only Scan using alias_of_reverse on alias_of alias_of_1  (cost=0.29..1.47 rows=1 width=44) (actual time=0.003..0.003 rows=0.05 loops=56)
+                             Index Cond: (artist_id = w.key)
+                             Filter: ((w.kind = 'a'::"char") AND (((('a'::"char")::text || ':'::text) || alias_artist_id) <> ALL (w.seen)))
+                             Heap Fetches: 0
+                             Index Searches: 56
+                             Buffers: shared hit=113
+                       ->  Index Only Scan using member_of_pkey on member_of  (cost=0.29..1.47 rows=1 width=44) (actual time=0.003..0.003 rows=0.04 loops=56)
+                             Index Cond: (member_artist_id = w.key)
+                             Filter: ((w.kind = 'a'::"char") AND (((('a'::"char")::text || ':'::text) || group_artist_id) <> ALL (w.seen)))
+                             Rows Removed by Filter: 0
+                             Heap Fetches: 0
+                             Index Searches: 56
+                             Buffers: shared hit=113
+                       ->  Index Only Scan using member_of_reverse on member_of member_of_1  (cost=0.29..1.47 rows=1 width=44) (actual time=0.003..0.003 rows=0.04 loops=56)
+                             Index Cond: (group_artist_id = w.key)
+                             Filter: ((w.kind = 'a'::"char") AND (((('a'::"char")::text || ':'::text) || member_artist_id) <> ALL (w.seen)))
+                             Rows Removed by Filter: 0
+                             Heap Fetches: 0
+                             Index Searches: 56
+                             Buffers: shared hit=113
+                       ->  Index Only Scan using mb_member_of_pkey on mb_member_of  (cost=0.29..1.47 rows=1 width=44) (actual time=0.003..0.003 rows=0.14 loops=56)
+                             Index Cond: (member_artist_id = w.key)
+                             Filter: ((w.kind = 'a'::"char") AND (((('a'::"char")::text || ':'::text) || group_artist_id) <> ALL (w.seen)))
+                             Heap Fetches: 0
+                             Index Searches: 56
+                             Buffers: shared hit=113
+                       ->  Index Only Scan using mb_member_of_reverse on mb_member_of mb_member_of_1  (cost=0.29..1.47 rows=1 width=44) (actual time=0.003..0.003 rows=0.00 loops=56)
+                             Index Cond: (group_artist_id = w.key)
+                             Filter: ((w.kind = 'a'::"char") AND (((('a'::"char")::text || ':'::text) || member_artist_id) <> ALL (w.seen)))
+                             Rows Removed by Filter: 0
+                             Heap Fetches: 0
+                             Index Searches: 56
+                             Buffers: shared hit=113
+   ->  Sort  (cost=332.54..332.54 rows=1 width=68) (actual time=5.020..5.020 rows=1.00 loops=1)
+         Sort Key: walk.depth
+         Sort Method: quicksort  Memory: 25kB
+         Buffers: shared hit=3422
+         ->  CTE Scan on walk  (cost=0.00..332.53 rows=1 width=68) (actual time=3.163..4.992 rows=1.00 loops=1)
+               Filter: ((kind = 'a'::"char") AND (key = '1'::text))
+               Rows Removed by Filter: 510
+               Storage: Memory  Maximum Storage: 87kB
+               Buffers: shared hit=3419
+ Planning:
+   Buffers: shared hit=678
+ Planning Time: 2.394 ms
+ Execution Time: 5.422 ms
+(174 rows)
+
+
+== p1-naive-cte  a:5665 -> a:1  cap 3
+ERROR:  temporary file size exceeds "temp_file_limit" (524288kB)
+
+== p1-naive-cte  a:5665 -> a:1  cap 4
+ERROR:  temporary file size exceeds "temp_file_limit" (524288kB)
+
