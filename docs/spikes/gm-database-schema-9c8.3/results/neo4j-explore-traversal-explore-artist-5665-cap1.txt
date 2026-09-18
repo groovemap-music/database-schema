@@ -1,0 +1,97 @@
+== explore-traversal  explore-artist-5665  cap 1
+:param entity_id => '5665';
+// get_explore_traversal, verbatim from api/queries/recommend_queries.py:403,
+// with `hops` filled in. Like `max_depth` above it is interpolated, not bound.
+//
+// 1
+MATCH (start:Artist {id: $entity_id})
+MATCH path = (start)-[:BY|ON|IS|ALIAS_OF|MEMBER_OF|DERIVED_FROM*1..1]-(discovered)
+WHERE discovered <> start
+  AND (discovered:Artist OR discovered:Label OR discovered:Genre OR discovered:Style)
+WITH discovered,
+     [n IN nodes(path) | coalesce(n.name, n.title, n.id)] AS path_names,
+     [r IN relationships(path) | type(r)] AS rel_types,
+     length(path) AS dist
+ORDER BY dist
+WITH discovered, collect({path_names: path_names, rel_types: rel_types, dist: dist})[0] AS best
+RETURN coalesce(discovered.id, discovered.name) AS id,
+       coalesce(discovered.name, discovered.id) AS name,
+       CASE
+         WHEN discovered:Artist THEN 'artist'
+         WHEN discovered:Label THEN 'label'
+         WHEN discovered:Genre THEN 'genre'
+         WHEN discovered:Style THEN 'style'
+       END AS type,
+       best.path_names AS path_names, best.rel_types AS rel_types, best.dist AS dist
+ORDER BY best.dist
+LIMIT 100;
+-- PROFILE
++-----------------------------------------------------------------------------------------------------+
+| id      | name              | type     | path_names                          | rel_types     | dist |
++-----------------------------------------------------------------------------------------------------+
+| "15972" | "Xenon Assembly"  | "artist" | ["Willow Union", "Xenon Assembly"]  | ["MEMBER_OF"] | 1    |
+| "9458"  | "Saffron Network" | "artist" | ["Willow Union", "Saffron Network"] | ["MEMBER_OF"] | 1    |
++-----------------------------------------------------------------------------------------------------+
+
++-------------------------------------------------------------------------------------------------+
+| Plan      | Statement   | Version | Planner | Runtime   | Time | DbHits | Rows | Memory (Bytes) |
++-------------------------------------------------------------------------------------------------+
+| "PROFILE" | "READ_ONLY" | "25"    | "COST"  | "SLOTTED" | 287  | 123    | 2    | 4616           |
++-------------------------------------------------------------------------------------------------+
+
+
+Cypher 25
+
+Planner COST
+
+Runtime SLOTTED
+
+Runtime version 2026.07.1
+
++-----------------------+----+-----------------------------------------------------------------------------------------------+----------------+------+---------+----------------+------------------------+------------+--------------+
+| Operator              | Id | Details                                                                                       | Estimated Rows | Rows | DB Hits | Memory (Bytes) | Page Cache Hits/Misses | Ordered by | Indexes Used |
++-----------------------+----+-----------------------------------------------------------------------------------------------+----------------+------+---------+----------------+------------------------+------------+--------------+
+| +ProduceResults       |  0 | id, name, type, path_names, rel_types, dist                                                   |              1 |    2 |       0 |              0 |                    0/0 |            |              |
+| |                     +----+-----------------------------------------------------------------------------------------------+----------------+------+---------+----------------+------------------------+            +--------------+
+| +Projection           |  1 | coalesce(cache[discovered.id], cache[discovered.name]) AS id, best.path_names AS path_names,  |              1 |    2 |       2 |                |                    0/0 |            |              |
+| |                     |    | coalesce(cache[discovered.name], cache[discovered.id]) AS name, best.rel_types AS rel_types,  |                |      |         |                |                        |            |              |
+| |                     |    | CASE                                                                                          |                |      |         |                |                        |            |              |
+| |                     |    |   WHEN discovered:Artist THEN $autostring_1                                                   |                |      |         |                |                        |            |              |
+| |                     |    |   WHEN discovered:Label THEN $autostring_2                                                    |                |      |         |                |                        |            |              |
+| |                     |    |   WHEN discovered:Genre THEN $autostring_3                                                    |                |      |         |                |                        |            |              |
+| |                     |    |   WHEN discovered:Style THEN $autostring_4                                                    |                |      |         |                |                        |            |              |
+| |                     |    | END AS type                                                                                   |                |      |         |                |                        |            |              |
+| |                     +----+-----------------------------------------------------------------------------------------------+----------------+------+---------+----------------+------------------------+            +--------------+
+| +CacheProperties      |  2 | cache[discovered.id], cache[discovered.name]                                                  |              1 |    2 |       4 |                |                    0/0 |            |              |
+| |                     +----+-----------------------------------------------------------------------------------------------+----------------+------+---------+----------------+------------------------+            +--------------+
+| +Top                  |  3 | dist ASC LIMIT 100                                                                            |              1 |    2 |       0 |           4056 |                    0/0 | dist ASC   |              |
+| |                     +----+-----------------------------------------------------------------------------------------------+----------------+------+---------+----------------+------------------------+------------+--------------+
+| +Projection           |  4 | best.dist AS dist                                                                             |              1 |    2 |       0 |                |                    0/0 |            |              |
+| |                     +----+-----------------------------------------------------------------------------------------------+----------------+------+---------+----------------+------------------------+------------+--------------+
+| +Projection           |  5 | anon_7[$autoint_0] AS best                                                                    |              1 |    2 |       0 |                |                    0/0 |            |              |
+| |                     +----+-----------------------------------------------------------------------------------------------+----------------+------+---------+----------------+------------------------+------------+--------------+
+| +EagerAggregation     |  6 | discovered, collect({path_names: path_names, rel_types: rel_types, dist: dist}) AS anon_7     |              1 |    2 |       0 |           1576 |                    0/0 |            |              |
+| |                     +----+-----------------------------------------------------------------------------------------------+----------------+------+---------+----------------+------------------------+------------+--------------+
+| +Projection           |  7 | [n IN nodes((start)-[anon_0*]-(discovered)) | coalesce(n.name, n.title, n.id)] AS path_names, |              1 |    2 |       4 |                |                    0/0 |            |              |
+| |                     |    | [r IN relationships((start)-[anon_0*]-(discovered)) | type(r)] AS rel_types                   |                |      |         |                |                        |            |              |
+| |                     +----+-----------------------------------------------------------------------------------------------+----------------+------+---------+----------------+------------------------+            +--------------+
+| +Sort                 |  8 | dist ASC                                                                                      |              1 |    2 |       0 |           1592 |                    0/0 | dist ASC   |              |
+| |                     +----+-----------------------------------------------------------------------------------------------+----------------+------+---------+----------------+------------------------+------------+--------------+
+| +Projection           |  9 | length((start)-[anon_0*]-(discovered)) AS dist                                                |              1 |    2 |       0 |                |                    0/0 |            |              |
+| |                     +----+-----------------------------------------------------------------------------------------------+----------------+------+---------+----------------+------------------------+------------+--------------+
+| +Filter               | 10 | discovered:Artist|Label|Genre|Style AND NOT discovered = start                                |              1 |    2 |      55 |                |                    0/0 |            |              |
+| |                     +----+-----------------------------------------------------------------------------------------------+----------------+------+---------+----------------+------------------------+------------+--------------+
+| +VarLengthExpand(All) | 11 | (start)-[anon_0:BY|ON|IS|ALIAS_OF|MEMBER_OF|DERIVED_FROM]-(discovered)                        |             21 |   55 |      56 |           1336 |                    0/0 |            |              |
+| |                     +----+-----------------------------------------------------------------------------------------------+----------------+------+---------+----------------+------------------------+------------+--------------+
+| +NodeIndexSeek        | 12 | RANGE INDEX start:Artist(id) WHERE id = $entity_id                                            |              1 |    1 |       2 |                |                    0/0 |            | artist_id: 1 |
++-----------------------+----+-----------------------------------------------------------------------------------------------+----------------+------+---------+----------------+------------------------+------------+--------------+
+
+Total database accesses: 123, total allocated memory: 4616
+
+2 rows
+ready to start consuming query after 272 ms, results consumed after another 15 ms
+-- wall clock, one discarded warm-up then 3 timed runs
+ready to start consuming query after 51 ms, results consumed after another 2 ms
+ready to start consuming query after 2 ms, results consumed after another 1 ms
+ready to start consuming query after 1 ms, results consumed after another 2 ms
+ready to start consuming query after 2 ms, results consumed after another 1 ms
