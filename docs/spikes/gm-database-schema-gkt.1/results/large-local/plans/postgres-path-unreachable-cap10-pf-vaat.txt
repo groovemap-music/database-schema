@@ -1,0 +1,9 @@
+== postgres  path/unreachable-cap10/pf-vaat  depth 10
+
+Function Scan on pf.find_path  (cost=0.25..0.26 rows=1 width=61) (actual time=3.734..3.735 rows=1.00 loops=1)
+  Output: found, depth, expanded, probes, seen_rows, levels
+  Function Call: pf.find_path('a'::"char", '5665'::text, 'a'::"char", '103111'::text, 10)
+  Buffers: shared hit=626 read=2 dirtied=5 written=3
+  I/O Timings: shared read=0.032 write=0.022
+Planning Time: 0.030 ms
+Execution Time: 3.744 ms

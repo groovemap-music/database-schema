@@ -1,0 +1,129 @@
+== gm-database-schema-gkt.1 — pf.explore with and without its row limit
+==
+== The bounded figure is measured by bench/runner.py over 30 iterations.
+== This is the unbounded companion: the same traversal with _limit NULL,
+== which is also the query the answer-equality check runs. Three
+== repetitions, because at three hops it is tens of seconds and thirty
+== would be a quarter of an hour to sharpen a figure whose point is its
+== order of magnitude.
+
+---------------- *1..2 unbounded, repetition 1
+                                                      QUERY PLAN                                                       
+-----------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=12.75..12.76 rows=1 width=8) (actual time=47.131..47.131 rows=1.00 loops=1)
+   Buffers: shared hit=6791 read=297 dirtied=17 written=15
+   I/O Timings: shared read=6.072 write=0.141
+   ->  Function Scan on explore  (cost=0.25..10.25 rows=1000 width=0) (actual time=47.105..47.116 rows=270.00 loops=1)
+         Buffers: shared hit=6791 read=297 dirtied=17 written=15
+         I/O Timings: shared read=6.072 write=0.141
+ Planning:
+   Buffers: shared hit=3
+ Planning Time: 0.077 ms
+ Execution Time: 47.472 ms
+(10 rows)
+
+---------------- *1..2 unbounded, repetition 2
+                                                      QUERY PLAN                                                       
+-----------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=12.75..12.76 rows=1 width=8) (actual time=37.856..37.856 rows=1.00 loops=1)
+   Buffers: shared hit=7084 read=2 dirtied=15 written=15
+   I/O Timings: shared read=0.040 write=0.132
+   ->  Function Scan on explore  (cost=0.25..10.25 rows=1000 width=0) (actual time=37.831..37.841 rows=270.00 loops=1)
+         Buffers: shared hit=7084 read=2 dirtied=15 written=15
+         I/O Timings: shared read=0.040 write=0.132
+ Planning:
+   Buffers: shared hit=3
+ Planning Time: 0.072 ms
+ Execution Time: 38.251 ms
+(10 rows)
+
+---------------- *1..2 unbounded, repetition 3
+                                                      QUERY PLAN                                                       
+-----------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=12.75..12.76 rows=1 width=8) (actual time=38.383..38.384 rows=1.00 loops=1)
+   Buffers: shared hit=7084 read=2 dirtied=15 written=15
+   I/O Timings: shared read=0.044 write=0.164
+   ->  Function Scan on explore  (cost=0.25..10.25 rows=1000 width=0) (actual time=38.358..38.368 rows=270.00 loops=1)
+         Buffers: shared hit=7084 read=2 dirtied=15 written=15
+         I/O Timings: shared read=0.044 write=0.164
+ Planning:
+   Buffers: shared hit=3
+ Planning Time: 0.066 ms
+ Execution Time: 38.650 ms
+(10 rows)
+
+---------------- *1..2 BOUNDED at 100, for the comparison
+                                                      QUERY PLAN                                                       
+-----------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=12.75..12.76 rows=1 width=8) (actual time=21.346..21.347 rows=1.00 loops=1)
+   Buffers: shared hit=3621 read=3 dirtied=6 written=7
+   I/O Timings: shared read=0.358 write=0.045
+   ->  Function Scan on explore  (cost=0.25..10.25 rows=1000 width=0) (actual time=21.335..21.340 rows=100.00 loops=1)
+         Buffers: shared hit=3621 read=3 dirtied=6 written=7
+         I/O Timings: shared read=0.358 write=0.045
+ Planning:
+   Buffers: shared hit=3
+ Planning Time: 0.068 ms
+ Execution Time: 21.628 ms
+(10 rows)
+
+---------------- *1..3 unbounded, repetition 1
+                                                          QUERY PLAN                                                          
+------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=12.75..12.76 rows=1 width=8) (actual time=27025.979..27025.980 rows=1.00 loops=1)
+   Buffers: shared hit=19653447 read=1470 dirtied=22426 written=22426
+   I/O Timings: shared read=13.960 write=154.604
+   ->  Function Scan on explore  (cost=0.25..10.25 rows=1000 width=0) (actual time=27025.783..27025.871 rows=2261.00 loops=1)
+         Buffers: shared hit=19653447 read=1470 dirtied=22426 written=22426
+         I/O Timings: shared read=13.960 write=154.604
+ Planning:
+   Buffers: shared hit=3
+ Planning Time: 0.071 ms
+ Execution Time: 27026.300 ms
+(10 rows)
+
+---------------- *1..3 unbounded, repetition 2
+                                                          QUERY PLAN                                                          
+------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=12.75..12.76 rows=1 width=8) (actual time=27136.766..27136.767 rows=1.00 loops=1)
+   Buffers: shared hit=19654912 read=2 dirtied=22426 written=22426
+   I/O Timings: shared read=0.025 write=164.138
+   ->  Function Scan on explore  (cost=0.25..10.25 rows=1000 width=0) (actual time=27136.557..27136.643 rows=2261.00 loops=1)
+         Buffers: shared hit=19654912 read=2 dirtied=22426 written=22426
+         I/O Timings: shared read=0.025 write=164.138
+ Planning:
+   Buffers: shared hit=3
+ Planning Time: 0.083 ms
+ Execution Time: 27137.090 ms
+(10 rows)
+
+---------------- *1..3 unbounded, repetition 3
+                                                          QUERY PLAN                                                          
+------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=12.75..12.76 rows=1 width=8) (actual time=26889.881..26889.881 rows=1.00 loops=1)
+   Buffers: shared hit=19654912 read=2 dirtied=22426 written=22426
+   I/O Timings: shared read=0.038 write=145.876
+   ->  Function Scan on explore  (cost=0.25..10.25 rows=1000 width=0) (actual time=26889.685..26889.770 rows=2261.00 loops=1)
+         Buffers: shared hit=19654912 read=2 dirtied=22426 written=22426
+         I/O Timings: shared read=0.038 write=145.876
+ Planning:
+   Buffers: shared hit=3
+ Planning Time: 0.068 ms
+ Execution Time: 26890.189 ms
+(10 rows)
+
+---------------- *1..3 BOUNDED at 100, for the comparison
+                                                      QUERY PLAN                                                       
+-----------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=12.75..12.76 rows=1 width=8) (actual time=18.840..18.840 rows=1.00 loops=1)
+   Buffers: shared hit=3617 read=2 dirtied=14 written=8
+   I/O Timings: shared read=0.019 write=0.113
+   ->  Function Scan on explore  (cost=0.25..10.25 rows=1000 width=0) (actual time=18.830..18.834 rows=100.00 loops=1)
+         Buffers: shared hit=3617 read=2 dirtied=14 written=8
+         I/O Timings: shared read=0.019 write=0.113
+ Planning:
+   Buffers: shared hit=3
+ Planning Time: 0.072 ms
+ Execution Time: 19.148 ms
+(10 rows)
+

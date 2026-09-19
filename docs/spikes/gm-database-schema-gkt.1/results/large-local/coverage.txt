@@ -1,0 +1,56 @@
+== gm-database-schema-gkt.1 — exhaustive breadth-first search from the seed
+==
+== Re-measured rather than inherited from gm-database-schema-9c8.3,
+== because the recommendation of a depth cap of 4 rests on it.
+
+-- level profile out of artist 5665, every vertex kind
+ depth | kind | vertices 
+-------+------+----------
+     0 | a    |        1
+     1 | a    |        2
+     1 | m    |        7
+     1 | r    |       46
+     2 | a    |       92
+     2 | g    |       15
+     2 | l    |       61
+     2 | m    |       42
+     2 | r    |       57
+     2 | s    |      100
+     3 | a    |     1771
+     3 | l    |       81
+     3 | m    |   249951
+     3 | r    |   999897
+     3 | s    |      139
+     4 | a    |   118129
+     4 | l    |    19858
+     4 | s    |      201
+(18 rows)
+
+-- the same, collapsed, with the running total
+ depth | vertices | cumulative 
+-------+----------+------------
+     0 |        1 |          1
+     1 |       55 |         56
+     2 |      367 |        423
+     3 |  1251839 |    1252262
+     4 |   138188 |    1390450
+(5 rows)
+
+-- how much of the traversal surface that is
+ reached | vertices_with_an_edge | eccentricity_of_artist_5665 
+---------+-----------------------+-----------------------------
+ 1390450 |               1390450 |                           4
+(1 row)
+
+-- and the rim root the distance-5 and distance-6 cases start from
+ depth | artists 
+-------+---------
+     0 |       1
+     1 |       0
+     2 |       2
+     3 |       1
+     4 |   93757
+     5 |   25677
+     6 |     557
+(7 rows)
+

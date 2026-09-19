@@ -1,0 +1,9 @@
+== postgres  path/unreachable-cap4/pf-vaat-deg  depth 4
+
+Function Scan on pf.find_path_deg  (cost=0.25..0.26 rows=1 width=61) (actual time=3.387..3.387 rows=1.00 loops=1)
+  Output: found, depth, expanded, probes, seen_rows, levels
+  Function Call: pf.find_path_deg('a'::"char", '5665'::text, 'a'::"char", '103111'::text, 4)
+  Buffers: shared hit=305 read=2 dirtied=5 written=3
+  I/O Timings: shared read=0.035 write=0.019
+Planning Time: 0.031 ms
+Execution Time: 3.396 ms

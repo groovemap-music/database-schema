@@ -1,0 +1,53 @@
+{
+  "scale": "large",
+  "mode": "local",
+  "answers_match": true,
+  "disagreements": [],
+  "gate_p95_ms": 1000.0,
+  "path": {
+    "pf-vaat": {
+      "worst_p95_ms": 1939.901,
+      "over_gate": [
+        {
+          "workload": "path/d5-artist-artist/pf-vaat",
+          "p95_ms": 1939.901,
+          "case": "d5-artist-artist"
+        },
+        {
+          "workload": "path/d6-artist-artist/pf-vaat",
+          "p95_ms": 1761.013,
+          "case": "d6-artist-artist"
+        }
+      ],
+      "path_go": false,
+      "go": false
+    },
+    "pf-vaat-deg": {
+      "worst_p95_ms": 2246.436,
+      "over_gate": [
+        {
+          "workload": "path/d6-artist-artist/pf-vaat-deg",
+          "p95_ms": 2246.436,
+          "case": "d6-artist-artist"
+        }
+      ],
+      "path_go": false,
+      "go": false
+    }
+  },
+  "explore": {
+    "worst_p95_ms": 17.285,
+    "over_gate": [],
+    "go": true
+  },
+  "variants_passing": [],
+  "measured_ceiling": {
+    "variant": "pf-vaat",
+    "worst_p95_ms": 1939.901,
+    "cases_over_gate": [
+      "d5-artist-artist",
+      "d6-artist-artist"
+    ]
+  },
+  "go": false
+}

@@ -1,0 +1,24 @@
+scale: fixture   heap: 2G   pagecache: 2G   image: neo4j:2026-community@sha256:dbc377fb9cd8fe8dabc19d3041b197d5ca0ef8bae514cea175b8df265e5b7a76
+name, versions, edition
+"Neo4j Kernel", ["2026.07.1"], "community"
+"Cypher", ["5", "25"], ""
+label, nodes
+"Artist", 1500
+"Genre", 15
+"Label", 300
+"Master", 1800
+"Release", 5000
+"Style", 440
+type, rels
+"ALIAS_OF", 286
+"BY", 12361
+"COLLABORATED_WITH", 506
+"DERIVED_FROM", 3456
+"FOUNDER_OF", 479
+"IS", 26564
+"MEMBER_OF", 775
+"ON", 6626
+"SIBLING_OF", 480
+"SUPPORTING_MUSICIAN", 528
+"TRIBUTE_TO", 477
+"VOICE_ACTOR_FOR", 452

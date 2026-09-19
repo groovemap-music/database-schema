@@ -1,0 +1,263 @@
+== gm-database-schema-gkt.1 — the cost of expanding ONE hub vertex
+==
+== The highest-degree vertex in the traversal surface, scanned and then
+== scanned-and-inserted, which is what pf.find_path does per frontier
+== vertex. Three repetitions of each so the figure is not one sample.
+
+ kind |      key       |  deg   
+------+----------------+--------
+ g    | Stage & Screen | 137653
+ g    | Hip Hop        | 137505
+ g    | Funk / Soul    | 137256
+ g    | Pop            | 137222
+ g    | Reggae         | 137196
+(5 rows)
+
+---------------- repetition 1: SCAN ONLY (the touch probe's access path)
+                                                                                         QUERY PLAN                                                                                         
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Finalize Aggregate  (cost=4084.14..4084.15 rows=1 width=8) (actual time=23.199..23.311 rows=1.00 loops=1)
+   Buffers: shared hit=476 read=236
+   I/O Timings: shared read=2.752
+   InitPlan expr_1
+     ->  Limit  (cost=2.47..2.47 rows=1 width=14) (actual time=0.156..0.157 rows=1.00 loops=1)
+           Buffers: shared hit=24
+           ->  Sort  (cost=2.47..2.47 rows=1 width=14) (actual time=0.155..0.155 rows=1.00 loops=1)
+                 Sort Key: degree.deg DESC, degree.key
+                 Sort Method: top-N heapsort  Memory: 25kB
+                 Buffers: shared hit=24
+                 ->  Index Scan using degree_pkey on degree  (cost=0.43..2.46 rows=1 width=14) (actual time=0.033..0.126 rows=15.00 loops=1)
+                       Index Cond: (kind = 'g'::"char")
+                       Index Searches: 1
+                       Buffers: shared hit=18
+   ->  Gather  (cost=4081.46..4081.67 rows=2 width=8) (actual time=20.830..23.295 rows=3.00 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         Buffers: shared hit=476 read=236
+         I/O Timings: shared read=2.752
+         ->  Partial Aggregate  (cost=3081.46..3081.47 rows=1 width=8) (actual time=16.581..16.582 rows=1.00 loops=3)
+               Buffers: shared hit=452 read=236
+               I/O Timings: shared read=2.752
+               ->  Parallel Append  (cost=0.42..2938.63 rows=57129 width=0) (actual time=0.087..14.103 rows=45884.33 loops=3)
+                     Buffers: shared hit=452 read=236
+                     I/O Timings: shared read=2.752
+                     ->  Parallel Index Only Scan using in_genre_reverse on in_genre  (cost=0.43..2082.53 rows=45682 width=0) (actual time=0.084..10.475 rows=36664.67 loops=3)
+                           Index Cond: (genre_name = (InitPlan expr_1).col1)
+                           Heap Fetches: 0
+                           Index Searches: 1
+                           Buffers: shared hit=312 read=236
+                           I/O Timings: shared read=2.752
+                     ->  Parallel Index Only Scan using master_in_genre_reverse on master_in_genre  (cost=0.42..570.46 rows=16160 width=0) (actual time=0.067..3.272 rows=27659.00 loops=1)
+                           Index Cond: (genre_name = (InitPlan expr_1).col1)
+                           Heap Fetches: 0
+                           Index Searches: 1
+                           Buffers: shared hit=140
+ Planning:
+   Buffers: shared hit=512
+ Planning Time: 1.878 ms
+ Execution Time: 23.405 ms
+(40 rows)
+
+---------------- repetition 1: SCAN AND INSERT (the expansion)
+                                                                                  QUERY PLAN                                                                                  
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Insert on seen  (cost=2.90..5464.76 rows=0 width=0) (actual time=1349.258..1349.260 rows=0.00 loops=1)
+   Conflict Resolution: NOTHING
+   Conflict Arbiter Indexes: seen_pkey
+   Tuples Inserted: 137653
+   Conflicting Tuples: 0
+   Buffers: shared hit=1154578 read=2 dirtied=2024 written=2025
+   I/O Timings: shared read=0.048 write=13.734
+   InitPlan expr_1
+     ->  Limit  (cost=2.47..2.47 rows=1 width=14) (actual time=0.175..0.175 rows=1.00 loops=1)
+           Buffers: shared hit=24
+           ->  Sort  (cost=2.47..2.47 rows=1 width=14) (actual time=0.174..0.174 rows=1.00 loops=1)
+                 Sort Key: degree.deg DESC, degree.key
+                 Sort Method: top-N heapsort  Memory: 25kB
+                 Buffers: shared hit=24
+                 ->  Index Scan using degree_pkey on degree  (cost=0.43..2.46 rows=1 width=14) (actual time=0.042..0.138 rows=15.00 loops=1)
+                       Index Cond: (kind = 'g'::"char")
+                       Index Searches: 1
+                       Buffers: shared hit=18
+   ->  Result  (cost=0.43..5462.29 rows=137109 width=78) (actual time=0.226..40.655 rows=137653.00 loops=1)
+         Buffers: shared hit=709
+         ->  Append  (cost=0.43..4091.20 rows=137109 width=39) (actual time=0.225..28.236 rows=137653.00 loops=1)
+               Buffers: shared hit=709
+               ->  Index Only Scan using in_genre_reverse on in_genre  (cost=0.43..2722.07 rows=109637 width=39) (actual time=0.225..15.211 rows=109994.00 loops=1)
+                     Index Cond: (genre_name = (InitPlan expr_1).col1)
+                     Heap Fetches: 0
+                     Index Searches: 1
+                     Buffers: shared hit=569
+               ->  Index Only Scan using master_in_genre_reverse on master_in_genre  (cost=0.42..683.58 rows=27472 width=39) (actual time=0.089..4.322 rows=27659.00 loops=1)
+                     Index Cond: (genre_name = (InitPlan expr_1).col1)
+                     Heap Fetches: 0
+                     Index Searches: 1
+                     Buffers: shared hit=140
+ Planning:
+   Buffers: shared hit=554
+ Planning Time: 1.775 ms
+ Execution Time: 1349.328 ms
+(36 rows)
+
+---------------- repetition 2: SCAN ONLY (the touch probe's access path)
+                                                                                         QUERY PLAN                                                                                         
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Finalize Aggregate  (cost=4084.14..4084.15 rows=1 width=8) (actual time=25.083..26.866 rows=1.00 loops=1)
+   Buffers: shared hit=713
+   InitPlan expr_1
+     ->  Limit  (cost=2.47..2.47 rows=1 width=14) (actual time=0.186..0.187 rows=1.00 loops=1)
+           Buffers: shared hit=24
+           ->  Sort  (cost=2.47..2.47 rows=1 width=14) (actual time=0.185..0.185 rows=1.00 loops=1)
+                 Sort Key: degree.deg DESC, degree.key
+                 Sort Method: top-N heapsort  Memory: 25kB
+                 Buffers: shared hit=24
+                 ->  Index Scan using degree_pkey on degree  (cost=0.43..2.46 rows=1 width=14) (actual time=0.036..0.133 rows=15.00 loops=1)
+                       Index Cond: (kind = 'g'::"char")
+                       Index Searches: 1
+                       Buffers: shared hit=18
+   ->  Gather  (cost=4081.46..4081.67 rows=2 width=8) (actual time=25.077..26.861 rows=3.00 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         Buffers: shared hit=713
+         ->  Partial Aggregate  (cost=3081.46..3081.47 rows=1 width=8) (actual time=19.113..19.114 rows=1.00 loops=3)
+               Buffers: shared hit=689
+               ->  Parallel Append  (cost=0.42..2938.63 rows=57129 width=0) (actual time=0.086..13.768 rows=45884.33 loops=3)
+                     Buffers: shared hit=689
+                     ->  Parallel Index Only Scan using in_genre_reverse on in_genre  (cost=0.43..2082.53 rows=45682 width=0) (actual time=0.082..8.799 rows=36664.67 loops=3)
+                           Index Cond: (genre_name = (InitPlan expr_1).col1)
+                           Heap Fetches: 0
+                           Index Searches: 1
+                           Buffers: shared hit=548
+                     ->  Parallel Index Only Scan using master_in_genre_reverse on master_in_genre  (cost=0.42..570.46 rows=16160 width=0) (actual time=0.046..3.589 rows=13829.50 loops=2)
+                           Index Cond: (genre_name = (InitPlan expr_1).col1)
+                           Heap Fetches: 0
+                           Index Searches: 1
+                           Buffers: shared hit=141
+ Planning:
+   Buffers: shared hit=512
+ Planning Time: 1.786 ms
+ Execution Time: 26.948 ms
+(35 rows)
+
+---------------- repetition 2: SCAN AND INSERT (the expansion)
+                                                                                  QUERY PLAN                                                                                  
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Insert on seen  (cost=2.90..5464.76 rows=0 width=0) (actual time=1370.447..1370.449 rows=0.00 loops=1)
+   Conflict Resolution: NOTHING
+   Conflict Arbiter Indexes: seen_pkey
+   Tuples Inserted: 137653
+   Conflicting Tuples: 0
+   Buffers: shared hit=1154578 read=2 dirtied=2024 written=2025
+   I/O Timings: shared read=0.046 write=40.439
+   InitPlan expr_1
+     ->  Limit  (cost=2.47..2.47 rows=1 width=14) (actual time=0.221..0.222 rows=1.00 loops=1)
+           Buffers: shared hit=24
+           ->  Sort  (cost=2.47..2.47 rows=1 width=14) (actual time=0.220..0.221 rows=1.00 loops=1)
+                 Sort Key: degree.deg DESC, degree.key
+                 Sort Method: top-N heapsort  Memory: 25kB
+                 Buffers: shared hit=24
+                 ->  Index Scan using degree_pkey on degree  (cost=0.43..2.46 rows=1 width=14) (actual time=0.086..0.192 rows=15.00 loops=1)
+                       Index Cond: (kind = 'g'::"char")
+                       Index Searches: 1
+                       Buffers: shared hit=18
+   ->  Result  (cost=0.43..5462.29 rows=137109 width=78) (actual time=0.277..41.358 rows=137653.00 loops=1)
+         Buffers: shared hit=709
+         ->  Append  (cost=0.43..4091.20 rows=137109 width=39) (actual time=0.276..28.246 rows=137653.00 loops=1)
+               Buffers: shared hit=709
+               ->  Index Only Scan using in_genre_reverse on in_genre  (cost=0.43..2722.07 rows=109637 width=39) (actual time=0.275..15.113 rows=109994.00 loops=1)
+                     Index Cond: (genre_name = (InitPlan expr_1).col1)
+                     Heap Fetches: 0
+                     Index Searches: 1
+                     Buffers: shared hit=569
+               ->  Index Only Scan using master_in_genre_reverse on master_in_genre  (cost=0.42..683.58 rows=27472 width=39) (actual time=0.048..4.004 rows=27659.00 loops=1)
+                     Index Cond: (genre_name = (InitPlan expr_1).col1)
+                     Heap Fetches: 0
+                     Index Searches: 1
+                     Buffers: shared hit=140
+ Planning:
+   Buffers: shared hit=554
+ Planning Time: 1.998 ms
+ Execution Time: 1370.528 ms
+(36 rows)
+
+---------------- repetition 3: SCAN ONLY (the touch probe's access path)
+                                                                                         QUERY PLAN                                                                                         
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Finalize Aggregate  (cost=4084.14..4084.15 rows=1 width=8) (actual time=17.781..18.829 rows=1.00 loops=1)
+   Buffers: shared hit=713
+   InitPlan expr_1
+     ->  Limit  (cost=2.47..2.47 rows=1 width=14) (actual time=0.147..0.148 rows=1.00 loops=1)
+           Buffers: shared hit=24
+           ->  Sort  (cost=2.47..2.47 rows=1 width=14) (actual time=0.146..0.147 rows=1.00 loops=1)
+                 Sort Key: degree.deg DESC, degree.key
+                 Sort Method: top-N heapsort  Memory: 25kB
+                 Buffers: shared hit=24
+                 ->  Index Scan using degree_pkey on degree  (cost=0.43..2.46 rows=1 width=14) (actual time=0.033..0.121 rows=15.00 loops=1)
+                       Index Cond: (kind = 'g'::"char")
+                       Index Searches: 1
+                       Buffers: shared hit=18
+   ->  Gather  (cost=4081.46..4081.67 rows=2 width=8) (actual time=17.775..18.824 rows=3.00 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         Buffers: shared hit=713
+         ->  Partial Aggregate  (cost=3081.46..3081.47 rows=1 width=8) (actual time=13.050..13.051 rows=1.00 loops=3)
+               Buffers: shared hit=689
+               ->  Parallel Append  (cost=0.42..2938.63 rows=57129 width=0) (actual time=0.735..9.367 rows=45884.33 loops=3)
+                     Buffers: shared hit=689
+                     ->  Parallel Index Only Scan using in_genre_reverse on in_genre  (cost=0.43..2082.53 rows=45682 width=0) (actual time=0.728..5.955 rows=36664.67 loops=3)
+                           Index Cond: (genre_name = (InitPlan expr_1).col1)
+                           Heap Fetches: 0
+                           Index Searches: 1
+                           Buffers: shared hit=548
+                     ->  Parallel Index Only Scan using master_in_genre_reverse on master_in_genre  (cost=0.42..570.46 rows=16160 width=0) (actual time=0.036..1.301 rows=13829.50 loops=2)
+                           Index Cond: (genre_name = (InitPlan expr_1).col1)
+                           Heap Fetches: 0
+                           Index Searches: 1
+                           Buffers: shared hit=141
+ Planning:
+   Buffers: shared hit=512
+ Planning Time: 1.748 ms
+ Execution Time: 18.914 ms
+(35 rows)
+
+---------------- repetition 3: SCAN AND INSERT (the expansion)
+                                                                                  QUERY PLAN                                                                                  
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Insert on seen  (cost=2.90..5464.76 rows=0 width=0) (actual time=1278.758..1278.760 rows=0.00 loops=1)
+   Conflict Resolution: NOTHING
+   Conflict Arbiter Indexes: seen_pkey
+   Tuples Inserted: 137653
+   Conflicting Tuples: 0
+   Buffers: shared hit=1154578 read=2 dirtied=2024 written=2025
+   I/O Timings: shared read=0.040 write=13.581
+   InitPlan expr_1
+     ->  Limit  (cost=2.47..2.47 rows=1 width=14) (actual time=0.140..0.141 rows=1.00 loops=1)
+           Buffers: shared hit=24
+           ->  Sort  (cost=2.47..2.47 rows=1 width=14) (actual time=0.140..0.140 rows=1.00 loops=1)
+                 Sort Key: degree.deg DESC, degree.key
+                 Sort Method: top-N heapsort  Memory: 25kB
+                 Buffers: shared hit=24
+                 ->  Index Scan using degree_pkey on degree  (cost=0.43..2.46 rows=1 width=14) (actual time=0.031..0.115 rows=15.00 loops=1)
+                       Index Cond: (kind = 'g'::"char")
+                       Index Searches: 1
+                       Buffers: shared hit=18
+   ->  Result  (cost=0.43..5462.29 rows=137109 width=78) (actual time=0.183..38.043 rows=137653.00 loops=1)
+         Buffers: shared hit=709
+         ->  Append  (cost=0.43..4091.20 rows=137109 width=39) (actual time=0.182..26.046 rows=137653.00 loops=1)
+               Buffers: shared hit=709
+               ->  Index Only Scan using in_genre_reverse on in_genre  (cost=0.43..2722.07 rows=109637 width=39) (actual time=0.182..14.114 rows=109994.00 loops=1)
+                     Index Cond: (genre_name = (InitPlan expr_1).col1)
+                     Heap Fetches: 0
+                     Index Searches: 1
+                     Buffers: shared hit=569
+               ->  Index Only Scan using master_in_genre_reverse on master_in_genre  (cost=0.42..683.58 rows=27472 width=39) (actual time=0.065..4.057 rows=27659.00 loops=1)
+                     Index Cond: (genre_name = (InitPlan expr_1).col1)
+                     Heap Fetches: 0
+                     Index Searches: 1
+                     Buffers: shared hit=140
+ Planning:
+   Buffers: shared hit=554
+ Planning Time: 1.717 ms
+ Execution Time: 1278.830 ms
+(36 rows)
+

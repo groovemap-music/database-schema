@@ -1,0 +1,33 @@
+== neo4j  explore/hops3/neo4j  depth 3
+
++ProduceResults@neo4j  rows=100  dbHits=0
+   id, name, type, path_names, rel_types, dist
+  +Projection@neo4j  rows=100  dbHits=123
+     coalesce(cache[discovered.id], cache[discovered.name]) AS id, best.path_names AS path_names, coalesce(cache[discovered.name], cache[discovered.id]) AS name, best.rel_types AS rel_types, CASE
+  WHEN discovered:Artist THEN $autostring_1
+  WHEN discovered:Label THEN $autostring_2
+  WHEN discovered:Genre THEN $autostring_3
+  WHEN discovered:Style THEN $autostring_4
+END AS type
+    +CacheProperties@neo4j  rows=100  dbHits=200
+       cache[discovered.id], cache[discovered.name]
+      +Top@neo4j  rows=100  dbHits=0
+         dist ASC LIMIT 100
+        +Projection@neo4j  rows=1996  dbHits=0
+           best.dist AS dist
+          +Projection@neo4j  rows=1996  dbHits=0
+             anon_7[$autoint_0] AS best
+            +EagerAggregation@neo4j  rows=1996  dbHits=0
+               discovered, collect({path_names: path_names, rel_types: rel_types, dist: dist}) AS anon_7
+              +Projection@neo4j  rows=28164  dbHits=133080
+                 [n IN nodes((start)-[anon_0*]-(discovered)) | coalesce(n.name, n.title, n.id)] AS path_names, [r IN relationships((start)-[anon_0*]-(discovered)) | type(r)] AS rel_types
+                +Sort@neo4j  rows=28164  dbHits=0
+                   dist ASC
+                  +Projection@neo4j  rows=28164  dbHits=0
+                     length((start)-[anon_0*]-(discovered)) AS dist
+                    +Filter@neo4j  rows=28164  dbHits=789388
+                       discovered:Artist|Label|Genre|Style AND NOT discovered = start
+                      +VarLengthExpand(All)@neo4j  rows=789388  dbHits=803669
+                         (start)-[anon_0:BY|ON|IS|ALIAS_OF|MEMBER_OF|DERIVED_FROM*..3]-(discovered)
+                        +NodeIndexSeek@neo4j  rows=1  dbHits=2
+                           RANGE INDEX start:Artist(id) WHERE id = $entity_id

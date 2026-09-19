@@ -1,0 +1,36 @@
+#cloud-config
+# gm-database-schema-gkt.1 — instance bootstrap. Throwaway spike infrastructure.
+#
+# Docker from Ubuntu's own repository rather than Docker's. The engines are
+# pinned by digest, so what matters is that a container runs at all and not which
+# Docker runs it, and using the distribution package means the instance is ready
+# without waiting on an apt key, a third-party source list and a second update.
+package_update: true
+packages:
+  - docker.io
+  - python3-venv
+  - python3-pip
+  - rsync
+  - jq
+  - sysstat
+
+runcmd:
+  - [systemctl, enable, --now, docker]
+  # The IBM Cloud Ubuntu image takes the VPC SSH key for the `ubuntu` account and
+  # not for root, so the harness runs as `ubuntu`. It needs the docker group to
+  # start containers and it needs to own its own working directory so the driver
+  # can rsync into it without sudo.
+  - [usermod, -aG, docker, ubuntu]
+  - [mkdir, -p, /opt/bench, /opt/bench/results]
+  - [chown, -R, "ubuntu:ubuntu", /opt/bench]
+  # A sentinel `run.sh --cloud` polls for, so it can tell "cloud-init is still
+  # running" apart from "the instance is broken".
+  - [touch, /opt/bench/.cloud-init-done]
+
+write_files:
+  - path: /etc/sysctl.d/99-bench.conf
+    content: |
+      # PostgreSQL asks for more shared memory than the default allows once
+      # shared_buffers is sized for a 32 GiB machine.
+      kernel.shmmax = 17179869184
+      kernel.shmall = 4194304

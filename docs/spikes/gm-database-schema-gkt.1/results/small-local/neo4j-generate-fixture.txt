@@ -1,0 +1,9 @@
+Artist: 1500
+Label: 300
+Master: 1800
+master-edges: 9828
+Release: 5000
+release-edges: 39179
+Genre: 15
+Style: 440
+mb-edges: 3983
