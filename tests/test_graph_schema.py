@@ -246,7 +246,7 @@ class TestGraphSchemaStatement:
             assert name.endswith(" migration"), f"{name} contains a DROP"
             relation = name.removeprefix("graph.").rsplit(" ", 2)[0]
             assert f"DROP VIEW graph.{relation} CASCADE;" in statement, name
-            assert "IF EXISTS (" in statement and "relkind = 'v'" in statement or "data_type <> 'text'" in statement, name
+            assert ("IF EXISTS (" in statement and "relkind = 'v'" in statement) or "data_type <> 'text'" in statement, name
 
     def test_every_migration_is_guarded_and_names_one_relation(self) -> None:
         migrations = [name for name, _statement in _GRAPH_STATEMENTS if name.endswith(" migration")]
@@ -607,6 +607,94 @@ class TestMusicBrainzEdgeViews:
             statement = statement_for(f"mb_rel_{source}_{target}")
             for column in ("relationship_id", "source_mbid", "target_mbid", "relationship_type", "begin_date", "end_date", "ended", "attributes"):
                 assert f"AS {column}" in statement
+
+
+# Copied from musicbrainz-graph-enricher's brainzgraphinator/_projections.py.
+# Pinned entry by entry rather than compared against an import, because the
+# enricher is a separate service this package does not depend on: a silent
+# divergence has to fail here rather than be invisible until a ported query
+# returns nothing.
+ENRICHER_MAP = {
+    "member of band": "MEMBER_OF",
+    "collaboration": "COLLABORATED_WITH",
+    "teacher": "TAUGHT",
+    "tribute": "TRIBUTE_TO",
+    "founder": "FOUNDED",
+    "supporting musician": "SUPPORTED",
+    "subgroup": "SUBGROUP_OF",
+    "artist rename": "RENAMED_TO",
+}
+
+
+class TestMusicBrainzRelationshipMap:
+    """The two stores disagree on the relationship vocabulary; the map closes it."""
+
+    def test_the_map_is_the_enrichers_map_entry_for_entry(self) -> None:
+        assert MUSICBRAINZ_RELATIONSHIP_TYPES == ENRICHER_MAP
+        assert len(MUSICBRAINZ_RELATIONSHIP_TYPES) == 8
+
+    def test_every_entry_is_rendered_into_the_function(self) -> None:
+        statement = statement_for_function("mb_relationship_type")
+        for raw, mapped in ENRICHER_MAP.items():
+            assert f"WHEN '{raw}' THEN '{mapped}'" in statement, raw
+
+    def test_the_rendered_case_has_no_fallback(self) -> None:
+        """The enricher writes no edge for an unmapped string, so the answer is NULL."""
+        statement = statement_for_function("mb_relationship_type")
+        assert "ELSE" not in statement
+        assert statement.count("WHEN ") == len(ENRICHER_MAP)
+
+    def test_the_function_is_immutable_and_strict(self) -> None:
+        statement = statement_for_function("mb_relationship_type")
+        assert "IMMUTABLE" in statement
+        assert "RETURNS NULL ON NULL INPUT" in statement
+
+    def test_every_pair_view_publishes_the_mapped_name_and_the_raw_string(self) -> None:
+        """One shared label needs one property set across all sixteen relations."""
+        for source, target in MUSICBRAINZ_PAIRS:
+            statement = statement_for(f"mb_rel_{source}_{target}")
+            assert "graph.mb_relationship_type(relationship.relationship_type) AS relationship_type" in statement
+            assert "relationship.relationship_type AS raw_relationship_type" in statement
+
+
+class TestPhase0Comparison:
+    """The retained definitions are a test fixture, never a shipped relation."""
+
+    def test_the_initializer_never_creates_a_phase_0_relation(self) -> None:
+        shipped = {name for name, _statement in _schema_statements()}
+        for name, _statement in phase0_comparison_statements("graph_phase0"):
+            assert name not in shipped, name
+        for _name, statement in _schema_statements():
+            assert "graph_phase0" not in str(statement)
+
+    def test_one_retained_definition_per_materialized_relation(self) -> None:
+        retained = {
+            name.removeprefix("graph_phase0.").removesuffix(" view")
+            for name, _statement in phase0_comparison_statements("graph_phase0")
+            if name.endswith(" view")
+        }
+        assert retained == MATERIALIZED - set(COUNTER_TABLES)
+
+    def test_the_bootstrap_fills_every_loader_written_table(self) -> None:
+        filled = {name.removeprefix("graph.").removesuffix(" bootstrap") for name, _statement in graph_bootstrap_statements("graph_phase0")}
+        assert filled == MATERIALIZED
+
+    def test_the_bootstrap_never_overwrites_a_loader_written_row(self) -> None:
+        for name, statement in graph_bootstrap_statements("graph_phase0"):
+            assert statement.endswith("ON CONFLICT DO NOTHING"), name
+            assert statement.startswith("INSERT INTO graph."), name
+
+    def test_the_bootstrap_does_not_write_the_generated_category(self) -> None:
+        statement = dict(graph_bootstrap_statements("graph_phase0"))["graph.credited_on bootstrap"]
+        assert "role_category" not in statement
+
+    def test_the_degree_relations_sum_edge_tables_rather_than_documents(self) -> None:
+        bootstrap = dict(graph_bootstrap_statements("graph_phase0"))
+        for relation in ("artist_degree", "release_degree_base"):
+            statement = bootstrap[f"graph.{relation} bootstrap"]
+            assert "jsonb" not in statement, relation
+            assert "public.releases" not in statement, relation
+            assert "graph.by_artist" in statement, relation
 
 
 class TestCollectionEdgeViews:
