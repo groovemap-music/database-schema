@@ -349,6 +349,7 @@ _GRAPH_STATEMENT_NAMES = frozenset(
         "graph.label_vertex view",
         "graph.artist_vertex view",
         "graph.release_degree view",
+        "graph.bootstrap_fill function",
     }
 )
 
