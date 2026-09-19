@@ -2709,13 +2709,15 @@ def _graph_table_statements() -> list[tuple[str, str]]:
 # and `graph` never holds one of these views again after the migration above
 # retires it. `tests/test_graph_schema.py` pins that.
 #
-# It is kept, rather than copied into the test tree, for one reason: the
-# comparison it feeds is only worth running while the two sides cannot drift.
-# The parity harness creates these definitions in a throwaway schema, fills the
-# tables from them, and then runs the same `GRAPH_TABLE` query over a graph
-# declared on the tables and over the retained views. A hand-copied body would
-# turn a real disagreement into a stale-copy artifact the first time a
-# projection rule moved.
+# It is kept, rather than copied into the test tree, because two things read it
+# and neither is worth having if the two sides can drift. The parity harness
+# creates these definitions in a throwaway schema, fills the tables from them,
+# and then runs the same `GRAPH_TABLE` query over a graph declared on the tables
+# and over the retained views. And `graph.bootstrap_fill()` below — the one
+# shipped thing in this module that writes a graph row — inlines the same bodies
+# to populate an environment once, so the fill is the phase 0 projection by
+# construction rather than by inspection. A hand-copied body would turn a real
+# disagreement into a stale-copy artifact the first time a projection rule moved.
 
 
 def _phase0_relation_bodies() -> dict[str, str]:
@@ -3028,15 +3030,146 @@ def graph_bootstrap_statements(schema: str) -> list[tuple[str, str]]:
     return statements
 
 
+# ── The bootstrap fill (shipped) ─────────────────────────────────────────────
+# Everything above this line is a definition. `graph.bootstrap_fill()` is the
+# one thing in this module that writes a graph row, and it is deliberately a
+# function nobody calls rather than a statement the initializer runs: applying
+# the schema must stay a declaration, and an environment that wants rows asks
+# for them.
+#
+# **It is not authoritative.** The SQL loaders own every relation it touches —
+# `discogs-sql-loader` writes an edge in the same transaction as the document it
+# came from and recomputes the counters on the `extraction_complete` latch, and
+# `musicbrainz-sql-loader` upserts its half of the shared medium vocabulary.
+# This fill exists so an environment can be populated once, before a loader has
+# run, so a read rewrite in `catalog-api` is not blocked on the dual-write. The
+# first loader pass supersedes it.
+
+# The counter relations' column lists, in the order each table declares them.
+# The vertex and edge lists are `_BOOTSTRAP_COLUMNS` above; these are separate
+# because the counter bodies are computed from the edge tables rather than
+# projected from a retained view, and only the fill needs them named.
+_COUNTER_COLUMNS: dict[str, tuple[str, ...]] = {
+    "genre_stats": ("name", "release_count", "artist_count", "label_count", "style_count", "first_year"),
+    "style_stats": ("name", "release_count", "artist_count", "label_count", "genre_count", "first_year"),
+    "label_stats": ("label_id", "release_count", "artist_count", "genre_count"),
+    "artist_degree": ("artist_id", "degree"),
+    "release_degree_base": ("release_id", "degree"),
+    "artist_genre": ("artist_id", "genre_name", "release_count"),
+    "label_genre": ("label_id", "genre_name", "release_count"),
+}
+
+# The order the fill runs in, and every group boundary in it is load-bearing.
+#
+# - **Vertices before edges.** `part_of` and `in_family` inner-join the vertex
+#   tables, so an edge written before its endpoints exist is silently absent
+#   rather than wrong, and `genre_stats` reads `part_of`.
+# - **Edges before counters.** Every counter is a sum over the edge tables and
+#   reads no document at all; filled first it would sum an empty relation and
+#   report a converged zero.
+# - **`artist_genre` and `label_genre` last**, with the other counters, because
+#   both join `by_artist`/`on_label` to `in_genre`.
+_BOOTSTRAP_FILL_ORDER: tuple[str, ...] = (*_MATERIALIZED_VERTICES, *_MATERIALIZED_EDGES, *tuple(_COUNTER_BOOTSTRAP))
+
+
+def _bootstrap_fill_source(relation: str) -> tuple[tuple[str, ...], str]:
+    """Return the columns one relation is filled with, and the body they come from.
+
+    The body is the phase 0 view's own, read out of `_phase0_relation_bodies()`
+    rather than copied, which is the whole reason those definitions are retained
+    in this module instead of in the test tree: the fill and the parity
+    comparison cannot disagree about what a relation projects, because there is
+    one text and both read it.
+    """
+    if relation in _COUNTER_BOOTSTRAP:
+        return _COUNTER_COLUMNS[relation], _COUNTER_BOOTSTRAP[relation]
+    return _BOOTSTRAP_COLUMNS[relation], _phase0_relation_bodies()[relation]
+
+
+def _bootstrap_fill_step(relation: str) -> str:
+    """Return the plpgsql that empties one relation, refills it, and reports the count.
+
+    `TRUNCATE` then `INSERT`, rather than an upsert: `ON CONFLICT DO NOTHING`
+    converges upward only. A row the documents no longer justify — a release
+    whose genre was corrected, a credit that was removed — would survive every
+    re-run, so the relation would drift away from its own definition instead of
+    toward it. Emptying it first makes the relation exactly the projection of
+    the documents present, which is what "idempotent" has to mean here.
+
+    Nothing names a conflict target because nothing can conflict: every body is
+    unique on its table's key, by a `DISTINCT`, a `DISTINCT ON`, a `GROUP BY`, or
+    a `UNION` over exactly those columns. A duplicate would raise rather than be
+    dropped in silence, which is the right failure for a projection that claims
+    to be the key.
+    """
+    columns, body = _bootstrap_fill_source(relation)
+    indented = "\n".join(f"        {line}" if line.strip() else "" for line in body.strip().splitlines())
+    projection = ", ".join(columns)
+    return f"""    TRUNCATE graph.{relation};
+    INSERT INTO graph.{relation} ({projection})
+    SELECT {projection}
+    FROM (
+{indented}
+    ) AS bootstrap;
+    GET DIAGNOSTICS row_count = ROW_COUNT;
+    relation := 'graph.{relation}';
+    RAISE NOTICE 'bootstrap_fill: % <- % row(s)', relation, row_count;
+    RETURN NEXT;
+"""  # noqa: S608
+
+
+def _bootstrap_fill_function() -> str:
+    """Return `graph.bootstrap_fill()`, the one-off fill of every loader-owned table.
+
+    One transaction, because the caller's statement is one: `SELECT * FROM
+    graph.bootstrap_fill()` either replaces all twenty-seven relations or
+    replaces none, so a failure half way through cannot leave edges pointing at
+    vertices that were truncated and never refilled.
+
+    It reports a row per relation, in fill order, and raises the same line as a
+    `NOTICE` so a psql session watching a long fill sees progress rather than
+    silence until the end.
+
+    `credited_on.role_category` is projected away rather than written: it is a
+    generated column, and naming it in an `INSERT` is an error rather than an
+    overwrite. Dropping it from the outer list costs nothing — it is a function
+    of `role`, which is in the key, so the `DISTINCT` inside the body yields the
+    same rows with or without it.
+
+    One known difference from what the loaders write. `graph.company` keys a
+    company with no Discogs id on `name:` followed by the name case-folded, and
+    this fill folds it with SQL `lower`, which is only an approximation of
+    Python's `str.casefold` — they disagree on the German eszett and a handful
+    of other characters. `discogs-sql-loader` applies the rule itself, so for
+    those few names the loader's id is the right one and this fill's is not.
+    The loader's row wins, as it does for every relation here.
+    """
+    steps = "\n".join(_bootstrap_fill_step(relation) for relation in _BOOTSTRAP_FILL_ORDER)
+    return f"""CREATE OR REPLACE FUNCTION graph.bootstrap_fill()
+RETURNS TABLE (relation text, row_count bigint)
+LANGUAGE plpgsql
+AS $bootstrap_fill$
+#variable_conflict use_column
+-- The two output columns are in scope for every statement below, so a body
+-- free to publish either name resolves to its own column rather than failing.
+BEGIN
+{steps}END
+$bootstrap_fill$"""
+
+
 def _build_graph_statements() -> list[tuple[str, str]]:
     """Return the ordered graph-schema statements: schema, functions, tables, views.
 
-    The order is load-bearing three times over. The rendered vocabulary
+    The order is load-bearing four times over. The rendered vocabulary
     functions precede everything, because `graph.credited_on` generates a column
     with one of them and four views call the others. The tables precede the
     views, because `part_of`, `in_family`, and `release_degree` now read tables
-    rather than documents. And every migration that frees a name precedes the
-    relation that takes it, which is what `_graph_table_statements` returns.
+    rather than documents. Every migration that frees a name precedes the
+    relation that takes it, which is what `_graph_table_statements` returns. And
+    `graph.bootstrap_fill` comes last, after every relation it writes or reads —
+    a plpgsql body resolves its names at first call rather than at creation, so
+    the position is a statement about what the function means rather than a
+    requirement, and it is kept honest by a test.
     """
     return [
         _GRAPH_SCHEMA_STATEMENT,
@@ -3053,6 +3186,9 @@ def _build_graph_statements() -> list[tuple[str, str]]:
         *_collection_views(),
         *_credit_views(),
         *_counter_views(),
+        # Last, because it reads all of it: the fill writes the tables above and
+        # its counter bodies read `graph.part_of`, which is one of the views.
+        ("graph.bootstrap_fill function", _bootstrap_fill_function()),
     ]
 
 

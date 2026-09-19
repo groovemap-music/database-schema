@@ -19,6 +19,42 @@
   "contract": "groovemap.persistence",
   "graph_schema": {
     "availability": "unconditional",
+    "bootstrap": {
+      "authority": "none",
+      "availability": "unconditional",
+      "fills": [
+        "alias_of",
+        "artist_degree",
+        "artist_genre",
+        "by_artist",
+        "company",
+        "credited_on",
+        "credited_to",
+        "derived_from",
+        "genre",
+        "genre_stats",
+        "in_genre",
+        "in_style",
+        "issued_on",
+        "label_genre",
+        "label_stats",
+        "master_by_artist",
+        "master_in_genre",
+        "master_in_style",
+        "media_family",
+        "medium",
+        "member_of",
+        "on_label",
+        "person",
+        "release_degree_base",
+        "same_as",
+        "style",
+        "style_stats"
+      ],
+      "function": "graph.bootstrap_fill",
+      "kind": "additive",
+      "note": "A one-off fill deriving every loader-written table from the catalog documents, using the same definitions those relations published as views before they were tables. It is NOT authoritative: the owner recorded against each relation writes it and supersedes this fill on its first pass. It exists so an environment can be populated once, before a loader has run, so a read rewrite is not blocked on the dual-write. Nothing calls it; applying the schema declares it and writes no row. Each relation is emptied and refilled in one transaction, so re-running converges in both directions and a row no document justifies is removed. It reports a row count per relation. One known divergence: a company with no Discogs id is keyed on its name case-folded, and this fill folds with SQL lower where the loader applies Python casefold, so a handful of characters key differently and the loader's row is the correct one."
+    },
     "counter_properties": {
       "availability": "unconditional",
       "kind": "additive",
@@ -67,6 +103,7 @@
     "documentation": "docs/architecture.md#graph-schema",
     "edge_relations": 38,
     "functions": [
+      "graph.bootstrap_fill",
       "graph.credit_role_category",
       "graph.mb_relationship_type",
       "graph.medium_label"

@@ -16,12 +16,20 @@ The `graph` schema is recorded in
 [`persistence/v1/compatibility.json`](persistence/v1/compatibility.json) under `graph_schema`
 as an additive object of contract version 1: sixty-four relations — twenty-seven loader-written
 tables and thirty-seven read-only views over tables the same contract already declares — plus
-three rendered functions. Four of those views exist so a vertex label can publish the counters
+four functions. Four of those views exist so a vertex label can publish the counters
 Neo4j carries on the node of the same name; `graph_schema.counter_properties` records which
 label carries which. The contract lists every relation with its shape and the service
 that writes it, because a consumer reading one needs both: the shape says whether an index is
 available, and the owner says who to chase when the relation is empty. This repository writes
 no graph row, so an empty table on a fresh database is the expected state.
+
+Three of those functions render a shared vocabulary. The fourth, `graph.bootstrap_fill`,
+is the one declared object that writes a graph row, and `graph_schema.bootstrap` records
+it with `authority: none`. It derives every loader-written table from the catalog documents so
+an environment can be populated once before a loader has run; **it is not authoritative and the
+owner recorded against each relation supersedes it on that owner's first pass.** Nothing calls
+it — applying the schema declares it and writes nothing — so an empty table on a fresh database
+is still the expected state.
 
 The views carry a stricter rule than the contract's general one. `CREATE OR REPLACE VIEW` may
 only append a column, and PostgreSQL refuses to drop, rename, reorder, or retype one a view

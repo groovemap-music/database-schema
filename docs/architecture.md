@@ -353,7 +353,10 @@ on a fresh database is the expected state, not a fault. `discogs-sql-loader` own
 them, `musicbrainz-sql-loader` owns the MusicBrainz half and co-owns the shared medium
 vocabulary, `catalog-api` owns the personal-collection views, and
 [`graph.release_degree`](#the-counter-degree-and-aggregate-relations) is the one relation
-split across two owners. The contract names the owner of each.
+split across two owners. The contract names the owner of each. The schema also declares
+[`graph.bootstrap_fill()`](#the-bootstrap-fill), which can write those rows on request, but
+nothing calls it and applying the schema still writes nothing — and what it writes is not
+authoritative.
 
 Twenty of the tables replaced a view that computed the same rows on every read. Spike
 gm-database-schema-9c8.1 measured those views and found every hot edge re-unnesting a JSONB
@@ -688,6 +691,82 @@ it here would key the vertex differently from the node it mirrors.
   column still being narrow. PostgreSQL refuses to retype a column a view reads even when the
   requested type is the one it already has, and the graph schema exposes exactly those
   columns as the bridge between the MusicBrainz and Discogs halves of the graph.
+
+### The bootstrap fill
+
+`graph.bootstrap_fill()` derives every one of the twenty-seven loader-written tables from the
+`artists`, `labels`, `masters`, `releases`, and `musicbrainz` documents in one pass. It exists
+for one situation: an environment that has the documents but has not run a loader, where a
+read rewrite in `catalog-api` would otherwise be blocked waiting for the dual-write. Run it
+once and the graph relations are populated.
+
+**It is not authoritative, and the loaders own every relation it touches.**
+`discogs-sql-loader` writes an edge in the same transaction as the document it came from and
+recomputes the counters on the `extraction_complete` latch it already handles;
+`musicbrainz-sql-loader` upserts its half of the shared medium vocabulary. Whatever this fill
+wrote is superseded the first time either of them runs, and where the two disagree the loader
+is right. Nothing in this repository calls it — applying the schema declares the function and
+writes no row — so a fresh database is still empty until somebody asks.
+
+```sql
+SELECT * FROM graph.bootstrap_fill();
+```
+
+```
+      relation       | row_count
+---------------------+-----------
+ graph.genre         |        16
+ graph.style         |       757
+ …
+```
+
+It returns a row per relation in fill order and raises the same line as a `NOTICE`, so a psql
+session watching a long fill sees progress rather than silence.
+
+Three things about how it works are worth stating, because each is a decision rather than a
+detail.
+
+**It is the phase 0 projection, by construction.** Twenty of these tables replaced a view that
+computed the same rows on every read. Those view bodies are still in `postgres.py`, retained
+for the table-versus-view parity comparison, and the fill inlines the same text rather than a
+copy of it. So "the fill agrees with the definition the relation published" is not a property
+anyone has to check — there is one definition and both read it. The seven counter relations
+never had a view; their bodies are the sums over the edge tables that the loaders implement,
+and they are shared the same way.
+
+**Each relation is emptied and refilled, in one transaction.** `TRUNCATE` then `INSERT`, not an
+upsert. `ON CONFLICT DO NOTHING` converges upward only: a row the documents no longer justify —
+a release whose genre was corrected, a credit that was removed — would survive every re-run, so
+the relation would drift away from its own definition rather than toward it. Emptying it first
+makes the relation exactly the projection of the documents present, which is what idempotent
+has to mean here. The whole fill is one statement, so it either replaces all twenty-seven
+relations or replaces none; a failure half way through cannot leave edges pointing at vertices
+that were truncated and never refilled. The cost is that a row a loader wrote which the
+documents do not justify is discarded too, which is a reason to run the bootstrap before the
+loaders rather than after them.
+
+**The order is load-bearing.** Vertex tables fill before edge tables, because `part_of` and
+`in_family` inner-join the vertex tables and an edge written before its endpoints exist is
+silently absent rather than visibly wrong. Edge tables fill before the counters, because every
+counter is a sum over the edge tables and reads no document at all — filled first it would sum
+an empty relation and report a converged zero. `artist_genre` and `label_genre` sit with the
+counters for the same reason: both join `by_artist` or `on_label` to `in_genre`.
+
+Two known divergences from what the loaders write, both recorded in the contract under
+`graph_schema.bootstrap`:
+
+- **Company ids for a company with no Discogs id.** The producer's rule keys such a company on
+  `name:` followed by the name case-folded with inner whitespace collapsed. This fill folds with
+  SQL `lower`, which is only an approximation of Python's `str.casefold` — they disagree on the
+  German eszett and a handful of other characters. For those few names the loader's id is the
+  right one and the fill's is not; the loader's row wins.
+- **`credited_on.role_category` is never written.** It is a generated column, so naming it in an
+  `INSERT` is an error rather than an overwrite. The engine computes it from `role`, which is in
+  the key, so the value is the same one the loader would produce.
+
+The integration suite runs the fill against the real-engine fixture, compares every relation's
+row count to the retained phase 0 view, runs it a second time and asserts the rows are
+identical, then writes a row no document justifies and asserts the next run removes it.
 
 ### Property graph
 

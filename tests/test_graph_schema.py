@@ -131,8 +131,14 @@ EDGE_KEYS = {
     "label_genre": (("label_id", "genre_name"), "label_id", "genre_name"),
 }
 
-# The functions rendered from the runtime's shared vocabularies.
-EXPECTED_FUNCTIONS = {"credit_role_category", "medium_label", "mb_relationship_type"}
+# The functions rendered from the runtime's shared vocabularies. Every one is
+# called from a relation body, so all three have to precede the relations.
+VOCABULARY_FUNCTIONS = {"credit_role_category", "medium_label", "mb_relationship_type"}
+
+# `graph.bootstrap_fill` is the fourth and is not one of them: nothing calls it,
+# it reads and writes the relations rather than being read by one, and it is the
+# only thing the schema declares that writes a graph row.
+EXPECTED_FUNCTIONS = VOCABULARY_FUNCTIONS | {"bootstrap_fill"}
 
 MUSICBRAINZ_PAIRS = [
     (source, target) for source in ("artist", "label", "release", "release_group") for target in ("artist", "label", "release", "release_group")
@@ -326,10 +332,15 @@ class TestGraphSchemaStatement:
     def test_functions_precede_the_relations_that_call_them(self) -> None:
         """`graph.credited_on` generates a column with one of them, so it is not only views."""
         names = [name for name, _statement in _GRAPH_STATEMENTS]
-        last_function = max(index for index, name in enumerate(names) if name.endswith(" function"))
+        last_vocabulary = max(names.index(f"graph.{function} function") for function in VOCABULARY_FUNCTIONS)
         for relation in ("credited_on", "medium"):
-            assert names.index(f"graph.{relation} table") > last_function
-        assert names.index("graph.mb_rel_artist_artist view") > last_function
+            assert names.index(f"graph.{relation} table") > last_vocabulary
+        assert names.index("graph.mb_rel_artist_artist view") > last_vocabulary
+
+    def test_the_bootstrap_fill_is_declared_after_everything_it_touches(self) -> None:
+        """It writes every table and its counter bodies read `graph.part_of`."""
+        names = [name for name, _statement in _GRAPH_STATEMENTS]
+        assert names[-1] == "graph.bootstrap_fill function"
 
     def test_statement_names_are_unique(self) -> None:
         names = [name for name, _statement in _GRAPH_STATEMENTS]
@@ -721,6 +732,69 @@ class TestPhase0Comparison:
             assert "graph.by_artist" in statement, relation
 
 
+class TestBootstrapFill:
+    """The one shipped thing that writes a graph row, and what keeps it honest."""
+
+    def test_it_is_declared_as_a_reporting_function(self) -> None:
+        statement = statement_for_function("bootstrap_fill")
+        assert statement.startswith("CREATE OR REPLACE FUNCTION graph.bootstrap_fill()\n")
+        assert "RETURNS TABLE (relation text, row_count bigint)" in statement
+        assert "LANGUAGE plpgsql" in statement
+
+    def test_it_fills_every_loader_written_table_and_nothing_else(self) -> None:
+        assert truncated_relations() == MATERIALIZED
+
+    def test_every_relation_is_emptied_before_it_is_refilled(self) -> None:
+        """An upsert converges upward only; a row the documents dropped has to go."""
+        statement = statement_for_function("bootstrap_fill")
+        for relation in MATERIALIZED:
+            truncate = statement.index(f"TRUNCATE graph.{relation};")
+            insert = statement.index(f"INSERT INTO graph.{relation} (")
+            assert truncate < insert, relation
+        assert "ON CONFLICT" not in statement
+
+    def test_it_reports_one_row_per_relation(self) -> None:
+        statement = statement_for_function("bootstrap_fill")
+        assert statement.count("RETURN NEXT;") == len(MATERIALIZED)
+        assert statement.count("RAISE NOTICE") == len(MATERIALIZED)
+        for relation in MATERIALIZED:
+            assert f"relation := 'graph.{relation}';" in statement, relation
+
+    def test_the_vertex_tables_are_filled_before_the_edge_tables(self) -> None:
+        """`part_of` and `in_family` inner-join them, so an early edge is silently absent."""
+        statement = statement_for_function("bootstrap_fill")
+        last_vertex = max(statement.index(f"TRUNCATE graph.{relation};") for relation in MATERIALIZED_VERTICES)
+        first_edge = min(statement.index(f"TRUNCATE graph.{relation};") for relation in MATERIALIZED_EDGES)
+        assert last_vertex < first_edge
+
+    def test_the_counters_are_filled_after_every_edge_table(self) -> None:
+        """Each one sums the edge tables, so an early counter converges on zero."""
+        statement = statement_for_function("bootstrap_fill")
+        last_edge = max(statement.index(f"TRUNCATE graph.{relation};") for relation in MATERIALIZED_EDGES)
+        first_counter = min(statement.index(f"TRUNCATE graph.{relation};") for relation in COUNTER_TABLES)
+        assert last_edge < first_counter
+
+    def test_it_never_writes_the_generated_category(self) -> None:
+        """Naming a generated column in an INSERT is an error, not an overwrite."""
+        statement = statement_for_function("bootstrap_fill")
+        assert "INSERT INTO graph.credited_on (person_name, release_id, role)\n" in statement
+
+    def test_every_body_is_the_retained_phase_0_definition(self) -> None:
+        """The fill and the parity comparison read one text, so they cannot drift."""
+        rendered = " ".join(statement_for_function("bootstrap_fill").split())
+        for relation in MATERIALIZED - set(COUNTER_TABLES):
+            body = " ".join(statement_for(relation).split())
+            body = body.removeprefix(f"CREATE OR REPLACE VIEW graph_phase0.{relation} AS ")
+            assert body in rendered, relation
+
+    def test_the_counter_bodies_read_the_edge_tables_and_no_document(self) -> None:
+        statement = statement_for_function("bootstrap_fill")
+        counters = statement[min(statement.index(f"TRUNCATE graph.{relation};") for relation in COUNTER_TABLES) :]
+        assert "jsonb" not in counters
+        assert "public.releases" not in counters
+        assert "graph.by_artist" in counters
+
+
 class TestCollectionEdgeViews:
     """Personal collections join the catalog on the stringified Discogs id."""
 
@@ -750,6 +824,12 @@ class TestSchemaQualification:
                     continue  # a set-returning function, not a stored relation
                 relation = match.group(1)
                 assert "." in relation, f"{name} reads unqualified relation {relation}"
+
+
+def truncated_relations() -> set[str]:
+    """Return every relation `graph.bootstrap_fill` empties before refilling it."""
+    statement = statement_for_function("bootstrap_fill")
+    return set(re.findall(r"TRUNCATE graph\.([a-z_]+);", statement))
 
 
 def statement_for_function(function: str) -> str:
@@ -785,7 +865,7 @@ class TestRenderedVocabularies:
         assert function_names() == EXPECTED_FUNCTIONS
 
     def test_functions_are_immutable_and_strict(self) -> None:
-        for function in EXPECTED_FUNCTIONS:
+        for function in VOCABULARY_FUNCTIONS:
             statement = statement_for_function(function)
             assert "IMMUTABLE" in statement
             assert "PARALLEL SAFE" in statement
