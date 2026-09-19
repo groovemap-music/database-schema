@@ -2934,7 +2934,7 @@ FROM graph.style AS style
 """,
     "label_stats": """
 SELECT on_label.label_id AS label_id,
-       count(*) AS release_count,
+       count(DISTINCT on_label.release_id) AS release_count,
        count(DISTINCT by_artist.artist_id) AS artist_count,
        count(DISTINCT in_genre.genre_name) AS genre_count
 FROM graph.on_label AS on_label
