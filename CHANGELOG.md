@@ -2,6 +2,19 @@
 
 All notable changes to the GrooveMap database schema will be documented here.
 
+## Unreleased
+
+### Docs
+
+- Document the graph schema's edge model, relation ownership, and the bootstrap fill in
+  `docs/architecture.md`, `docs/runtime-configuration.md`, and the README, and complete the
+  `groovemap.persistence` v1 contract metadata to match.
+
+### Fix
+
+- **graph**: stop `graph.label_stats.release_count` fanning out over a label's `by_artist` and
+  `in_genre` joins, so a release with several artists or genres counts once per label.
+
 ## v0.3.0 (2026-09-14)
 
 ### Feat
