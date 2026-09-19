@@ -1,0 +1,12 @@
+# Nothing Terraform writes about this deployment may be committed. State holds
+# resource ids and can hold credentials; a plan file holds the whole variable
+# set including the API key; the inventory holds the floating IPs.
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+*.tfplan
+inventory.json
+.terraform/
+.terraform.lock.hcl
+crash.log
