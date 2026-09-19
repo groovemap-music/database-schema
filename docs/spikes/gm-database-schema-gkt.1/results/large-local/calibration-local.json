@@ -1,0 +1,57 @@
+{
+  "calibration_version": 1,
+  "timestamp": "2026-09-19T01:00:23Z",
+  "system": {
+    "platform": "Linux-6.8.0-117-generic-aarch64-with-glibc2.41",
+    "machine": "aarch64",
+    "processor": "",
+    "cpu_count": 2,
+    "python_version": "3.13.15",
+    "ram_gb": 7.74
+  },
+  "benchmarks": {
+    "cpu_single_thread": {
+      "test": "cpu_single_thread_sha256",
+      "ops": 2302191,
+      "duration_sec": 5.0,
+      "ops_per_sec": 460438.2
+    },
+    "cpu_multi_thread": {
+      "test": "cpu_multi_thread_sha256",
+      "cores": 2,
+      "ops": 4154178,
+      "duration_sec": 5.0,
+      "ops_per_sec": 830835.6
+    },
+    "memory_bandwidth": {
+      "test": "memory_bandwidth_64mb",
+      "write_mb_per_sec": 89632.4,
+      "read_mb_per_sec": 39797.6
+    },
+    "disk_sequential_write": {
+      "test": "disk_sequential_write",
+      "size_mb": 256,
+      "duration_sec": 0.48,
+      "mb_per_sec": 533.8
+    },
+    "disk_sequential_read": {
+      "test": "disk_sequential_read",
+      "size_mb": 256,
+      "duration_sec": 0.026,
+      "mb_per_sec": 9755.9
+    },
+    "disk_random_read": {
+      "test": "disk_random_read_4k",
+      "duration_sec": 5.0,
+      "iops": 484113.8
+    },
+    "python_sort": {
+      "test": "python_sort_1m_floats",
+      "elements": 1000000,
+      "iterations": 5,
+      "avg_sec": 0.1811,
+      "sorts_per_sec": 5.523
+    }
+  },
+  "label": "Docker Desktop VM on Apple M1 Pro (2 vCPU, 7.7 GiB)"
+}

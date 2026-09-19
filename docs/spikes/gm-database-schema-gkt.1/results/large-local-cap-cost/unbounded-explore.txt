@@ -1,0 +1,26 @@
+== the cost of pf.explore WITHOUT the row limit, large scale, local mode
+==
+== This is the query the answer-equality check runs: `_limit => NULL`, so the
+== traversal exhausts every level instead of stopping at a hundred qualifying
+== vertices. It is here because the measured `*1..3` figure of 13.9 ms is easy
+== to misread as a property of the vertex-at-a-time loop, and it is not. It is
+== a property of the EARLY STOP. Without the stop the same loop over the same
+== surface costs what gm-database-schema-9c8.3's level-synchronous traversal
+== cost, which is the honest comparison.
+
+SELECT count(*) FROM pf.explore('a','5665',2,NULL);
+ count
+-------
+   270
+Time: 119.258 ms
+
+SELECT count(*) FROM pf.explore('a','5665',3,NULL);
+ count
+-------
+  2261
+Time: 29774.164 ms (00:29.774)
+
+== For reference, on the same machine and the same catalog:
+==   pf.explore('a','5665',3,100)          13.9 ms   (this spike, measured)
+==   gm-database-schema-9c8.3 path.traverse 21,404 ms (level-synchronous, no limit)
+==   Neo4j *1..3 with LIMIT 100             3,052 ms

@@ -1,0 +1,9 @@
+== postgres  explore/hops3/pf-explore  depth 3
+
+Function Scan on pf.explore  (cost=0.25..10.25 rows=1000 width=68) (actual time=11.464..11.469 rows=100.00 loops=1)
+  Output: id, type, dist
+  Function Call: pf.explore('a'::"char", '5665'::text, 3, 100)
+  Buffers: shared hit=2243 read=2 dirtied=6 written=7
+  I/O Timings: shared read=0.021 write=0.028
+Planning Time: 0.024 ms
+Execution Time: 11.480 ms

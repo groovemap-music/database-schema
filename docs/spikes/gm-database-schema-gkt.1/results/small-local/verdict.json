@@ -1,0 +1,32 @@
+{
+  "scale": "small",
+  "mode": "local",
+  "answers_match": true,
+  "disagreements": [],
+  "gate_p95_ms": 1000.0,
+  "path": {
+    "pf-vaat": {
+      "worst_p95_ms": 25.375,
+      "over_gate": [],
+      "path_go": true,
+      "go": true
+    },
+    "pf-vaat-deg": {
+      "worst_p95_ms": 31.67,
+      "over_gate": [],
+      "path_go": true,
+      "go": true
+    }
+  },
+  "explore": {
+    "worst_p95_ms": 16.784,
+    "over_gate": [],
+    "go": true
+  },
+  "variants_passing": [
+    "pf-vaat",
+    "pf-vaat-deg"
+  ],
+  "measured_ceiling": null,
+  "go": true
+}

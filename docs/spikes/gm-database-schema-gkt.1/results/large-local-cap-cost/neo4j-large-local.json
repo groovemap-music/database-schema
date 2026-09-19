@@ -1,0 +1,332 @@
+{
+  "engine": "neo4j",
+  "scale": "large",
+  "mode": "local",
+  "timestamp": "2026-09-19T02:02:00Z",
+  "budgets": {
+    "transaction_timeout_s": 120,
+    "mcp_s": 30
+  },
+  "environment": {
+    "version": "Neo4j Kernel 2026.07.1 community",
+    "counts": {
+      "node:Master": 250000,
+      "node:Artist": 120000,
+      "node:Label": 20000,
+      "node:Style": 440,
+      "node:Genre": 15,
+      "node:Release": 1000000,
+      "rel:MEMBER_OF": 58778,
+      "rel:VOICE_ACTOR_FOR": 36431,
+      "rel:FOUNDER_OF": 36317,
+      "rel:SUPPORTING_MUSICIAN": 36527,
+      "rel:ALIAS_OF": 22453,
+      "rel:SIBLING_OF": 36539,
+      "rel:TRIBUTE_TO": 36277,
+      "rel:COLLABORATED_WITH": 36636,
+      "rel:BY": 2320462,
+      "rel:DERIVED_FROM": 700388,
+      "rel:IS": 4887793,
+      "rel:ON": 1329094
+    }
+  },
+  "calibration": {
+    "calibration_version": 1,
+    "timestamp": "2026-09-19T01:00:23Z",
+    "system": {
+      "platform": "Linux-6.8.0-117-generic-aarch64-with-glibc2.41",
+      "machine": "aarch64",
+      "processor": "",
+      "cpu_count": 2,
+      "python_version": "3.13.15",
+      "ram_gb": 7.74
+    },
+    "benchmarks": {
+      "cpu_single_thread": {
+        "test": "cpu_single_thread_sha256",
+        "ops": 2302191,
+        "duration_sec": 5.0,
+        "ops_per_sec": 460438.2
+      },
+      "cpu_multi_thread": {
+        "test": "cpu_multi_thread_sha256",
+        "cores": 2,
+        "ops": 4154178,
+        "duration_sec": 5.0,
+        "ops_per_sec": 830835.6
+      },
+      "memory_bandwidth": {
+        "test": "memory_bandwidth_64mb",
+        "write_mb_per_sec": 89632.4,
+        "read_mb_per_sec": 39797.6
+      },
+      "disk_sequential_write": {
+        "test": "disk_sequential_write",
+        "size_mb": 256,
+        "duration_sec": 0.48,
+        "mb_per_sec": 533.8
+      },
+      "disk_sequential_read": {
+        "test": "disk_sequential_read",
+        "size_mb": 256,
+        "duration_sec": 0.026,
+        "mb_per_sec": 9755.9
+      },
+      "disk_random_read": {
+        "test": "disk_random_read_4k",
+        "duration_sec": 5.0,
+        "iops": 484113.8
+      },
+      "python_sort": {
+        "test": "python_sort_1m_floats",
+        "elements": 1000000,
+        "iterations": 5,
+        "avg_sec": 0.1811,
+        "sorts_per_sec": 5.523
+      }
+    },
+    "label": "Docker Desktop VM on Apple M1 Pro (2 vCPU, 7.7 GiB)"
+  },
+  "results": [
+    {
+      "workload": "path/d6-cap2/cypher",
+      "kind": "path",
+      "case": "d6-artist-artist",
+      "variant": "cypher",
+      "depth": 2,
+      "requested_iterations": 15,
+      "tags": [
+        "cap-cost"
+      ],
+      "notes": "a connected pair against a cap below its distance",
+      "verdict_gate": false,
+      "errors": 0,
+      "iterations": 15,
+      "p50_ms": 5.348,
+      "p95_ms": 6.974,
+      "min_ms": 4.034,
+      "max_ms": 16.237,
+      "mean_ms": 6.051,
+      "stdev_ms": 2.908,
+      "samples_ms": [
+        4.229,
+        5.321,
+        5.213,
+        5.348,
+        4.034,
+        5.501,
+        5.193,
+        16.237,
+        5.124,
+        5.654,
+        5.389,
+        4.698,
+        6.314,
+        6.974,
+        5.532
+      ],
+      "answer": {
+        "found": false,
+        "depth": null,
+        "rows": [],
+        "row_count": 0,
+        "work": {}
+      },
+      "accesses": {
+        "total_accesses": 16
+      }
+    },
+    {
+      "workload": "path/d6-cap3/cypher",
+      "kind": "path",
+      "case": "d6-artist-artist",
+      "variant": "cypher",
+      "depth": 3,
+      "requested_iterations": 15,
+      "tags": [
+        "cap-cost"
+      ],
+      "notes": "a connected pair against a cap below its distance",
+      "verdict_gate": false,
+      "errors": 0,
+      "iterations": 15,
+      "p50_ms": 4.452,
+      "p95_ms": 7.289,
+      "min_ms": 3.542,
+      "max_ms": 13.258,
+      "mean_ms": 5.119,
+      "stdev_ms": 2.444,
+      "samples_ms": [
+        4.452,
+        4.766,
+        5.036,
+        4.155,
+        3.667,
+        3.962,
+        4.123,
+        13.258,
+        3.75,
+        3.542,
+        4.878,
+        5.537,
+        7.289,
+        3.737,
+        4.631
+      ],
+      "answer": {
+        "found": false,
+        "depth": null,
+        "rows": [],
+        "row_count": 0,
+        "work": {}
+      },
+      "accesses": {
+        "total_accesses": 24
+      }
+    },
+    {
+      "workload": "path/d6-cap4/cypher",
+      "kind": "path",
+      "case": "d6-artist-artist",
+      "variant": "cypher",
+      "depth": 4,
+      "requested_iterations": 15,
+      "tags": [
+        "cap-cost"
+      ],
+      "notes": "a connected pair against a cap below its distance",
+      "verdict_gate": false,
+      "errors": 0,
+      "iterations": 15,
+      "p50_ms": 3.708,
+      "p95_ms": 5.976,
+      "min_ms": 3.154,
+      "max_ms": 10.677,
+      "mean_ms": 4.463,
+      "stdev_ms": 1.943,
+      "samples_ms": [
+        5.976,
+        4.382,
+        4.285,
+        5.177,
+        3.754,
+        3.514,
+        3.708,
+        10.677,
+        5.63,
+        3.481,
+        3.339,
+        3.369,
+        3.279,
+        3.154,
+        3.225
+      ],
+      "answer": {
+        "found": false,
+        "depth": null,
+        "rows": [],
+        "row_count": 0,
+        "work": {}
+      },
+      "accesses": {
+        "total_accesses": 84
+      }
+    },
+    {
+      "workload": "path/d6-cap6/cypher",
+      "kind": "path",
+      "case": "d6-artist-artist",
+      "variant": "cypher",
+      "depth": 6,
+      "requested_iterations": 15,
+      "tags": [
+        "cap-cost"
+      ],
+      "notes": "a connected pair against a cap below its distance",
+      "verdict_gate": false,
+      "errors": 0,
+      "iterations": 15,
+      "p50_ms": 39.692,
+      "p95_ms": 41.908,
+      "min_ms": 39.031,
+      "max_ms": 46.382,
+      "mean_ms": 40.304,
+      "stdev_ms": 1.862,
+      "samples_ms": [
+        40.634,
+        39.651,
+        41.124,
+        39.958,
+        39.285,
+        41.908,
+        39.903,
+        46.382,
+        39.177,
+        39.031,
+        39.692,
+        39.274,
+        39.47,
+        39.901,
+        39.167
+      ],
+      "answer": {
+        "found": true,
+        "depth": 6,
+        "rows": [],
+        "row_count": 0,
+        "work": {}
+      },
+      "accesses": {
+        "total_accesses": 150157
+      }
+    },
+    {
+      "workload": "path/d6-cap10/cypher",
+      "kind": "path",
+      "case": "d6-artist-artist",
+      "variant": "cypher",
+      "depth": 10,
+      "requested_iterations": 15,
+      "tags": [
+        "cap-cost"
+      ],
+      "notes": "a connected pair against a cap below its distance",
+      "verdict_gate": false,
+      "errors": 0,
+      "iterations": 15,
+      "p50_ms": 39.028,
+      "p95_ms": 44.674,
+      "min_ms": 36.85,
+      "max_ms": 47.479,
+      "mean_ms": 40.246,
+      "stdev_ms": 2.888,
+      "samples_ms": [
+        47.479,
+        42.408,
+        38.679,
+        39.028,
+        38.484,
+        38.177,
+        39.517,
+        44.674,
+        37.678,
+        41.942,
+        40.621,
+        38.411,
+        36.85,
+        38.546,
+        41.195
+      ],
+      "answer": {
+        "found": true,
+        "depth": 6,
+        "rows": [],
+        "row_count": 0,
+        "work": {}
+      },
+      "accesses": {
+        "total_accesses": 150157
+      }
+    }
+  ]
+}
