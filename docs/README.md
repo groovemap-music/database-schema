@@ -4,7 +4,8 @@
   source-specific producer boundaries, executable schema inventory, migrations, execution
   order, failure behavior, the two real-engine
   [integration tiers](architecture.md#integration-tiers), and the
-  [graph schema](architecture.md#graph-schema) with its conditional
+  [graph schema](architecture.md#graph-schema) with its non-authoritative
+  [bootstrap fill](architecture.md#the-bootstrap-fill) and its conditional
   [property graph](architecture.md#property-graph).
 - [Runtime configuration](runtime-configuration.md) — database endpoints, credentials,
   secret files, TLS, logging, image behavior, and the metrics and spans the initializer emits.

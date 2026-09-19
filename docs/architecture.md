@@ -15,7 +15,7 @@ flowchart LR
     DEP[deployment] -->|owns| OP[Credentials, configuration, ordering, image digest]
     PC -->|declares| PG[(PostgreSQL schema)]
     PC -->|declares| N[(Neo4j schema)]
-    PG -->|projects| GV[graph schema: 52 views]
+    PG -->|projects| GV[graph schema: 27 tables, 33 views]
     GV -. "PostgreSQL 19 and SCHEMA_PROPERTY_GRAPH" .-> CAT["graph.catalog property graph"]
     PC -. uses .-> CL
     OP -. runs .-> PC
@@ -339,20 +339,39 @@ Every index and constraint above is additive within persistence contract v1 — 
 
 ## Graph schema
 
-The `graph` schema re-presents the catalog tables as the vertex and edge relations of the
-property graph the Neo4j enrichers already build. Every object in it is a `CREATE OR REPLACE
-VIEW` over a table declared elsewhere in
-[`src/groovemap_schema/postgres.py`](../src/groovemap_schema/postgres.py); nothing is
-materialized, nothing is copied, and no base table changes. The schema is additive within
-persistence contract v1: [the persistence compatibility contract](../contracts/persistence/)
-records the views, the four appended key columns, and the property graph as additive objects
-of version 1.
+The `graph` schema re-presents the catalog as the vertex and edge relations of the property
+graph the Neo4j enrichers already build. Sixty-four relations, declared in
+[`src/groovemap_schema/postgres.py`](../src/groovemap_schema/postgres.py): twenty-seven
+loader-written tables and thirty-seven read-only views over tables declared elsewhere in the
+same module. The schema is additive within persistence contract v1:
+[the persistence compatibility contract](../contracts/persistence/) records every relation
+with its shape and its owner, the text key rule, and the property graph as additive objects of
+version 1.
 
-Read the section in two halves. The fifty-two views are unconditional — every supported
+**This repository declares every relation and writes rows into none of them.** An empty table
+on a fresh database is the expected state, not a fault. `discogs-sql-loader` owns most of
+them, `musicbrainz-sql-loader` owns the MusicBrainz half and co-owns the shared medium
+vocabulary, `catalog-api` owns the personal-collection views, and
+[`graph.release_degree`](#the-counter-degree-and-aggregate-relations) is the one relation
+split across two owners. The contract names the owner of each. The schema also declares
+[`graph.bootstrap_fill()`](#the-bootstrap-fill), which can write those rows on request, but
+nothing calls it and applying the schema still writes nothing — and what it writes is not
+authoritative.
+
+Twenty of the tables replaced a view that computed the same rows on every read. Spike
+gm-database-schema-9c8.1 measured those views and found every hot edge re-unnesting a JSONB
+document per query, unable to carry an index, and — because a view cannot be probed from its
+target end — reproducing a sequential scan on the traversal direction the ported Cypher uses
+most. Spike gm-database-schema-9c8.2 Table 2 and Table 3 fix the shapes, keys, indexes, and
+owners; this schema follows them and does not invent one. Seven further tables hold the
+counters the graph enrichers compute in a post-import pass, which a graph declared over views
+had nowhere to put.
+
+Read the section in two halves. The sixty-four relations are unconditional — every supported
 engine gets all of them, on PostgreSQL 18 and 19 alike. The `CREATE PROPERTY GRAPH`
 declaration layered over them is not: it needs PostgreSQL 19 and an explicit switch, and
 [when it is applied](#when-it-is-applied) is the one place those gates are stated. A consumer
-reads the views and probes for the graph.
+reads the relations and probes for the graph.
 
 Names are the contract. A vertex view is named for the Neo4j label it mirrors and an edge
 view for the relationship type, lowercased and de-reserved, so a later `CREATE PROPERTY
@@ -364,12 +383,21 @@ ADR 0012 names a label, its mapping table is the contract and this schema follow
 That contract is enforced by the engine, not only by convention. `CREATE OR REPLACE VIEW`
 may only append columns to the end of an existing view: PostgreSQL refuses to drop, rename,
 reorder, or retype a column the view already exposes, and fails the statement outright rather
-than replacing it. So within this no-DROP schema, adding a column to a view is the only
-change that is safe to ship on its own. Renaming a view or a view column, removing one,
-changing its position, or widening its type is a breaking change to the published contract
-and needs a coordinated `DROP ... CASCADE` migration under the persistence contract's
-expand/migrate/contract rule — expand with the new shape alongside the old, migrate readers,
-then contract — not an edit to the statement list here.
+than replacing it. So adding a column to a view is the only change that is safe to ship on its
+own. Renaming a view or a view column, removing one, changing its position, or widening its
+type is a breaking change to the published contract and needs a coordinated migration under
+the persistence contract's expand/migrate/contract rule — expand with the new shape alongside
+the old, migrate readers, then contract — not an edit to the statement list here.
+
+Changing a relation's *shape* is the one case the schema handles itself, and it is the only
+place anything here drops anything. A relation that becomes a loader-written table is preceded
+by a guarded migration: a `DO` block that reads `pg_class`, drops the view only if a view of
+that name is still there, and does nothing otherwise. A fresh database drops nothing. A second
+apply finds a table rather than a view and drops nothing either. `CASCADE` is required because
+on PostgreSQL 19 `graph.catalog` depends on the view, and the property graph is re-declared on
+the same run. The four Discogs vertex relations that stay views carry the same guard for the
+same reason, conditioned on their key column still reading as `character varying`, which makes
+it self-healing from any half-applied state.
 
 The same rule binds the base tables underneath. PostgreSQL will not retype a column a view
 reads, so once a graph view exposes a column, an `ALTER COLUMN ... TYPE` against it fails
@@ -402,73 +430,142 @@ with a tab or a newline — in `country`, in a normalized credit role, or in the
 MusicBrainz payloads pad with spaces in practice, so the two agree on real data; a document
 that pads otherwise is the known gap.
 
-### Neo4j type to view mapping
+### Neo4j type to relation mapping
 
 This is the whole mapping, and it carries three names per row rather than two. The Neo4j label
-or relationship type an enricher writes is the first; the view that re-presents it is the
-second; and on PostgreSQL 19 the SQL/PGQ label is the third — always the view name, verbatim,
+or relationship type an enricher writes is the first; the relation that re-presents it is the
+second; and on PostgreSQL 19 the SQL/PGQ label is the third — always the relation name, verbatim,
 which is what the de-reserving rule in ADR 0012 buys. So `:Release` is `graph.release` is
 `MATCH (r IS release)`, and `[:BY]` out of a release is `graph.by_artist` is
 `-[IS by_artist]->`, with no second table to consult. See [labels](#labels) for the two
-keywords that were checked and for the shared label sixteen views carry on top of their own.
+keywords that were checked and for the shared label sixteen relations carry on top of their own.
 
-Vertex views. The key column is what edge views join to.
+Vertex relations. The key column is what edge relations join to, and every one of them is
+`text`, `uuid`, or `bigint` — never `character varying`; see
+[the text key rule](#the-text-key-rule). "Shape" is `table` where a loader writes the rows and
+`view` where the relation is a projection of a table written elsewhere.
 
-| Neo4j label | View | Key column | Other columns |
-| --- | --- | --- | --- |
-| `:Artist` | `graph.artist` | `artist_id` | `name`, `gm_item_id`, `hash`, `updated_at`, `artist_key` |
-| `:Label` | `graph.label` | `label_id` | `name`, `gm_item_id`, `hash`, `updated_at`, `label_key` |
-| `:Master` | `graph.master` | `master_id` | `title`, `year`, `genres`, `styles`, `gm_item_id`, `hash`, `updated_at`, `master_key` |
-| `:Release` | `graph.release` | `release_id` | `title`, `year`, `country`, `genres`, `styles`, `media_families`, `gm_item_id`, `hash`, `updated_at`, `release_key` |
-| `:Genre` | `graph.genre` | `name` | — |
-| `:Style` | `graph.style` | `name` | — |
-| `:Person` | `graph.person` | `name` | — |
-| `:Company` | `graph.company` | `company_id` | `name`, `discogs_label_id` |
-| `:Medium` | `graph.medium` | `medium_id` | `family`, `label` |
-| `:MediaFamily` | `graph.media_family` | `name` | — |
-| `:User` | `graph.app_user` | `user_id` | `is_active`, `is_admin`, `created_at`, `updated_at` |
-| (native identity) | `graph.catalog_item` | `item_id` | `kind`, `created_at` |
-| (MusicBrainz artist) | `graph.mb_artist` | `mbid` | `name`, `sort_name`, `type`, `gender`, `begin_date`, `end_date`, `ended`, `area`, `begin_area`, `end_area`, `disambiguation`, `discogs_artist_id`, `updated_at` |
-| (MusicBrainz label) | `graph.mb_label` | `mbid` | `name`, `type`, `label_code`, `begin_date`, `end_date`, `ended`, `area`, `disambiguation`, `discogs_label_id`, `updated_at` |
-| (MusicBrainz release) | `graph.mb_release` | `mbid` | `name`, `barcode`, `status`, `release_group_mbid`, `discogs_release_id`, `media_families`, `updated_at` |
-| (MusicBrainz release group) | `graph.mb_release_group` | `mbid` | `name`, `type`, `secondary_types`, `first_release_date`, `disambiguation`, `discogs_master_id`, `updated_at` |
+Four of these relations hold the rows of a label without being the element table the property
+graph binds. `:Genre`, `:Style`, `:Label`, and `:Artist` bind a `<label>_vertex` view that
+joins the relation below to its counter relation, so that the counters `graphinator` writes
+onto those four nodes read as properties of the same label here. The rows, the key, and every
+column in this table are unchanged by that; the projection only adds columns. See
+[the counter relations](#the-counter-degree-and-aggregate-relations).
 
-The four Discogs entity views end with an appended `<entity>_key`: the same value as
-`<entity>_id`, typed `text` so the property graph can join on it. It is structural rather than
-part of the mapping above — nothing but `CREATE PROPERTY GRAPH` reads it — but it is not
-gated, so it is there on PostgreSQL 18 and with the switch off as well. See
-[the four restated vertex keys](#the-four-restated-vertex-keys) for why it exists.
+| Neo4j label | Relation | Shape | Key column | Other columns |
+| --- | --- | --- | --- | --- |
+| `:Artist` | `graph.artist` | view | `artist_id` | `name`, `gm_item_id`, `hash`, `updated_at`, `gm_id` |
+| `:Label` | `graph.label` | view | `label_id` | `name`, `gm_item_id`, `hash`, `updated_at`, `gm_id` |
+| `:Master` | `graph.master` | view | `master_id` | `title`, `year`, `genres`, `styles`, `gm_item_id`, `hash`, `updated_at`, `gm_id` |
+| `:Release` | `graph.release` | view | `release_id` | `title`, `year`, `country`, `genres`, `styles`, `media_families`, `gm_item_id`, `hash`, `updated_at`, `formats`, `catalog_number`, `gm_id` |
+| `:Genre` | `graph.genre` | **table** | `name` | — |
+| `:Style` | `graph.style` | **table** | `name` | — |
+| `:Person` | `graph.person` | **table** | `name` | — |
+| `:Company` | `graph.company` | **table** | `company_id` | `name`, `discogs_label_id` |
+| `:Medium` | `graph.medium` | **table** | `medium_id` | `family`, `label` |
+| `:MediaFamily` | `graph.media_family` | **table** | `name` | — |
+| `:User` | `graph.app_user` | view | `user_id` | `is_active`, `is_admin`, `created_at`, `updated_at` |
+| (native identity) | `graph.catalog_item` | view | `item_id` | `kind`, `created_at` |
+| (MusicBrainz artist) | `graph.mb_artist` | view | `mbid` | `name`, `sort_name`, `type`, `gender`, `begin_date`, `end_date`, `ended`, `area`, `begin_area`, `end_area`, `disambiguation`, `discogs_artist_id`, `updated_at` |
+| (MusicBrainz label) | `graph.mb_label` | view | `mbid` | `name`, `type`, `label_code`, `begin_date`, `end_date`, `ended`, `area`, `disambiguation`, `discogs_label_id`, `updated_at` |
+| (MusicBrainz release) | `graph.mb_release` | view | `mbid` | `name`, `barcode`, `status`, `release_group_mbid`, `discogs_release_id`, `media_families`, `updated_at` |
+| (MusicBrainz release group) | `graph.mb_release_group` | view | `mbid` | `name`, `type`, `secondary_types`, `first_release_date`, `disambiguation`, `discogs_master_id`, `updated_at` |
+
+The six name-keyed vertex relations are tables because their views were the most expensive
+relations in the schema and could not carry an index. Each was a `SELECT DISTINCT` over a full
+unnest of every release and every master to yield a few hundred rows, which is why a scan of
+`masters` appeared in the label DNA plan even though that query has nothing to do with
+masters. `graph.genre`, `graph.style`, and `graph.person` also carry a `GIN` trigram index on
+`name`, which the six full-text query functions the coverage spike found need and which a view
+cannot carry at all. The extension is created by the initializer and each index is guarded on
+it actually being present, so a deployment whose role cannot create an extension loses trigram
+search rather than the schema.
+
+`graph.company`'s identity rule is the producer's and the table deliberately does not
+recompute it: a whole Discogs id of at least one when the source supplies one, otherwise
+`name:` followed by the name case-folded with inner whitespace collapsed and punctuation left
+alone. PostgreSQL's `lower` only approximates Python's `casefold` — they disagree on the
+German eszett and a handful of other characters — so the loader writes the rule's own answer
+and the approximation retired with the view.
+
+The four Discogs entity relations stay views: they are straight projections of an indexed
+table and do not need materializing on read grounds. Each now publishes its key as
+`data_id::text`, which retires the appended `<entity>_key` restatement the phase 0 views
+carried. Each also appends `gm_id`, the native catalog identity ADR 0009 mints, read from
+`provider_aliases` — the one table `catalog-api`'s `gm_id` projection job reads — through its
+partial unique index on `(provider, entity_kind, external_id) WHERE valid_to IS NULL`. The
+join is a single index probe, cannot multiply a row, and is a `LEFT JOIN` so an entity the
+resolver has not reached yet is still a vertex. Exposing it here is what makes a cross-store
+copy unnecessary.
+
+`graph.release` also publishes `formats` and `catalog_number`, the two `:Release` properties
+the graph writes from `data->'formats'[].name` and `labels[0].catno`. `catalog_number` was
+written twice in the graph — by `graphinator` and again by `catalog-api`'s syncer — and
+neither `user_collections` nor `user_wantlists` has a column for it, so the Discogs copy is
+the one with a relational home.
 
 `graph.app_user` deliberately omits `email` and every credential column: the Neo4j
 `:User` node carries only an id, and a graph relation is the wrong surface on which to widen
 personal data.
 
-Edge views. Every one exposes a stable key column set plus the source and target key columns
-that join the vertex views above.
+Edge relations. Every one exposes a stable key column set plus the source and target key
+columns that join the vertex relations above. **Every edge table is indexed in both
+directions**: the primary key serves the forward walk and a second index serves the reverse,
+because the ported Cypher enters these edges from the target end as often as from the source.
+A table indexed one way only reproduces the exact failure the views had. "Reverse index" is
+that second index; the primary key is the key column set in the column before it.
 
-| Neo4j relationship | View | Key columns | Source → target | Source |
-| --- | --- | --- | --- | --- |
-| `(:Release)-[:BY]->(:Artist)` | `graph.by_artist` | `release_id`, `artist_id` | `release_id` → `artist_id` | `releases.data->'artists'` |
-| `(:Release)-[:ON]->(:Label)` | `graph.on_label` | `release_id`, `label_id` | `release_id` → `label_id` | `releases.data->'labels'` |
-| `(:Release)-[:DERIVED_FROM]->(:Master)` | `graph.derived_from` | `release_id`, `master_id` | `release_id` → `master_id` | `releases.data->>'master_id'` |
-| `(:Release)-[:IS]->(:Genre)` | `graph.in_genre` | `release_id`, `genre_name` | `release_id` → `genre_name` | `releases.data->'genres'` |
-| `(:Release)-[:IS]->(:Style)` | `graph.in_style` | `release_id`, `style_name` | `release_id` → `style_name` | `releases.data->'styles'` |
-| `(:Master)-[:BY]->(:Artist)` | `graph.master_by_artist` | `master_id`, `artist_id` | `master_id` → `artist_id` | `masters.data->'artists'` |
-| `(:Master)-[:IS]->(:Genre)` | `graph.master_in_genre` | `master_id`, `genre_name` | `master_id` → `genre_name` | `masters.data->'genres'` |
-| `(:Master)-[:IS]->(:Style)` | `graph.master_in_style` | `master_id`, `style_name` | `master_id` → `style_name` | `masters.data->'styles'` |
-| `(:Style)-[:PART_OF]->(:Genre)` | `graph.part_of` | `style_name`, `genre_name` | `style_name` → `genre_name` | releases and masters carrying exactly one genre |
-| `(:Artist)-[:MEMBER_OF]->(:Artist)` | `graph.member_of` | `member_artist_id`, `group_artist_id` | `member_artist_id` → `group_artist_id` | `artists.data->'members'` and `->'groups'` |
-| `(:Artist)-[:ALIAS_OF]->(:Artist)` | `graph.alias_of` | `alias_artist_id`, `artist_id` | `alias_artist_id` → `artist_id` | `artists.data->'aliases'` |
-| `(:Label)-[:SUBLABEL_OF]->(:Label)` | `graph.sublabel_of` | `sublabel_id`, `parent_label_id` | `sublabel_id` → `parent_label_id` | `labels.data->'parentLabel'` and `->'sublabels'` |
-| `(:Person)-[:CREDITED_ON]->(:Release)` | `graph.credited_on` | `person_name`, `release_id`, `role` | `person_name` → `release_id` | `releases.data->'extraartists'` |
-| `(:Person)-[:SAME_AS]->(:Artist)` | `graph.same_as` | `person_name`, `artist_id` | `person_name` → `artist_id` | `releases.data->'extraartists'` |
-| `(:Release)-[:CREDITED_TO]->(:Company)` | `graph.credited_to` | `release_id`, `company_id`, `role`, `source` | `release_id` → `company_id` | `releases.data->'companies'` |
-| `(:Release)-[:ISSUED_ON]->(:Medium)` | `graph.issued_on` | `release_id`, `medium_id`, `source` | `release_id` → `medium_id` | `releases.media` and `musicbrainz.releases.media` |
-| `(:Medium)-[:IN_FAMILY]->(:MediaFamily)` | `graph.in_family` | `medium_id`, `family_name` | `medium_id` → `family_name` | `releases.media` and `musicbrainz.releases.media` |
-| `(:User)-[:COLLECTED]->(:Release)` | `graph.collected` | `collection_id` | `user_id` → `release_id` | `user_collections` |
-| `(:User)-[:WANTS]->(:Release)` | `graph.wants` | `wantlist_id` | `user_id` → `release_id` | `user_wantlists` |
-| (native ownership) | `graph.owns` | `owned_copy_id` | `user_id` → `item_id` | `owned_copies` |
-| (MusicBrainz relationship) | `graph.mb_rel_<source>_<target>` | `relationship_id` | `source_mbid` → `target_mbid` | `musicbrainz.relationships` |
+| Neo4j relationship | Relation | Shape | Key columns | Reverse index | Source → target | Source |
+| --- | --- | --- | --- | --- | --- | --- |
+| `(:Release)-[:BY]->(:Artist)` | `graph.by_artist` | **table** | `release_id`, `artist_id` | `(artist_id, release_id)` | `release_id` → `artist_id` | `releases.data->'artists'` |
+| `(:Release)-[:ON]->(:Label)` | `graph.on_label` | **table** | `release_id`, `label_id` | `(label_id, release_id)` | `release_id` → `label_id` | `releases.data->'labels'` |
+| `(:Release)-[:DERIVED_FROM]->(:Master)` | `graph.derived_from` | **table** | `release_id`, `master_id` | `(master_id, release_id)` | `release_id` → `master_id` | `releases.data->>'master_id'` |
+| `(:Release)-[:IS]->(:Genre)` | `graph.in_genre` | **table** | `release_id`, `genre_name` | `(genre_name, release_id)` | `release_id` → `genre_name` | `releases.data->'genres'` |
+| `(:Release)-[:IS]->(:Style)` | `graph.in_style` | **table** | `release_id`, `style_name` | `(style_name, release_id)` | `release_id` → `style_name` | `releases.data->'styles'` |
+| `(:Master)-[:BY]->(:Artist)` | `graph.master_by_artist` | **table** | `master_id`, `artist_id` | `(artist_id, master_id)` | `master_id` → `artist_id` | `masters.data->'artists'` |
+| `(:Master)-[:IS]->(:Genre)` | `graph.master_in_genre` | **table** | `master_id`, `genre_name` | `(genre_name, master_id)` | `master_id` → `genre_name` | `masters.data->'genres'` |
+| `(:Master)-[:IS]->(:Style)` | `graph.master_in_style` | **table** | `master_id`, `style_name` | `(style_name, master_id)` | `master_id` → `style_name` | `masters.data->'styles'` |
+| `(:Style)-[:PART_OF]->(:Genre)` | `graph.part_of` | view | `style_name`, `genre_name` | — | `style_name` → `genre_name` | releases and masters carrying exactly one genre |
+| `(:Artist)-[:MEMBER_OF]->(:Artist)` | `graph.member_of` | **table** | `member_artist_id`, `group_artist_id` | `(group_artist_id, member_artist_id)` | `member_artist_id` → `group_artist_id` | `artists.data->'members'` and `->'groups'` |
+| `(:Artist)-[:ALIAS_OF]->(:Artist)` | `graph.alias_of` | **table** | `alias_artist_id`, `artist_id` | `(artist_id, alias_artist_id)` | `alias_artist_id` → `artist_id` | `artists.data->'aliases'` |
+| `(:Label)-[:SUBLABEL_OF]->(:Label)` | `graph.sublabel_of` | view | `sublabel_id`, `parent_label_id` | — | `sublabel_id` → `parent_label_id` | `labels.data->'parentLabel'` and `->'sublabels'` |
+| `(:Person)-[:CREDITED_ON]->(:Release)` | `graph.credited_on` | **table** | `person_name`, `release_id`, `role` | `(release_id, person_name)` | `person_name` → `release_id` | `releases.data->'extraartists'` |
+| `(:Person)-[:SAME_AS]->(:Artist)` | `graph.same_as` | **table** | `person_name`, `artist_id` | `(artist_id)` | `person_name` → `artist_id` | `releases.data->'extraartists'` |
+| `(:Release)-[:CREDITED_TO]->(:Company)` | `graph.credited_to` | **table** | `release_id`, `company_id`, `role`, `source` | `(company_id, release_id)` | `release_id` → `company_id` | `releases.data->'companies'` |
+| `(:Release)-[:ISSUED_ON]->(:Medium)` | `graph.issued_on` | **table** | `release_id`, `medium_id`, `source` | `(medium_id, release_id)` | `release_id` → `medium_id` | `releases.media` and `musicbrainz.releases.media` |
+| `(:Medium)-[:IN_FAMILY]->(:MediaFamily)` | `graph.in_family` | view | `medium_id`, `family_name` | — | `medium_id` → `family_name` | `graph.medium` |
+| (artist genre aggregate) | `graph.artist_genre` | **table** | `artist_id`, `genre_name` | `(genre_name, artist_id)` | `artist_id` → `genre_name` | `graph.by_artist` × `graph.in_genre` |
+| (label genre aggregate) | `graph.label_genre` | **table** | `label_id`, `genre_name` | `(genre_name, label_id)` | `label_id` → `genre_name` | `graph.on_label` × `graph.in_genre` |
+| `(:User)-[:COLLECTED]->(:Release)` | `graph.collected` | view | `collection_id` | — | `user_id` → `release_id` | `user_collections` |
+| `(:User)-[:WANTS]->(:Release)` | `graph.wants` | view | `wantlist_id` | — | `user_id` → `release_id` | `user_wantlists` |
+| (native ownership) | `graph.owns` | view | `owned_copy_id` | — | `user_id` → `item_id` | `owned_copies` |
+| (MusicBrainz relationship) | `graph.mb_rel_<source>_<target>` | view | `relationship_id` | — | `source_mbid` → `target_mbid` | `musicbrainz.relationships` |
+
+Three edges stay views, and Table 2 of the coverage spike says why in each case. `part_of` is
+bounded by 757 styles times 16 genres, `in_family` by the media taxonomy, and `sublabel_of`
+is read by nothing in `catalog-api`'s `api/queries/` at all — Table 2 says to materialize it
+only when a caller appears, and none has. The personal-collection edges stay views because
+`user_collections` and `user_wantlists` are real tables with real indexes; ADR 0012 phase 4
+makes them views on purpose. `part_of` keeps its single-genre guard verbatim and now
+inner-joins the style and genre vertex tables so an edge never points at a vertex row that is
+not there; `in_family` projects `graph.medium` rather than re-unnesting both providers' media
+blocks.
+
+Two more properties of the edge tables are worth stating because they are deliberate.
+**No edge table declares a foreign key.** A loader writes an edge in the same transaction as
+the document it came from and may legitimately name an entity it has not ingested yet, exactly
+as `graphinator` merges a target node as it writes the edge; resolution is the property
+graph's job. And **`source` stays in the key of `credited_to` and `issued_on`**, with its own
+index, precisely so `discogs-sql-loader` writing `source='discogs'` and
+`musicbrainz-sql-loader` writing `source='musicbrainz'` do not collide and so each one's
+source-scoped prune reaches only its own rows.
+
+`graph.credited_on.role_category` is a generated column over
+`graph.credit_role_category(role)` rather than a column a loader writes. Nine credits
+functions read it and a loader that forgot to set it would produce a silent null rather than a
+failure. The expression binds to the function at creation time, so re-rendering that function
+from a newer runtime pin does not recompute stored rows; a taxonomy move is a backfill, which
+is what it is in Neo4j too.
 
 `graph.collected` also exposes `instance_id`, `folder_id`, `condition`, `rating`, and
 `date_added`; its natural key is `(user_id, release_id, instance_id)`, and `collection_id` is
@@ -501,8 +598,42 @@ Each one filters on its own `(source_entity_type, target_entity_type)` pair and 
 both endpoint tables, which is what drops the dangling rows. All sixteen are declared rather
 than only the pairs some catalog happens to hold today, so the set of relations is a property
 of the schema and not of the data loaded into it. Every one exposes `relationship_id`,
-`source_mbid`, `target_mbid`, `relationship_type`, `begin_date`, `end_date`, `ended`, and
-`attributes`.
+`source_mbid`, `target_mbid`, `relationship_type`, `begin_date`, `end_date`, `ended`,
+`attributes`, and `raw_relationship_type`.
+
+Until now nothing indexed that pair filter. `musicbrainz.relationships` carries a natural-key
+constraint that guarantees uniqueness but leads with the source identifier, which is not a
+useful access path for a filter on the endpoint types. Two indexes close it —
+`(source_entity_type, target_entity_type, source_mbid)` and the mirrored
+`(…, target_mbid)` — because a relationship is reached from its target as often as from its
+source. `musicbrainz.artists (discogs_artist_id)` is the column the MusicBrainz read crosses
+key spaces on and is already indexed.
+
+**The two stores disagree about the relationship vocabulary, and the disagreement is closed
+here.** `musicbrainz-sql-loader` stores the raw MusicBrainz string; the graph enricher maps it
+to a Neo4j relationship type before it writes an edge. A query ported from Cypher asks for
+`MEMBER_OF` and would find `member of band`. `graph.mb_relationship_type(text)` renders
+`brainzgraphinator`'s `MB_RELATIONSHIP_MAP` verbatim — eight entries, pinned entry by entry in
+the test suite — so `relationship_type` publishes the Neo4j name and `raw_relationship_type`
+publishes the string the loader stored.
+
+The enricher resolves an unmapped string to `None` and writes no edge at all. The relational
+side cannot drop the row, because `musicbrainz.relationships` holds every relationship the
+loader ingested rather than only the eight the enricher projects, so the mapped column is
+`NULL` there and the raw string stays readable beside it. A consumer filtering on the mapped
+name therefore sees exactly the edges Neo4j carries; one filtering on the raw string sees
+everything.
+
+| MusicBrainz relationship | Neo4j type |
+| --- | --- |
+| `artist rename` | `RENAMED_TO` |
+| `collaboration` | `COLLABORATED_WITH` |
+| `founder` | `FOUNDED` |
+| `member of band` | `MEMBER_OF` |
+| `subgroup` | `SUBGROUP_OF` |
+| `supporting musician` | `SUPPORTED` |
+| `teacher` | `TAUGHT` |
+| `tribute` | `TRIBUTE_TO` |
 
 ### Credits, companies, and media
 
@@ -561,16 +692,104 @@ it here would key the vertex differently from the node it mirrors.
   requested type is the one it already has, and the graph schema exposes exactly those
   columns as the bridge between the MusicBrainz and Discogs halves of the graph.
 
+### The bootstrap fill
+
+`graph.bootstrap_fill()` derives every one of the twenty-seven loader-written tables from the
+`artists`, `labels`, `masters`, `releases`, and `musicbrainz` documents in one pass. It exists
+for one situation: an environment that has the documents but has not run a loader, where a
+read rewrite in `catalog-api` would otherwise be blocked waiting for the dual-write. Run it
+once and the graph relations are populated.
+
+**It is not authoritative, and the loaders own every relation it touches.**
+`discogs-sql-loader` writes an edge in the same transaction as the document it came from and
+recomputes the counters on the `extraction_complete` latch it already handles;
+`musicbrainz-sql-loader` upserts its half of the shared medium vocabulary. Whatever this fill
+wrote is superseded the first time either of them runs, and where the two disagree the loader
+is right. Nothing in this repository calls it — applying the schema declares the function and
+writes no row — so a fresh database is still empty until somebody asks.
+
+```sql
+SELECT * FROM graph.bootstrap_fill();
+```
+
+```
+      relation       | row_count
+---------------------+-----------
+ graph.genre         |        16
+ graph.style         |       757
+ …
+```
+
+It returns a row per relation in fill order and raises the same line as a `NOTICE`, so a psql
+session watching a long fill sees progress rather than silence.
+
+Three things about how it works are worth stating, because each is a decision rather than a
+detail.
+
+**It is the phase 0 projection, by construction.** Twenty of these tables replaced a view that
+computed the same rows on every read. Those view bodies are still in `postgres.py`, retained
+for the table-versus-view parity comparison, and the fill inlines the same text rather than a
+copy of it. So "the fill agrees with the definition the relation published" is not a property
+anyone has to check — there is one definition and both read it. The seven counter relations
+never had a view; their bodies are the sums over the edge tables that the loaders implement,
+and they are shared the same way.
+
+**Each relation is emptied and refilled, in one transaction.** `TRUNCATE` then `INSERT`, not an
+upsert. `ON CONFLICT DO NOTHING` converges upward only: a row the documents no longer justify —
+a release whose genre was corrected, a credit that was removed — would survive every re-run, so
+the relation would drift away from its own definition rather than toward it. Emptying it first
+makes the relation exactly the projection of the documents present, which is what idempotent
+has to mean here. The whole fill is one statement, so it either replaces all twenty-seven
+relations or replaces none; a failure half way through cannot leave edges pointing at vertices
+that were truncated and never refilled. The cost is that a row a loader wrote which the
+documents do not justify is discarded too, which is a reason to run the bootstrap before the
+loaders rather than after them.
+
+**The order is load-bearing.** Vertex tables fill before edge tables, because `part_of` and
+`in_family` inner-join the vertex tables and an edge written before its endpoints exist is
+silently absent rather than visibly wrong. Edge tables fill before the counters, because every
+counter's count is a sum over the edge tables — `genre_stats` and `style_stats` also join
+`graph.release` for `first_year`, a document-backed view, but every count column reads no
+document — filled first the counts would sum an empty relation and report a converged zero.
+`artist_genre` and `label_genre` sit with the counters for the same reason: both join
+`by_artist` or `on_label` to `in_genre`.
+
+One known divergence from what the loaders write, recorded in the contract under
+`graph_schema.bootstrap`:
+
+- **Company ids for a company with no Discogs id.** The producer's rule keys such a company on
+  `name:` followed by the name case-folded with inner whitespace collapsed. This fill folds with
+  SQL `lower`, which is only an approximation of Python's `str.casefold` — they disagree on the
+  German eszett and a handful of other characters. For those few names the loader's id is the
+  right one and the fill's is not; the loader's row wins.
+
+`credited_on.role_category` is never written by the fill either — it is a generated column, so
+naming it in an `INSERT` is an error rather than an overwrite — but that is not a second
+divergence: the engine computes it from `role`, which is in the key, so the fill produces the
+same value the loader would.
+
+The integration suite runs the fill against the real-engine fixture, compares every relation's
+row count to the retained phase 0 view, runs it a second time and asserts the rows are
+identical, then writes a row no document justifies and asserts the next run removes it.
+
 ### Property graph
 
 PostgreSQL 19 adds SQL/PGQ, and with it `CREATE PROPERTY GRAPH`: a named, read-only graph over
 relations that a `GRAPH_TABLE` query pattern-matches. `graph.catalog` declares one over every
-view above — sixteen vertex tables and thirty-six edge tables, one element per view — so the
-same projection serves both a `SELECT` against a view and a graph pattern. Nothing is
-materialized and nothing is copied; each element is read from its view at query time.
+relation above — 17 vertex element tables and 38 edge element tables — so the same
+relation serves both a `SELECT` and a graph pattern. The declaration itself materializes
+nothing and copies nothing: each element is read from the table or view underneath it at query
+time, and the twenty-seven tables are written by their loaders whether the graph is declared
+or not.
+
+Nine relations bind no element. Four hold the rows and four the counters of a label that
+binds a view joining them — see
+[the counter relations](#the-counter-degree-and-aggregate-relations) — and the ninth is
+`graph.release_degree_base`, the loader-written half of release degree, which the graph
+reaches through `graph.release_degree`.
 
 It is the one conditional object in this schema. On PostgreSQL 18, and on 19 with the switch
-off, `graph.catalog` does not exist while all fifty-two views do, so no consumer may assume it
+off, `graph.catalog` does not exist while all sixty-four relations do, so no consumer may assume it
 — [the persistence compatibility contract](../contracts/persistence/) records it as additive
 but conditional for exactly that reason. The gates are stated once, in
 [when it is applied](#when-it-is-applied) below.
@@ -585,17 +804,17 @@ every supported engine gets, and this one is conditional. It is rendered here in
 ```sql
 CREATE PROPERTY GRAPH graph.catalog
     VERTEX TABLES (
-        graph.artist AS artist KEY (artist_key)
-            LABEL artist PROPERTIES (artist_id::text AS artist_id, name, gm_item_id, hash, updated_at),
-        graph.label AS label KEY (label_key)
-            LABEL label PROPERTIES (label_id::text AS label_id, name, gm_item_id, hash, updated_at),
-        graph.master AS master KEY (master_key)
-            LABEL master PROPERTIES (master_id::text AS master_id, title, year, genres, styles, gm_item_id, hash, updated_at),
-        graph.release AS release KEY (release_key)
-            LABEL release PROPERTIES (release_id, title, year, country, genres, styles, media_families, gm_item_id, hash, updated_at),
-        graph.genre AS genre KEY (name)
+        graph.artist_vertex AS artist KEY (artist_id)
+            LABEL artist PROPERTIES ALL COLUMNS,
+        graph.label_vertex AS label KEY (label_id)
+            LABEL label PROPERTIES ALL COLUMNS,
+        graph.master AS master KEY (master_id)
+            LABEL master PROPERTIES ALL COLUMNS,
+        graph.release AS release KEY (release_id)
+            LABEL release PROPERTIES ALL COLUMNS,
+        graph.genre_vertex AS genre KEY (name)
             LABEL genre PROPERTIES ALL COLUMNS,
-        graph.style AS style KEY (name)
+        graph.style_vertex AS style KEY (name)
             LABEL style PROPERTIES ALL COLUMNS,
         graph.person AS person KEY (name)
             LABEL person PROPERTIES ALL COLUMNS,
@@ -616,85 +835,95 @@ CREATE PROPERTY GRAPH graph.catalog
         graph.mb_release AS mb_release KEY (mbid)
             LABEL mb_release PROPERTIES ALL COLUMNS,
         graph.mb_release_group AS mb_release_group KEY (mbid)
-            LABEL mb_release_group PROPERTIES ALL COLUMNS
+            LABEL mb_release_group PROPERTIES ALL COLUMNS,
+        graph.release_degree AS release_degree KEY (release_id)
+            LABEL release_degree PROPERTIES ALL COLUMNS
     )
     EDGE TABLES (
         graph.by_artist AS by_artist KEY (release_id, artist_id)
-            SOURCE KEY (release_id) REFERENCES release (release_key)
-            DESTINATION KEY (artist_id) REFERENCES artist (artist_key)
+            SOURCE KEY (release_id) REFERENCES release (release_id)
+            DESTINATION KEY (artist_id) REFERENCES artist (artist_id)
             LABEL by_artist PROPERTIES ALL COLUMNS,
         graph.on_label AS on_label KEY (release_id, label_id)
-            SOURCE KEY (release_id) REFERENCES release (release_key)
-            DESTINATION KEY (label_id) REFERENCES label (label_key)
+            SOURCE KEY (release_id) REFERENCES release (release_id)
+            DESTINATION KEY (label_id) REFERENCES label (label_id)
             LABEL on_label PROPERTIES ALL COLUMNS,
         graph.derived_from AS derived_from KEY (release_id, master_id)
-            SOURCE KEY (release_id) REFERENCES release (release_key)
-            DESTINATION KEY (master_id) REFERENCES master (master_key)
+            SOURCE KEY (release_id) REFERENCES release (release_id)
+            DESTINATION KEY (master_id) REFERENCES master (master_id)
             LABEL derived_from PROPERTIES ALL COLUMNS,
         graph.in_genre AS in_genre KEY (release_id, genre_name)
-            SOURCE KEY (release_id) REFERENCES release (release_key)
+            SOURCE KEY (release_id) REFERENCES release (release_id)
             DESTINATION KEY (genre_name) REFERENCES genre (name)
             LABEL in_genre PROPERTIES ALL COLUMNS,
         graph.in_style AS in_style KEY (release_id, style_name)
-            SOURCE KEY (release_id) REFERENCES release (release_key)
+            SOURCE KEY (release_id) REFERENCES release (release_id)
             DESTINATION KEY (style_name) REFERENCES style (name)
             LABEL in_style PROPERTIES ALL COLUMNS,
         graph.master_by_artist AS master_by_artist KEY (master_id, artist_id)
-            SOURCE KEY (master_id) REFERENCES master (master_key)
-            DESTINATION KEY (artist_id) REFERENCES artist (artist_key)
-            LABEL master_by_artist PROPERTIES (master_id::text AS master_id, artist_id),
+            SOURCE KEY (master_id) REFERENCES master (master_id)
+            DESTINATION KEY (artist_id) REFERENCES artist (artist_id)
+            LABEL master_by_artist PROPERTIES ALL COLUMNS,
         graph.master_in_genre AS master_in_genre KEY (master_id, genre_name)
-            SOURCE KEY (master_id) REFERENCES master (master_key)
+            SOURCE KEY (master_id) REFERENCES master (master_id)
             DESTINATION KEY (genre_name) REFERENCES genre (name)
-            LABEL master_in_genre PROPERTIES (master_id::text AS master_id, genre_name),
+            LABEL master_in_genre PROPERTIES ALL COLUMNS,
         graph.master_in_style AS master_in_style KEY (master_id, style_name)
-            SOURCE KEY (master_id) REFERENCES master (master_key)
+            SOURCE KEY (master_id) REFERENCES master (master_id)
             DESTINATION KEY (style_name) REFERENCES style (name)
-            LABEL master_in_style PROPERTIES (master_id::text AS master_id, style_name),
+            LABEL master_in_style PROPERTIES ALL COLUMNS,
         graph.part_of AS part_of KEY (style_name, genre_name)
             SOURCE KEY (style_name) REFERENCES style (name)
             DESTINATION KEY (genre_name) REFERENCES genre (name)
             LABEL part_of PROPERTIES ALL COLUMNS,
         graph.member_of AS member_of KEY (member_artist_id, group_artist_id)
-            SOURCE KEY (member_artist_id) REFERENCES artist (artist_key)
-            DESTINATION KEY (group_artist_id) REFERENCES artist (artist_key)
+            SOURCE KEY (member_artist_id) REFERENCES artist (artist_id)
+            DESTINATION KEY (group_artist_id) REFERENCES artist (artist_id)
             LABEL member_of PROPERTIES ALL COLUMNS,
         graph.alias_of AS alias_of KEY (alias_artist_id, artist_id)
-            SOURCE KEY (alias_artist_id) REFERENCES artist (artist_key)
-            DESTINATION KEY (artist_id) REFERENCES artist (artist_key)
-            LABEL alias_of PROPERTIES (alias_artist_id, artist_id::text AS artist_id),
+            SOURCE KEY (alias_artist_id) REFERENCES artist (artist_id)
+            DESTINATION KEY (artist_id) REFERENCES artist (artist_id)
+            LABEL alias_of PROPERTIES ALL COLUMNS,
         graph.sublabel_of AS sublabel_of KEY (sublabel_id, parent_label_id)
-            SOURCE KEY (sublabel_id) REFERENCES label (label_key)
-            DESTINATION KEY (parent_label_id) REFERENCES label (label_key)
+            SOURCE KEY (sublabel_id) REFERENCES label (label_id)
+            DESTINATION KEY (parent_label_id) REFERENCES label (label_id)
             LABEL sublabel_of PROPERTIES ALL COLUMNS,
         graph.credited_on AS credited_on KEY (person_name, release_id, role)
             SOURCE KEY (person_name) REFERENCES person (name)
-            DESTINATION KEY (release_id) REFERENCES release (release_key)
+            DESTINATION KEY (release_id) REFERENCES release (release_id)
             LABEL credited_on PROPERTIES ALL COLUMNS,
         graph.same_as AS same_as KEY (person_name, artist_id)
             SOURCE KEY (person_name) REFERENCES person (name)
-            DESTINATION KEY (artist_id) REFERENCES artist (artist_key)
+            DESTINATION KEY (artist_id) REFERENCES artist (artist_id)
             LABEL same_as PROPERTIES ALL COLUMNS,
         graph.credited_to AS credited_to KEY (release_id, company_id, role, source)
-            SOURCE KEY (release_id) REFERENCES release (release_key)
+            SOURCE KEY (release_id) REFERENCES release (release_id)
             DESTINATION KEY (company_id) REFERENCES company (company_id)
             LABEL credited_to PROPERTIES ALL COLUMNS,
         graph.issued_on AS issued_on KEY (release_id, medium_id, source)
-            SOURCE KEY (release_id) REFERENCES release (release_key)
+            SOURCE KEY (release_id) REFERENCES release (release_id)
             DESTINATION KEY (medium_id) REFERENCES medium (medium_id)
             LABEL issued_on PROPERTIES ALL COLUMNS,
         graph.in_family AS in_family KEY (medium_id, family_name)
             SOURCE KEY (medium_id) REFERENCES medium (medium_id)
             DESTINATION KEY (family_name) REFERENCES media_family (name)
             LABEL in_family PROPERTIES ALL COLUMNS,
+        graph.artist_genre AS artist_genre KEY (artist_id, genre_name)
+            SOURCE KEY (artist_id) REFERENCES artist (artist_id)
+            DESTINATION KEY (genre_name) REFERENCES genre (name)
+            LABEL artist_genre PROPERTIES ALL COLUMNS,
+        graph.label_genre AS label_genre KEY (label_id, genre_name)
+            SOURCE KEY (label_id) REFERENCES label (label_id)
+            DESTINATION KEY (genre_name) REFERENCES genre (name)
+            LABEL label_genre PROPERTIES ALL COLUMNS,
         graph.collected AS collected KEY (collection_id)
             SOURCE KEY (user_id) REFERENCES app_user (user_id)
-            DESTINATION KEY (release_id) REFERENCES release (release_key)
-            LABEL collected PROPERTIES ALL COLUMNS,
+            DESTINATION KEY (release_id) REFERENCES release (release_id)
+            LABEL collected PROPERTIES (collection_id, user_id, release_id::text AS release_id, instance_id, folder_id, condition, rating, date_added),
         graph.wants AS wants KEY (wantlist_id)
             SOURCE KEY (user_id) REFERENCES app_user (user_id)
-            DESTINATION KEY (release_id) REFERENCES release (release_key)
-            LABEL wants PROPERTIES ALL COLUMNS,
+            DESTINATION KEY (release_id) REFERENCES release (release_id)
+            LABEL wants PROPERTIES (wantlist_id, user_id, release_id::text AS release_id, rating, date_added),
         graph.owns AS owns KEY (owned_copy_id)
             SOURCE KEY (user_id) REFERENCES app_user (user_id)
             DESTINATION KEY (item_id) REFERENCES catalog_item (item_id)
@@ -800,9 +1029,9 @@ A property graph is a relation with its own `relkind`:
 | --- | --- |
 | `pg_class.relkind` for `graph.catalog` | `g` |
 | Elements, labels, and properties | `pg_propgraph_element`, `pg_propgraph_label`, `pg_propgraph_element_label`, `pg_propgraph_property`, `pg_propgraph_label_property` |
-| Elements declared | 52, matching the 52 views one for one |
-| Labels declared | 53 — one per view, plus the shared `mb_related` |
-| Distinct property names | 74, each with exactly one data type |
+| Elements declared | 55 — 17 vertex, 38 edge |
+| Labels declared | 56 — one per element, plus the shared `mb_related` |
+| Distinct property names | one row per name, each with exactly one data type |
 
 `pg_propgraph_property` is the engine's own register of the SQL/PGQ rule that one property name
 carries one data type across a whole graph, so a single row per name is that rule holding
@@ -812,95 +1041,209 @@ rather than a restatement of it. The integration suite asserts it directly.
 block followed by `ALTER PROPERTY GRAPH graph.catalog OWNER TO ...`, placed after the views it
 reads. The round trip is faithful but not textual — `PROPERTIES ALL COLUMNS` comes back expanded
 into an explicit alphabetized column list, and a label matching its element alias is dropped
-rather than written out, because it is what the grammar already defaults to. Thirty-six of the
-fifty-two elements therefore dump with no label clause at all. The sixteen carrying a second
+rather than written out, because it is what the grammar already defaults to. All but sixteen
+of the 59 elements therefore dump with no label clause at all. The sixteen carrying a second
 label keep both, as `DEFAULT LABEL` for their own and `LABEL mb_related` for the shared one,
 since dropping the first would silently change which labels the element has. A dump taken from
 a 19 server therefore restores onto another 19 server and fails on an 18 one, which is the same
 boundary the switch draws.
 
 On PostgreSQL 18 the property graph object does not exist: no `graph.catalog`, no relation of
-relkind `g` in schema `graph`, and the `pg_propgraph_*` catalogs are absent. The views it would
-have been declared over are all still there, and so are the four columns added for it — see
-[the four restated vertex keys](#the-four-restated-vertex-keys) below. The 18 schema is
-therefore not identical to its pre-property-graph state; it differs by exactly those four
-additive columns and by nothing else.
+relkind `g` in schema `graph`, and the `pg_propgraph_*` catalogs are absent. Every relation it
+would have been declared over is still there, tables and views alike, with the same columns,
+keys, and indexes — see [the text key rule](#the-text-key-rule) below for why the keys read as
+`text` on an engine that cannot carry a property graph. The tables are not a property-graph
+feature: they are the read shape spike gm-database-schema-9c8.1 recommends, and PostgreSQL 18
+gets the whole benefit of them with the switch off.
 
 #### Labels
 
-Every element carries its view name as its label, verbatim. That is what the naming rule in ADR
-0012 buys: `:User` is projected as `graph.app_user` because `user` is reserved, and the
+Every element carries its relation name as its label, verbatim. That is what the naming rule in
+ADR 0012 buys: `:User` is projected as `graph.app_user` because `user` is reserved, and the
 overloaded `[:BY]`, `[:ON]`, and `[:IS]` types as `by_artist`, `on_label`, `in_genre`, and
 `in_style`. Checked against `pg_get_keywords()` on 19beta3, only `label` and `release` are
 keywords at all and both are unreserved, so no label here needs quoting.
 
+Four labels are the exception, and they are named for the Neo4j label rather than for the
+relation underneath: `genre`, `style`, `label`, and `artist` bind `graph.genre_vertex`,
+`graph.style_vertex`, `graph.label_vertex`, and `graph.artist_vertex`. Those four views exist
+only so the label can publish the counters Neo4j carries on the node of the same name; the
+label is what a query names, so the label keeps the Neo4j spelling. See
+[the counter relations](#the-counter-degree-and-aggregate-relations).
+
 The sixteen `mb_rel_<source>_<target>` views carry a second, shared label, `mb_related`. SQL/PGQ
 allows one label across several element tables only when every one of them exposes the same
-property names and types, and these sixteen do: each projects the same eight columns of
-`musicbrainz.relationships`. Keeping the per-pair label as well costs nothing and loses nothing,
+property names and types, and these sixteen do: each projects the same nine columns of
+`musicbrainz.relationships`. That same rule is why a counter relation cannot simply be
+attached to the label it describes as a second element table. Keeping the per-pair label as well costs nothing and loses nothing,
 so a query picks its own altitude — `[IS mb_rel_artist_label]` for one endpoint pair, or
 `[IS mb_related]` for any MusicBrainz relationship without spelling out all sixteen.
 
-#### Properties, and the four names that had to be cast
+#### Properties, and the two names that still have to be cast
 
-`PROPERTIES ALL COLUMNS` is the default here; nine elements carry an explicit list instead.
+`PROPERTIES ALL COLUMNS` is the default here; three elements carry an explicit list instead.
 
-SQL/PGQ requires every property of a given name to have one data type across the whole graph,
-and four names are spelled two ways by the views. `artist_id`, `label_id`, and `master_id` are
-`character varying` where they are read from a catalog table's `data_id` and `text` where they
-are read out of a JSONB document with `->>`; `discogs_label_id` is `bigint` on the MusicBrainz
-side and `text` on the Discogs side. Each is unified on `text`: the cast is total, it never
-overflows the way `text` to `bigint` can on an unbounded digit string, and it is the type the
-JSONB half of the graph already produces.
+SQL/PGQ requires every property of a given name to have one data type across the whole graph.
+With every key column now `text`, only two names are still spelled two ways.
+`discogs_label_id` is `bigint` on the MusicBrainz side and `text` on the Discogs side, and
+`release_id` is `text` on every graph relation except `graph.collected` and `graph.wants`,
+which read `releases.data_id` through a join and publish it as `character varying`. Both are
+unified on `text`: the cast is total, and it never overflows the way `text` to `bigint` can on
+an unbounded digit string.
 
 | Property | Cast in | Left alone in |
 | --- | --- | --- |
-| `artist_id` | `artist`, `alias_of` | `by_artist`, `master_by_artist`, `same_as` |
-| `label_id` | `label` | `on_label` |
-| `master_id` | `master`, `master_by_artist`, `master_in_genre`, `master_in_style` | `derived_from` |
 | `discogs_label_id` | `mb_label` | `company` |
+| `release_id` | `collected`, `wants` | every other relation that exposes it |
 
-Nothing else is cast. `release_id` is `character varying` in all eleven views that expose it, so
-no rule forces one, and it keeps its published type — which is why `release_id` is `character
-varying` while `artist_id` is `text`. The other three provider bridges, `discogs_artist_id`,
-`discogs_master_id`, and `discogs_release_id`, stay `bigint` for the same reason; joining one to
-the Discogs half of the graph needs an explicit cast in the query. The remaining seventy
-property names were already consistent across every view that exposes them.
+Nothing else is cast. `artist_id`, `label_id`, and `master_id` used to need one on the vertex
+side and no longer do: the four Discogs vertex views publish `data_id::text` directly. The
+three other provider bridges — `discogs_artist_id`, `discogs_master_id`, and
+`discogs_release_id` — stay `bigint`, because joining one to the Discogs half of the graph is
+a deliberate cast in the query rather than a property-type problem.
 
-#### The four restated vertex keys
+The counter beads add properties without moving any existing name: `formats` and
+`catalog_number` on `release`, `gm_id` on the four Discogs vertices, `raw_relationship_type` on
+the sixteen MusicBrainz pair relations, and the counters on `genre`, `style`, `label`, and
+`artist`. Every one is appended after the published columns, and every counter name carries one
+type across the graph — the five `*_count` names and `degree` are `bigint`, `first_year` is
+`integer`.
 
-`graph.artist`, `graph.label`, `graph.master`, and `graph.release` are each keyed on an appended
-`text` column — `artist_key`, `label_key`, `master_key`, `release_key` — rather than on the
-`<entity>_id` the mapping table above publishes.
+#### The text key rule
+
+Every vertex key in `graph.catalog` is `text`, `uuid`, or `bigint`. None is
+`character varying`, and none is an appended restatement of another column.
 
 PostgreSQL 19beta3 resolves the equality operator for an edge endpoint against the referenced
 vertex column's own type, and `character varying` registers none of its own: every
 `varchar = varchar` comparison in PostgreSQL runs through a binary coercion to `text`. An edge
 whose `SOURCE` or `DESTINATION` resolves to a `varchar` vertex key is therefore rejected with
-`no equality operator exists for SOURCE key comparison of edge "..."`. `text`, `uuid`, `bigint`,
-and even `bpchar` are all accepted; `varchar` and `varchar(n)` are not. Only the vertex side is
-checked, so an edge column may stay `character varying` — and all of them do.
+`no equality operator exists for SOURCE key comparison of edge "..."`. `text`, `uuid`,
+`bigint`, and even `bpchar` are all accepted; `varchar` and `varchar(n)` are not. Only the
+vertex side is checked, which is why `graph.collected` and `graph.wants` may go on publishing
+a `character varying` `release_id` as an endpoint.
 
-The four Discogs entity tables key on `data_id VARCHAR`, so all four vertex views inherited it.
-Retyping a published view column is a breaking change the persistence contract forbids, and
-`CREATE OR REPLACE VIEW` refuses it outright, so each view instead *appends* a `text`
-restatement of the same value — the additive change the contract does allow, and the one shape
-`CREATE OR REPLACE VIEW` accepts. `<entity>_id` keeps its published type and stays the property;
-`<entity>_key` is structural, is not declared as a property, and nothing but
-`CREATE PROPERTY GRAPH` reads it.
+The four Discogs entity tables key on `data_id VARCHAR`, so the phase 0 vertex views inherited
+it and worked around it by appending a `text` restatement — `artist_key`, `label_key`,
+`master_key`, `release_key` — because `CREATE OR REPLACE VIEW` refuses to retype a published
+column and appending was the one change it accepts. **Those four columns are retired.** The
+loader-written tables are declared `text` from the start and never needed the workaround, and
+once the edge side was `text` throughout there was no reason for the vertex side to be
+anything else, so the four views now publish `data_id::text` as `<entity>_id` itself. A
+guarded migration drops and recreates each view when its key column still reads as
+`character varying`; on a database that has already been migrated it does nothing.
 
-These four columns are not gated. `SCHEMA_PROPERTY_GRAPH` and the server version gate the
-`CREATE PROPERTY GRAPH` statement alone — see [when it is applied](#when-it-is-applied) — and
-the views are part of the unconditional schema, so a
-PostgreSQL 18 server with the switch off still gets `artist_key`, `label_key`, `master_key`, and
-`release_key`. That is the one way the property graph shows up on an engine that cannot carry
-it, and it shows up by addition only: four columns appended after the published ones, no rename,
-no removal, no type change, nothing dropped. Adding a column to a view is the change this schema is built to ship on
-its own, and a consumer selecting named columns from these views does not see it at all.
+The change is invisible to a consumer. psycopg returns `str` for both types, the column name
+and its position are unchanged, and nothing but `CREATE PROPERTY GRAPH` ever read the appended
+restatements — they were never declared as properties. The persistence contract records the
+retirement under `graph_schema.key_columns`.
 
-Whether this survives to 19 GA is not something this schema depends on. If a later beta accepts
-a `varchar` vertex key, the four `KEY` clauses can point back at `<entity>_id` and the appended
-columns become dead weight rather than a migration.
+#### The counter, degree, and aggregate relations
+
+Eight `catalog-api` functions read node properties that `graphinator`'s post-import pass
+writes and that no phase 0 view carried: the `Genre`, `Style`, and `Label` counters and the
+two `first_year` values, plus the artist and release degrees. `explore_genre`'s own docstring
+records that reading `g.release_count` replaces four traversal queries — roughly 200 million
+database hits for Rock — with a single property read. A rewrite that dropped the counter and
+re-aggregated on request would not merely get slower; it would reproduce the failure that took
+the rarity pipeline down for thirty-three consecutive days.
+
+The loaders write them into relations of their own:
+
+| Relation | Replaces | Key | Other indexes |
+| --- | --- | --- | --- |
+| `graph.genre_stats` | `Genre.release_count`, `.artist_count`, `.label_count`, `.style_count`, `.first_year` | `name` | `(first_year)` |
+| `graph.style_stats` | `Style.release_count`, `.artist_count`, `.label_count`, `.genre_count`, `.first_year` | `name` | `(first_year)` |
+| `graph.label_stats` | `Label.release_count`, `.artist_count`, `.genre_count` | `label_id` | `(release_count)` |
+| `graph.artist_degree` | `size([(a)-[]-() \| 1])`, `COUNT { (a)--() }` | `artist_id` | `(degree DESC)` |
+| `graph.release_degree_base` | the catalog half of `COUNT { (r)--() }` | `release_id` | — |
+| `graph.artist_genre` | a two-hop expansion `catalog-api` walks today | `(artist_id, genre_name)` | `(genre_name, artist_id)` |
+| `graph.label_genre` | the same for labels | `(label_id, genre_name)` | `(genre_name, label_id)` |
+
+`discogs-sql-loader` refreshes all of them on the `extraction_complete` message it already
+handles, which is the same latch `graphinator` uses to start its own post-import pass — so
+they cost no new scheduler. Every count is a sum over the edge tables and none re-reads a
+JSONB document directly — `genre_stats` and `style_stats` do join `graph.release` for
+`first_year`, a document-backed view, but that lookup is a `min` over an indexed column, not a
+count — which is what keeps the pass affordable.
+
+**Four of them read back as properties of the label Neo4j carries them on.** That is the
+parity claim and it is the point of the whole arrangement: `MATCH (g IS genre) COLUMNS
+(g.release_count)` reads exactly as the Cypher it replaces, and no query has to learn a second
+label to find a counter.
+
+| Label | Element table | Storage | Counters | Properties gained |
+| --- | --- | --- | --- | --- |
+| `genre` | `graph.genre_vertex` | `graph.genre` | `graph.genre_stats` | `release_count`, `artist_count`, `label_count`, `style_count`, `first_year` |
+| `style` | `graph.style_vertex` | `graph.style` | `graph.style_stats` | `release_count`, `artist_count`, `label_count`, `genre_count`, `first_year` |
+| `label` | `graph.label_vertex` | `graph.label` | `graph.label_stats` | `release_count`, `artist_count`, `genre_count` |
+| `artist` | `graph.artist_vertex` | `graph.artist` | `graph.artist_degree` | `degree` |
+
+Each `<label>_vertex` is a view that `LEFT JOIN`s the storage relation to the counter
+relation. A view rather than a second element table, because SQL/PGQ admits one element table
+per label unless every table exposes an identical property set: declaring `graph.genre` and
+`graph.genre_stats` both as `LABEL genre` is refused on 19beta3 with `mismatching number of
+properties in definition of label "genre"`. A view joining the two is one element table, and
+the engine accepts it.
+
+The join is free when it is not read. Each counter relation is unique on the join column, so
+the planner removes the `LEFT JOIN` outright for a query that names no counter: the pilot
+collaborator two-hop plans identically over `graph.artist_vertex` and over `graph.artist`
+alone, with `graph.artist_degree` absent from the plan entirely. The integration suite asserts
+both halves of that — the relation's absence when no counter is named and its presence when
+one is.
+
+A count reads zero where the loader has not computed one yet, because every caller does
+arithmetic on it and a null would propagate through a ratio or a sum. `first_year` is
+deliberately not defaulted: an unknown first year must not read as year zero, and every caller
+of it already tests for null.
+
+The counter relations themselves are **not** declared as labels. Every property they carry is
+reachable on the Neo4j label, so a second label would be published surface with no query
+behind it. They stay loader-owned storage, and the contract records them as relations with an
+owner and no element.
+
+**`graph.release_degree` is the one counter that stays a label of its own**, and the reason is
+a measurement rather than a rule. Release degree as Neo4j computes it counts `COLLECTED` and
+`WANTS` edges, which `catalog-api` writes and the loader never sees. So it is a view summing
+`graph.release_degree_base` against a live count over `user_collections` and `user_wantlists`,
+and that live half is a pair of lateral counts no unique key makes removable. Folding it onto
+the `release` vertex would make every release binding in every traversal count collection and
+wantlist rows even where degree is never read: the same
+`(r IS release)-[IS in_genre]->(g IS genre)` traversal plans in nine lines against a plain
+`release` and nineteen against a joined one, the extra containing a scan of
+`release_degree_base` and both aggregates. `MATCH (r IS release_degree WHERE r.release_id =
+…)` is therefore the one carry-forward spelling a rewrite has to learn, and the reason is the
+live half of the count rather than any SQL/PGQ limit.
+
+The view resolves the release id across two type spaces through a `CASE` that yields `NULL`
+for a non-numeric id, which is total — `release_id = NULL` matches no row and the count is
+zero rather than a cast error — and keeps both lookups on their index. It is the one relation
+in the whole edge model split across two owners, and the contract records it as such rather
+than leaving it to whoever writes it first.
+
+#### Two costs worth budgeting for
+
+Neither blocks anything here; both are stated so the query-rewrite beads can plan around them.
+
+**An upgrade that runs with the switch off loses the property graph until the next run with it
+on.** The view-to-table migration drops the phase 0 view with `CASCADE`, and on PostgreSQL 19
+`graph.catalog` depends on that view, so the migration takes the graph with it and relies on
+the same run re-declaring it. `_apply_property_graph` only re-declares when
+`SCHEMA_PROPERTY_GRAPH` is enabled, so an operator who upgrades with the switch off on a
+server that already carried the graph ends that run with the tables in place and no
+`graph.catalog`. The next run with the switch on restores it, because the catalog existence
+check finds nothing and creates it. Turn the switch on for the upgrade run, or expect one
+window without the graph.
+
+**`gm_id` costs one index probe per vertex binding.** The four Discogs vertex views `LEFT
+JOIN` `provider_aliases`, whose uniqueness comes from a *partial* unique index — `WHERE
+valid_to IS NULL` — and the planner cannot prove a partial index unique for join removal the
+way it can a primary key. So unlike the counter join, this one stays in the plan whether or
+not `gm_id` is selected, and a traversal binding artists pays for it at every hop. It is the
+correct source: `provider_aliases` is the table `catalog-api`'s own `gm_id` projection job
+reads, and the `gm_item_id` column on the entity tables is not the same guarantee. The cost is
+recorded here so a query-rewrite bead can budget for it rather than discover it.
 
 #### Querying it
 

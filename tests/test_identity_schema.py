@@ -215,32 +215,108 @@ _ADDED_STATEMENT_NAMES = frozenset(
     }
 )
 
-# The graph schema adds one statement for the schema itself and one per vertex or
-# edge view. They are transcribed here for the same reason the names above are:
-# the snapshot test only proves that no LEGACY statement moved or changed, and it
-# can only do that if every new name is declared by hand.
+# The graph schema adds one statement for the schema itself, one for the trigram
+# extension, one per rendered vocabulary function, one per loader-written table
+# and index, one guarded migration per relation whose shape or key type moved,
+# and one per surviving view. They are transcribed here for the same reason the
+# names above are: the snapshot test only proves that no LEGACY statement moved
+# or changed, and it can only do that if every new name is declared by hand.
+# The endpoint-pair indexes spike gm-database-schema-9c8.2 found missing. Every
+# one of the sixteen `graph.mb_rel_<source>_<target>` views filters on the pair
+# and nothing indexed it, so they belong to the graph work rather than to the
+# legacy MusicBrainz statement set.
+_ADDED_MUSICBRAINZ_INDEX_NAMES = frozenset({"idx_mb_rels_endpoint_source", "idx_mb_rels_endpoint_target"})
+
 _GRAPH_STATEMENT_NAMES = frozenset(
     {
         "graph schema",
+        "pg_trgm extension",
         "graph.credit_role_category function",
         "graph.medium_label function",
+        "graph.mb_relationship_type function",
+        "graph.genre view-to-table migration",
+        "graph.style view-to-table migration",
+        "graph.person view-to-table migration",
+        "graph.media_family view-to-table migration",
+        "graph.medium view-to-table migration",
+        "graph.company view-to-table migration",
+        "graph.by_artist view-to-table migration",
+        "graph.on_label view-to-table migration",
+        "graph.derived_from view-to-table migration",
+        "graph.in_genre view-to-table migration",
+        "graph.in_style view-to-table migration",
+        "graph.master_by_artist view-to-table migration",
+        "graph.master_in_genre view-to-table migration",
+        "graph.master_in_style view-to-table migration",
+        "graph.member_of view-to-table migration",
+        "graph.alias_of view-to-table migration",
+        "graph.credited_on view-to-table migration",
+        "graph.same_as view-to-table migration",
+        "graph.credited_to view-to-table migration",
+        "graph.issued_on view-to-table migration",
+        "graph.artist key-type migration",
+        "graph.label key-type migration",
+        "graph.master key-type migration",
+        "graph.release key-type migration",
+        "graph.sublabel_of key-type migration",
+        "graph.genre table",
+        "graph.genre_name_trgm index",
+        "graph.style table",
+        "graph.style_name_trgm index",
+        "graph.person table",
+        "graph.person_name_trgm index",
+        "graph.media_family table",
+        "graph.medium table",
+        "graph.company table",
+        "graph.by_artist table",
+        "graph.by_artist_reverse index",
+        "graph.on_label table",
+        "graph.on_label_reverse index",
+        "graph.derived_from table",
+        "graph.derived_from_reverse index",
+        "graph.in_genre table",
+        "graph.in_genre_reverse index",
+        "graph.in_style table",
+        "graph.in_style_reverse index",
+        "graph.master_by_artist table",
+        "graph.master_by_artist_reverse index",
+        "graph.master_in_genre table",
+        "graph.master_in_genre_reverse index",
+        "graph.master_in_style table",
+        "graph.master_in_style_reverse index",
+        "graph.member_of table",
+        "graph.member_of_reverse index",
+        "graph.alias_of table",
+        "graph.alias_of_reverse index",
+        "graph.credited_on table",
+        "graph.credited_on_reverse index",
+        "graph.credited_on_role_category index",
+        "graph.same_as table",
+        "graph.same_as_reverse index",
+        "graph.credited_to table",
+        "graph.credited_to_reverse index",
+        "graph.credited_to_source index",
+        "graph.issued_on table",
+        "graph.issued_on_reverse index",
+        "graph.issued_on_source index",
+        "graph.genre_stats table",
+        "graph.genre_stats_first_year index",
+        "graph.style_stats table",
+        "graph.style_stats_first_year index",
+        "graph.label_stats table",
+        "graph.label_stats_release_count index",
+        "graph.artist_degree table",
+        "graph.artist_degree_degree index",
+        "graph.release_degree_base table",
+        "graph.artist_genre table",
+        "graph.artist_genre_reverse index",
+        "graph.label_genre table",
+        "graph.label_genre_reverse index",
         "graph.artist view",
         "graph.label view",
         "graph.master view",
         "graph.release view",
-        "graph.genre view",
-        "graph.style view",
-        "graph.by_artist view",
-        "graph.on_label view",
-        "graph.derived_from view",
-        "graph.in_genre view",
-        "graph.in_style view",
-        "graph.master_by_artist view",
-        "graph.master_in_genre view",
-        "graph.master_in_style view",
         "graph.part_of view",
-        "graph.member_of view",
-        "graph.alias_of view",
         "graph.sublabel_of view",
         "graph.mb_artist view",
         "graph.mb_label view",
@@ -267,15 +343,13 @@ _GRAPH_STATEMENT_NAMES = frozenset(
         "graph.collected view",
         "graph.wants view",
         "graph.owns view",
-        "graph.person view",
-        "graph.company view",
-        "graph.medium view",
-        "graph.media_family view",
-        "graph.credited_on view",
-        "graph.same_as view",
-        "graph.credited_to view",
-        "graph.issued_on view",
         "graph.in_family view",
+        "graph.genre_vertex view",
+        "graph.style_vertex view",
+        "graph.label_vertex view",
+        "graph.artist_vertex view",
+        "graph.release_degree view",
+        "graph.bootstrap_fill function",
     }
 )
 
@@ -675,12 +749,12 @@ class TestLegacyStatementsUnchanged:
 
     def test_legacy_names_are_intact_and_ordered(self) -> None:
         names = [name for name, _stmt in _schema_statements()]
-        added = _ADDED_STATEMENT_NAMES | _GRAPH_STATEMENT_NAMES
+        added = _ADDED_STATEMENT_NAMES | _GRAPH_STATEMENT_NAMES | _ADDED_MUSICBRAINZ_INDEX_NAMES
         surviving = [name for name in names if name not in added]
         assert surviving == _LEGACY_STATEMENT_NAMES
 
     def test_no_legacy_name_was_reused_for_a_new_statement(self) -> None:
-        added = _ADDED_STATEMENT_NAMES | _GRAPH_STATEMENT_NAMES
+        added = _ADDED_STATEMENT_NAMES | _GRAPH_STATEMENT_NAMES | _ADDED_MUSICBRAINZ_INDEX_NAMES
         assert not (added & set(_LEGACY_STATEMENT_NAMES))
 
     def test_declared_graph_names_match_the_schema(self) -> None:

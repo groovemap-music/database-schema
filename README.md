@@ -32,9 +32,14 @@ non-required job that reports without blocking. See the
 [integration tiers](docs/architecture.md#integration-tiers) for what each tier proves and
 how the beta tier is promoted at PostgreSQL 19 general availability.
 
-The PostgreSQL schema includes a `graph` schema: fifty-two read-only views re-presenting the
-catalog as the vertex and edge relations the Neo4j enrichers build. Those views are applied on
-every engine. The `graph.catalog` SQL/PGQ property graph declared over them is not —
+The PostgreSQL schema includes a `graph` schema: sixty-four relations re-presenting the catalog
+as the vertex and edge relations the Neo4j enrichers build. Twenty-seven are tables the ingestion
+loaders write and thirty-seven are read-only views; this repository declares all of them and
+writes rows into none. `discogs-sql-loader` owns most of them, `musicbrainz-sql-loader` owns the
+MusicBrainz half and co-owns the shared medium vocabulary, `catalog-api` owns the
+personal-collection views, and `graph.release_degree` is split across `discogs-sql-loader` and
+`catalog-api`; the contract names the owner of each relation individually. Every relation is
+applied on every engine. The `graph.catalog` SQL/PGQ property graph declared over them is not —
 `SCHEMA_PROPERTY_GRAPH` is off by default and, even when enabled, the declaration is skipped
 with a logged reason on a server below PostgreSQL 19, so a consumer must probe for it rather
 than assume it. See the [graph schema](docs/architecture.md#graph-schema) and

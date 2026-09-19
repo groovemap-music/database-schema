@@ -262,11 +262,19 @@ class TestCreatePostgresSchema:
             # form PostgreSQL offers for a function or a trigger, neither of which
             # has an IF NOT EXISTS spelling. Both still have to clear the DROP
             # guard below.
-            exempt = ("ALTER COLUMN" in upper and "TYPE " in upper) or "CREATE OR REPLACE" in upper
+            # A DO block is idempotent by its own guard rather than by an
+            # IF NOT EXISTS clause: it reads the catalog and acts only when the
+            # state it is migrating from is still there, so a second apply is a
+            # no-op. Every one of them is checked below instead.
+            guarded_block = upper.startswith("DO $")
+            exempt = ("ALTER COLUMN" in upper and "TYPE " in upper) or "CREATE OR REPLACE" in upper or guarded_block
             if not exempt:
                 assert "IF NOT EXISTS" in upper, f"Statement is not idempotent: {stmt[:80]}..."
+            if guarded_block:
+                assert "END IF;" in upper, f"Unguarded DO block: {stmt[:80]}..."
             # A multi-statement blob could still hide an un-guarded DROP that would
-            # not be idempotent — any DROP must be guarded with IF EXISTS.
+            # not be idempotent — any DROP must be guarded, either by IF EXISTS or
+            # by the catalog probe of the DO block that wraps it.
             if "DROP " in upper:
                 assert "IF EXISTS" in upper, f"Statement contains an un-guarded DROP: {stmt[:80]}..."
 
