@@ -9,6 +9,7 @@ from common.credit_roles import ROLE_CATEGORIES, categorize_role
 from common.media import medium_ids, medium_label
 
 from groovemap_schema.postgres import (
+    _COUNTER_BEARING_VERTICES,
     _EDGE_TABLES,
     _GRAPH_STATEMENTS,
     _TEXT_KEY_RETYPES,
@@ -68,14 +69,40 @@ VERTEX_KEYS = {
     "company": ("company_id",),
     "medium": ("medium_id",),
     "media_family": ("name",),
-    # Table 3: the counters `graphinator` writes onto nodes in a post-import
-    # pass, which a graph over views had nowhere to put.
-    "genre_stats": ("name",),
-    "style_stats": ("name",),
-    "label_stats": ("label_id",),
-    "artist_degree": ("artist_id",),
+    # Neo4j carries release degree on `:Release`, but its live half is two
+    # lateral counts no unique key makes removable, so it is the one counter
+    # that stays a label of its own rather than a property of the label it
+    # describes. The other four are properties of `genre`, `style`, `label`,
+    # and `artist`; see `COUNTER_PROPERTIES`.
     "release_degree": ("release_id",),
 }
+
+# The relation each counter-bearing label binds, and the counter properties it
+# has to publish. This is the parity claim: `graphinator` writes these onto the
+# Neo4j node of the same name, so a ported Cypher query reads them off the same
+# label rather than off a second one it would have to learn.
+COUNTER_PROPERTIES = {
+    "genre": ("genre_vertex", ("release_count", "artist_count", "label_count", "style_count", "first_year")),
+    "style": ("style_vertex", ("release_count", "artist_count", "label_count", "genre_count", "first_year")),
+    "label": ("label_vertex", ("release_count", "artist_count", "genre_count")),
+    "artist": ("artist_vertex", ("degree",)),
+}
+
+# The relations that hold rows or counters but bind no label of their own,
+# because the label that describes them binds a projection joining the two.
+STORAGE_ONLY = frozenset(
+    {
+        "genre",
+        "style",
+        "artist",
+        "label",
+        "genre_stats",
+        "style_stats",
+        "label_stats",
+        "artist_degree",
+        "release_degree_base",
+    }
+)
 
 # Every edge view, with its key column set and the (source, target) columns that
 # join to the vertex views above.
@@ -314,10 +341,7 @@ class TestRelationNames:
 
     def test_declared_relations_are_exactly_the_documented_set(self) -> None:
         expected = set(VERTEX_KEYS) | set(EDGE_KEYS) | {f"mb_rel_{source}_{target}" for source, target in MUSICBRAINZ_PAIRS}
-        # `release_degree_base` is the loader-written half of a relation the
-        # property graph declares through its view, so it is a relation without
-        # being an element.
-        assert view_names() == expected | {"release_degree_base"}
+        assert view_names() == expected | STORAGE_ONLY | {relation for relation, _columns in COUNTER_PROPERTIES.values()}
 
     def test_every_materialized_relation_is_a_table_and_nothing_else_is(self) -> None:
         assert table_names() == MATERIALIZED
@@ -929,8 +953,53 @@ class TestPropertyGraph:
         assert PROPERTY_GRAPH_STATEMENT[0] not in {name for name, _statement in _GRAPH_STATEMENTS}
 
     def test_every_element_table_is_a_declared_graph_relation(self) -> None:
-        elements = {vertex.view for vertex in _property_graph_vertices()} | {edge.view for edge in _property_graph_edges()}
-        assert elements == view_names() - {"release_degree_base"}
+        elements = {element.element for element in (*_property_graph_vertices(), *_property_graph_edges())}
+        assert elements == view_names() - STORAGE_ONLY
+
+    def test_only_the_counter_bearing_labels_bind_a_relation_of_another_name(self) -> None:
+        renamed = {vertex.view: vertex.element for vertex in _property_graph_vertices() if vertex.element != vertex.view}
+        assert renamed == {label: relation for label, (relation, _columns) in COUNTER_PROPERTIES.items()}
+        for edge in _property_graph_edges():
+            assert edge.element == edge.view, edge.view
+
+    def test_each_counter_bearing_label_publishes_its_counters_as_properties(self) -> None:
+        """The parity claim: `g.release_count` reads off `:Genre`, as it does in Neo4j."""
+        for label, (relation, columns) in COUNTER_PROPERTIES.items():
+            vertex = next(candidate for candidate in _property_graph_vertices() if candidate.view == label)
+            assert vertex.element == relation, label
+            # PROPERTIES ALL COLUMNS, so every column of the projection is a
+            # property and the projection's column list is the property list.
+            assert vertex.properties is None, label
+            statement = GRAPH_STATEMENTS[f"graph.{relation} view"]
+            for column in columns:
+                assert f"AS {column}\n" in statement or f"AS {column}," in statement, f"{relation} is missing {column}"
+
+    def test_each_counter_projection_left_joins_its_uniquely_keyed_counter_relation(self) -> None:
+        """A LEFT JOIN to a uniquely-keyed relation is removed when nothing reads it."""
+        for relation, storage, counters, _carried, _counted in _COUNTER_BEARING_VERTICES:
+            statement = GRAPH_STATEMENTS[f"graph.{relation} view"]
+            assert f"FROM graph.{storage} AS {storage}" in statement, relation
+            assert f"LEFT JOIN graph.{counters} AS {counters} ON" in statement, relation
+            assert "PRIMARY KEY" in ddl_for(counters), counters
+
+    def test_a_count_reads_zero_and_a_first_year_reads_null(self) -> None:
+        """Every caller does arithmetic on a count; none may divide by a null."""
+        for relation, _storage, counters, _carried, counted in _COUNTER_BEARING_VERTICES:
+            statement = GRAPH_STATEMENTS[f"graph.{relation} view"]
+            for column in counted:
+                assert f"COALESCE({counters}.{column}, 0)::bigint AS {column}" in statement, f"{relation}.{column}"
+            if "first_year" in statement:
+                assert f"{counters}.first_year AS first_year" in statement, relation
+                assert "COALESCE(" + counters + ".first_year" not in statement, relation
+
+    def test_release_degree_is_the_one_counter_that_stays_its_own_label(self) -> None:
+        """Its live half is two lateral counts the planner cannot remove."""
+        labels = {vertex.view for vertex in _property_graph_vertices()}
+        assert "release_degree" in labels
+        assert not labels & {"genre_stats", "style_stats", "label_stats", "artist_degree"}
+        statement = statement_for("release_degree")
+        assert "CROSS JOIN LATERAL" in statement
+        assert "release_degree" not in GRAPH_STATEMENTS["graph.release view"]
 
     def test_every_vertex_and_edge_alias_is_unique(self) -> None:
         aliases = [vertex.view for vertex in _property_graph_vertices()] + [edge.view for edge in _property_graph_edges()]
@@ -1030,7 +1099,10 @@ class TestPropertyGraph:
             assert f"LABEL {element.view} " in statement, element.view
 
     def test_the_declared_labels_are_the_relations_plus_the_shared_one(self) -> None:
-        assert self.labels() == (view_names() - {"release_degree_base"}) | {MUSICBRAINZ_RELATIONSHIP_LABEL}
+        """A label is a relation name verbatim, except the four that bind a projection."""
+        projections = {relation for relation, _columns in COUNTER_PROPERTIES.values()}
+        expected = (view_names() - STORAGE_ONLY - projections) | set(COUNTER_PROPERTIES) | {MUSICBRAINZ_RELATIONSHIP_LABEL}
+        assert self.labels() == expected
 
     def test_every_edge_declares_explicit_keys_and_references(self) -> None:
         """No endpoint is inferred from a foreign key: views carry none."""
@@ -1070,4 +1142,4 @@ class TestPropertyGraphDocumentation:
         documented = documented_property_graph_ddl()
         assert documented.rstrip().endswith(");")
         for element in (*_property_graph_vertices(), *_property_graph_edges()):
-            assert f"graph.{element.view} AS {element.view} " in documented, element.view
+            assert f"graph.{element.element} AS {element.view} " in documented, element.view

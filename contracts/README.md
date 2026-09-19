@@ -14,9 +14,11 @@ services never require lockstep source checkouts.
 
 The `graph` schema is recorded in
 [`persistence/v1/compatibility.json`](persistence/v1/compatibility.json) under `graph_schema`
-as an additive object of contract version 1: sixty relations — twenty-seven loader-written
-tables and thirty-three read-only views over tables the same contract already declares — plus
-three rendered functions. The contract lists every relation with its shape and the service
+as an additive object of contract version 1: sixty-four relations — twenty-seven loader-written
+tables and thirty-seven read-only views over tables the same contract already declares — plus
+three rendered functions. Four of those views exist so a vertex label can publish the counters
+Neo4j carries on the node of the same name; `graph_schema.counter_properties` records which
+label carries which. The contract lists every relation with its shape and the service
 that writes it, because a consumer reading one needs both: the shape says whether an index is
 available, and the owner says who to chase when the relation is empty. This repository writes
 no graph row, so an empty table on a fresh database is the expected state.

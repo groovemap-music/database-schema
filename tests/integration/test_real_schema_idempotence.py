@@ -15,6 +15,7 @@ from psycopg.types.json import Jsonb
 from groovemap_schema import initializer
 from groovemap_schema.neo4j import SCHEMA_STATEMENTS
 from groovemap_schema.postgres import (
+    _COUNTER_BEARING_VERTICES,
     _EDGE_TABLES,
     _GRAPH_STATEMENTS,
     MUSICBRAINZ_RELATIONSHIP_TYPES,
@@ -22,6 +23,8 @@ from groovemap_schema.postgres import (
     PROPERTY_GRAPH_RELATION,
     PROPERTY_GRAPH_SCHEMA,
     PROPERTY_GRAPH_SWITCH,
+    _property_graph_edges,
+    _property_graph_vertices,
     _widen_to_bigint,
     graph_bootstrap_statements,
     phase0_comparison_statements,
@@ -135,6 +138,12 @@ EXPECTED_GRAPH_VIEWS = {name.removeprefix("graph.").removesuffix(" view") for na
 EXPECTED_GRAPH_TABLES = {name.removeprefix("graph.").removesuffix(" table") for name, _statement in _GRAPH_STATEMENTS if name.endswith(" table")}
 EXPECTED_GRAPH_RELATIONS = EXPECTED_GRAPH_VIEWS | EXPECTED_GRAPH_TABLES
 
+# Every element of `graph.catalog`, and the nine relations that bind none: they
+# hold rows or counters for a label that binds a view joining them, plus the
+# loader-written half of release degree.
+DECLARED_ELEMENTS = (*_property_graph_vertices(), *_property_graph_edges())
+STORAGE_ONLY_RELATIONS = EXPECTED_GRAPH_RELATIONS - {element.element for element in DECLARED_ELEMENTS}
+
 # The schema holding the retained phase 0 view definitions. It is created by the
 # parity test alone; the initializer never emits it and a deployed database
 # never carries it.
@@ -189,6 +198,18 @@ EXPECTED_GRAPH_COLUMNS = {
     ("graph", "style_stats", "genre_count", "bigint"),
     ("graph", "label_stats", "label_id", "text"),
     ("graph", "artist_degree", "degree", "bigint"),
+    # The four projections each label binds, carrying its counters as
+    # properties exactly as the Neo4j node of the same name carries them.
+    ("graph", "genre_vertex", "name", "text"),
+    ("graph", "genre_vertex", "release_count", "bigint"),
+    ("graph", "genre_vertex", "style_count", "bigint"),
+    ("graph", "genre_vertex", "first_year", "integer"),
+    ("graph", "style_vertex", "genre_count", "bigint"),
+    ("graph", "style_vertex", "first_year", "integer"),
+    ("graph", "label_vertex", "label_id", "text"),
+    ("graph", "label_vertex", "genre_count", "bigint"),
+    ("graph", "artist_vertex", "artist_id", "text"),
+    ("graph", "artist_vertex", "degree", "bigint"),
     ("graph", "release_degree_base", "degree", "bigint"),
     ("graph", "release_degree", "degree", "bigint"),
     ("graph", "artist_genre", "genre_name", "text"),
@@ -472,9 +493,11 @@ async def assert_the_property_graph_matches_the_server() -> None:
         """,
         (PROPERTY_GRAPH_SCHEMA, PROPERTY_GRAPH_RELATION),
     )
-    declared = EXPECTED_GRAPH_RELATIONS - {"release_degree_base"}
-    assert {alias for alias, _relation, _kind in elements} == declared
-    assert {relation for _alias, relation, _kind in elements} == {f"graph.{view}" for view in declared}
+    # An alias is the label; the relation underneath it differs for the four
+    # labels that bind a counter projection.
+    assert {alias for alias, _relation, _kind in elements} == {element.view for element in DECLARED_ELEMENTS}
+    assert {relation for _alias, relation, _kind in elements} == {f"graph.{element.element}" for element in DECLARED_ELEMENTS}
+    assert {f"graph.{relation}" for relation in STORAGE_ONLY_RELATIONS}.isdisjoint({relation for _alias, relation, _kind in elements})
     assert {kind for _alias, _relation, kind in elements} == {"e", "v"}
 
     # SQL/PGQ requires one data type per property name across the whole graph.
@@ -1068,6 +1091,125 @@ async def test_graph_table_queries_run_over_the_sentinel_rows() -> None:
     assert await postgres_rows(MUSICBRAINZ_RELATIONSHIP) == [("Alice", "MEMBER_OF", "The Band")]
     assert await postgres_rows(MUSICBRAINZ_RELATIONSHIP_SHARED_LABEL) == [("Alice", "MEMBER_OF", "The Band")]
     assert await postgres_rows(MUSICBRAINZ_RELATIONSHIP_RAW_TYPE) == [("Alice", "member of band", "The Band")]
+
+
+# ── Counters as properties of the label Neo4j carries them on ───────────────
+# `graphinator` writes release_count, artist_count, label_count, style_count and
+# first_year onto `:Genre`, and the equivalents onto `:Style`, `:Label` and
+# `:Artist`. Eight catalog-api functions read them as node properties, so the
+# parity claim is that they read as properties of the same label here. These
+# queries are the claim: a bare read, a filter, and a read across an edge.
+
+COUNTERS_ON_THE_GENRE_LABEL = """
+SELECT * FROM GRAPH_TABLE (graph.catalog
+    MATCH (g IS genre)
+    COLUMNS (g.name AS name, g.release_count AS release_count, g.style_count AS style_count, g.first_year AS first_year)
+) ORDER BY 1
+"""
+
+FILTERING_ON_A_COUNTER = """
+SELECT * FROM GRAPH_TABLE (graph.catalog
+    MATCH (g IS genre WHERE g.release_count > 0)
+    COLUMNS (g.name AS name, g.release_count AS release_count)
+) ORDER BY 1
+"""
+
+COUNTERS_READ_ACROSS_AN_EDGE = """
+SELECT * FROM GRAPH_TABLE (graph.catalog
+    MATCH (r IS release)-[IS in_genre]->(g IS genre)
+    COLUMNS (r.release_id AS release_id, g.name AS name, g.release_count AS release_count)
+) ORDER BY 1, 2
+"""
+
+DEGREE_ON_THE_ARTIST_LABEL = """
+SELECT * FROM GRAPH_TABLE (graph.catalog
+    MATCH (a IS artist WHERE a.artist_id = '7')
+    COLUMNS (a.artist_id AS artist_id, a.name AS name, a.degree AS degree)
+)
+"""
+
+# Release degree is the one counter that is NOT a property of its label, and
+# this is the carry-forward spelling a rewrite uses instead.
+RELEASE_DEGREE_AS_ITS_OWN_LABEL = """
+SELECT * FROM GRAPH_TABLE (graph.catalog
+    MATCH (r IS release_degree WHERE r.release_id = '111')
+    COLUMNS (r.release_id AS release_id, r.degree AS degree)
+)
+"""
+
+# The two-hop the pilot family walks, read with no counter named. The planner
+# removes each LEFT JOIN to a uniquely-keyed counter relation outright, so the
+# shape costs nothing on the path catalog-api actually migrates first.
+PILOT_TWO_HOP_PLAN = """
+EXPLAIN (COSTS OFF)
+SELECT * FROM GRAPH_TABLE (graph.catalog
+    MATCH (anchor IS artist WHERE anchor.artist_id = '1')
+          <-[IS by_artist]-(credit IS release)-[IS by_artist]->(peer IS artist)
+    COLUMNS (peer.artist_id AS collaborator_id, peer.name AS collaborator_name, credit.release_id AS release_id)
+)
+"""
+
+
+@pytest.mark.asyncio
+async def test_the_counters_read_as_properties_of_the_label_neo4j_carries_them_on() -> None:
+    """`g.release_count` reads off `:Genre`, exactly as the Cypher it replaces does."""
+    await apply_schema()
+    if await server_version_num() < PROPERTY_GRAPH_MINIMUM_SERVER_VERSION:
+        pytest.skip("GRAPH_TABLE needs PostgreSQL 19")
+    await seed_graph_fixtures()
+    await bootstrap_the_loader_tables()
+
+    # A LEFT JOIN to a uniquely-keyed relation neither drops a vertex nor
+    # doubles one. Proving it on the engine is what says the projection is a
+    # presentation of the storage relation rather than a second population.
+    for relation, storage, _counters, _carried, _counted in _COUNTER_BEARING_VERTICES:
+        # Both names come from the initializer's own statement list.
+        projected = await postgres_rows(f"SELECT count(*) FROM graph.{relation}")  # noqa: S608
+        stored = await postgres_rows(f"SELECT count(*) FROM graph.{storage}")  # noqa: S608
+        assert projected == stored, relation
+        assert stored[0][0] > 0, storage
+
+    assert await postgres_rows(COUNTERS_ON_THE_GENRE_LABEL) == [("Rock", 1, 2, 1969)]
+    assert await postgres_rows(FILTERING_ON_A_COUNTER) == [("Rock", 1)]
+    assert await postgres_rows(COUNTERS_READ_ACROSS_AN_EDGE) == [("111", "Rock", 1)]
+    assert await postgres_rows(DEGREE_ON_THE_ARTIST_LABEL) == [("7", "Alice", 6)]
+
+    # Release degree stays a label of its own; this is the one carry-forward
+    # spelling, and the reason is the live half of the count rather than any
+    # SQL/PGQ limit.
+    base = await postgres_rows("SELECT degree FROM graph.release_degree_base WHERE release_id = '111'")
+    assert await postgres_rows(RELEASE_DEGREE_AS_ITS_OWN_LABEL) == [("111", base[0][0] + 2)]
+
+
+@pytest.mark.asyncio
+async def test_the_counter_join_is_removed_when_no_counter_is_read() -> None:
+    """A LEFT JOIN to a uniquely-keyed relation costs nothing when nothing reads it.
+
+    This is what makes carrying the counters on the label free on the pilot
+    path: the two-hop collaborator walk names no counter, so neither artist
+    binding pays for `graph.artist_degree` at all.
+    """
+    await apply_schema()
+    if await server_version_num() < PROPERTY_GRAPH_MINIMUM_SERVER_VERSION:
+        pytest.skip("GRAPH_TABLE needs PostgreSQL 19")
+    await seed_pilot_fixtures()
+    await bootstrap_the_loader_tables()
+    await execute_all([("analyze", "ANALYZE graph.artist, graph.artist_degree, graph.by_artist")])
+
+    plan = "\n".join(str(row[0]) for row in await postgres_rows(PILOT_TWO_HOP_PLAN))
+    assert "artist_degree" not in plan, plan
+    assert "by_artist" in plan, plan
+
+    # The join is present the moment a counter is named, which is what proves
+    # the absence above is the planner removing it rather than the property
+    # being unreachable.
+    named = "\n".join(
+        str(row[0])
+        for row in await postgres_rows(
+            "EXPLAIN (COSTS OFF) " + DEGREE_ON_THE_ARTIST_LABEL.replace("'7'", "'1'"),
+        )
+    )
+    assert "artist_degree" in named, named
 
 
 @pytest.mark.asyncio

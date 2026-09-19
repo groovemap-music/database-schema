@@ -364,7 +364,7 @@ owners; this schema follows them and does not invent one. Seven further tables h
 counters the graph enrichers compute in a post-import pass, which a graph declared over views
 had nowhere to put.
 
-Read the section in two halves. The sixty relations are unconditional — every supported
+Read the section in two halves. The sixty-four relations are unconditional — every supported
 engine gets all of them, on PostgreSQL 18 and 19 alike. The `CREATE PROPERTY GRAPH`
 declaration layered over them is not: it needs PostgreSQL 19 and an explicit switch, and
 [when it is applied](#when-it-is-applied) is the one place those gates are stated. A consumer
@@ -441,6 +441,13 @@ Vertex relations. The key column is what edge relations join to, and every one o
 `text`, `uuid`, or `bigint` — never `character varying`; see
 [the text key rule](#the-text-key-rule). "Shape" is `table` where a loader writes the rows and
 `view` where the relation is a projection of a table written elsewhere.
+
+Four of these relations hold the rows of a label without being the element table the property
+graph binds. `:Genre`, `:Style`, `:Label`, and `:Artist` bind a `<label>_vertex` view that
+joins the relation below to its counter relation, so that the counters `graphinator` writes
+onto those four nodes read as properties of the same label here. The rows, the key, and every
+column in this table are unchanged by that; the projection only adds columns. See
+[the counter relations](#the-counter-degree-and-aggregate-relations).
 
 | Neo4j label | Relation | Shape | Key column | Other columns |
 | --- | --- | --- | --- | --- |
@@ -686,18 +693,20 @@ it here would key the vertex differently from the node it mirrors.
 
 PostgreSQL 19 adds SQL/PGQ, and with it `CREATE PROPERTY GRAPH`: a named, read-only graph over
 relations that a `GRAPH_TABLE` query pattern-matches. `graph.catalog` declares one over every
-relation above — 21 vertex element tables and 38 edge element tables — so the same
+relation above — 17 vertex element tables and 38 edge element tables — so the same
 relation serves both a `SELECT` and a graph pattern. The declaration itself materializes
 nothing and copies nothing: each element is read from the table or view underneath it at query
 time, and the twenty-seven tables are written by their loaders whether the graph is declared
 or not.
 
-The one relation that is not an element is `graph.release_degree_base`, the loader-written
-half of release degree; the graph reaches it through `graph.release_degree`, the view that
-sums it against the live personal counts.
+Nine relations bind no element. Four hold the rows and four the counters of a label that
+binds a view joining them — see
+[the counter relations](#the-counter-degree-and-aggregate-relations) — and the ninth is
+`graph.release_degree_base`, the loader-written half of release degree, which the graph
+reaches through `graph.release_degree`.
 
 It is the one conditional object in this schema. On PostgreSQL 18, and on 19 with the switch
-off, `graph.catalog` does not exist while all sixty relations do, so no consumer may assume it
+off, `graph.catalog` does not exist while all sixty-four relations do, so no consumer may assume it
 — [the persistence compatibility contract](../contracts/persistence/) records it as additive
 but conditional for exactly that reason. The gates are stated once, in
 [when it is applied](#when-it-is-applied) below.
@@ -712,17 +721,17 @@ every supported engine gets, and this one is conditional. It is rendered here in
 ```sql
 CREATE PROPERTY GRAPH graph.catalog
     VERTEX TABLES (
-        graph.artist AS artist KEY (artist_id)
+        graph.artist_vertex AS artist KEY (artist_id)
             LABEL artist PROPERTIES ALL COLUMNS,
-        graph.label AS label KEY (label_id)
+        graph.label_vertex AS label KEY (label_id)
             LABEL label PROPERTIES ALL COLUMNS,
         graph.master AS master KEY (master_id)
             LABEL master PROPERTIES ALL COLUMNS,
         graph.release AS release KEY (release_id)
             LABEL release PROPERTIES ALL COLUMNS,
-        graph.genre AS genre KEY (name)
+        graph.genre_vertex AS genre KEY (name)
             LABEL genre PROPERTIES ALL COLUMNS,
-        graph.style AS style KEY (name)
+        graph.style_vertex AS style KEY (name)
             LABEL style PROPERTIES ALL COLUMNS,
         graph.person AS person KEY (name)
             LABEL person PROPERTIES ALL COLUMNS,
@@ -744,14 +753,6 @@ CREATE PROPERTY GRAPH graph.catalog
             LABEL mb_release PROPERTIES ALL COLUMNS,
         graph.mb_release_group AS mb_release_group KEY (mbid)
             LABEL mb_release_group PROPERTIES ALL COLUMNS,
-        graph.genre_stats AS genre_stats KEY (name)
-            LABEL genre_stats PROPERTIES ALL COLUMNS,
-        graph.style_stats AS style_stats KEY (name)
-            LABEL style_stats PROPERTIES ALL COLUMNS,
-        graph.label_stats AS label_stats KEY (label_id)
-            LABEL label_stats PROPERTIES ALL COLUMNS,
-        graph.artist_degree AS artist_degree KEY (artist_id)
-            LABEL artist_degree PROPERTIES ALL COLUMNS,
         graph.release_degree AS release_degree KEY (release_id)
             LABEL release_degree PROPERTIES ALL COLUMNS
     )
@@ -945,8 +946,8 @@ A property graph is a relation with its own `relkind`:
 | --- | --- |
 | `pg_class.relkind` for `graph.catalog` | `g` |
 | Elements, labels, and properties | `pg_propgraph_element`, `pg_propgraph_label`, `pg_propgraph_element_label`, `pg_propgraph_property`, `pg_propgraph_label_property` |
-| Elements declared | 59 — 21 vertex, 38 edge |
-| Labels declared | 60 — one per element, plus the shared `mb_related` |
+| Elements declared | 55 — 17 vertex, 38 edge |
+| Labels declared | 56 — one per element, plus the shared `mb_related` |
 | Distinct property names | one row per name, each with exactly one data type |
 
 `pg_propgraph_property` is the engine's own register of the SQL/PGQ rule that one property name
@@ -974,16 +975,24 @@ gets the whole benefit of them with the switch off.
 
 #### Labels
 
-Every element carries its view name as its label, verbatim. That is what the naming rule in ADR
-0012 buys: `:User` is projected as `graph.app_user` because `user` is reserved, and the
+Every element carries its relation name as its label, verbatim. That is what the naming rule in
+ADR 0012 buys: `:User` is projected as `graph.app_user` because `user` is reserved, and the
 overloaded `[:BY]`, `[:ON]`, and `[:IS]` types as `by_artist`, `on_label`, `in_genre`, and
 `in_style`. Checked against `pg_get_keywords()` on 19beta3, only `label` and `release` are
 keywords at all and both are unreserved, so no label here needs quoting.
 
+Four labels are the exception, and they are named for the Neo4j label rather than for the
+relation underneath: `genre`, `style`, `label`, and `artist` bind `graph.genre_vertex`,
+`graph.style_vertex`, `graph.label_vertex`, and `graph.artist_vertex`. Those four views exist
+only so the label can publish the counters Neo4j carries on the node of the same name; the
+label is what a query names, so the label keeps the Neo4j spelling. See
+[the counter relations](#the-counter-degree-and-aggregate-relations).
+
 The sixteen `mb_rel_<source>_<target>` views carry a second, shared label, `mb_related`. SQL/PGQ
 allows one label across several element tables only when every one of them exposes the same
-property names and types, and these sixteen do: each projects the same eight columns of
-`musicbrainz.relationships`. Keeping the per-pair label as well costs nothing and loses nothing,
+property names and types, and these sixteen do: each projects the same nine columns of
+`musicbrainz.relationships`. That same rule is why a counter relation cannot simply be
+attached to the label it describes as a second element table. Keeping the per-pair label as well costs nothing and loses nothing,
 so a query picks its own altitude — `[IS mb_rel_artist_label]` for one endpoint pair, or
 `[IS mb_related]` for any MusicBrainz relationship without spelling out all sixteen.
 
@@ -1011,9 +1020,11 @@ three other provider bridges — `discogs_artist_id`, `discogs_master_id`, and
 a deliberate cast in the query rather than a property-type problem.
 
 The counter beads add properties without moving any existing name: `formats` and
-`catalog_number` on `release`, `gm_id` on the four Discogs vertices, and
-`raw_relationship_type` on the sixteen MusicBrainz pair relations. Every one is appended after
-the published columns.
+`catalog_number` on `release`, `gm_id` on the four Discogs vertices, `raw_relationship_type` on
+the sixteen MusicBrainz pair relations, and the counters on `genre`, `style`, `label`, and
+`artist`. Every one is appended after the published columns, and every counter name carries one
+type across the graph — the five `*_count` names and `degree` are `bigint`, `first_year` is
+`integer`.
 
 #### The text key rule
 
@@ -1054,8 +1065,7 @@ database hits for Rock — with a single property read. A rewrite that dropped t
 re-aggregated on request would not merely get slower; it would reproduce the failure that took
 the rarity pipeline down for thirty-three consecutive days.
 
-A property graph declared over views has nowhere to put a node property, so these become
-relations of their own. Each is a vertex or edge element with its own label:
+The loaders write them into relations of their own:
 
 | Relation | Replaces | Key | Other indexes |
 | --- | --- | --- | --- |
@@ -1072,24 +1082,83 @@ handles, which is the same latch `graphinator` uses to start its own post-import
 they cost no new scheduler. Every one is a sum over the edge tables and none re-reads a JSONB
 document, which is what makes the pass affordable.
 
-**`graph.release_degree` is the one relation split across two owners, and it is recorded as
-such rather than resolved by whoever writes it first.** Release degree as Neo4j computes it
-counts `COLLECTED` and `WANTS` edges, which `catalog-api` writes and the loader never sees.
-Either the loader's counter excludes them — a parity diff the rarity scoring would have to be
-re-tuned for — or degree is a view summing a loader-written base against a live count. The
-second is correct and it is cheap, because `user_collections` and `user_wantlists` both index
-`release_id`, so `graph.release_degree` is a view over `graph.release_degree_base` plus two
-indexed counts. The graph side holds the Discogs id as text and the user side as `BIGINT`; the
-view resolves it through a `CASE` that yields `NULL` for a non-numeric id, which is total —
-`release_id = NULL` matches no row and the count is zero rather than a cast error — and keeps
-both lookups on their index.
+**Four of them read back as properties of the label Neo4j carries them on.** That is the
+parity claim and it is the point of the whole arrangement: `MATCH (g IS genre) COLUMNS
+(g.release_count)` reads exactly as the Cypher it replaces, and no query has to learn a second
+label to find a counter.
 
-Because the counters are their own labels rather than properties of the labels they describe,
-a query that read `g.release_count` off a `:Genre` node reads
-`MATCH (g IS genre_stats WHERE g.name = …)` instead. SQL/PGQ admits one element table per
-label unless every table exposes an identical property set, and these are loader-refreshed
-relations with their own key and their own write cadence. The binding costs a primary key
-probe; it is not a traversal.
+| Label | Element table | Storage | Counters | Properties gained |
+| --- | --- | --- | --- | --- |
+| `genre` | `graph.genre_vertex` | `graph.genre` | `graph.genre_stats` | `release_count`, `artist_count`, `label_count`, `style_count`, `first_year` |
+| `style` | `graph.style_vertex` | `graph.style` | `graph.style_stats` | `release_count`, `artist_count`, `label_count`, `genre_count`, `first_year` |
+| `label` | `graph.label_vertex` | `graph.label` | `graph.label_stats` | `release_count`, `artist_count`, `genre_count` |
+| `artist` | `graph.artist_vertex` | `graph.artist` | `graph.artist_degree` | `degree` |
+
+Each `<label>_vertex` is a view that `LEFT JOIN`s the storage relation to the counter
+relation. A view rather than a second element table, because SQL/PGQ admits one element table
+per label unless every table exposes an identical property set: declaring `graph.genre` and
+`graph.genre_stats` both as `LABEL genre` is refused on 19beta3 with `mismatching number of
+properties in definition of label "genre"`. A view joining the two is one element table, and
+the engine accepts it.
+
+The join is free when it is not read. Each counter relation is unique on the join column, so
+the planner removes the `LEFT JOIN` outright for a query that names no counter: the pilot
+collaborator two-hop plans identically over `graph.artist_vertex` and over `graph.artist`
+alone, with `graph.artist_degree` absent from the plan entirely. The integration suite asserts
+both halves of that — the relation's absence when no counter is named and its presence when
+one is.
+
+A count reads zero where the loader has not computed one yet, because every caller does
+arithmetic on it and a null would propagate through a ratio or a sum. `first_year` is
+deliberately not defaulted: an unknown first year must not read as year zero, and every caller
+of it already tests for null.
+
+The counter relations themselves are **not** declared as labels. Every property they carry is
+reachable on the Neo4j label, so a second label would be published surface with no query
+behind it. They stay loader-owned storage, and the contract records them as relations with an
+owner and no element.
+
+**`graph.release_degree` is the one counter that stays a label of its own**, and the reason is
+a measurement rather than a rule. Release degree as Neo4j computes it counts `COLLECTED` and
+`WANTS` edges, which `catalog-api` writes and the loader never sees. So it is a view summing
+`graph.release_degree_base` against a live count over `user_collections` and `user_wantlists`,
+and that live half is a pair of lateral counts no unique key makes removable. Folding it onto
+the `release` vertex would make every release binding in every traversal count collection and
+wantlist rows even where degree is never read: the same
+`(r IS release)-[IS in_genre]->(g IS genre)` traversal plans in nine lines against a plain
+`release` and nineteen against a joined one, the extra containing a scan of
+`release_degree_base` and both aggregates. `MATCH (r IS release_degree WHERE r.release_id =
+…)` is therefore the one carry-forward spelling a rewrite has to learn, and the reason is the
+live half of the count rather than any SQL/PGQ limit.
+
+The view resolves the release id across two type spaces through a `CASE` that yields `NULL`
+for a non-numeric id, which is total — `release_id = NULL` matches no row and the count is
+zero rather than a cast error — and keeps both lookups on their index. It is the one relation
+in the whole edge model split across two owners, and the contract records it as such rather
+than leaving it to whoever writes it first.
+
+#### Two costs worth budgeting for
+
+Neither blocks anything here; both are stated so the query-rewrite beads can plan around them.
+
+**An upgrade that runs with the switch off loses the property graph until the next run with it
+on.** The view-to-table migration drops the phase 0 view with `CASCADE`, and on PostgreSQL 19
+`graph.catalog` depends on that view, so the migration takes the graph with it and relies on
+the same run re-declaring it. `_apply_property_graph` only re-declares when
+`SCHEMA_PROPERTY_GRAPH` is enabled, so an operator who upgrades with the switch off on a
+server that already carried the graph ends that run with the tables in place and no
+`graph.catalog`. The next run with the switch on restores it, because the catalog existence
+check finds nothing and creates it. Turn the switch on for the upgrade run, or expect one
+window without the graph.
+
+**`gm_id` costs one index probe per vertex binding.** The four Discogs vertex views `LEFT
+JOIN` `provider_aliases`, whose uniqueness comes from a *partial* unique index — `WHERE
+valid_to IS NULL` — and the planner cannot prove a partial index unique for join removal the
+way it can a primary key. So unlike the counter join, this one stays in the plan whether or
+not `gm_id` is selected, and a traversal binding artists pays for it at every hop. It is the
+correct source: `provider_aliases` is the table `catalog-api`'s own `gm_id` projection job
+reads, and the `gm_item_id` column on the entity tables is not the same guarantee. The cost is
+recorded here so a query-rewrite bead can budget for it rather than discover it.
 
 #### Querying it
 

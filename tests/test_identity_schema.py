@@ -344,6 +344,10 @@ _GRAPH_STATEMENT_NAMES = frozenset(
         "graph.wants view",
         "graph.owns view",
         "graph.in_family view",
+        "graph.genre_vertex view",
+        "graph.style_vertex view",
+        "graph.label_vertex view",
+        "graph.artist_vertex view",
         "graph.release_degree view",
     }
 )

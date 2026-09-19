@@ -2109,27 +2109,89 @@ JOIN graph.media_family AS family ON family.name = medium.family
     ]
 
 
-def _counter_views() -> list[tuple[str, str]]:
-    """Return the one counter relation that cannot belong to a single owner.
+# The four labels Neo4j carries counters on, each paired with the relation
+# holding its own rows and the relation holding its counters. A property graph
+# admits ONE element table per label — two tables sharing a label must expose an
+# identical property set, and PostgreSQL 19 beta 3 refuses the pair outright
+# with `mismatching number of properties in definition of label "genre"` — so
+# the counters cannot be attached to the label as a second element table. A view
+# that joins the two is one element table, which is what makes
+# `MATCH (g IS genre) COLUMNS (g.release_count)` read exactly as the Cypher it
+# replaces.
+_COUNTER_BEARING_VERTICES: tuple[tuple[str, str, str, tuple[str, ...], tuple[str, ...]], ...] = (
+    ("genre_vertex", "genre", "genre_stats", ("name",), ("release_count", "artist_count", "label_count", "style_count")),
+    ("style_vertex", "style", "style_stats", ("name",), ("release_count", "artist_count", "label_count", "genre_count")),
+    (
+        "label_vertex",
+        "label",
+        "label_stats",
+        ("label_id", "name", "gm_item_id", "hash", "updated_at", "gm_id"),
+        ("release_count", "artist_count", "genre_count"),
+    ),
+    ("artist_vertex", "artist", "artist_degree", ("artist_id", "name", "gm_item_id", "hash", "updated_at", "gm_id"), ("degree",)),
+)
 
-    Neo4j's release degree counts COLLECTED and WANTS edges as well as the
-    catalog ones. `discogs-sql-loader` writes `graph.release_degree_base` and
-    never sees a collection row; catalog-api writes `user_collections` and
-    `user_wantlists` and never computes a degree. Summing a loader-written base
-    against a live count is the reading that keeps both owners honest, and it is
-    cheap because both user tables index `release_id`.
+# The join column of each, which is also the key of both relations either side
+# of it. That the counter relation is UNIQUE on it is the whole reason this
+# shape is free: the planner removes a LEFT JOIN to a uniquely-keyed relation
+# outright when no column of it is selected, so a traversal that never names a
+# counter plans exactly as it did against the storage relation alone.
+_COUNTER_JOIN_COLUMNS = {"genre_vertex": "name", "style_vertex": "name", "label_vertex": "label_id", "artist_vertex": "artist_id"}
 
-    The alternative — a loader counter that simply excludes the personal edges —
-    is a parity diff the rarity scoring would have to be re-tuned for, so it is
-    not taken.
 
-    `release_id` is the Discogs id as text on the graph side and a BIGINT on the
-    user side. The lateral resolves it to a bigint or to NULL, which is total:
-    a non-numeric catalog id yields NULL, `release_id = NULL` matches no row, and
-    the count is zero rather than a cast error. Comparing bigint to bigint is
-    also what keeps both lookups on their index.
+def _counter_vertex_view(relation: str, storage: str, counters: str, carried: tuple[str, ...], counted: tuple[str, ...]) -> tuple[str, str]:
+    """Return the vertex projection joining one storage relation to its counters.
+
+    A count reads zero where the loader has not computed one yet, because every
+    caller of these does arithmetic on it and a null would propagate through a
+    ratio or a sum. `first_year` is deliberately not defaulted: an unknown first
+    year must not read as year zero, and every caller of it tests for null
+    already.
     """
-    return [
+    join = _COUNTER_JOIN_COLUMNS[relation]
+    columns = [f"       {storage}.{column:<14} AS {column}," for column in carried]
+    columns.extend(f"       COALESCE({counters}.{column}, 0)::bigint AS {column}," for column in counted)
+    if counters.endswith("_stats") and counters != "label_stats":
+        columns.append(f"       {counters}.first_year AS first_year,")
+    body = "\n".join(columns).rstrip(",")
+    return _view(
+        relation,
+        f"""
+SELECT
+{body}
+FROM graph.{storage} AS {storage}
+LEFT JOIN graph.{counters} AS {counters} ON {counters}.{join} = {storage}.{join}
+""",  # noqa: S608
+    )
+
+
+def _counter_views() -> list[tuple[str, str]]:
+    """Return the vertex projections carrying the counters, and release degree.
+
+    Eight `catalog-api` functions read counters that `graphinator` writes onto
+    `:Genre`, `:Style`, `:Label`, and `:Artist` nodes in a post-import pass.
+    `explore_genre`'s own docstring records that reading `g.release_count`
+    replaces four traversal queries — roughly 200 million database hits for Rock
+    — with one property read, and re-aggregating on request is the failure that
+    took the rarity pipeline down for thirty-three days. So these have to stay
+    properties of the label the Cypher names, not a second label a rewrite has
+    to learn.
+
+    Each label therefore binds a projection that joins its storage relation to
+    its counter relation. The counter relations stay exactly as the loaders
+    write them; nothing here duplicates a row.
+
+    `graph.release_degree` is the one counter that is NOT folded onto its label,
+    and the reason is a measurement rather than a rule. Its live half is a pair
+    of lateral counts over `user_collections` and `user_wantlists`, which no
+    unique key makes removable, so folding it onto the `release` vertex would
+    make every release binding in every traversal count collection and wantlist
+    rows even where degree is never read — a nine-line plan becomes nineteen.
+    It stays its own label, and `MATCH (r IS release_degree WHERE r.release_id =
+    …)` is the one spelling a rewrite has to carry forward.
+    """
+    views = [_counter_vertex_view(*entry) for entry in _COUNTER_BEARING_VERTICES]
+    views.append(
         _view(
             "release_degree",
             """
@@ -2150,8 +2212,9 @@ CROSS JOIN LATERAL (
     WHERE wantlist.release_id = numeric_id.discogs_id
 ) AS wanted
 """,
-        ),
-    ]
+        )
+    )
+    return views
 
 
 # ── Loader-written graph relations (spike gm-database-schema-9c8.1 / 9c8.2) ───
@@ -3026,12 +3089,24 @@ MUSICBRAINZ_RELATIONSHIP_LABEL = "mb_related"
 
 
 class _PropertyGraphVertex(NamedTuple):
-    """One vertex element table: a graph schema view, its key, and its properties."""
+    """One vertex element table: its label, its key, and its properties.
+
+    `view` is the alias and the label. `relation` is the graph-schema relation
+    underneath it, which differs from the label only for the four labels that
+    carry counters: those bind a `<label>_vertex` projection rather than the
+    storage relation of the same name. See `_counter_views`.
+    """
 
     view: str
     key: tuple[str, ...]
     # None means PROPERTIES ALL COLUMNS.
     properties: tuple[str, ...] | None = None
+    relation: str | None = None
+
+    @property
+    def element(self) -> str:
+        """Return the graph-schema relation this element table reads."""
+        return self.relation or self.view
 
 
 class _PropertyGraphEdge(NamedTuple):
@@ -3047,6 +3122,16 @@ class _PropertyGraphEdge(NamedTuple):
     destination_columns: tuple[str, ...]
     properties: tuple[str, ...] | None = None
     extra_labels: tuple[str, ...] = ()
+
+    @property
+    def element(self) -> str:
+        """Return the graph-schema relation this element table reads.
+
+        No edge label binds a relation of a different name, so this is always
+        the label itself. It exists so a caller can walk vertices and edges
+        together without knowing which kind it is holding.
+        """
+        return self.view
 
 
 def _property_graph_vertices() -> tuple[_PropertyGraphVertex, ...]:
@@ -3068,22 +3153,32 @@ def _property_graph_vertices() -> tuple[_PropertyGraphVertex, ...]:
     `graph.collected` and `graph.wants`, which read `releases.data_id` through a
     join and publish it as `character varying`. Each is unified on `text`.
 
-    The five counter relations are declared as vertices of their own rather than
-    folded into the labels they describe. Neo4j carried these as node properties
-    of `:Genre`, `:Style`, `:Label`, `:Artist`, and `:Release`, but SQL/PGQ
-    admits one element table per label unless every table exposes an identical
-    property set, and the counters are loader-refreshed relations with their own
-    key and their own write cadence. `MATCH (g IS genre_stats WHERE g.name = …)`
-    is the spelling; it is one binding, not a traversal, so it costs a primary
-    key probe.
+    Four labels bind a relation of a different name. `genre`, `style`, `label`,
+    and `artist` read a `<label>_vertex` projection that joins the relation
+    holding their rows to the relation holding their counters, because Neo4j
+    carries those counters as node properties of exactly those four labels and
+    exact parity is the point: `MATCH (g IS genre) COLUMNS (g.release_count)`
+    reads as the Cypher it replaces. Attaching the counter relation to the same
+    label as a second element table is not an option — SQL/PGQ admits one
+    element table per label unless every table exposes an identical property
+    set, and PostgreSQL 19 beta 3 refuses the pair with `mismatching number of
+    properties in definition of label "genre"`. A view is one element table.
+
+    The projection is free when it is not read: the counter relation is unique
+    on the join column, so the planner removes the LEFT JOIN outright for a
+    query that names no counter, and the pilot two-hop plans identically over
+    the projection and over the storage relation alone.
+
+    `release_degree` is the one counter that stays a label of its own; see
+    `_counter_views` for the measurement behind that.
     """
     return (
-        _PropertyGraphVertex("artist", ("artist_id",)),
-        _PropertyGraphVertex("label", ("label_id",)),
+        _PropertyGraphVertex("artist", ("artist_id",), relation="artist_vertex"),
+        _PropertyGraphVertex("label", ("label_id",), relation="label_vertex"),
         _PropertyGraphVertex("master", ("master_id",)),
         _PropertyGraphVertex("release", ("release_id",)),
-        _PropertyGraphVertex("genre", ("name",)),
-        _PropertyGraphVertex("style", ("name",)),
+        _PropertyGraphVertex("genre", ("name",), relation="genre_vertex"),
+        _PropertyGraphVertex("style", ("name",), relation="style_vertex"),
         _PropertyGraphVertex("person", ("name",)),
         _PropertyGraphVertex("company", ("company_id",)),
         _PropertyGraphVertex("medium", ("medium_id",)),
@@ -3110,11 +3205,13 @@ def _property_graph_vertices() -> tuple[_PropertyGraphVertex, ...]:
         ),
         _PropertyGraphVertex("mb_release", ("mbid",)),
         _PropertyGraphVertex("mb_release_group", ("mbid",)),
-        # The counters `graphinator`'s post-import pass writes onto nodes today.
-        _PropertyGraphVertex("genre_stats", ("name",)),
-        _PropertyGraphVertex("style_stats", ("name",)),
-        _PropertyGraphVertex("label_stats", ("label_id",)),
-        _PropertyGraphVertex("artist_degree", ("artist_id",)),
+        # The one counter that is not a property of the label it describes. Its
+        # live half is a pair of lateral counts no unique key makes removable,
+        # so folding it onto `release` would double the plan of every traversal
+        # that binds a release. The counter relations behind the other four are
+        # loader-owned storage and are deliberately NOT declared as labels of
+        # their own: every property they carry is reachable on the Neo4j label,
+        # so a second label would be surface with no query behind it.
         _PropertyGraphVertex("release_degree", ("release_id",)),
     )
 
@@ -3290,7 +3387,7 @@ def _labels_and_properties(view: str, properties: tuple[str, ...] | None, extra_
 def _property_graph_statement() -> str:
     """Render CREATE PROPERTY GRAPH graph.catalog over the graph schema views."""
     vertices = [
-        f"        {PROPERTY_GRAPH_SCHEMA}.{vertex.view} AS {vertex.view} KEY {_columns(vertex.key)}\n"
+        f"        {PROPERTY_GRAPH_SCHEMA}.{vertex.element} AS {vertex.view} KEY {_columns(vertex.key)}\n"
         f"            {_labels_and_properties(vertex.view, vertex.properties)}"
         for vertex in _property_graph_vertices()
     ]

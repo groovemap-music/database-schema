@@ -83,10 +83,46 @@ assert relations["release_degree"]["owner"] == "discogs-sql-loader, catalog-api"
 assert relations["release_degree"]["shape"] == "view"
 assert relations["release_degree_base"]["shape"] == "table"
 
-# The property graph binds every relation except the loader-written half of
-# release degree, which it reaches through the view that sums it.
-element_views = {element.view for element in (*_property_graph_vertices(), *_property_graph_edges())}
-assert element_views == set(declared_shapes) - {"release_degree_base"}
+# Four labels carry counters Neo4j carries as node properties of the same node,
+# so each binds a view joining its storage relation to its counter relation
+# rather than the storage relation itself. The counters recorded here are the
+# parity claim, and every one is checked against the relation that publishes it.
+counters = graph["counter_properties"]
+assert counters["kind"] == "additive"
+assert counters["availability"] == "unconditional"
+vertices_by_label = {vertex.view: vertex for vertex in _property_graph_vertices()}
+for label, recorded in counters["labels"].items():
+    vertex = vertices_by_label[label]
+    element = f"{PROPERTY_GRAPH_SCHEMA}.{vertex.element}"
+    assert recorded["element_table"] == element, label
+    assert vertex.element != vertex.view, label
+    body = view_statements[element]
+    assert f"{PROPERTY_GRAPH_SCHEMA}.{recorded['counters'].removeprefix(f'{PROPERTY_GRAPH_SCHEMA}.')}" in table_statements, label
+    assert f"LEFT JOIN {recorded['counters']} AS" in body, label
+    for column in recorded["properties"]:
+        assert f"AS {column}" in body, f"{label}.{column}"
+
+# `graph.release_degree` is the one counter that stays a label of its own, and
+# the counter relations behind the other four bind no label at all.
+assert "release_degree" in vertices_by_label
+assert not set(vertices_by_label) & {recorded["counters"].removeprefix("graph.") for recorded in counters["labels"].values()}
+
+# The property graph binds every relation except the nine that hold rows or
+# counters for a label that binds a projection over them, plus the loader-written
+# half of release degree.
+element_relations = {element.element for element in (*_property_graph_vertices(), *_property_graph_edges())}
+storage_only = set(declared_shapes) - element_relations
+assert storage_only == {
+    "artist",
+    "artist_degree",
+    "genre",
+    "genre_stats",
+    "label",
+    "label_stats",
+    "release_degree_base",
+    "style",
+    "style_stats",
+}, storage_only
 
 # Appending a column is the only view change safe to ship on its own; the engine
 # enforces the rest by refusing the replacement.

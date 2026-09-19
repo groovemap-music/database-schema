@@ -19,6 +19,51 @@
   "contract": "groovemap.persistence",
   "graph_schema": {
     "availability": "unconditional",
+    "counter_properties": {
+      "availability": "unconditional",
+      "kind": "additive",
+      "labels": {
+        "artist": {
+          "counters": "graph.artist_degree",
+          "element_table": "graph.artist_vertex",
+          "properties": [
+            "degree"
+          ]
+        },
+        "genre": {
+          "counters": "graph.genre_stats",
+          "element_table": "graph.genre_vertex",
+          "properties": [
+            "release_count",
+            "artist_count",
+            "label_count",
+            "style_count",
+            "first_year"
+          ]
+        },
+        "label": {
+          "counters": "graph.label_stats",
+          "element_table": "graph.label_vertex",
+          "properties": [
+            "release_count",
+            "artist_count",
+            "genre_count"
+          ]
+        },
+        "style": {
+          "counters": "graph.style_stats",
+          "element_table": "graph.style_vertex",
+          "properties": [
+            "release_count",
+            "artist_count",
+            "label_count",
+            "genre_count",
+            "first_year"
+          ]
+        }
+      },
+      "note": "graphinator writes these onto the Neo4j node of the same name, so the property graph publishes them on the same label rather than on a second one a rewrite would have to learn. SQL/PGQ admits one element table per label unless every table exposes an identical property set, so the label binds a view joining its storage relation to its counter relation; the counter relation is unique on the join column, so the planner removes the join for a query that reads no counter. A count reads zero where the loader has not computed one; first_year stays null. graph.release_degree is the one counter that stays a label of its own, because its live half is a pair of lateral counts no unique key makes removable."
+    },
     "documentation": "docs/architecture.md#graph-schema",
     "edge_relations": 38,
     "functions": [
@@ -34,7 +79,7 @@
       "type": "text"
     },
     "kind": "additive",
-    "note": "Twenty relations are loader-written tables and the rest are read-only views over tables declared elsewhere in this contract. Seven further tables hold the counters, degrees, and genre aggregates the graph enrichers compute today. This repository declares every one of them and writes rows into none: the owner named against each relation does that, so an empty table on a fresh database is the expected state rather than a fault.",
+    "note": "Twenty relations are loader-written tables replacing a view that computed the same rows on every read, seven more hold the counters, degrees, and genre aggregates the graph enrichers compute today, and the rest are read-only views over tables declared elsewhere in this contract. This repository declares every one of them and writes rows into none: the owner named against each relation does that, so an empty table on a fresh database is the expected state rather than a fault.",
     "property_graph": {
       "absent_on": "PostgreSQL 18, and PostgreSQL 19 with the switch off",
       "availability": "conditional",
@@ -45,12 +90,13 @@
       "consumer_rule": "consumers must not assume it exists; probe pg_class for a relation named catalog in schema graph, of relkind g, and fall back to the views, which are always present",
       "documentation": "docs/architecture.md#property-graph",
       "edge_tables": 38,
+      "element_tables": "Fifty-five of the sixty-four graph relations. The nine that bind no element hold rows or counters for a label that binds a view joining them, plus graph.release_degree_base, whose rows the graph reaches through graph.release_degree.",
       "kind": "additive",
       "name": "graph.catalog",
       "note": "A SQL/PGQ declaration over the graph schema's tables and views, applied after the rest of the PostgreSQL schema. A closed gate is logged and is not a failure. There is no IF NOT EXISTS for a property graph and this initializer never drops one except through a shape migration that re-declares it on the same run, so an existing graph.catalog is otherwise left as it is and a changed declaration does not roll out on its own.",
-      "vertex_tables": 21
+      "vertex_tables": 17
     },
-    "relation_count": 60,
+    "relation_count": 64,
     "relations": {
       "alias_of": {
         "owner": "discogs-sql-loader",
@@ -71,6 +117,10 @@
       "artist_genre": {
         "owner": "discogs-sql-loader",
         "shape": "table"
+      },
+      "artist_vertex": {
+        "owner": "discogs-sql-loader",
+        "shape": "view"
       },
       "by_artist": {
         "owner": "discogs-sql-loader",
@@ -108,6 +158,10 @@
         "owner": "discogs-sql-loader",
         "shape": "table"
       },
+      "genre_vertex": {
+        "owner": "discogs-sql-loader",
+        "shape": "view"
+      },
       "in_family": {
         "owner": "discogs-sql-loader, musicbrainz-sql-loader",
         "shape": "view"
@@ -135,6 +189,10 @@
       "label_stats": {
         "owner": "discogs-sql-loader",
         "shape": "table"
+      },
+      "label_vertex": {
+        "owner": "discogs-sql-loader",
+        "shape": "view"
       },
       "master": {
         "owner": "discogs-sql-loader",
@@ -284,6 +342,10 @@
         "owner": "discogs-sql-loader",
         "shape": "table"
       },
+      "style_vertex": {
+        "owner": "discogs-sql-loader",
+        "shape": "view"
+      },
       "sublabel_of": {
         "owner": "discogs-sql-loader",
         "shape": "view"
@@ -295,7 +357,7 @@
     },
     "schema": "graph",
     "tables": 27,
-    "vertex_relations": 21,
+    "vertex_relations": 17,
     "view_evolution": {
       "allowed": "appending a column to the end of an existing view",
       "engine_enforcement": "CREATE OR REPLACE VIEW fails the statement outright rather than replacing the view",
@@ -309,7 +371,7 @@
       "rule": "append-only",
       "shape_change": "A relation that becomes a loader-written table is replaced by a guarded migration that drops the view only when one is still there, in the same pass that creates the table. The published column names survive the change; the key columns are retyped from character varying to text, which psycopg returns identically."
     },
-    "views": 33
+    "views": 37
   },
   "owners": [
     "database-schema"
