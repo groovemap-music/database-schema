@@ -6,6 +6,7 @@ from pathlib import Path
 
 from groovemap_schema import __version__
 from groovemap_schema.postgres import (
+    _BOOTSTRAP_FILL_ORDER,
     _GRAPH_STATEMENTS,
     PROPERTY_GRAPH_MINIMUM_SERVER_VERSION,
     PROPERTY_GRAPH_NAME,
@@ -146,6 +147,21 @@ assert not [column for vertex in _property_graph_vertices() for column in vertex
 for body in (*view_statements.values(), *table_statements.values()):
     for retired in ("artist_key", "label_key", "master_key", "release_key"):
         assert retired not in body, retired
+
+# The bootstrap fill is recorded as the one declared object that writes a graph
+# row, and as writing none of them authoritatively. What it fills is read back
+# from the fill order rather than restated, so a relation that becomes a table
+# without being added to the fill fails this check rather than shipping as a
+# table the bootstrap silently leaves empty.
+bootstrap = graph["bootstrap"]
+assert bootstrap["kind"] == "additive"
+assert bootstrap["availability"] == "unconditional"
+assert bootstrap["authority"] == "none"
+assert bootstrap["function"] == "graph.bootstrap_fill"
+assert bootstrap["function"] in graph["functions"]
+assert bootstrap["fills"] == sorted(_BOOTSTRAP_FILL_ORDER)
+assert set(bootstrap["fills"]) == {relation for relation, shape in declared_shapes.items() if shape == "table"}
+assert "NOT authoritative" in bootstrap["note"]
 
 # The property graph is conditional on both the server version and the switch, so
 # a consumer that assumes it exists is reading a contract this repository never made.
