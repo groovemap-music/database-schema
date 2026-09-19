@@ -5,7 +5,7 @@
 #
 # Throwaway spike harness. ./README.md documents the whole sequence; this is the
 # entry point for all of it. Its shape is adapted from `investigations/run.sh` on
-# the db-alternatives branch of SimplicityGuy/discogsography: flags select a
+# the owner's earlier db-alternatives branch: flags select a
 # mode, positionals are the local mode's arguments, local is the default and
 # needs no flag, and cloud is opt-in.
 #

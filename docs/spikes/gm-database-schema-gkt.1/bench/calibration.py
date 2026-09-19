@@ -1,8 +1,8 @@
 """Hardware calibration.
 
 Throwaway spike harness for gm-database-schema-gkt.1, adapted from
-``investigations/calibration/calibrate.py`` on the ``db-alternatives`` branch of
-SimplicityGuy/discogsography.
+``investigations/calibration/calibrate.py`` on the owner's earlier
+``db-alternatives`` branch.
 
 Standard library only, deliberately. It is copied to a bare Ubuntu instance and
 run with the system ``python3``; there is no virtualenv there and installing one

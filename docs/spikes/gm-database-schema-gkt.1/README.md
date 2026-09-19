@@ -50,8 +50,11 @@ the shortest path and not one hop too long.
 
 ## Where the harness shape comes from
 
-`investigations/` on the `db-alternatives` branch of
-`SimplicityGuy/discogsography`: hardware calibration, workloads declared as data
+The owner's earlier database-alternatives investigation — the
+`investigations/` tree on that project's `db-alternatives` branch. It is named
+by branch rather than by repository because this repository's distribution
+contract forbids the retired project name in published source. From it:
+hardware calibration, workloads declared as data
 with their own iteration counts, a runner reporting p50/p95, a comparison step, a
 generated report, `small` and `large` scale points, one script with a local
 Docker mode and a cloud mode. Three things are deliberately different and the

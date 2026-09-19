@@ -4,8 +4,10 @@ Throwaway. Nothing here ships, no product code imports it, and it is checked in
 only so the numbers in ``../gm-database-schema-gkt.1-procedural-pathfinder.md``
 can be reproduced.
 
-Its shape is adapted from the ``investigations/`` harness on the
-``db-alternatives`` branch of SimplicityGuy/discogsography: a hardware
+Its shape is adapted from the ``investigations/`` harness on the owner's earlier
+``db-alternatives`` branch, named by branch rather than by repository because
+this repository's distribution contract forbids the retired project name in
+published source: a hardware
 calibration step, workloads declared as data with their own iteration counts, a
 runner that reports p50/p95, a comparison step, a generated report, and the same
 ``small``/``large`` scale pair driven from one script in either a local Docker
