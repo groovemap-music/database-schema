@@ -254,7 +254,6 @@ def _path_workloads() -> list[Workload]:
                     case="d6-artist-artist",
                     variant=variant,
                     depth=cap,
-                    iterations=15,
                     tags=("cap-cost",),
                     notes="a connected pair against a cap below its distance",
                 )
@@ -302,9 +301,8 @@ def _explore_workloads() -> list[Workload]:
                 case="explore-artist-5665",
                 variant="cypher",
                 depth=hops,
-                iterations=30 if hops < EXPLORE_MAX_HOPS else 10,
                 verdict=gate,
-                notes="" if hops < EXPLORE_MAX_HOPS else "10 iterations; seconds each on the Neo4j side",
+                notes="" if hops < EXPLORE_MAX_HOPS else "seconds per iteration on the Neo4j side",
                 tags=("headline", "baseline"),
             )
         )

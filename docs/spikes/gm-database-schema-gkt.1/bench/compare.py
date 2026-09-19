@@ -44,8 +44,30 @@ def load(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text())
 
 
+def _slug(workload: str) -> str:
+    """The middle segment of a workload name, which identifies the measurement.
+
+    `path/unreachable/pf-vaat` and `path/unreachable-cap10/pf-vaat` share a case,
+    a variant and a depth, so a key built from those three is not unique and
+    silently collapses the gated measurement into the cap sweep. The workload
+    name is unique; its middle segment is what pairs a PostgreSQL row with the
+    Neo4j row measuring the same thing, across the two engines' different
+    variant names (`neo4j` on the headline rows, `cypher` on the sweeps).
+    """
+    parts = workload.split("/")
+    return parts[1] if len(parts) > 2 else workload
+
+
 def _by_case(payload: dict[str, Any], kind: str) -> dict[tuple[str, int, str], dict[str, Any]]:
-    return {(r["case"], r["depth"], r["variant"]): r for r in payload["results"] if r["kind"] == kind}
+    out: dict[tuple[str, int, str], dict[str, Any]] = {}
+    for r in payload["results"]:
+        if r["kind"] != kind:
+            continue
+        key = (_slug(r["workload"]), r["depth"], r["variant"])
+        if key in out:  # pragma: no cover - a workloads.py bug, not a data one
+            raise ValueError(f"duplicate measurement key {key} from {r['workload']}")
+        out[key] = r
+    return out
 
 
 def check_answers(pg: dict[str, Any], neo: dict[str, Any]) -> list[Disagreement]:
@@ -64,7 +86,9 @@ def check_answers(pg: dict[str, Any], neo: dict[str, Any]) -> list[Disagreement]
     out: list[Disagreement] = []
     neo_paths = _by_case(neo, "path")
     for (case, depth, variant), record in _by_case(pg, "path").items():
-        baseline = neo_paths.get((case, depth, "cypher"))
+        # The Neo4j side names its headline variant `neo4j` and its sweep
+        # variants `cypher`; try both rather than assume one.
+        baseline = neo_paths.get((case, depth, "cypher")) or neo_paths.get((case, depth, "neo4j"))
         if variant in DIFFERENT_GRAPH or baseline is None or "answer" not in record or "answer" not in baseline:
             continue
         mine, theirs = record["answer"], baseline["answer"]
@@ -75,7 +99,7 @@ def check_answers(pg: dict[str, Any], neo: dict[str, Any]) -> list[Disagreement]
 
     neo_explore = _by_case(neo, "explore")
     for (case, depth, variant), record in _by_case(pg, "explore").items():
-        baseline = neo_explore.get((case, depth, "cypher"))
+        baseline = neo_explore.get((case, depth, "cypher")) or neo_explore.get((case, depth, "neo4j"))
         if variant in DIFFERENT_GRAPH or baseline is None or "answer" not in record or "answer" not in baseline:
             continue
         mine = {tuple(r) for r in record["answer"]["rows"]}

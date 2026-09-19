@@ -43,7 +43,9 @@ the shortest path and not one hop too long.
 | `bench/runner.py` | The measurement loop: warm-up, iterations, p50/p95, answers, buffers, plans. |
 | `bench/calibration.py` | What the machine can do. Standard library only, so it runs on a bare instance. |
 | `bench/compare.py` | The answer check against Neo4j, and the Verdict gate evaluated rather than asserted. |
-| `bench/report.py` | The tables the spike document quotes, generated rather than transcribed. |
+| `bench/report.py` | The single-mode tables, generated rather than transcribed. |
+| `bench/document.py` | The cross-mode tables, local and cloud side by side. The document's widest tables are its output, not a hand-merge of two reports. |
+| `bench/verify_document.py` | Fails if the document's cross-mode tables have drifted from the results. Run by `./run.sh --verify`. |
 | `infra/` | Terraform for IBM Cloud VPC. Two instances on one profile, SSH restricted to the driver. |
 | `cloud/` | What runs ON an instance: common bootstrap, then one bootstrap per engine. |
 | `results/` | The captured evidence, kept. See [`results/README.md`](results/README.md). |

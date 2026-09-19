@@ -13,6 +13,8 @@
 #   ./run.sh local small           measure locally at the small scale
 #   ./run.sh --build small         build the local engines at a scale, no measuring
 #   ./run.sh --report <dir>        compare a results directory and render its tables
+#   ./run.sh --verify              regenerate the cross-mode tables and check that
+#                                  the spike document still matches them
 #   ./run.sh --cloud               provision IBM Cloud, run both scales, fetch, destroy
 #   ./run.sh --cloud-keep          the same without the destroy, for inspection
 #   ./run.sh --cloud-destroy       destroy and verify nothing survives
@@ -146,6 +148,22 @@ report_dir() {
         --postgres "$out/postgres-$scale-$mode.json" --neo4j "$out/neo4j-$scale-$mode.json" \
         --output "$out/verdict.json" ) || true
     echo "report: $out/report.md"
+    cross_mode
+}
+
+# The document's widest tables put local and cloud side by side, and assembling
+# that merge by hand is what put six cap-sweep figures into cloud columns twice.
+# It is generated, and then the document is CHECKED against it, because a
+# generated table that someone pastes and then edits is no better than a hand
+# one.
+cross_mode() {
+    local results="$HERE/results"
+    [[ -d "$results" ]] || return 0
+    ( cd "$HERE" && uv run --project "$REPO" python -m bench.document \
+        --results "$results" --output "$results/cross-mode.md" >/dev/null ) || return 0
+    echo "cross-mode tables: $results/cross-mode.md"
+    ( cd "$HERE" && uv run --project "$REPO" python -m bench.verify_document \
+        --results "$results" --document "$HERE/../gm-database-schema-gkt.1-procedural-pathfinder.md" ) || true
 }
 
 run_local() {
@@ -359,6 +377,7 @@ case "${1:-}" in
     --help|-h)       sed -n '2,30p' "${BASH_SOURCE[0]}"; exit 0 ;;
     --build)         build_postgres "${2:-large}"; build_neo4j "${2:-large}"; exit 0 ;;
     --report)        report_dir "${2:?usage: --report <dir>}" "${3:-large}" "${4:-local}"; exit 0 ;;
+    --verify)        cross_mode; exit 0 ;;
     --cloud)         run_cloud destroy; exit 0 ;;
     --cloud-keep)    run_cloud keep; exit 0 ;;
     --cloud-destroy) cloud_destroy; exit 0 ;;

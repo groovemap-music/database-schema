@@ -123,8 +123,11 @@ def capture_plans(engine: Any, workloads: list[Workload], outdir: Path) -> None:
     """
     plans = outdir / "plans"
     plans.mkdir(parents=True, exist_ok=True)
+    # `cap-cost` is captured too: the recommendation of a depth cap of 4 rests on
+    # that table, and a table a recommendation rests on needs its plans kept.
+    wanted = {"headline", "cap-sweep", "cap-cost"}
     for workload in workloads:
-        if "headline" not in workload.tags and "cap-sweep" not in workload.tags:
+        if not wanted & set(workload.tags):
             continue
         target = plans / f"{engine.name}-{workload.name.replace('/', '-')}.txt"
         try:
