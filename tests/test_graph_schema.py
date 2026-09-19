@@ -10,6 +10,7 @@ from common.media import medium_ids, medium_label
 
 from groovemap_schema.postgres import (
     _COUNTER_BEARING_VERTICES,
+    _COUNTER_BOOTSTRAP,
     _EDGE_TABLES,
     _GRAPH_STATEMENTS,
     _TEXT_KEY_RETYPES,
@@ -730,6 +731,23 @@ class TestPhase0Comparison:
             assert "jsonb" not in statement, relation
             assert "public.releases" not in statement, relation
             assert "graph.by_artist" in statement, relation
+
+    def test_label_stats_release_count_does_not_fan_out_over_the_left_joins(self) -> None:
+        """A label's release_count must be over its own distinct releases.
+
+        `label_stats.release_count` is `on_label` LEFT JOINed to both
+        `by_artist` and `in_genre`, which multiplies one release's row into
+        one per (artist, genre) pair. `artist_count` and `genre_count` already
+        deduplicate with DISTINCT on the column they name; release_count has
+        to as well, or a release with several artists and genres is counted
+        several times over instead of once. The real-engine proof is
+        `test_label_stats_release_count_does_not_fan_out_over_artists_and_genres`
+        in `tests/integration/test_real_schema_idempotence.py`.
+        """
+        statement = _COUNTER_BOOTSTRAP["label_stats"]
+        assert "count(DISTINCT on_label.release_id) AS release_count" in statement
+        assert "count(DISTINCT by_artist.artist_id) AS artist_count" in statement
+        assert "count(DISTINCT in_genre.genre_name) AS genre_count" in statement
 
 
 class TestBootstrapFill:
