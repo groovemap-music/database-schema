@@ -1,0 +1,9 @@
+== postgres  path/d5-artist-artist/pf-vaat  depth 10
+
+Function Scan on pf.find_path  (cost=0.25..0.26 rows=1 width=61) (actual time=4219.438..4219.439 rows=1.00 loops=1)
+  Output: found, depth, expanded, probes, seen_rows, levels
+  Function Call: pf.find_path('a'::"char", '55563'::text, 'a'::"char", '4814'::text, 10)
+  Buffers: shared hit=1690049 read=2 dirtied=2746 written=2746
+  I/O Timings: shared read=0.028 write=33.120
+Planning Time: 0.030 ms
+Execution Time: 4219.453 ms

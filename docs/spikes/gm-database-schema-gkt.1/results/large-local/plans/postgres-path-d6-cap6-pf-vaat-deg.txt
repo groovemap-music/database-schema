@@ -1,0 +1,9 @@
+== postgres  path/d6-cap6/pf-vaat-deg  depth 6
+
+Function Scan on pf.find_path_deg  (cost=0.25..0.26 rows=1 width=61) (actual time=1956.919..1956.920 rows=1.00 loops=1)
+  Output: found, depth, expanded, probes, seen_rows, levels
+  Function Call: pf.find_path_deg('a'::"char", '55563'::text, 'a'::"char", '32509'::text, 6)
+  Buffers: shared hit=2394720 read=2 dirtied=3065 written=3064
+  I/O Timings: shared read=0.016 write=13.504
+Planning Time: 0.039 ms
+Execution Time: 1956.931 ms

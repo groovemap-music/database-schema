@@ -1,0 +1,352 @@
+-- gm-database-schema-gkt.1 — the vertex-at-a-time searches. Throwaway spike DDL.
+--
+-- A TEMPLATE, not a script. `load.sh` instantiates it three times, so the three
+-- variants the Evidence section compares cannot drift apart in anything except
+-- the one thing each of them changes:
+--
+--   @SUF@      @EDGE@          frontier order          side chosen by
+--   ''         pf.edge         queue order             frontier cardinality
+--   '_no_is'   pf.edge_no_is   queue order             frontier cardinality
+--   '_deg'     pf.edge         ascending degree        summed frontier degree
+--
+-- The first is the design the bead asks about. The second is the same search
+-- over a surface with the IS class removed, for the for-information section, and
+-- it is a different SURFACE rather than a different algorithm. The third is the
+-- same search over the same surface with a different ORDER of expansion, and it
+-- is the one that needs a precomputed relation to exist — `pf.degree`, built by
+-- `sql/degree.sql`.
+--
+-- Why the order is worth a variant of its own. Correctness does not care: the
+-- argument below shows every touch found anywhere in a level reports the same
+-- distance, so a level may be expanded in any order. Cost cares enormously. A
+-- level here mixes vertices of degree 4 with the fifteen Genre vertices of
+-- degree ~137,000, and the search pays for whatever it expands BEFORE it
+-- touches. Expanding cheap vertices first is therefore free insurance: if a
+-- cheap vertex touches, the hub is never expanded at all, and if none does, the
+-- hub is expanded exactly as it would have been.
+--
+-- ===========================================================================
+-- What this is, and why it is not what gm-database-schema-9c8.3 measured
+-- ===========================================================================
+--
+-- That spike measured three level-synchronous searches and concluded that the
+-- thing separating PostgreSQL from Neo4j is not storage and not the index but
+-- that "Neo4j's shortest-path expander can stop in the middle of a level and a
+-- SQL statement cannot". That is true of a SQL statement. It is not true of a
+-- PL/pgSQL loop, and the difference is this file.
+--
+-- A level-synchronous expansion is one statement per level: it joins the whole
+-- frontier against the whole edge surface and produces the whole next level.
+-- At level 3 out of artist 5665 the frontier is 1,251,839 vertices, the join
+-- yields 11,006,163 candidate arrivals, and 1.3% of them are new. The answer to
+-- the `d4` case was inside the first fraction of that level, and the statement
+-- had no way to say so.
+--
+-- Here the unit of work is one vertex. For each vertex of the frontier, in
+-- order, two statements run:
+--
+--   1. a TOUCH PROBE — does this vertex have a neighbour the OTHER side has
+--      already seen? One index scan per branch of the edge surface, each
+--      neighbour probed against `pf.seen`'s primary key, `LIMIT 1` on the
+--      outside so the scan stops at the first hit;
+--   2. an EXPANSION — insert the neighbours that neither side has seen.
+--
+-- If the probe hits, the function returns. Nothing after that vertex in the
+-- level is expanded and the rest of the level is never materialised. That is
+-- exactly the early termination Neo4j's expander has, expressed in the only
+-- place in PostgreSQL where a loop can decide to stop: a procedural body.
+--
+-- ===========================================================================
+-- Why first touch is the shortest path, and not one hop too long
+-- ===========================================================================
+--
+-- gm-database-schema-9c8.3 warns that "stopping the moment the frontiers touch
+-- is the version of this algorithm that is off by one", and it is right about
+-- the version it describes — one that compares the two FRONTIERS. This one
+-- compares each newly reachable vertex against the whole of the opposite SEEN
+-- set, and that version is exact. The argument, because a Verdict rests on it:
+--
+--   Let df and db be the depths to which the forward and backward searches are
+--   COMPLETE, and let the invariant be: no path of length <= df + db exists.
+--   It holds at the start, when df = db = 0 and the source-equals-target case
+--   has already been answered.
+--
+--   Suppose the forward side now expands level df + 1 and a probe on a frontier
+--   vertex v (at depth df) finds a neighbour w in the backward seen set at depth
+--   b <= db. That witnesses a walk of length df + 1 + b.
+--
+--   By the invariant no path of length <= df + db exists, so the true distance
+--   is at least df + db + 1. And df + 1 + b <= df + 1 + db. So the witnessed
+--   walk has length exactly df + db + 1, which is the true distance. FIRST TOUCH
+--   IS EXACT — and, incidentally, every touch found anywhere in this level has
+--   the same length, which is why the loop does not have to keep looking for a
+--   better one.
+--
+--   The invariant survives a level that finds nothing. Take a shortest path P of
+--   length L <= df + 1 + db and let x be the vertex on P at distance
+--   min(df + 1, L) from the source. If L >= df + 1 then x is at forward depth
+--   df + 1 and at backward depth L - (df + 1) <= db, so x is in the backward
+--   seen set, and the probe on x's forward parent would have found it. If
+--   L < df + 1 then x is the target, at backward depth 0, and an earlier level
+--   would have found it. Either way the level cannot have found nothing.
+--
+-- The function nevertheless computes the length from the recorded depths rather
+-- than from df + db + 1. The two are equal by the argument above; deriving it
+-- from the data means a mistake in the argument shows up as a disagreement with
+-- Neo4j instead of as a silently wrong answer.
+--
+-- ===========================================================================
+-- The two statements, and why they are shaped the way they are
+-- ===========================================================================
+--
+-- The touch probe is a LATERAL subquery carrying its own LIMIT. That is not
+-- decoration: a LATERAL with a LIMIT cannot be pulled up into a join, so the
+-- planner is left with a nested loop that probes `pf.seen`'s primary key once
+-- per candidate neighbour, and the outer LIMIT 1 stops the whole scan at the
+-- first hit. Written as a plain join the planner is free to hash the entire seen
+-- set — which at 1.25 million rows is the level-synchronous cost this file
+-- exists to avoid, reintroduced through the back door.
+--
+-- `pf.seen`'s statistics are worthless by construction: the table is truncated
+-- at the start of every call, so whatever ANALYZE last saw bears no relation to
+-- what is in it now. Forcing the access path through the query's shape rather
+-- than trusting the planner is the only way to get a stable plan out of that.
+--
+-- Both statements are plain SQL inside PL/pgSQL, so PostgreSQL prepares and
+-- caches each one per session on first execution and reuses the plan for every
+-- vertex afterwards. That is the "prepared statements" part of the design: a
+-- search that expands 3,000 vertices pays for two plans, not six thousand.
+
+DROP FUNCTION IF EXISTS pf.explore@SUF@("char", text, int, int);
+DROP FUNCTION IF EXISTS pf.find_path@SUF@("char", text, "char", text, int);
+
+-- ---------------------------------------------------------------------------
+-- Shortest path
+-- ---------------------------------------------------------------------------
+--
+-- The signature mirrors `find_shortest_path` (api/queries/neo4j_queries.py:97):
+-- two endpoints and a maximum depth, clamped server-side to [1, 10] with a
+-- default of 6, because the Cypher it replaces interpolates that number as a
+-- literal and clamps it for the same reason.
+
+CREATE FUNCTION pf.find_path@SUF@(
+    _sk "char", _skey text, _tk "char", _tkey text, _max_depth int DEFAULT 6
+) RETURNS pf.result
+LANGUAGE plpgsql AS $$
+DECLARE
+    r        pf.result;
+    df       int := 0;          -- forward depth, complete
+    db       int := 0;          -- backward depth, complete
+    _side    smallint;
+    _other   smallint;
+    _gen     int;
+    _next    int;
+    fsize    bigint;   -- cost of the forward frontier, by the active rule
+    bsize    bigint;   -- cost of the backward frontier, by the active rule
+    fcount   bigint;   -- cardinality, which is what "exhausted" means
+    bcount   bigint;
+    grew     bigint;
+    added    bigint;
+    v        record;
+    hit      record;
+    fwd_kind "char";
+    fwd_key  text;
+    bwd_kind "char";
+    bwd_key  text;
+    a_nodes  text[];
+    a_rels   text[];
+    b_nodes  text[];
+    b_rels   text[];
+BEGIN
+    -- The same clamp the Cypher function applies, for the same reason.
+    _max_depth := greatest(1, least(coalesce(_max_depth, 6), 10));
+
+    r.found    := false;
+    r.expanded := 0;
+    r.probes   := 0;
+    r.levels   := ARRAY[]::int[];
+
+    TRUNCATE pf.seen;
+
+    IF _sk = _tk AND _skey = _tkey THEN
+        r.found := true; r.depth := 0; r.seen_rows := 0;
+        r.nodes := ARRAY[_sk::text || ':' || _skey]; r.rels := ARRAY[]::text[];
+        RETURN r;
+    END IF;
+
+    INSERT INTO pf.seen (side, kind, key, depth) VALUES (0, _sk, _skey, 0), (1, _tk, _tkey, 0);
+
+    <<search>>
+    WHILE df + db < _max_depth LOOP
+        -- Expand from the smaller frontier. Against a graph with hub vertices
+        -- the two ends grow at wildly different rates, and the cost of a level
+        -- is the number of vertices in it.
+        @SIZES_SQL@
+
+        -- One side exhausted: the component is closed and there is no path.
+        EXIT search WHEN fcount = 0 OR bcount = 0;
+
+        IF fsize <= bsize THEN
+            _side := 0; _other := 1; _gen := df; _next := df + 1;
+        ELSE
+            _side := 1; _other := 0; _gen := db; _next := db + 1;
+        END IF;
+
+        added := 0;
+
+        -- ---- the level, one vertex at a time ------------------------------
+        FOR v IN @FRONTIER_SQL@
+        LOOP
+            r.probes := r.probes + 1;
+
+            -- 1. touch probe
+            SELECT e.dst_kind AS k, e.dst_key AS y, e.rel AS rel, o.depth AS odepth
+            INTO hit
+            FROM @EDGE@ AS e,
+                 LATERAL (SELECT s.depth FROM pf.seen AS s
+                          WHERE s.side = _other AND s.kind = e.dst_kind AND s.key = e.dst_key
+                          LIMIT 1) AS o
+            WHERE e.src_kind = v.kind AND e.src_key = v.key
+            LIMIT 1;
+
+            IF FOUND THEN
+                r.found := true;
+                r.depth := _gen + 1 + hit.odepth;
+                IF _side = 0 THEN
+                    fwd_kind := v.kind;   fwd_key := v.key;
+                    bwd_kind := hit.k;    bwd_key := hit.y;
+                ELSE
+                    fwd_kind := hit.k;    fwd_key := hit.y;
+                    bwd_kind := v.kind;   bwd_key := v.key;
+                END IF;
+                SELECT t.nodes, t.rels INTO a_nodes, a_rels FROM pf.trace(0::smallint, fwd_kind, fwd_key) AS t;
+                SELECT t.nodes, t.rels INTO b_nodes, b_rels FROM pf.trace(1::smallint, bwd_kind, bwd_key) AS t;
+                -- The backward trace runs target-first; reverse it so the
+                -- returned path reads source to target like the Cypher's does.
+                r.nodes := a_nodes
+                         || (SELECT array_agg(n ORDER BY i DESC) FROM unnest(b_nodes) WITH ORDINALITY AS u(n, i));
+                r.rels  := a_rels || ARRAY[hit.rel]
+                         || coalesce((SELECT array_agg(x ORDER BY i DESC) FROM unnest(b_rels) WITH ORDINALITY AS w(x, i)),
+                                     ARRAY[]::text[]);
+                EXIT search;
+            END IF;
+
+            -- 2. expansion. `ON CONFLICT DO NOTHING` is the seen check: one
+            -- probe against the primary key that is being maintained anyway,
+            -- and what survives it is by construction the set of vertices whose
+            -- shortest distance from this end is `_next`.
+            INSERT INTO pf.seen (side, kind, key, depth, par_kind, par_key, rel)
+            SELECT _side, e.dst_kind, e.dst_key, _next, v.kind, v.key, e.rel
+            FROM @EDGE@ AS e
+            WHERE e.src_kind = v.kind AND e.src_key = v.key
+            ON CONFLICT (side, kind, key) DO NOTHING;
+
+            GET DIAGNOSTICS grew = ROW_COUNT;
+            added := added + grew;
+            r.expanded := r.expanded + 1;
+        END LOOP;
+
+        r.levels := r.levels || added::int;
+
+        IF _side = 0 THEN df := _next; ELSE db := _next; END IF;
+    END LOOP search;
+
+    SELECT count(*) INTO r.seen_rows FROM pf.seen;
+    RETURN r;
+END;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- Bounded explore traversal
+-- ---------------------------------------------------------------------------
+--
+-- The signature mirrors `get_explore_traversal`
+-- (api/queries/recommend_queries.py:403): a start vertex, a hop count clamped to
+-- [1, 3] with anything outside falling back to 2, and the function's own
+-- `LIMIT 100`.
+--
+-- gm-database-schema-9c8.3 measured this at 21.4 s for `*1..3` and wrote that
+-- "`LIMIT 100` cannot rescue it, because the Cypher orders by distance and takes
+-- the best path per discovered node, which is an aggregate over the whole
+-- traversal". That is a true statement about the Cypher. It is not a true
+-- statement about the RESULT, and the difference is worth being precise about,
+-- because it is most of the Verdict.
+--
+-- The projection is `ORDER BY dist LIMIT 100` over one row per discovered node.
+-- Breadth-first discovery produces nodes in non-decreasing distance order, so
+-- once 100 qualifying nodes have been discovered, no node discovered later can
+-- displace any of them: a later node's distance is greater than or equal to the
+-- distance of everything already held. The traversal can therefore stop, and the
+-- rows it has are a correct answer to the query as written.
+--
+-- What stopping does NOT preserve is WHICH 100 come back when more than 100
+-- nodes share the boundary distance. Neither engine promises that. Neo4j's
+-- `ORDER BY dist LIMIT 100` breaks ties in whatever order the expander produced
+-- them, and repeating the query can return a different hundred. This function
+-- orders ties by key so that at least its own answer is reproducible, and the
+-- equality check in the harness compares the UNBOUNDED discovery sets of the two
+-- engines rather than two arbitrary hundreds. `_limit => NULL` is how the
+-- harness asks for that.
+
+CREATE FUNCTION pf.explore@SUF@(
+    _sk "char", _skey text, _hops int DEFAULT 2, _limit int DEFAULT 100
+) RETURNS TABLE (id text, name text, type text, path_names text[], rel_types text[], dist int)
+LANGUAGE plpgsql AS $$
+DECLARE
+    d       int;
+    v       record;
+    qual    bigint := 0;
+    got     bigint;
+BEGIN
+    -- `get_explore_traversal` does not clamp out-of-range hops, it replaces them
+    -- with its default. Mirrored rather than improved.
+    IF _hops IS NULL OR _hops < 1 OR _hops > 3 THEN _hops := 2; END IF;
+
+    TRUNCATE pf.seen;
+    INSERT INTO pf.seen (side, kind, key, depth) VALUES (0, _sk, _skey, 0);
+
+    <<walk>>
+    FOR d IN 1.._hops LOOP
+        FOR v IN SELECT s.kind, s.key FROM pf.seen AS s
+                 WHERE s.side = 0 AND s.depth = d - 1 ORDER BY s.kind, s.key
+        LOOP
+            WITH nxt AS (
+                INSERT INTO pf.seen (side, kind, key, depth, par_kind, par_key, rel)
+                SELECT 0, e.dst_kind, e.dst_key, d, v.kind, v.key, e.rel
+                FROM @EDGE@ AS e
+                WHERE e.src_kind = v.kind AND e.src_key = v.key
+                ON CONFLICT (side, kind, key) DO NOTHING
+                RETURNING kind
+            )
+            SELECT count(*) FILTER (WHERE kind IN ('a', 'l', 'g', 's'))
+            INTO got FROM nxt;
+
+            qual := qual + got;
+            -- The row limit is met. Every vertex still unexpanded is at this
+            -- distance or further, so none of them can enter an `ORDER BY dist
+            -- LIMIT n` that is already full.
+            EXIT walk WHEN _limit IS NOT NULL AND qual >= _limit;
+        END LOOP;
+    END LOOP walk;
+
+    RETURN QUERY
+    WITH discovered AS (
+        SELECT s.kind, s.key, s.depth
+        FROM pf.seen AS s
+        WHERE s.side = 0 AND s.depth > 0 AND s.kind IN ('a', 'l', 'g', 's')
+        ORDER BY s.depth, s.key
+        LIMIT _limit
+    )
+    SELECT c.key,
+           coalesce(
+               CASE c.kind
+                   WHEN 'a' THEN (SELECT x.name FROM graph_mat.artist AS x WHERE x.artist_id = c.key)
+                   WHEN 'l' THEN (SELECT x.name FROM graph_mat.label  AS x WHERE x.label_id  = c.key)
+                   ELSE c.key
+               END, c.key),
+           CASE c.kind WHEN 'a' THEN 'artist' WHEN 'l' THEN 'label' WHEN 'g' THEN 'genre' ELSE 'style' END,
+           t.nodes, t.rels, c.depth
+    FROM discovered AS c, LATERAL pf.trace(0::smallint, c.kind, c.key) AS t
+    ORDER BY c.depth, c.key;
+END;
+$$;

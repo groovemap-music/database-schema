@@ -1,0 +1,13 @@
+== neo4j  path/d6-artist-artist/neo4j  depth 10
+
++ProduceResults@neo4j  rows=1  dbHits=0
+   nodes, rels
+  +Projection@neo4j  rows=1  dbHits=26
+     [node IN nodes(p) | {id: coalesce(node.id, cache[node.name]), name: coalesce(cache[node.name], node.title, $autostring_0), labels: labels(node)}] AS nodes, [rel IN relationships(p) | type(rel)] AS rels
+    +ShortestPath@neo4j  rows=1  dbHits=150120
+       p = (a)-[anon_0:BY|ON|IS|ALIAS_OF|MEMBER_OF|DERIVED_FROM*..10]-(b)
+      +CartesianProduct@neo4j  rows=1  dbHits=0
+        +NodeIndexSeek@neo4j  rows=1  dbHits=2
+           RANGE INDEX a:Artist(id) WHERE id = $from_id
+        +NodeIndexSeek@neo4j  rows=1  dbHits=2
+           RANGE INDEX b:Artist(id) WHERE id = $to_id

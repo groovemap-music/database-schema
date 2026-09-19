@@ -1,0 +1,57 @@
+{
+  "calibration_version": 1,
+  "timestamp": "2026-09-19T01:24:11Z",
+  "system": {
+    "platform": "Linux-6.8.0-1062-ibm-x86_64-with-glibc2.39",
+    "machine": "x86_64",
+    "processor": "x86_64",
+    "cpu_count": 8,
+    "python_version": "3.12.3",
+    "ram_gb": 31.39
+  },
+  "benchmarks": {
+    "cpu_single_thread": {
+      "test": "cpu_single_thread_sha256",
+      "ops": 514712,
+      "duration_sec": 5.0,
+      "ops_per_sec": 102942.4
+    },
+    "cpu_multi_thread": {
+      "test": "cpu_multi_thread_sha256",
+      "cores": 8,
+      "ops": 399551,
+      "duration_sec": 5.0,
+      "ops_per_sec": 79910.2
+    },
+    "memory_bandwidth": {
+      "test": "memory_bandwidth_64mb",
+      "write_mb_per_sec": 29297.0,
+      "read_mb_per_sec": 28029.1
+    },
+    "disk_sequential_write": {
+      "test": "disk_sequential_write",
+      "size_mb": 256,
+      "duration_sec": 4.901,
+      "mb_per_sec": 52.2
+    },
+    "disk_sequential_read": {
+      "test": "disk_sequential_read",
+      "size_mb": 256,
+      "duration_sec": 0.046,
+      "mb_per_sec": 5547.8
+    },
+    "disk_random_read": {
+      "test": "disk_random_read_4k",
+      "duration_sec": 5.0,
+      "iops": 394382.8
+    },
+    "python_sort": {
+      "test": "python_sort_1m_floats",
+      "elements": 1000000,
+      "iterations": 5,
+      "avg_sec": 0.2538,
+      "sorts_per_sec": 3.94
+    }
+  },
+  "label": "IBM Cloud VPC bx2-8x32 (neo4j)"
+}
