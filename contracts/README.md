@@ -49,6 +49,15 @@ to fall back to the views. See
 [the graph schema](../docs/architecture.md#graph-schema) for the projection and
 [the property graph](../docs/architecture.md#property-graph) for the declaration and its gates.
 
+`musicbrainz_delete_reconciliation` records the additive `updated_at` column on
+`musicbrainz.relationships` and `musicbrainz.external_links` — the two MusicBrainz tables that,
+unlike every other entity table, were declared with `created_at` only. `musicbrainz-sql-loader`
+is the consumer: it refreshes `updated_at` on every upsert and reconciles deletes by removing
+rows where `updated_at < run start`, the same `purge_stale_rows` shape `discogs-sql-loader`
+already runs against the Discogs entity tables' own `updated_at`. DDL ownership stays with this
+repository, so the column is declared here rather than carried as a startup `ALTER` in the
+loader.
+
 Catalog event shapes are not owned here. Discogs events belong to
 [`discogs-ingestion`](https://github.com/groovemap-music/discogs-ingestion), and MusicBrainz
 events belong to
