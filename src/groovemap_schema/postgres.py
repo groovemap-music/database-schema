@@ -1337,6 +1337,20 @@ _MUSICBRAINZ_INDEXES: list[tuple[str, str]] = [
         "idx_mb_rels_type",
         "CREATE INDEX IF NOT EXISTS idx_mb_rels_type ON musicbrainz.relationships (relationship_type)",
     ),
+    # The sixteen `graph.mb_rel_<source>_<target>` views each filter on their own
+    # ordered endpoint-type pair and inner-join both endpoint tables, and until
+    # now nothing indexed that filter. The natural key leads with the source
+    # identifier, so it is a uniqueness constraint rather than a useful access
+    # path for the pair. Both directions are indexed because a relationship is
+    # reached from its target as often as from its source.
+    (
+        "idx_mb_rels_endpoint_source",
+        "CREATE INDEX IF NOT EXISTS idx_mb_rels_endpoint_source ON musicbrainz.relationships (source_entity_type, target_entity_type, source_mbid)",
+    ),
+    (
+        "idx_mb_rels_endpoint_target",
+        "CREATE INDEX IF NOT EXISTS idx_mb_rels_endpoint_target ON musicbrainz.relationships (source_entity_type, target_entity_type, target_mbid)",
+    ),
     (
         "idx_mb_links_mbid",
         "CREATE INDEX IF NOT EXISTS idx_mb_links_mbid ON musicbrainz.external_links (mbid)",
@@ -1390,6 +1404,15 @@ _MUSICBRAINZ_INDEXES: list[tuple[str, str]] = [
 # fragment built by the helpers below — and none of it reaches this module from
 # a caller, a request, or a row. There is no runtime input to inject.
 _GRAPH_SCHEMA_STATEMENT = ("graph schema", "CREATE SCHEMA IF NOT EXISTS graph")
+
+# Trigram search is what the six full-text query functions the coverage spike
+# found need, and it is one of the two reasons the name-keyed vertex relations
+# had to stop being views. Creating the extension can need a privilege a
+# hardened deployment withholds, so every index that uses it is guarded on the
+# extension being present rather than on this statement having succeeded: the
+# worst case is a deployment without trigram search, not a deployment without a
+# schema.
+_PG_TRGM_STATEMENT = ("pg_trgm extension", "CREATE EXTENSION IF NOT EXISTS pg_trgm")
 
 
 def _jsonb_array(expression: str) -> str:
@@ -1447,45 +1470,96 @@ _TAGGED_DOCUMENTS = """
 """
 
 
-def _discogs_vertex_views() -> list[tuple[str, str]]:
-    """Return the vertex views over the Discogs entity tables, genres, and styles.
+# The native catalog identity ADR 0009 mints, read from the one table
+# catalog-api's `gm_id` projection job reads. `provider_aliases` carries a
+# partial UNIQUE index on `(provider, entity_kind, external_id) WHERE valid_to
+# IS NULL`, so this is a single index probe per entity row and cannot turn one
+# vertex into two. A Discogs id is stringified into `external_id`, which is what
+# makes the comparison against `data_id` a text comparison rather than a cast.
+_NATIVE_IDENTITY_JOIN = """
+LEFT JOIN public.provider_aliases AS alias
+       ON alias.provider = 'discogs'
+      AND alias.entity_kind = '{kind}'
+      AND alias.external_id = {table}.data_id
+      AND alias.valid_to IS NULL
+"""
 
-    Each of the four entity views ends with a `text` restatement of its key —
-    `artist_key`, `label_key`, `master_key`, `release_key` — appended after the
-    published columns, which is the one shape `CREATE OR REPLACE VIEW` accepts.
-    It exists because PostgreSQL 19 cannot resolve an equality operator for a
-    `character varying` property-graph vertex key; see `_DISCOGS_VERTEX_KEYS`.
-    Nothing but `CREATE PROPERTY GRAPH` reads it, and it is not a property.
+
+def _native_identity_join(table: str, kind: str) -> str:
+    """Return the LEFT JOIN exposing one entity table's native `gm_id`."""
+    return _NATIVE_IDENTITY_JOIN.format(table=table, kind=kind).strip()
+
+
+# `Release.formats` is read by six catalog-api functions and is what
+# `graphinator` flattens out of `data->'formats'[].name`. The same array-typed
+# guard the tag arrays use applies, because a malformed document must skip a row
+# rather than fail the view.
+_FORMAT_NAMES = f"""ARRAY(SELECT format.value ->> 'name'
+             FROM jsonb_array_elements({_jsonb_array("releases.data -> 'formats'")}) AS format(value)
+             WHERE {_non_empty("btrim(format.value ->> 'name')")})"""  # noqa: S608
+
+# `Release.catalog_number` is written twice in the graph today — by `graphinator`
+# from `labels[0].catno` and again by catalog-api's syncer — and neither
+# `user_collections` nor `user_wantlists` has a column for it. The Discogs copy
+# is the one with a relational home. Subscripting a non-array by an integer
+# yields NULL, so a flattened `labels` block contributes nothing rather than
+# raising.
+_CATALOG_NUMBER = "NULLIF(btrim(releases.data -> 'labels' -> 0 ->> 'catno'), '')"
+
+
+def _discogs_vertex_views() -> list[tuple[str, str]]:
+    """Return the four vertex views over the Discogs entity tables.
+
+    Each publishes its key as `text` rather than the `character varying` the
+    catalog table keys on, because PostgreSQL 19 cannot resolve an equality
+    operator for a `character varying` property-graph vertex key. That retires
+    the appended `<entity>_key` restatements the phase 0 views carried for the
+    same reason: with the published key already `text` there is nothing left for
+    a second column to restate. `_key_retype_migration` is what lets the
+    republished view land on a database that still holds the old shape.
+
+    Each also appends `gm_id`, the native catalog identity ADR 0009 mints. It is
+    read from `provider_aliases` — the one table catalog-api's `gm_id`
+    projection job reads — through the partial unique index on
+    `(provider, entity_kind, external_id) WHERE valid_to IS NULL`, so the join
+    is a single index probe and cannot multiply a row. Exposing it here is what
+    makes the projection job's cross-store copy unnecessary: a consumer that
+    wants the native id of a Discogs entity reads it off the vertex.
+
+    `graph.genre` and `graph.style` are no longer here. They are tables now; see
+    `_vertex_table_statements`.
     """
     return [
         _view(
             "artist",
-            """
-SELECT artists.data_id         AS artist_id,
+            f"""
+SELECT artists.data_id::text   AS artist_id,
        artists.data ->> 'name' AS name,
        artists.gm_item_id      AS gm_item_id,
        artists.hash            AS hash,
        artists.updated_at      AS updated_at,
-       artists.data_id::text   AS artist_key
+       alias.native_id         AS gm_id
 FROM public.artists AS artists
-""",
+{_native_identity_join("artists", "artist")}
+""",  # noqa: S608
         ),
         _view(
             "label",
-            """
-SELECT labels.data_id         AS label_id,
+            f"""
+SELECT labels.data_id::text   AS label_id,
        labels.data ->> 'name' AS name,
        labels.gm_item_id      AS gm_item_id,
        labels.hash            AS hash,
        labels.updated_at      AS updated_at,
-       labels.data_id::text   AS label_key
+       alias.native_id        AS gm_id
 FROM public.labels AS labels
-""",
+{_native_identity_join("labels", "label")}
+""",  # noqa: S608
         ),
         _view(
             "master",
             f"""
-SELECT masters.data_id          AS master_id,
+SELECT masters.data_id::text    AS master_id,
        masters.data ->> 'title' AS title,
        masters.data ->> 'year'  AS year,
        {_text_array("masters.data -> 'genres'")} AS genres,
@@ -1493,14 +1567,15 @@ SELECT masters.data_id          AS master_id,
        masters.gm_item_id       AS gm_item_id,
        masters.hash             AS hash,
        masters.updated_at       AS updated_at,
-       masters.data_id::text    AS master_key
+       alias.native_id          AS gm_id
 FROM public.masters AS masters
+{_native_identity_join("masters", "master")}
 """,  # noqa: S608
         ),
         _view(
             "release",
             f"""
-SELECT releases.data_id          AS release_id,
+SELECT releases.data_id::text    AS release_id,
        releases.data ->> 'title' AS title,
        releases.data ->> 'year'  AS year,
        NULLIF(btrim(releases.data ->> 'country'), '') AS country,
@@ -1510,146 +1585,78 @@ SELECT releases.data_id          AS release_id,
        releases.gm_item_id       AS gm_item_id,
        releases.hash             AS hash,
        releases.updated_at       AS updated_at,
-       releases.data_id::text    AS release_key
+       {_FORMAT_NAMES}           AS formats,
+       {_CATALOG_NUMBER}         AS catalog_number,
+       alias.native_id           AS gm_id
 FROM public.releases AS releases
-""",  # noqa: S608
-        ),
-        _view(
-            "genre",
-            f"""
-SELECT DISTINCT genre.value AS name
-FROM ({_TAGGED_DOCUMENTS.strip()}) AS source
-CROSS JOIN LATERAL jsonb_array_elements_text({_jsonb_array("source.document -> 'genres'")}) AS genre(value)
-WHERE {_non_empty("genre.value")}
-""",  # noqa: S608
-        ),
-        _view(
-            "style",
-            f"""
-SELECT DISTINCT style.value AS name
-FROM ({_TAGGED_DOCUMENTS.strip()}) AS source
-CROSS JOIN LATERAL jsonb_array_elements_text({_jsonb_array("source.document -> 'styles'")}) AS style(value)
-WHERE {_non_empty("style.value")}
+{_native_identity_join("releases", "release")}
 """,  # noqa: S608
         ),
     ]
 
 
-def _reference_edge_view(view_name: str, table: str, source_column: str, json_key: str, target_column: str) -> tuple[str, str]:
-    """Return an edge view unnesting one JSONB array of entity references.
-
-    DISTINCT is not decoration: a Discogs release lists the same label once per
-    catalogue number and the same artist once per join phrase, so the raw unnest
-    repeats a pair the composite key has to hold exactly once.
-    """
-    return _view(
-        view_name,
-        f"""
-SELECT DISTINCT entity.data_id            AS {source_column},
-       btrim(element.value ->> 'id')      AS {target_column}
-FROM public.{table} AS entity
-CROSS JOIN LATERAL jsonb_array_elements({_jsonb_array(f"entity.data -> '{json_key}'")}) AS element(value)
-WHERE {_usable_id("element.value ->> 'id'")}
-""",  # noqa: S608
-    )
-
-
-def _tag_edge_view(view_name: str, table: str, source_column: str, json_key: str, target_column: str) -> tuple[str, str]:
-    """Return an edge view unnesting one JSONB array of genre or style names."""
-    return _view(
-        view_name,
-        f"""
-SELECT DISTINCT entity.data_id AS {source_column},
-       tag.value               AS {target_column}
-FROM public.{table} AS entity
-CROSS JOIN LATERAL jsonb_array_elements_text({_jsonb_array(f"entity.data -> '{json_key}'")}) AS tag(value)
-WHERE {_non_empty("tag.value")}
-""",  # noqa: S608
-    )
-
-
 def _discogs_edge_views() -> list[tuple[str, str]]:
-    """Return the edge views over the Discogs entity documents."""
+    """Return the two Discogs edge relations that stay views.
+
+    The other thirteen are tables now; see `_EDGE_TABLES`. These two are the
+    ones Table 2 of the coverage spike keeps as views, and for the same reason
+    in both cases: the relation is bounded by a taxonomy rather than by the
+    catalog. `part_of` is bounded by 757 styles times 16 genres and `sublabel_of`
+    is not read by anything in `api/queries/` at all, so neither pays for a
+    write path. Table 2 says to materialize `sublabel_of` only when a caller
+    appears, and none has.
+
+    Both now inner-join the vertex tables their endpoints resolve to, which is
+    the discipline the MusicBrainz relationship views already follow: an edge
+    appears once both of its endpoints are loaded, and never points at a vertex
+    row that is not there. `sublabel_of` is the exception — both its endpoints
+    are `public.labels`, which is a real table the loader writes directly, so
+    there is nothing to wait for.
+    """
     genres = "source.document -> 'genres'"
     styles = "source.document -> 'styles'"
     return [
-        _reference_edge_view("by_artist", "releases", "release_id", "artists", "artist_id"),
-        _reference_edge_view("on_label", "releases", "release_id", "labels", "label_id"),
-        _view(
-            "derived_from",
-            f"""
-SELECT releases.data_id                     AS release_id,
-       btrim(releases.data ->> 'master_id')  AS master_id
-FROM public.releases AS releases
-WHERE {_usable_id("releases.data ->> 'master_id'")}
-""",  # noqa: S608
-        ),
-        _tag_edge_view("in_genre", "releases", "release_id", "genres", "genre_name"),
-        _tag_edge_view("in_style", "releases", "release_id", "styles", "style_name"),
-        _reference_edge_view("master_by_artist", "masters", "master_id", "artists", "artist_id"),
-        _tag_edge_view("master_in_genre", "masters", "master_id", "genres", "genre_name"),
-        _tag_edge_view("master_in_style", "masters", "master_id", "styles", "style_name"),
         # PART_OF is unambiguous only when the source record carries exactly one
         # genre: with two, nothing in the document says which genre a style sits
         # under. Release and master documents both assert it and the enricher
-        # projects both, so both are unioned here.
+        # projects both, so both are unioned here. The single-genre guard is
+        # carried over verbatim from the phase 0 view — it is the whole
+        # correctness argument for the relation and materializing the two
+        # endpoint vertices around it must not weaken it.
         _view(
             "part_of",
             f"""
-SELECT DISTINCT style.value   AS style_name,
-       genre.genre_name       AS genre_name
-FROM ({_TAGGED_DOCUMENTS.strip()}) AS source
-CROSS JOIN LATERAL (
-    SELECT single.value AS genre_name
-    FROM jsonb_array_elements_text({_jsonb_array(genres)}) AS single(value)
-) AS genre
-CROSS JOIN LATERAL jsonb_array_elements_text({_jsonb_array(styles)}) AS style(value)
-WHERE jsonb_array_length({_jsonb_array(genres)}) = 1
-  AND {_non_empty("genre.genre_name")}
-  AND {_non_empty("style.value")}
+SELECT asserted.style_name AS style_name,
+       asserted.genre_name AS genre_name
+FROM (
+    SELECT DISTINCT style.value   AS style_name,
+           genre.genre_name       AS genre_name
+    FROM ({_TAGGED_DOCUMENTS.strip()}) AS source
+    CROSS JOIN LATERAL (
+        SELECT single.value AS genre_name
+        FROM jsonb_array_elements_text({_jsonb_array(genres)}) AS single(value)
+    ) AS genre
+    CROSS JOIN LATERAL jsonb_array_elements_text({_jsonb_array(styles)}) AS style(value)
+    WHERE jsonb_array_length({_jsonb_array(genres)}) = 1
+      AND {_non_empty("genre.genre_name")}
+      AND {_non_empty("style.value")}
+) AS asserted
+JOIN graph.style AS style ON style.name = asserted.style_name
+JOIN graph.genre AS genre ON genre.name = asserted.genre_name
 """,  # noqa: S608
         ),
-        # Discogs states band membership from both ends — the band lists
-        # `members`, the member lists `groups` — so the two unnests become one
-        # directed edge and UNION collapses the duplicate a reciprocal pair makes.
-        _view(
-            "member_of",
-            f"""
-SELECT btrim(element.value ->> 'id') AS member_artist_id,
-       artists.data_id               AS group_artist_id
-FROM public.artists AS artists
-CROSS JOIN LATERAL jsonb_array_elements({_jsonb_array("artists.data -> 'members'")}) AS element(value)
-WHERE {_usable_id("element.value ->> 'id'")}
-UNION
-SELECT artists.data_id               AS member_artist_id,
-       btrim(element.value ->> 'id') AS group_artist_id
-FROM public.artists AS artists
-CROSS JOIN LATERAL jsonb_array_elements({_jsonb_array("artists.data -> 'groups'")}) AS element(value)
-WHERE {_usable_id("element.value ->> 'id'")}
-""",  # noqa: S608
-        ),
-        _view(
-            "alias_of",
-            f"""
-SELECT DISTINCT btrim(element.value ->> 'id') AS alias_artist_id,
-       artists.data_id                        AS artist_id
-FROM public.artists AS artists
-CROSS JOIN LATERAL jsonb_array_elements({_jsonb_array("artists.data -> 'aliases'")}) AS element(value)
-WHERE {_usable_id("element.value ->> 'id'")}
-""",  # noqa: S608
-        ),
-        # A label hierarchy is likewise stated from both ends: `parentLabel` on
-        # the child and `sublabels` on the parent.
+        # A label hierarchy is stated from both ends: `parentLabel` on the child
+        # and `sublabels` on the parent.
         _view(
             "sublabel_of",
             f"""
-SELECT labels.data_id                                  AS sublabel_id,
+SELECT labels.data_id::text                            AS sublabel_id,
        btrim(labels.data -> 'parentLabel' ->> 'id')    AS parent_label_id
 FROM public.labels AS labels
 WHERE {_usable_id("labels.data -> 'parentLabel' ->> 'id'")}
 UNION
 SELECT btrim(element.value ->> 'id') AS sublabel_id,
-       labels.data_id                AS parent_label_id
+       labels.data_id::text          AS parent_label_id
 FROM public.labels AS labels
 CROSS JOIN LATERAL jsonb_array_elements({_jsonb_array("labels.data -> 'sublabels'")}) AS element(value)
 WHERE {_usable_id("element.value ->> 'id'")}
@@ -1754,6 +1761,12 @@ def _musicbrainz_edge_views() -> list[tuple[str, str]]:
     All sixteen ordered pairs over the four modelled entity types are declared
     rather than only the pairs some catalog happens to hold today, so the set of
     relations is a property of the schema and not of the data loaded into it.
+
+    `relationship_type` publishes the Neo4j type name, so a query ported from
+    Cypher reads the vocabulary it was written against; `raw_relationship_type`
+    is appended after it and publishes the MusicBrainz string the loader stored.
+    Both are text and both are present on all sixteen views, which is what lets
+    them keep sharing one `mb_related` label.
     """
     views: list[tuple[str, str]] = []
     for source_type, source_table, source_name in _MUSICBRAINZ_GRAPH_ENTITIES:
@@ -1765,11 +1778,12 @@ def _musicbrainz_edge_views() -> list[tuple[str, str]]:
 SELECT relationship.id                AS relationship_id,
        relationship.source_mbid       AS source_mbid,
        relationship.target_mbid       AS target_mbid,
-       relationship.relationship_type AS relationship_type,
+       graph.mb_relationship_type(relationship.relationship_type) AS relationship_type,
        relationship.begin_date        AS begin_date,
        relationship.end_date          AS end_date,
        relationship.ended             AS ended,
-       relationship.attributes        AS attributes
+       relationship.attributes        AS attributes,
+       relationship.relationship_type AS raw_relationship_type
 FROM musicbrainz.relationships AS relationship
 JOIN {source_table} AS source_entity ON source_entity.mbid = relationship.source_mbid
 JOIN {target_table} AS target_entity ON target_entity.mbid = relationship.target_mbid
@@ -1917,6 +1931,52 @@ def _credit_role_category_function() -> str:
         """  # noqa: S608
 
 
+# The MusicBrainz relationship vocabulary, copied verbatim from
+# `musicbrainz-graph-enricher`'s `brainzgraphinator/_projections.py`. The two
+# stores disagree today and that disagreement is the gap this closes:
+# `musicbrainz-sql-loader` stores the raw MusicBrainz string while the graph
+# enricher maps it to a Neo4j relationship type before it writes an edge, so a
+# query ported from Cypher asks for `MEMBER_OF` and finds `member of band`.
+#
+# The enricher resolves an unmapped string to None and writes no edge at all.
+# The relational side cannot drop the row — `musicbrainz.relationships` holds
+# every relationship the loader ingested, not only the eight the enricher
+# projects — so the mapped column is NULL there and the raw string stays
+# readable beside it. A consumer filtering on the mapped name therefore sees
+# exactly the edges Neo4j carries, and one filtering on the raw string sees
+# everything.
+MUSICBRAINZ_RELATIONSHIP_TYPES: dict[str, str] = {
+    "member of band": "MEMBER_OF",
+    "collaboration": "COLLABORATED_WITH",
+    "teacher": "TAUGHT",
+    "tribute": "TRIBUTE_TO",
+    "founder": "FOUNDED",
+    "supporting musician": "SUPPORTED",
+    "subgroup": "SUBGROUP_OF",
+    "artist rename": "RENAMED_TO",
+}
+
+
+def _mb_relationship_type_function() -> str:
+    """Return the IMMUTABLE function rendering the enricher's relationship map."""
+    branches = "\n".join(
+        f"            WHEN {_sql_literal(raw)} THEN {_sql_literal(mapped)}" for raw, mapped in sorted(MUSICBRAINZ_RELATIONSHIP_TYPES.items())
+    )
+    return f"""
+        CREATE OR REPLACE FUNCTION graph.mb_relationship_type(raw_relationship_type text)
+        RETURNS text
+        LANGUAGE sql
+        IMMUTABLE
+        PARALLEL SAFE
+        RETURNS NULL ON NULL INPUT
+        AS $mb_relationship_type$
+        SELECT CASE raw_relationship_type
+{branches}
+        END
+        $mb_relationship_type$
+        """
+
+
 def _medium_label_function() -> str:
     """Return the IMMUTABLE function rendering the vendored media taxonomy's labels.
 
@@ -2023,21 +2083,663 @@ _MEDIA_SOURCE = f"""
 
 
 def _credit_views() -> list[tuple[str, str]]:
-    """Return the person, company, and media vertex and edge views."""
+    """Return the one credit-and-media relation that stays a view.
+
+    `person`, `company`, `medium`, and `media_family` are vertex tables now, and
+    `credited_on`, `same_as`, `credited_to`, and `issued_on` are edge tables; the
+    sources above are retained because the phase 0 comparison schema still
+    renders them, not because the initializer creates them.
+
+    `in_family` is bounded by the media taxonomy — a few dozen rows — so Table 2
+    of the coverage spike keeps it a view, now over `graph.medium` rather than
+    over a re-unnest of both providers' media blocks. The `medium` table already
+    carries the family each medium belongs to, so the relation is a projection
+    of one small table joined to the family vertex it resolves to.
+    """
     return [
         _view(
-            "person",
-            f"""
+            "in_family",
+            """
+SELECT medium.medium_id AS medium_id,
+       medium.family    AS family_name
+FROM graph.medium AS medium
+JOIN graph.media_family AS family ON family.name = medium.family
+""",
+        ),
+    ]
+
+
+# The four labels Neo4j carries counters on, each paired with the relation
+# holding its own rows and the relation holding its counters. A property graph
+# admits ONE element table per label — two tables sharing a label must expose an
+# identical property set, and PostgreSQL 19 beta 3 refuses the pair outright
+# with `mismatching number of properties in definition of label "genre"` — so
+# the counters cannot be attached to the label as a second element table. A view
+# that joins the two is one element table, which is what makes
+# `MATCH (g IS genre) COLUMNS (g.release_count)` read exactly as the Cypher it
+# replaces.
+_COUNTER_BEARING_VERTICES: tuple[tuple[str, str, str, tuple[str, ...], tuple[str, ...]], ...] = (
+    ("genre_vertex", "genre", "genre_stats", ("name",), ("release_count", "artist_count", "label_count", "style_count")),
+    ("style_vertex", "style", "style_stats", ("name",), ("release_count", "artist_count", "label_count", "genre_count")),
+    (
+        "label_vertex",
+        "label",
+        "label_stats",
+        ("label_id", "name", "gm_item_id", "hash", "updated_at", "gm_id"),
+        ("release_count", "artist_count", "genre_count"),
+    ),
+    ("artist_vertex", "artist", "artist_degree", ("artist_id", "name", "gm_item_id", "hash", "updated_at", "gm_id"), ("degree",)),
+)
+
+# The join column of each, which is also the key of both relations either side
+# of it. That the counter relation is UNIQUE on it is the whole reason this
+# shape is free: the planner removes a LEFT JOIN to a uniquely-keyed relation
+# outright when no column of it is selected, so a traversal that never names a
+# counter plans exactly as it did against the storage relation alone.
+_COUNTER_JOIN_COLUMNS = {"genre_vertex": "name", "style_vertex": "name", "label_vertex": "label_id", "artist_vertex": "artist_id"}
+
+
+def _counter_vertex_view(relation: str, storage: str, counters: str, carried: tuple[str, ...], counted: tuple[str, ...]) -> tuple[str, str]:
+    """Return the vertex projection joining one storage relation to its counters.
+
+    A count reads zero where the loader has not computed one yet, because every
+    caller of these does arithmetic on it and a null would propagate through a
+    ratio or a sum. `first_year` is deliberately not defaulted: an unknown first
+    year must not read as year zero, and every caller of it tests for null
+    already.
+    """
+    join = _COUNTER_JOIN_COLUMNS[relation]
+    columns = [f"       {storage}.{column:<14} AS {column}," for column in carried]
+    columns.extend(f"       COALESCE({counters}.{column}, 0)::bigint AS {column}," for column in counted)
+    if counters.endswith("_stats") and counters != "label_stats":
+        columns.append(f"       {counters}.first_year AS first_year,")
+    body = "\n".join(columns).rstrip(",")
+    return _view(
+        relation,
+        f"""
+SELECT
+{body}
+FROM graph.{storage} AS {storage}
+LEFT JOIN graph.{counters} AS {counters} ON {counters}.{join} = {storage}.{join}
+""",  # noqa: S608
+    )
+
+
+def _counter_views() -> list[tuple[str, str]]:
+    """Return the vertex projections carrying the counters, and release degree.
+
+    Eight `catalog-api` functions read counters that `graphinator` writes onto
+    `:Genre`, `:Style`, `:Label`, and `:Artist` nodes in a post-import pass.
+    `explore_genre`'s own docstring records that reading `g.release_count`
+    replaces four traversal queries — roughly 200 million database hits for Rock
+    — with one property read, and re-aggregating on request is the failure that
+    took the rarity pipeline down for thirty-three days. So these have to stay
+    properties of the label the Cypher names, not a second label a rewrite has
+    to learn.
+
+    Each label therefore binds a projection that joins its storage relation to
+    its counter relation. The counter relations stay exactly as the loaders
+    write them; nothing here duplicates a row.
+
+    `graph.release_degree` is the one counter that is NOT folded onto its label,
+    and the reason is a measurement rather than a rule. Its live half is a pair
+    of lateral counts over `user_collections` and `user_wantlists`, which no
+    unique key makes removable, so folding it onto the `release` vertex would
+    make every release binding in every traversal count collection and wantlist
+    rows even where degree is never read — a nine-line plan becomes nineteen.
+    It stays its own label, and `MATCH (r IS release_degree WHERE r.release_id =
+    …)` is the one spelling a rewrite has to carry forward.
+    """
+    views = [_counter_vertex_view(*entry) for entry in _COUNTER_BEARING_VERTICES]
+    views.append(
+        _view(
+            "release_degree",
+            """
+SELECT base.release_id                                             AS release_id,
+       (base.degree + collected.tally + wanted.tally)::bigint      AS degree
+FROM graph.release_degree_base AS base
+CROSS JOIN LATERAL (
+    SELECT CASE WHEN base.release_id ~ '^[0-9]+$' THEN base.release_id::bigint END AS discogs_id
+) AS numeric_id
+CROSS JOIN LATERAL (
+    SELECT count(*) AS tally
+    FROM public.user_collections AS collection
+    WHERE collection.release_id = numeric_id.discogs_id
+) AS collected
+CROSS JOIN LATERAL (
+    SELECT count(*) AS tally
+    FROM public.user_wantlists AS wantlist
+    WHERE wantlist.release_id = numeric_id.discogs_id
+) AS wanted
+""",
+        )
+    )
+    return views
+
+
+# ── Loader-written graph relations (spike gm-database-schema-9c8.1 / 9c8.2) ───
+# The relations below are TABLES, not views, and this repository does not write
+# a single row into any of them. `discogs-sql-loader` owns every one except the
+# `medium`, `media_family`, and `issued_on` rows carrying `source =
+# 'musicbrainz'`, which `musicbrainz-sql-loader` upserts alongside them. The
+# initializer's whole job here is to declare the shape and the indexes and then
+# get out of the way; an empty table on a fresh database is the expected state
+# until a loader runs.
+#
+# Why tables at all, when the phase 0 views already produced the same rows:
+# spike gm-database-schema-9c8.1 measured the views and found every hot edge
+# re-unnesting a JSONB document per query, unable to carry an index, and unable
+# to be entered from the target end at all. Its recommendation is these tables
+# with both directions indexed. Spike gm-database-schema-9c8.2 Table 2 and
+# Table 3 are the shapes, keys, indexes, and owners; nothing here invents one.
+#
+# Three rules hold across the whole set:
+#
+# - **Every key column is `text`.** PostgreSQL 19 beta 3 cannot resolve an
+#   equality operator for a `character varying` property-graph vertex key, which
+#   is why the phase 0 Discogs vertex views carried appended `<entity>_key`
+#   restatements. Tables written as `text` from the start need no such
+#   workaround, and the four appended columns are retired with them.
+# - **Every edge table is indexed in both directions.** The primary key serves
+#   the forward walk and a second index serves the reverse, because the ported
+#   Cypher enters these edges from the target end as often as from the source.
+#   An edge table indexed one way only reproduces the exact failure the views
+#   have.
+# - **No foreign key to any base table.** A loader writes an edge in the same
+#   transaction as the document it came from and may legitimately reach an
+#   entity it has not ingested yet, exactly as `graphinator` merges a target
+#   node as it writes the edge. Resolution is the property graph's job.
+
+# Retiring a phase 0 view is the one place this schema drops anything, and it
+# drops only a relation it is replacing in the same pass, only when a view of
+# that name is actually still there. A fresh database drops nothing; a second
+# apply finds a table rather than a view and drops nothing either. CASCADE is
+# required because on PostgreSQL 19 `graph.catalog` depends on the view, and
+# `_apply_property_graph` re-declares the graph on the same run.
+_VIEW_TO_TABLE_MIGRATION = """
+DO ${tag}$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM pg_class AS relation
+        JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+        WHERE namespace.nspname = 'graph'
+          AND relation.relname = '{relation}'
+          AND relation.relkind = 'v'
+    ) THEN
+        DROP VIEW graph.{relation} CASCADE;
+    END IF;
+END
+${tag}$
+"""
+
+# The same guard for the four Discogs vertex relations that stay views. Their
+# key column is being retyped from `character varying` to `text` and their
+# appended `<entity>_key` restatement removed, and `CREATE OR REPLACE VIEW`
+# refuses both. The condition is the retype itself rather than the presence of
+# the appended column, so the guard is self-healing from any half-applied state
+# and is a no-op the moment the key already reads as `text`.
+_KEY_RETYPE_MIGRATION = """
+DO ${tag}$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'graph'
+          AND table_name = '{relation}'
+          AND column_name = '{column}'
+          AND data_type <> 'text'
+    ) THEN
+        DROP VIEW graph.{relation} CASCADE;
+    END IF;
+END
+${tag}$
+"""
+
+# Trigram indexes are what the six full-text query functions the coverage spike
+# found need, and they are the reason `graph.genre`, `graph.style`, and
+# `graph.person` had to stop being views: a view cannot carry an index at all.
+# The extension is created above, but a deployment whose role cannot create one
+# should lose the index rather than the schema, so each index is guarded on the
+# extension actually being present instead of assuming the CREATE succeeded.
+_TRIGRAM_INDEX = """
+DO ${tag}$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm') THEN
+        CREATE INDEX IF NOT EXISTS {index} ON graph.{relation} USING GIN ({column} gin_trgm_ops);
+    END IF;
+END
+${tag}$
+"""
+
+
+def _view_to_table_migration(relation: str) -> tuple[str, str]:
+    """Return the guarded statement retiring one phase 0 view before its table."""
+    return (
+        f"graph.{relation} view-to-table migration",
+        _VIEW_TO_TABLE_MIGRATION.format(tag=f"retire_{relation}", relation=relation).strip(),
+    )
+
+
+def _key_retype_migration(relation: str, column: str) -> tuple[str, str]:
+    """Return the guarded statement letting one vertex view republish a text key."""
+    return (
+        f"graph.{relation} key-type migration",
+        _KEY_RETYPE_MIGRATION.format(tag=f"retype_{relation}", relation=relation, column=column).strip(),
+    )
+
+
+def _table(relation: str, columns: str) -> tuple[str, str]:
+    """Return the named CREATE TABLE IF NOT EXISTS statement for one relation.
+
+    COLUMNS is written the way it reads best — aligned across several lines for
+    a wide relation, on one line for a relation with a single column — so the
+    body is re-indented here rather than at every call site.
+    """
+    body = "\n".join(line if line.startswith(" ") else f"    {line}" for line in columns.strip(chr(10)).rstrip().splitlines())
+    return (f"graph.{relation} table", f"CREATE TABLE IF NOT EXISTS graph.{relation} (\n{body}\n)")
+
+
+def _table_index(relation: str, suffix: str, columns: str) -> tuple[str, str]:
+    """Return a named secondary index on one graph table."""
+    index = f"{relation}_{suffix}"
+    return (f"graph.{index} index", f"CREATE INDEX IF NOT EXISTS {index} ON graph.{relation} ({columns})")
+
+
+def _trigram_index(relation: str, column: str) -> tuple[str, str]:
+    """Return the extension-guarded GIN trigram index autocomplete reads."""
+    index = f"{relation}_{column}_trgm"
+    return (
+        f"graph.{index} index",
+        _TRIGRAM_INDEX.format(tag=f"trgm_{relation}", index=index, relation=relation, column=column).strip(),
+    )
+
+
+# The six vertex relations that were `SELECT DISTINCT` over a full unnest of
+# every release and every master to yield a few hundred rows. Each keeps exactly
+# the columns its phase 0 view published, so the property graph's property lists
+# do not move; only the shape underneath them does.
+def _vertex_table_statements() -> list[tuple[str, str]]:
+    """Return the name-keyed vertex tables and their indexes."""
+    return [
+        _table("genre", "name text PRIMARY KEY"),
+        _trigram_index("genre", "name"),
+        _table("style", "name text PRIMARY KEY"),
+        _trigram_index("style", "name"),
+        # `:Person` is keyed on the verbatim credit name, exactly as Neo4j keys
+        # it. Folding it here would key the vertex differently from the node.
+        _table("person", "name text PRIMARY KEY"),
+        _trigram_index("person", "name"),
+        _table("media_family", "name text PRIMARY KEY"),
+        _table(
+            "medium",
+            """
+    medium_id text PRIMARY KEY,
+    family    text,
+    label     text
+""",
+        ),
+        # The producer's identity rule for a company is the loader's to apply and
+        # is deliberately NOT recomputed here: a whole Discogs id of at least one
+        # when the source supplies one, otherwise `name:` followed by the name
+        # case-folded with inner whitespace collapsed and punctuation left alone.
+        # The phase 0 view approximated Python's `casefold` with SQL `lower`,
+        # which disagrees on the German eszett and a handful of other characters.
+        # `discogs-sql-loader` writes the rule's own answer, so the approximation
+        # retires with the view rather than being carried forward as a generated
+        # column that would re-introduce it.
+        _table(
+            "company",
+            """
+    company_id       text PRIMARY KEY,
+    name             text,
+    discogs_label_id text
+""",
+        ),
+    ]
+
+
+# Table 2 of the coverage spike, in its own order. Each entry is the relation,
+# its column block, the reverse index that makes the target-end walk cheap, and
+# any extra index the table lists. `part_of`, `in_family`, and `sublabel_of` are
+# absent on purpose and stay views; see `_discogs_edge_views` and `_credit_views`.
+_EDGE_TABLES: list[tuple[str, str, str, tuple[tuple[str, str], ...]]] = [
+    (
+        "by_artist",
+        """
+    release_id text NOT NULL,
+    artist_id  text NOT NULL,
+    PRIMARY KEY (release_id, artist_id)
+""",
+        "artist_id, release_id",
+        (),
+    ),
+    (
+        "on_label",
+        """
+    release_id text NOT NULL,
+    label_id   text NOT NULL,
+    PRIMARY KEY (release_id, label_id)
+""",
+        "label_id, release_id",
+        (),
+    ),
+    (
+        "derived_from",
+        """
+    release_id text NOT NULL,
+    master_id  text NOT NULL,
+    PRIMARY KEY (release_id, master_id)
+""",
+        "master_id, release_id",
+        (),
+    ),
+    (
+        "in_genre",
+        """
+    release_id text NOT NULL,
+    genre_name text NOT NULL,
+    PRIMARY KEY (release_id, genre_name)
+""",
+        "genre_name, release_id",
+        (),
+    ),
+    (
+        "in_style",
+        """
+    release_id text NOT NULL,
+    style_name text NOT NULL,
+    PRIMARY KEY (release_id, style_name)
+""",
+        "style_name, release_id",
+        (),
+    ),
+    (
+        "master_by_artist",
+        """
+    master_id text NOT NULL,
+    artist_id text NOT NULL,
+    PRIMARY KEY (master_id, artist_id)
+""",
+        "artist_id, master_id",
+        (),
+    ),
+    (
+        "master_in_genre",
+        """
+    master_id  text NOT NULL,
+    genre_name text NOT NULL,
+    PRIMARY KEY (master_id, genre_name)
+""",
+        "genre_name, master_id",
+        (),
+    ),
+    (
+        "master_in_style",
+        """
+    master_id  text NOT NULL,
+    style_name text NOT NULL,
+    PRIMARY KEY (master_id, style_name)
+""",
+        "style_name, master_id",
+        (),
+    ),
+    # Read in both directions by `expand_artist_aliases` and
+    # `count_artist_aliases`, which is the whole reason it cannot stay a view.
+    (
+        "member_of",
+        """
+    member_artist_id text NOT NULL,
+    group_artist_id  text NOT NULL,
+    PRIMARY KEY (member_artist_id, group_artist_id)
+""",
+        "group_artist_id, member_artist_id",
+        (),
+    ),
+    (
+        "alias_of",
+        """
+    alias_artist_id text NOT NULL,
+    artist_id       text NOT NULL,
+    PRIMARY KEY (alias_artist_id, artist_id)
+""",
+        "artist_id, alias_artist_id",
+        (),
+    ),
+    # One person credited twice on a release under two roles is two edges, so
+    # `role` is in the key. `role_category` is generated rather than written:
+    # nine credits functions read it and a loader that forgot to set it would
+    # produce a silent null rather than a failure. The expression is bound to
+    # `graph.credit_role_category` at creation time, so re-rendering that
+    # function from a newer runtime pin does not recompute stored rows; a
+    # taxonomy move is a backfill, which is the same thing it is in Neo4j.
+    (
+        "credited_on",
+        """
+    person_name   text NOT NULL,
+    release_id    text NOT NULL,
+    role          text NOT NULL,
+    role_category text GENERATED ALWAYS AS (graph.credit_role_category(role)) STORED,
+    PRIMARY KEY (person_name, release_id, role)
+""",
+        "release_id, person_name",
+        (("role_category", "role_category, person_name"),),
+    ),
+    (
+        "same_as",
+        """
+    person_name text NOT NULL,
+    artist_id   text NOT NULL,
+    PRIMARY KEY (person_name, artist_id)
+""",
+        "artist_id",
+        (),
+    ),
+    # `source` stays in the key, as ADR 0011 and the phase 0 view already have
+    # it, and carries its own index because each loader prunes its own rows.
+    (
+        "credited_to",
+        """
+    release_id    text NOT NULL,
+    company_id    text NOT NULL,
+    role          text NOT NULL,
+    role_category text NOT NULL DEFAULT 'other',
+    source        text NOT NULL,
+    PRIMARY KEY (release_id, company_id, role, source)
+""",
+        "company_id, release_id",
+        (("source", "source"),),
+    ),
+    # `:Medium` and `:MediaFamily` are shared across catalogs and each provider
+    # writes its own edge to them, so `source` is part of the key rather than a
+    # property — precisely so `discogs-sql-loader` writing `source='discogs'`
+    # and `musicbrainz-sql-loader` writing `source='musicbrainz'` do not
+    # collide, and so each one's source-scoped prune reaches only its own rows.
+    (
+        "issued_on",
+        """
+    release_id text NOT NULL,
+    medium_id  text NOT NULL,
+    source     text NOT NULL,
+    qty        bigint NOT NULL DEFAULT 1,
+    PRIMARY KEY (release_id, medium_id, source)
+""",
+        "medium_id, release_id",
+        (("source", "source"),),
+    ),
+]
+
+
+def _edge_table_statements() -> list[tuple[str, str]]:
+    """Return the fourteen Discogs edge tables with both directions indexed."""
+    statements: list[tuple[str, str]] = []
+    for relation, columns, reverse, extras in _EDGE_TABLES:
+        statements.append(_table(relation, columns))
+        statements.append(_table_index(relation, "reverse", reverse))
+        statements.extend(_table_index(relation, suffix, index_columns) for suffix, index_columns in extras)
+    return statements
+
+
+# Table 3 of the coverage spike: the pre-computed node properties `graphinator`
+# writes in a post-import pass and that eight catalog-api functions read as if
+# they were free. A graph declared over views has nowhere to put them.
+#
+# `discogs-sql-loader` refreshes all of these on the `extraction_complete`
+# message it already handles, which is the same latch `graphinator` uses to
+# start its own post-import pass — so they cost no new scheduler. The degree
+# relations are sums over the edge tables above and never re-read a JSONB
+# document.
+#
+# `graph.release_degree_base` is the one relation in the whole edge model split
+# across two owners. Neo4j's release degree counts COLLECTED and WANTS edges,
+# which catalog-api writes and the loader never sees. The loader writes the base
+# count here and `graph.release_degree` adds the live counts; see
+# `_counter_views`.
+def _counter_table_statements() -> list[tuple[str, str]]:
+    """Return the counter, degree, and genre-aggregate relations and their indexes."""
+    return [
+        _table(
+            "genre_stats",
+            """
+    name          text PRIMARY KEY,
+    release_count bigint NOT NULL DEFAULT 0,
+    artist_count  bigint NOT NULL DEFAULT 0,
+    label_count   bigint NOT NULL DEFAULT 0,
+    style_count   bigint NOT NULL DEFAULT 0,
+    first_year    integer
+""",
+        ),
+        _table_index("genre_stats", "first_year", "first_year"),
+        _table(
+            "style_stats",
+            """
+    name          text PRIMARY KEY,
+    release_count bigint NOT NULL DEFAULT 0,
+    artist_count  bigint NOT NULL DEFAULT 0,
+    label_count   bigint NOT NULL DEFAULT 0,
+    genre_count   bigint NOT NULL DEFAULT 0,
+    first_year    integer
+""",
+        ),
+        _table_index("style_stats", "first_year", "first_year"),
+        _table(
+            "label_stats",
+            """
+    label_id      text PRIMARY KEY,
+    release_count bigint NOT NULL DEFAULT 0,
+    artist_count  bigint NOT NULL DEFAULT 0,
+    genre_count   bigint NOT NULL DEFAULT 0
+""",
+        ),
+        _table_index("label_stats", "release_count", "release_count"),
+        # `size([(a)-[]-() | 1])` and `COUNT { (a)--() }` are documented memory
+        # hazards in Neo4j; an indexed counter read replaces a list-materializing
+        # scan. The descending index is what the leaderboard reads order on.
+        _table(
+            "artist_degree",
+            """
+    artist_id text PRIMARY KEY,
+    degree    bigint NOT NULL DEFAULT 0
+""",
+        ),
+        _table_index("artist_degree", "degree", "degree DESC"),
+        _table(
+            "release_degree_base",
+            """
+    release_id text PRIMARY KEY,
+    degree     bigint NOT NULL DEFAULT 0
+""",
+        ),
+        # The two aggregates that have no Neo4j counterpart at all. Both are
+        # keyed on the pair and carry the reverse index, so "which genres does
+        # this artist release in" and "which artists release in this genre" are
+        # both index-only reads.
+        _table(
+            "artist_genre",
+            """
+    artist_id     text NOT NULL,
+    genre_name    text NOT NULL,
+    release_count bigint NOT NULL DEFAULT 0,
+    PRIMARY KEY (artist_id, genre_name)
+""",
+        ),
+        _table_index("artist_genre", "reverse", "genre_name, artist_id"),
+        _table(
+            "label_genre",
+            """
+    label_id      text NOT NULL,
+    genre_name    text NOT NULL,
+    release_count bigint NOT NULL DEFAULT 0,
+    PRIMARY KEY (label_id, genre_name)
+""",
+        ),
+        _table_index("label_genre", "reverse", "genre_name, label_id"),
+    ]
+
+
+# Every relation that stops being a view, in the order its table is created.
+_MATERIALIZED_VERTICES = ("genre", "style", "person", "media_family", "medium", "company")
+_MATERIALIZED_EDGES = tuple(relation for relation, _columns, _reverse, _extras in _EDGE_TABLES)
+
+# The relations that stay views but republish a key column as `text`. The four
+# Discogs vertices do it because a property-graph vertex key cannot be
+# `character varying`; `sublabel_of` does it because a UNION takes the type of
+# its first branch and that branch reads `labels.data_id`, so the column came
+# out `character varying` while every other edge key in the schema is `text`.
+_TEXT_KEY_RETYPES: tuple[tuple[str, str], ...] = (
+    ("artist", "artist_id"),
+    ("label", "label_id"),
+    ("master", "master_id"),
+    ("release", "release_id"),
+    ("sublabel_of", "sublabel_id"),
+)
+
+
+def _graph_table_statements() -> list[tuple[str, str]]:
+    """Return every loader-owned table, preceded by the migrations that free its name."""
+    migrations = [_view_to_table_migration(relation) for relation in (*_MATERIALIZED_VERTICES, *_MATERIALIZED_EDGES)]
+    migrations.extend(_key_retype_migration(relation, column) for relation, column in _TEXT_KEY_RETYPES)
+    return [*migrations, *_vertex_table_statements(), *_edge_table_statements(), *_counter_table_statements()]
+
+
+# ── Phase 0 definitions, retained for the table-versus-view comparison ───────
+# Everything below builds the view bodies the twenty materialized relations had
+# before they became tables. NOTHING HERE IS SHIPPED AS A RELATION: none of it
+# is reachable from `_schema_statements()`, the initializer never creates it,
+# and `graph` never holds one of these views again after the migration above
+# retires it. `tests/test_graph_schema.py` pins that.
+#
+# It is kept, rather than copied into the test tree, for one reason: the
+# comparison it feeds is only worth running while the two sides cannot drift.
+# The parity harness creates these definitions in a throwaway schema, fills the
+# tables from them, and then runs the same `GRAPH_TABLE` query over a graph
+# declared on the tables and over the retained views. A hand-copied body would
+# turn a real disagreement into a stale-copy artifact the first time a
+# projection rule moved.
+
+
+def _phase0_relation_bodies() -> dict[str, str]:
+    """Return the phase 0 view body of every relation that is now a table."""
+    genres = "source.document -> 'genres'"
+    styles = "source.document -> 'styles'"
+    bodies = {
+        "genre": f"""
+SELECT DISTINCT genre.value AS name
+FROM ({_TAGGED_DOCUMENTS.strip()}) AS source
+CROSS JOIN LATERAL jsonb_array_elements_text({_jsonb_array(genres)}) AS genre(value)
+WHERE {_non_empty("genre.value")}
+""",  # noqa: S608
+        "style": f"""
+SELECT DISTINCT style.value AS name
+FROM ({_TAGGED_DOCUMENTS.strip()}) AS source
+CROSS JOIN LATERAL jsonb_array_elements_text({_jsonb_array(styles)}) AS style(value)
+WHERE {_non_empty("style.value")}
+""",  # noqa: S608
+        "person": f"""
 SELECT DISTINCT credit.person_name AS name
 FROM ({_CREDIT_SOURCE.strip()}) AS credit
 """,  # noqa: S608
-        ),
-        # A company appears on many releases and the source spells its name
-        # inconsistently, so one representative is picked deterministically rather
-        # than left to whichever row the planner reaches last.
-        _view(
-            "company",
-            f"""
+        "company": f"""
 SELECT DISTINCT ON (credit.company_id)
        credit.company_id                                      AS company_id,
        COALESCE(credit.company_name, credit.company_id)       AS name,
@@ -2047,10 +2749,7 @@ WHERE credit.company_id IS NOT NULL
   AND credit.role IS NOT NULL
 ORDER BY credit.company_id, COALESCE(credit.company_name, credit.company_id)
 """,  # noqa: S608
-        ),
-        _view(
-            "medium",
-            f"""
+        "medium": f"""
 SELECT DISTINCT ON (media.medium_id)
        media.medium_id                       AS medium_id,
        media.family_name                     AS family,
@@ -2058,41 +2757,58 @@ SELECT DISTINCT ON (media.medium_id)
 FROM ({_MEDIA_SOURCE.strip()}) AS media
 ORDER BY media.medium_id, media.family_name
 """,  # noqa: S608
-        ),
-        _view(
-            "media_family",
-            f"""
+        "media_family": f"""
 SELECT DISTINCT media.family_name AS name
 FROM ({_MEDIA_SOURCE.strip()}) AS media
 """,  # noqa: S608
-        ),
+        "derived_from": f"""
+SELECT releases.data_id::text                 AS release_id,
+       btrim(releases.data ->> 'master_id')   AS master_id
+FROM public.releases AS releases
+WHERE {_usable_id("releases.data ->> 'master_id'")}
+""",  # noqa: S608
+        # Discogs states band membership from both ends — the band lists
+        # `members`, the member lists `groups` — so the two unnests become one
+        # directed edge and UNION collapses the duplicate a reciprocal pair makes.
+        "member_of": f"""
+SELECT btrim(element.value ->> 'id') AS member_artist_id,
+       artists.data_id::text         AS group_artist_id
+FROM public.artists AS artists
+CROSS JOIN LATERAL jsonb_array_elements({_jsonb_array("artists.data -> 'members'")}) AS element(value)
+WHERE {_usable_id("element.value ->> 'id'")}
+UNION
+SELECT artists.data_id::text         AS member_artist_id,
+       btrim(element.value ->> 'id') AS group_artist_id
+FROM public.artists AS artists
+CROSS JOIN LATERAL jsonb_array_elements({_jsonb_array("artists.data -> 'groups'")}) AS element(value)
+WHERE {_usable_id("element.value ->> 'id'")}
+""",  # noqa: S608
+        "alias_of": f"""
+SELECT DISTINCT btrim(element.value ->> 'id') AS alias_artist_id,
+       artists.data_id::text                  AS artist_id
+FROM public.artists AS artists
+CROSS JOIN LATERAL jsonb_array_elements({_jsonb_array("artists.data -> 'aliases'")}) AS element(value)
+WHERE {_usable_id("element.value ->> 'id'")}
+""",  # noqa: S608
         # CREDITED_ON is keyed on (person, release, role): one person credited
         # twice on a release under two roles is two edges.
-        _view(
-            "credited_on",
-            f"""
+        "credited_on": f"""
 SELECT DISTINCT credit.person_name                          AS person_name,
        credit.release_id                                    AS release_id,
        credit.role                                          AS role,
        graph.credit_role_category(credit.role)              AS role_category
 FROM ({_CREDIT_SOURCE.strip()}) AS credit
 """,  # noqa: S608
-        ),
-        _view(
-            "same_as",
-            f"""
+        "same_as": f"""
 SELECT DISTINCT credit.person_name AS person_name,
        credit.artist_id            AS artist_id
 FROM ({_CREDIT_SOURCE.strip()}) AS credit
 WHERE {_usable_id("credit.artist_id")}
 """,  # noqa: S608
-        ),
         # CREDITED_TO is keyed on (release, company, role, source); the same entry
         # repeated in the document is one edge, and the first occurrence wins so
         # the row reads the way the release does.
-        _view(
-            "credited_to",
-            f"""
+        "credited_to": f"""
 SELECT DISTINCT ON (credit.release_id, credit.company_id, credit.role)
        credit.release_id    AS release_id,
        credit.company_id    AS company_id,
@@ -2104,44 +2820,239 @@ WHERE credit.company_id IS NOT NULL
   AND credit.role IS NOT NULL
 ORDER BY credit.release_id, credit.company_id, credit.role, credit.entry_position
 """,  # noqa: S608
-        ),
         # Two format entries resolving to the same canonical medium — a 2xLP split
         # across two Discogs entries — are one edge whose qty is their sum.
-        _view(
-            "issued_on",
-            f"""
-SELECT media.release_id    AS release_id,
-       media.medium_id     AS medium_id,
-       media.provider      AS source,
+        "issued_on": f"""
+SELECT media.release_id       AS release_id,
+       media.medium_id        AS medium_id,
+       media.provider         AS source,
        SUM(media.qty)::bigint AS qty
 FROM ({_MEDIA_SOURCE.strip()}) AS media
 GROUP BY media.release_id, media.medium_id, media.provider
 """,  # noqa: S608
-        ),
-        _view(
-            "in_family",
-            f"""
-SELECT DISTINCT media.medium_id AS medium_id,
-       media.family_name         AS family_name
-FROM ({_MEDIA_SOURCE.strip()}) AS media
-""",  # noqa: S608
-        ),
+    }
+    for relation, table, source_column, json_key, target_column in (
+        ("by_artist", "releases", "release_id", "artists", "artist_id"),
+        ("on_label", "releases", "release_id", "labels", "label_id"),
+        ("master_by_artist", "masters", "master_id", "artists", "artist_id"),
+    ):
+        bodies[relation] = f"""
+SELECT DISTINCT entity.data_id::text          AS {source_column},
+       btrim(element.value ->> 'id')          AS {target_column}
+FROM public.{table} AS entity
+CROSS JOIN LATERAL jsonb_array_elements({_jsonb_array(f"entity.data -> '{json_key}'")}) AS element(value)
+WHERE {_usable_id("element.value ->> 'id'")}
+"""  # noqa: S608
+    for relation, table, source_column, json_key, target_column in (
+        ("in_genre", "releases", "release_id", "genres", "genre_name"),
+        ("in_style", "releases", "release_id", "styles", "style_name"),
+        ("master_in_genre", "masters", "master_id", "genres", "genre_name"),
+        ("master_in_style", "masters", "master_id", "styles", "style_name"),
+    ):
+        bodies[relation] = f"""
+SELECT DISTINCT entity.data_id::text AS {source_column},
+       tag.value                     AS {target_column}
+FROM public.{table} AS entity
+CROSS JOIN LATERAL jsonb_array_elements_text({_jsonb_array(f"entity.data -> '{json_key}'")}) AS tag(value)
+WHERE {_non_empty("tag.value")}
+"""  # noqa: S608
+    return bodies
+
+
+# The columns the bootstrap copies into each table. `credited_on.role_category`
+# is absent on purpose: it is a generated column, and naming it in an INSERT is
+# an error rather than an overwrite.
+_BOOTSTRAP_COLUMNS: dict[str, tuple[str, ...]] = {
+    "genre": ("name",),
+    "style": ("name",),
+    "person": ("name",),
+    "media_family": ("name",),
+    "medium": ("medium_id", "family", "label"),
+    "company": ("company_id", "name", "discogs_label_id"),
+    "by_artist": ("release_id", "artist_id"),
+    "on_label": ("release_id", "label_id"),
+    "derived_from": ("release_id", "master_id"),
+    "in_genre": ("release_id", "genre_name"),
+    "in_style": ("release_id", "style_name"),
+    "master_by_artist": ("master_id", "artist_id"),
+    "master_in_genre": ("master_id", "genre_name"),
+    "master_in_style": ("master_id", "style_name"),
+    "member_of": ("member_artist_id", "group_artist_id"),
+    "alias_of": ("alias_artist_id", "artist_id"),
+    "credited_on": ("person_name", "release_id", "role"),
+    "same_as": ("person_name", "artist_id"),
+    "credited_to": ("release_id", "company_id", "role", "role_category", "source"),
+    "issued_on": ("release_id", "medium_id", "source", "qty"),
+}
+
+# How `discogs-sql-loader` computes each counter relation on the
+# `extraction_complete` latch. These are sums over the edge tables and never
+# re-read a JSONB document, which is the property that makes the post-import
+# pass affordable. They are written here because the loader needs one definition
+# to implement rather than five readings of a prose table, and because the
+# parity harness fills the relations with them.
+_COUNTER_BOOTSTRAP: dict[str, str] = {
+    "genre_stats": """
+SELECT genre.name AS name,
+       (SELECT count(*) FROM graph.in_genre AS edge WHERE edge.genre_name = genre.name) AS release_count,
+       (SELECT count(DISTINCT by_artist.artist_id)
+          FROM graph.in_genre AS edge
+          JOIN graph.by_artist AS by_artist ON by_artist.release_id = edge.release_id
+         WHERE edge.genre_name = genre.name) AS artist_count,
+       (SELECT count(DISTINCT on_label.label_id)
+          FROM graph.in_genre AS edge
+          JOIN graph.on_label AS on_label ON on_label.release_id = edge.release_id
+         WHERE edge.genre_name = genre.name) AS label_count,
+       (SELECT count(*) FROM graph.part_of AS part WHERE part.genre_name = genre.name) AS style_count,
+       (SELECT min(NULLIF(btrim(release.year), '')::integer)
+          FROM graph.in_genre AS edge
+          JOIN graph.release AS release ON release.release_id = edge.release_id
+         WHERE edge.genre_name = genre.name
+           AND btrim(release.year) ~ '^[0-9]{4}$') AS first_year
+FROM graph.genre AS genre
+""",
+    "style_stats": """
+SELECT style.name AS name,
+       (SELECT count(*) FROM graph.in_style AS edge WHERE edge.style_name = style.name) AS release_count,
+       (SELECT count(DISTINCT by_artist.artist_id)
+          FROM graph.in_style AS edge
+          JOIN graph.by_artist AS by_artist ON by_artist.release_id = edge.release_id
+         WHERE edge.style_name = style.name) AS artist_count,
+       (SELECT count(DISTINCT on_label.label_id)
+          FROM graph.in_style AS edge
+          JOIN graph.on_label AS on_label ON on_label.release_id = edge.release_id
+         WHERE edge.style_name = style.name) AS label_count,
+       (SELECT count(*) FROM graph.part_of AS part WHERE part.style_name = style.name) AS genre_count,
+       (SELECT min(NULLIF(btrim(release.year), '')::integer)
+          FROM graph.in_style AS edge
+          JOIN graph.release AS release ON release.release_id = edge.release_id
+         WHERE edge.style_name = style.name
+           AND btrim(release.year) ~ '^[0-9]{4}$') AS first_year
+FROM graph.style AS style
+""",
+    "label_stats": """
+SELECT on_label.label_id AS label_id,
+       count(*) AS release_count,
+       count(DISTINCT by_artist.artist_id) AS artist_count,
+       count(DISTINCT in_genre.genre_name) AS genre_count
+FROM graph.on_label AS on_label
+LEFT JOIN graph.by_artist AS by_artist ON by_artist.release_id = on_label.release_id
+LEFT JOIN graph.in_genre AS in_genre ON in_genre.release_id = on_label.release_id
+GROUP BY on_label.label_id
+""",
+    # Every edge a Neo4j `:Artist` node carries, counted undirected exactly as
+    # `COUNT { (a)--() }` does.
+    "artist_degree": """
+SELECT endpoint.artist_id AS artist_id, count(*) AS degree
+FROM (
+    SELECT artist_id FROM graph.by_artist
+    UNION ALL SELECT artist_id FROM graph.master_by_artist
+    UNION ALL SELECT artist_id FROM graph.same_as
+    UNION ALL SELECT member_artist_id AS artist_id FROM graph.member_of
+    UNION ALL SELECT group_artist_id AS artist_id FROM graph.member_of
+    UNION ALL SELECT alias_artist_id AS artist_id FROM graph.alias_of
+    UNION ALL SELECT artist_id FROM graph.alias_of
+) AS endpoint
+GROUP BY endpoint.artist_id
+""",
+    # The catalog half of release degree. The personal half is counted live by
+    # `graph.release_degree`, which is the one relation split across two owners.
+    "release_degree_base": """
+SELECT endpoint.release_id AS release_id, count(*) AS degree
+FROM (
+    SELECT release_id FROM graph.by_artist
+    UNION ALL SELECT release_id FROM graph.on_label
+    UNION ALL SELECT release_id FROM graph.in_genre
+    UNION ALL SELECT release_id FROM graph.in_style
+    UNION ALL SELECT release_id FROM graph.derived_from
+    UNION ALL SELECT release_id FROM graph.credited_on
+    UNION ALL SELECT release_id FROM graph.credited_to
+    UNION ALL SELECT release_id FROM graph.issued_on
+) AS endpoint
+GROUP BY endpoint.release_id
+""",
+    "artist_genre": """
+SELECT by_artist.artist_id AS artist_id,
+       in_genre.genre_name AS genre_name,
+       count(DISTINCT by_artist.release_id) AS release_count
+FROM graph.by_artist AS by_artist
+JOIN graph.in_genre AS in_genre ON in_genre.release_id = by_artist.release_id
+GROUP BY by_artist.artist_id, in_genre.genre_name
+""",
+    "label_genre": """
+SELECT on_label.label_id AS label_id,
+       in_genre.genre_name AS genre_name,
+       count(DISTINCT on_label.release_id) AS release_count
+FROM graph.on_label AS on_label
+JOIN graph.in_genre AS in_genre ON in_genre.release_id = on_label.release_id
+GROUP BY on_label.label_id, in_genre.genre_name
+""",
+}
+
+
+def phase0_comparison_statements(schema: str) -> list[tuple[str, str]]:
+    """Return the statements creating the retained phase 0 views in SCHEMA.
+
+    Test-only. `_schema_statements()` never yields any of this and the shipped
+    `graph` schema never holds one of these views once the migration above has
+    run. SCHEMA is a caller-chosen identifier, not input from a row or a request.
+    """
+    statements = [(f"{schema} schema", f"CREATE SCHEMA IF NOT EXISTS {schema}")]
+    statements.extend(
+        (f"{schema}.{relation} view", f"CREATE OR REPLACE VIEW {schema}.{relation} AS\n{body.strip()}")
+        for relation, body in sorted(_phase0_relation_bodies().items())
+    )
+    return statements
+
+
+def graph_bootstrap_statements(schema: str) -> list[tuple[str, str]]:
+    """Return the statements filling every loader-owned table once, from SCHEMA.
+
+    Test-only, and the reference the loaders implement rather than a shipped
+    refresh: `discogs-sql-loader` writes these rows incrementally, in the same
+    transaction as the document they came from, and recomputes the counter
+    relations on the `extraction_complete` message it already handles.
+    """
+    statements = [
+        (
+            f"graph.{relation} bootstrap",
+            f"INSERT INTO graph.{relation} ({', '.join(columns)}) "  # noqa: S608
+            f"SELECT {', '.join(columns)} FROM {schema}.{relation} ON CONFLICT DO NOTHING",
+        )
+        for relation, columns in _BOOTSTRAP_COLUMNS.items()
     ]
+    statements.extend(
+        (f"graph.{relation} bootstrap", f"INSERT INTO graph.{relation}\n{body.strip()}\nON CONFLICT DO NOTHING")
+        for relation, body in _COUNTER_BOOTSTRAP.items()
+    )
+    return statements
 
 
 def _build_graph_statements() -> list[tuple[str, str]]:
-    """Return the ordered graph-schema statements: schema, functions, then views."""
+    """Return the ordered graph-schema statements: schema, functions, tables, views.
+
+    The order is load-bearing three times over. The rendered vocabulary
+    functions precede everything, because `graph.credited_on` generates a column
+    with one of them and four views call the others. The tables precede the
+    views, because `part_of`, `in_family`, and `release_degree` now read tables
+    rather than documents. And every migration that frees a name precedes the
+    relation that takes it, which is what `_graph_table_statements` returns.
+    """
     return [
         _GRAPH_SCHEMA_STATEMENT,
-        # The rendered taxonomy functions precede the views that call them.
+        _PG_TRGM_STATEMENT,
+        # The rendered vocabulary functions precede the relations that call them.
         ("graph.credit_role_category function", _credit_role_category_function()),
         ("graph.medium_label function", _medium_label_function()),
+        ("graph.mb_relationship_type function", _mb_relationship_type_function()),
+        *_graph_table_statements(),
         *_discogs_vertex_views(),
         *_discogs_edge_views(),
         *_musicbrainz_vertex_views(),
         *_musicbrainz_edge_views(),
         *_collection_views(),
         *_credit_views(),
+        *_counter_views(),
     ]
 
 
@@ -2178,12 +3089,24 @@ MUSICBRAINZ_RELATIONSHIP_LABEL = "mb_related"
 
 
 class _PropertyGraphVertex(NamedTuple):
-    """One vertex element table: a graph schema view, its key, and its properties."""
+    """One vertex element table: its label, its key, and its properties.
+
+    `view` is the alias and the label. `relation` is the graph-schema relation
+    underneath it, which differs from the label only for the four labels that
+    carry counters: those bind a `<label>_vertex` projection rather than the
+    storage relation of the same name. See `_counter_views`.
+    """
 
     view: str
     key: tuple[str, ...]
     # None means PROPERTIES ALL COLUMNS.
     properties: tuple[str, ...] | None = None
+    relation: str | None = None
+
+    @property
+    def element(self) -> str:
+        """Return the graph-schema relation this element table reads."""
+        return self.relation or self.view
 
 
 class _PropertyGraphEdge(NamedTuple):
@@ -2200,69 +3123,62 @@ class _PropertyGraphEdge(NamedTuple):
     properties: tuple[str, ...] | None = None
     extra_labels: tuple[str, ...] = ()
 
+    @property
+    def element(self) -> str:
+        """Return the graph-schema relation this element table reads.
 
-# The key column each Discogs vertex view exposes for the property graph to join
-# on. `artists.data_id` and its three siblings are `VARCHAR`, and PostgreSQL 19
-# beta3 rejects an edge whose SOURCE or DESTINATION resolves to a `character
-# varying` vertex key: it looks the equality operator up against the referenced
-# column's own type, and `varchar` registers none of its own — every `varchar =
-# varchar` comparison in PostgreSQL runs through a binary coercion to `text`.
-# `uuid`, `bigint`, `text`, and even `bpchar` all work; `varchar` and
-# `varchar(n)` do not. Retyping a published view column is a breaking change the
-# persistence contract forbids, and `CREATE OR REPLACE VIEW` refuses it outright,
-# so each of the four views instead *appends* a `text` restatement of its key —
-# the additive change the contract does allow. `<entity>_id` keeps its published
-# type and stays the property; `<entity>_key` is structural and is deliberately
-# left out of every property list.
-_DISCOGS_VERTEX_KEYS = {
-    "artist": "artist_key",
-    "label": "label_key",
-    "master": "master_key",
-    "release": "release_key",
-}
+        No edge label binds a relation of a different name, so this is always
+        the label itself. It exists so a caller can walk vertices and edges
+        together without knowing which kind it is holding.
+        """
+        return self.view
 
 
 def _property_graph_vertices() -> tuple[_PropertyGraphVertex, ...]:
     """Return every vertex element table of `graph.catalog`.
 
-    The explicit property lists are not decoration. SQL/PGQ requires every
-    property of a given name to have one data type across the whole graph, and
-    four names are spelled two ways by the views: `artist_id`, `label_id`, and
-    `master_id` are `character varying` where they are read from a catalog
-    table's `data_id` and `text` where they are read out of a JSONB document,
-    and `discogs_label_id` is `bigint` on the MusicBrainz side and `text` on the
-    Discogs side. Each is unified on `text`: the cast is total, it never
-    overflows the way `text -> bigint` can, and it is the type the JSONB half of
-    the graph already produces. `release_id` needs no cast — it is `character
-    varying` in all eleven views that expose it — so it keeps its published type,
-    and the asymmetry with `artist_id` is the price of casting only what the
-    rules force.
+    Every key is `text`, `uuid`, or `bigint` — never `character varying`.
+    PostgreSQL 19 beta 3 looks the equality operator up against the referenced
+    column's own type and `varchar` registers none of its own, so a `character
+    varying` vertex key makes every edge that points at it unresolvable. The
+    phase 0 declaration worked around that with four appended `<entity>_key`
+    restatements; the relations now publish `text` keys directly and the
+    workaround is retired. Labels and property names are unchanged by that: only
+    the key types moved.
+
+    The explicit property lists that remain are the two casts SQL/PGQ still
+    forces. A property name must have one data type across the whole graph, and
+    `discogs_label_id` is `bigint` on the MusicBrainz side and `text` on the
+    Discogs side, while `release_id` is `text` on every graph relation except
+    `graph.collected` and `graph.wants`, which read `releases.data_id` through a
+    join and publish it as `character varying`. Each is unified on `text`.
+
+    Four labels bind a relation of a different name. `genre`, `style`, `label`,
+    and `artist` read a `<label>_vertex` projection that joins the relation
+    holding their rows to the relation holding their counters, because Neo4j
+    carries those counters as node properties of exactly those four labels and
+    exact parity is the point: `MATCH (g IS genre) COLUMNS (g.release_count)`
+    reads as the Cypher it replaces. Attaching the counter relation to the same
+    label as a second element table is not an option — SQL/PGQ admits one
+    element table per label unless every table exposes an identical property
+    set, and PostgreSQL 19 beta 3 refuses the pair with `mismatching number of
+    properties in definition of label "genre"`. A view is one element table.
+
+    The projection is free when it is not read: the counter relation is unique
+    on the join column, so the planner removes the LEFT JOIN outright for a
+    query that names no counter, and the pilot two-hop plans identically over
+    the projection and over the storage relation alone.
+
+    `release_degree` is the one counter that stays a label of its own; see
+    `_counter_views` for the measurement behind that.
     """
     return (
-        _PropertyGraphVertex(
-            "artist",
-            ("artist_key",),
-            ("artist_id::text AS artist_id", "name", "gm_item_id", "hash", "updated_at"),
-        ),
-        _PropertyGraphVertex(
-            "label",
-            ("label_key",),
-            ("label_id::text AS label_id", "name", "gm_item_id", "hash", "updated_at"),
-        ),
-        _PropertyGraphVertex(
-            "master",
-            ("master_key",),
-            ("master_id::text AS master_id", "title", "year", "genres", "styles", "gm_item_id", "hash", "updated_at"),
-        ),
-        # No cast: `release_id` is `character varying` everywhere. The list exists
-        # only to keep the structural `release_key` column out of the properties.
-        _PropertyGraphVertex(
-            "release",
-            ("release_key",),
-            ("release_id", "title", "year", "country", "genres", "styles", "media_families", "gm_item_id", "hash", "updated_at"),
-        ),
-        _PropertyGraphVertex("genre", ("name",)),
-        _PropertyGraphVertex("style", ("name",)),
+        _PropertyGraphVertex("artist", ("artist_id",), relation="artist_vertex"),
+        _PropertyGraphVertex("label", ("label_id",), relation="label_vertex"),
+        _PropertyGraphVertex("master", ("master_id",)),
+        _PropertyGraphVertex("release", ("release_id",)),
+        _PropertyGraphVertex("genre", ("name",), relation="genre_vertex"),
+        _PropertyGraphVertex("style", ("name",), relation="style_vertex"),
         _PropertyGraphVertex("person", ("name",)),
         _PropertyGraphVertex("company", ("company_id",)),
         _PropertyGraphVertex("medium", ("medium_id",)),
@@ -2289,6 +3205,14 @@ def _property_graph_vertices() -> tuple[_PropertyGraphVertex, ...]:
         ),
         _PropertyGraphVertex("mb_release", ("mbid",)),
         _PropertyGraphVertex("mb_release_group", ("mbid",)),
+        # The one counter that is not a property of the label it describes. Its
+        # live half is a pair of lateral counts no unique key makes removable,
+        # so folding it onto `release` would double the plan of every traversal
+        # that binds a release. The counter relations behind the other four are
+        # loader-owned storage and are deliberately NOT declared as labels of
+        # their own: every property they carry is reachable on the Neo4j label,
+        # so a second label would be surface with no query behind it.
+        _PropertyGraphVertex("release_degree", ("release_id",)),
     )
 
 
@@ -2321,56 +3245,37 @@ def _musicbrainz_relationship_edges() -> list[_PropertyGraphEdge]:
 def _property_graph_edges() -> tuple[_PropertyGraphEdge, ...]:
     """Return every edge element table of `graph.catalog`.
 
-    Every key is the column set docs/architecture.md publishes for that view, and
-    every endpoint resolves to the `<entity>_key` restatement on the four Discogs
-    vertex views and to the published key column everywhere else.
+    Every key is the column set docs/architecture.md publishes for that
+    relation, and every endpoint now resolves to the published key column of its
+    vertex rather than to an appended restatement of it. `graph.collected` and
+    `graph.wants` carry the one remaining cast: their `release_id` comes through
+    a join on `releases.data_id` and is `character varying`, which is a legal
+    endpoint type but the wrong property type, so it is published as `text`.
     """
-    artist_key = _DISCOGS_VERTEX_KEYS["artist"]
-    label_key = _DISCOGS_VERTEX_KEYS["label"]
-    master_key = _DISCOGS_VERTEX_KEYS["master"]
-    release_key = _DISCOGS_VERTEX_KEYS["release"]
     return (
         _PropertyGraphEdge(
-            "by_artist", ("release_id", "artist_id"), ("release_id",), "release", (release_key,), ("artist_id",), "artist", (artist_key,)
-        ),
-        _PropertyGraphEdge("on_label", ("release_id", "label_id"), ("release_id",), "release", (release_key,), ("label_id",), "label", (label_key,)),
-        _PropertyGraphEdge(
-            "derived_from", ("release_id", "master_id"), ("release_id",), "release", (release_key,), ("master_id",), "master", (master_key,)
-        ),
-        _PropertyGraphEdge("in_genre", ("release_id", "genre_name"), ("release_id",), "release", (release_key,), ("genre_name",), "genre", ("name",)),
-        _PropertyGraphEdge("in_style", ("release_id", "style_name"), ("release_id",), "release", (release_key,), ("style_name",), "style", ("name",)),
-        _PropertyGraphEdge(
-            "master_by_artist",
-            ("master_id", "artist_id"),
-            ("master_id",),
-            "master",
-            (master_key,),
-            ("artist_id",),
-            "artist",
-            (artist_key,),
-            ("master_id::text AS master_id", "artist_id"),
+            "by_artist", ("release_id", "artist_id"), ("release_id",), "release", ("release_id",), ("artist_id",), "artist", ("artist_id",)
         ),
         _PropertyGraphEdge(
-            "master_in_genre",
-            ("master_id", "genre_name"),
-            ("master_id",),
-            "master",
-            (master_key,),
-            ("genre_name",),
-            "genre",
-            ("name",),
-            ("master_id::text AS master_id", "genre_name"),
+            "on_label", ("release_id", "label_id"), ("release_id",), "release", ("release_id",), ("label_id",), "label", ("label_id",)
         ),
         _PropertyGraphEdge(
-            "master_in_style",
-            ("master_id", "style_name"),
-            ("master_id",),
-            "master",
-            (master_key,),
-            ("style_name",),
-            "style",
-            ("name",),
-            ("master_id::text AS master_id", "style_name"),
+            "derived_from", ("release_id", "master_id"), ("release_id",), "release", ("release_id",), ("master_id",), "master", ("master_id",)
+        ),
+        _PropertyGraphEdge(
+            "in_genre", ("release_id", "genre_name"), ("release_id",), "release", ("release_id",), ("genre_name",), "genre", ("name",)
+        ),
+        _PropertyGraphEdge(
+            "in_style", ("release_id", "style_name"), ("release_id",), "release", ("release_id",), ("style_name",), "style", ("name",)
+        ),
+        _PropertyGraphEdge(
+            "master_by_artist", ("master_id", "artist_id"), ("master_id",), "master", ("master_id",), ("artist_id",), "artist", ("artist_id",)
+        ),
+        _PropertyGraphEdge(
+            "master_in_genre", ("master_id", "genre_name"), ("master_id",), "master", ("master_id",), ("genre_name",), "genre", ("name",)
+        ),
+        _PropertyGraphEdge(
+            "master_in_style", ("master_id", "style_name"), ("master_id",), "master", ("master_id",), ("style_name",), "style", ("name",)
         ),
         _PropertyGraphEdge("part_of", ("style_name", "genre_name"), ("style_name",), "style", ("name",), ("genre_name",), "genre", ("name",)),
         _PropertyGraphEdge(
@@ -2378,31 +3283,16 @@ def _property_graph_edges() -> tuple[_PropertyGraphEdge, ...]:
             ("member_artist_id", "group_artist_id"),
             ("member_artist_id",),
             "artist",
-            (artist_key,),
+            ("artist_id",),
             ("group_artist_id",),
             "artist",
-            (artist_key,),
-        ),
-        _PropertyGraphEdge(
-            "alias_of",
-            ("alias_artist_id", "artist_id"),
-            ("alias_artist_id",),
-            "artist",
-            (artist_key,),
             ("artist_id",),
-            "artist",
-            (artist_key,),
-            ("alias_artist_id", "artist_id::text AS artist_id"),
         ),
         _PropertyGraphEdge(
-            "sublabel_of",
-            ("sublabel_id", "parent_label_id"),
-            ("sublabel_id",),
-            "label",
-            (label_key,),
-            ("parent_label_id",),
-            "label",
-            (label_key,),
+            "alias_of", ("alias_artist_id", "artist_id"), ("alias_artist_id",), "artist", ("artist_id",), ("artist_id",), "artist", ("artist_id",)
+        ),
+        _PropertyGraphEdge(
+            "sublabel_of", ("sublabel_id", "parent_label_id"), ("sublabel_id",), "label", ("label_id",), ("parent_label_id",), "label", ("label_id",)
         ),
         _PropertyGraphEdge(
             "credited_on",
@@ -2412,15 +3302,15 @@ def _property_graph_edges() -> tuple[_PropertyGraphEdge, ...]:
             ("name",),
             ("release_id",),
             "release",
-            (release_key,),
+            ("release_id",),
         ),
-        _PropertyGraphEdge("same_as", ("person_name", "artist_id"), ("person_name",), "person", ("name",), ("artist_id",), "artist", (artist_key,)),
+        _PropertyGraphEdge("same_as", ("person_name", "artist_id"), ("person_name",), "person", ("name",), ("artist_id",), "artist", ("artist_id",)),
         _PropertyGraphEdge(
             "credited_to",
             ("release_id", "company_id", "role", "source"),
             ("release_id",),
             "release",
-            (release_key,),
+            ("release_id",),
             ("company_id",),
             "company",
             ("company_id",),
@@ -2430,23 +3320,45 @@ def _property_graph_edges() -> tuple[_PropertyGraphEdge, ...]:
             ("release_id", "medium_id", "source"),
             ("release_id",),
             "release",
-            (release_key,),
+            ("release_id",),
             ("medium_id",),
             "medium",
             ("medium_id",),
         ),
         _PropertyGraphEdge(
-            "in_family",
-            ("medium_id", "family_name"),
-            ("medium_id",),
-            "medium",
-            ("medium_id",),
-            ("family_name",),
-            "media_family",
-            ("name",),
+            "in_family", ("medium_id", "family_name"), ("medium_id",), "medium", ("medium_id",), ("family_name",), "media_family", ("name",)
         ),
-        _PropertyGraphEdge("collected", ("collection_id",), ("user_id",), "app_user", ("user_id",), ("release_id",), "release", (release_key,)),
-        _PropertyGraphEdge("wants", ("wantlist_id",), ("user_id",), "app_user", ("user_id",), ("release_id",), "release", (release_key,)),
+        # The two genre aggregates the owner asked for. They have no Neo4j
+        # counterpart: `graphinator` never wrote an artist-to-genre edge, and
+        # catalog-api answers the question today by walking `by_artist` into
+        # `in_genre` and counting. A keyed pair with the count on it replaces a
+        # two-hop expansion with one index read.
+        _PropertyGraphEdge(
+            "artist_genre", ("artist_id", "genre_name"), ("artist_id",), "artist", ("artist_id",), ("genre_name",), "genre", ("name",)
+        ),
+        _PropertyGraphEdge("label_genre", ("label_id", "genre_name"), ("label_id",), "label", ("label_id",), ("genre_name",), "genre", ("name",)),
+        _PropertyGraphEdge(
+            "collected",
+            ("collection_id",),
+            ("user_id",),
+            "app_user",
+            ("user_id",),
+            ("release_id",),
+            "release",
+            ("release_id",),
+            ("collection_id", "user_id", "release_id::text AS release_id", "instance_id", "folder_id", "condition", "rating", "date_added"),
+        ),
+        _PropertyGraphEdge(
+            "wants",
+            ("wantlist_id",),
+            ("user_id",),
+            "app_user",
+            ("user_id",),
+            ("release_id",),
+            "release",
+            ("release_id",),
+            ("wantlist_id", "user_id", "release_id::text AS release_id", "rating", "date_added"),
+        ),
         _PropertyGraphEdge("owns", ("owned_copy_id",), ("user_id",), "app_user", ("user_id",), ("item_id",), "catalog_item", ("item_id",)),
         *_musicbrainz_relationship_edges(),
     )
@@ -2475,7 +3387,7 @@ def _labels_and_properties(view: str, properties: tuple[str, ...] | None, extra_
 def _property_graph_statement() -> str:
     """Render CREATE PROPERTY GRAPH graph.catalog over the graph schema views."""
     vertices = [
-        f"        {PROPERTY_GRAPH_SCHEMA}.{vertex.view} AS {vertex.view} KEY {_columns(vertex.key)}\n"
+        f"        {PROPERTY_GRAPH_SCHEMA}.{vertex.element} AS {vertex.view} KEY {_columns(vertex.key)}\n"
         f"            {_labels_and_properties(vertex.view, vertex.properties)}"
         for vertex in _property_graph_vertices()
     ]
