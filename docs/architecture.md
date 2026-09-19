@@ -340,9 +340,9 @@ Every index and constraint above is additive within persistence contract v1 — 
 ## Graph schema
 
 The `graph` schema re-presents the catalog as the vertex and edge relations of the property
-graph the Neo4j enrichers already build. Sixty relations, declared in
+graph the Neo4j enrichers already build. Sixty-four relations, declared in
 [`src/groovemap_schema/postgres.py`](../src/groovemap_schema/postgres.py): twenty-seven
-loader-written tables and thirty-three read-only views over tables declared elsewhere in the
+loader-written tables and thirty-seven read-only views over tables declared elsewhere in the
 same module. The schema is additive within persistence contract v1:
 [the persistence compatibility contract](../contracts/persistence/) records every relation
 with its shape and its owner, the text key rule, and the property graph as additive objects of
@@ -748,11 +748,13 @@ loaders rather than after them.
 **The order is load-bearing.** Vertex tables fill before edge tables, because `part_of` and
 `in_family` inner-join the vertex tables and an edge written before its endpoints exist is
 silently absent rather than visibly wrong. Edge tables fill before the counters, because every
-counter is a sum over the edge tables and reads no document at all — filled first it would sum
-an empty relation and report a converged zero. `artist_genre` and `label_genre` sit with the
-counters for the same reason: both join `by_artist` or `on_label` to `in_genre`.
+counter's count is a sum over the edge tables — `genre_stats` and `style_stats` also join
+`graph.release` for `first_year`, a document-backed view, but every count column reads no
+document — filled first the counts would sum an empty relation and report a converged zero.
+`artist_genre` and `label_genre` sit with the counters for the same reason: both join
+`by_artist` or `on_label` to `in_genre`.
 
-Two known divergences from what the loaders write, both recorded in the contract under
+One known divergence from what the loaders write, recorded in the contract under
 `graph_schema.bootstrap`:
 
 - **Company ids for a company with no Discogs id.** The producer's rule keys such a company on
@@ -760,9 +762,11 @@ Two known divergences from what the loaders write, both recorded in the contract
   SQL `lower`, which is only an approximation of Python's `str.casefold` — they disagree on the
   German eszett and a handful of other characters. For those few names the loader's id is the
   right one and the fill's is not; the loader's row wins.
-- **`credited_on.role_category` is never written.** It is a generated column, so naming it in an
-  `INSERT` is an error rather than an overwrite. The engine computes it from `role`, which is in
-  the key, so the value is the same one the loader would produce.
+
+`credited_on.role_category` is never written by the fill either — it is a generated column, so
+naming it in an `INSERT` is an error rather than an overwrite — but that is not a second
+divergence: the engine computes it from `role`, which is in the key, so the fill produces the
+same value the loader would.
 
 The integration suite runs the fill against the real-engine fixture, compares every relation's
 row count to the retained phase 0 view, runs it a second time and asserts the rows are
@@ -1158,8 +1162,10 @@ The loaders write them into relations of their own:
 
 `discogs-sql-loader` refreshes all of them on the `extraction_complete` message it already
 handles, which is the same latch `graphinator` uses to start its own post-import pass — so
-they cost no new scheduler. Every one is a sum over the edge tables and none re-reads a JSONB
-document, which is what makes the pass affordable.
+they cost no new scheduler. Every count is a sum over the edge tables and none re-reads a
+JSONB document directly — `genre_stats` and `style_stats` do join `graph.release` for
+`first_year`, a document-backed view, but that lookup is a `min` over an indexed column, not a
+count — which is what keeps the pass affordable.
 
 **Four of them read back as properties of the label Neo4j carries them on.** That is the
 parity claim and it is the point of the whole arrangement: `MATCH (g IS genre) COLUMNS

@@ -3064,9 +3064,11 @@ _COUNTER_COLUMNS: dict[str, tuple[str, ...]] = {
 # - **Vertices before edges.** `part_of` and `in_family` inner-join the vertex
 #   tables, so an edge written before its endpoints exist is silently absent
 #   rather than wrong, and `genre_stats` reads `part_of`.
-# - **Edges before counters.** Every counter is a sum over the edge tables and
-#   reads no document at all; filled first it would sum an empty relation and
-#   report a converged zero.
+# - **Edges before counters.** Every counter's count is a sum over the edge
+#   tables — genre_stats and style_stats also join graph.release for
+#   first_year, a document-backed view, but the counts themselves read no
+#   document; filled first they would sum an empty relation and report a
+#   converged zero.
 # - **`artist_genre` and `label_genre` last**, with the other counters, because
 #   both join `by_artist`/`on_label` to `in_genre`.
 _BOOTSTRAP_FILL_ORDER: tuple[str, ...] = (*_MATERIALIZED_VERTICES, *_MATERIALIZED_EDGES, *tuple(_COUNTER_BOOTSTRAP))
