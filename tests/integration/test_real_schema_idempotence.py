@@ -1628,3 +1628,44 @@ async def test_the_bootstrap_fill_reproduces_the_phase_0_projection() -> None:
     await execute_all([("stale row", f"INSERT INTO graph.genre (name) VALUES ('{STALE_GENRE}')")])  # noqa: S608
     assert await run_the_bootstrap_fill() == reported
     assert await postgres_rows("SELECT count(*) FROM graph.genre WHERE name = %s", (STALE_GENRE,)) == [(0,)]
+
+
+# A release credited to several artists and carrying several genres, on a label
+# that owns nothing else. Before the fix, `label_stats.release_count` was a bare
+# `count(*)` over `on_label` LEFT JOINed to both `by_artist` and `in_genre`, so
+# this one release's two artists times its two genres reported a release_count
+# of four instead of one. Appended last, after every prior test in this module
+# has made its own full-relation assertions, so the extra label/release/genre
+# rows this seeds cannot perturb them.
+FANOUT_FIXTURE_LABEL_ID = "600"
+FANOUT_FIXTURE_RELEASE = {
+    "id": 601,
+    "title": "Fanout Release",
+    "artists": [{"id": 602, "name": "Fanout Artist One"}, {"id": 603, "name": "Fanout Artist Two"}],
+    "labels": [{"id": 600, "catno": "FAN1"}],
+    "genres": ["Fanout Genre One", "Fanout Genre Two"],
+}
+
+
+async def seed_label_stats_fanout_fixture() -> None:
+    """Write one release with two artists and two genres under one label."""
+    connection = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params())
+    async with connection, connection.cursor() as cursor:
+        await cursor.execute(
+            "INSERT INTO releases (data_id, hash, data) VALUES (%s, %s, %s) ON CONFLICT (data_id) DO NOTHING",
+            (str(FANOUT_FIXTURE_RELEASE["id"]), "hash-601", Jsonb(FANOUT_FIXTURE_RELEASE)),
+        )
+        await connection.commit()
+
+
+@pytest.mark.asyncio
+async def test_label_stats_release_count_does_not_fan_out_over_artists_and_genres() -> None:
+    """One release with two artists and two genres still counts once for its label."""
+    await apply_schema()
+    await seed_label_stats_fanout_fixture()
+    await bootstrap_the_loader_tables()
+
+    assert await postgres_rows(
+        "SELECT release_count, artist_count, genre_count FROM graph.label_stats WHERE label_id = %s",
+        (FANOUT_FIXTURE_LABEL_ID,),
+    ) == [(1, 2, 2)]

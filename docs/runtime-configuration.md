@@ -60,6 +60,26 @@ property graph and this initializer never drops a relation, so turning the switc
 remove the graph and changing the declaration does not roll out on its own; both are deliberate
 operator actions.
 
+## The bootstrap fill
+
+The initializer never writes a graph row — applying the schema declares
+`graph.bootstrap_fill()` and stops there, so a fresh database's `graph` relations start empty.
+An operator who needs those relations populated once, in an environment that already holds the
+`artists`/`labels`/`masters`/`releases`/`musicbrainz` documents but has not yet run a loader,
+calls the function directly against the target database:
+
+```sql
+SELECT * FROM graph.bootstrap_fill();
+```
+
+**It is not authoritative.** `discogs-sql-loader` and `musicbrainz-sql-loader` own every
+relation it touches and supersede whatever it wrote the first time either one runs; where the
+fill and a loader disagree, the loader is right. Nothing in this image calls it, and no
+environment variable enables it — it exists only for an operator to invoke by hand before the
+loaders have run, so a `catalog-api` read rewrite is not blocked on the dual-write. See
+[the bootstrap fill](architecture.md#the-bootstrap-fill) for the fill order, the emptying and
+refilling behavior, and its one known divergence from the loaders.
+
 ## Image and operational behavior
 
 The published image is `ghcr.io/groovemap-music/database-schema`. It runs as numeric user and
