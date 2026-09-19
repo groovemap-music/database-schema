@@ -40,6 +40,10 @@ echo "pathfinder"          && instantiate ''       'pf.edge'       "$INDEX_ORDER
 echo "pathfinder (no IS)"  && instantiate '_no_is' 'pf.edge_no_is' "$INDEX_ORDER_SQL"   "$COUNT_SIZES_SQL"  | psql_run -f -
 echo "pathfinder (degree)" && instantiate '_deg'   'pf.edge'       "$DEGREE_ORDER_SQL" "$DEGREE_SIZES_SQL" | psql_run -f -
 echo "hstore" && psql_run -f - < "$here/sql/hstore.sql"
+# `pf.bfs_all` lives here because it is how the endpoint cases were chosen, but
+# `hub-cost.sh` also needs it to re-measure the catalog's reach, so it is built
+# with everything else rather than applied by hand.
+echo "endpoint helper" && psql_run -f - < "$here/sql/pick-endpoints.sql" >/dev/null
 
 echo "edge classes"
 psql_run -c "SELECT rel, directed_rows FROM pf.edge_class ORDER BY directed_rows DESC"

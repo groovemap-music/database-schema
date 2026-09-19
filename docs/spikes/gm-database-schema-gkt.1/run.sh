@@ -12,6 +12,8 @@
 #   ./run.sh                       measure locally at the large scale
 #   ./run.sh local small           measure locally at the small scale
 #   ./run.sh --build small         build the local engines at a scale, no measuring
+#   ./run.sh --build-pg large      build only PostgreSQL, for the captures that
+#                                  never touch Neo4j (hub-cost.sh)
 #   ./run.sh --report <dir>        compare a results directory and render its tables
 #   ./run.sh --verify              regenerate the cross-mode tables and check that
 #                                  the spike document still matches them
@@ -51,11 +53,39 @@ scale_name() { case "$1" in small) echo fixture ;; large) echo synthetic ;; *) e
 # Free space is checked before anything large is written, because the failure
 # mode otherwise is a half-loaded catalog and a machine with no room to clean it
 # up. gm-database-schema-9c8.3 lost 3.4 GB to one unbounded statement.
+#
+# TWO filesystems matter and they are not the same one. A named volume lands
+# inside the Docker VM, which has its own disk; the host only has to have room
+# when that VM's disk image needs to GROW, and for the Neo4j build it also has
+# to hold the import CSV under ~/.cache before it is copied into a volume.
+#
+# An earlier revision checked the host alone and refused builds that would have
+# fitted easily — on this machine the host had 8 GiB free while the VM had 57 GiB
+# available, because removing a volume returns space to the VM and never shrinks
+# the image. Checking the wrong filesystem is worse than not checking: it stops
+# work that was safe and says nothing about the work that is not.
 require_disk() {
-    local need_gb="$1" avail
-    avail="$(df -g "$HOME" | awk 'NR==2 {print $4}')"
-    if (( avail < need_gb )); then
-        echo "only ${avail} GiB free; ${need_gb} GiB wanted. Stopping rather than filling the disk." >&2
+    local scale="$1" engine="$2" need_vm_gb need_host_gb avail_vm avail_host
+    case "$scale:$engine" in
+        large:postgres) need_vm_gb=12; need_host_gb=5 ;;
+        large:neo4j)    need_vm_gb=10; need_host_gb=7 ;;   # +CSV staging on the host
+        *:neo4j)        need_vm_gb=3;  need_host_gb=5 ;;
+        *)              need_vm_gb=3;  need_host_gb=5 ;;
+    esac
+
+    avail_host="$(df -g "$HOME" | awk 'NR==2 {print $4}')"
+    # `docker system df` reports images and volumes, not the filesystem holding
+    # them, so the free figure is read from inside a throwaway container.
+    avail_vm="$(docker run --rm alpine:latest df -BG / 2>/dev/null | awk 'NR==2 {gsub(/G/, "", $4); print $4}')"
+    avail_vm="${avail_vm:-0}"
+
+    if (( avail_vm < need_vm_gb )); then
+        echo "the Docker VM has ${avail_vm} GiB free; the $scale $engine build wants ${need_vm_gb} GiB there." >&2
+        echo "Run './run.sh --clean' first. Nothing this spike did not create is ever pruned." >&2
+        exit 1
+    fi
+    if (( avail_host < need_host_gb )); then
+        echo "the host has ${avail_host} GiB free; the $scale $engine build wants ${need_host_gb} GiB there." >&2
         exit 1
     fi
 }
@@ -63,7 +93,7 @@ require_disk() {
 build_postgres() {
     local scale="$1" generator_scale
     generator_scale="$(scale_name "$scale")"
-    require_disk 12
+    require_disk "$scale" postgres
 
     docker rm --force "$PG_CONTAINER" >/dev/null 2>&1 || true
     docker volume rm --force "$PG_VOLUME" >/dev/null 2>&1 || true
@@ -100,7 +130,7 @@ raise SystemExit(0 if asyncio.run(initializer._apply_postgres_schema(params)) el
 
 build_neo4j() {
     local scale="$1"
-    require_disk 10
+    require_disk "$scale" neo4j
     "$HERE/neo4j-build.sh" "$(scale_name "$scale")" "$RESULTS_ROOT/$scale-local" "$HOME/.cache/gmgkt1-spike/csv-$(scale_name "$scale")"
 }
 
@@ -376,6 +406,7 @@ run_clean() {
 case "${1:-}" in
     --help|-h)       sed -n '2,30p' "${BASH_SOURCE[0]}"; exit 0 ;;
     --build)         build_postgres "${2:-large}"; build_neo4j "${2:-large}"; exit 0 ;;
+    --build-pg)      build_postgres "${2:-large}"; exit 0 ;;
     --report)        report_dir "${2:?usage: --report <dir>}" "${3:-large}" "${4:-local}"; exit 0 ;;
     --verify)        cross_mode; exit 0 ;;
     --cloud)         run_cloud destroy; exit 0 ;;
