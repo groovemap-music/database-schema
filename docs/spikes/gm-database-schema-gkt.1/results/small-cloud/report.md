@@ -30,7 +30,10 @@ Neo4j: `Neo4j Kernel 2026.07.1 community`
 | `d4-artist-artist` | 4 | 49.5 | 60.5 | **3.43** |
 | `d5-artist-artist` | 5 | 63.5 | 56.2 | **3.52** |
 | `d6-artist-artist` | 6 | 66.6 | 72.8 | **3.80** |
-| `unreachable` | — | 38.1 | 21.4 | **2.33** |
+| `unreachable` | — | 29.5 | 13.4 | **2.94** |
+
+*30 timed iterations per row, after discarded warm-ups.*
+
 
 ### Shortest path, p95 — the Verdict gate is 1000 ms
 
@@ -43,7 +46,10 @@ Neo4j: `Neo4j Kernel 2026.07.1 community`
 | `d4-artist-artist` | 4 | 50.9 | 61.5 | **3.94** |
 | `d5-artist-artist` | 5 | 65.8 | 57.7 | **3.94** |
 | `d6-artist-artist` | 6 | 70.4 | 77.1 | **4.45** |
-| `unreachable` | — | 38.8 | 21.9 | **2.85** |
+| `unreachable` | — | 31.2 | 13.6 | **3.38** |
+
+*30 timed iterations per row, after discarded warm-ups.*
+
 
 ### Work done
 
@@ -56,7 +62,7 @@ Neo4j: `Neo4j Kernel 2026.07.1 community`
 | `d4-artist-artist` | 17 | 18 | 731 | 6,736 | 826 |
 | `d5-artist-artist` | 10 | 11 | 1,499 | 14,446 | 1,657 |
 | `d6-artist-artist` | 14 | 15 | 1,507 | 14,260 | 1,652 |
-| `unreachable` | 2 | 2 | 636 | 4,965 | 659 |
+| `unreachable` | 2 | 2 | 636 | 4,964 | 659 |
 
 ### Depth cap against the miss
 
@@ -70,6 +76,9 @@ Neo4j: `Neo4j Kernel 2026.07.1 community`
 | 8 | 38.5 | 21.4 | **2.39** |
 | 10 | 38.1 | 21.4 | **2.33** |
 
+*30 timed iterations per row, after discarded warm-ups.*
+
+
 ### Bounded explore traversal
 
 | Hops | `pf.explore` p50 | `pf.explore` p95 | Neo4j p50 | Neo4j DbHits | Rows |
@@ -77,6 +86,9 @@ Neo4j: `Neo4j Kernel 2026.07.1 community`
 | `*1..1` | 30.3 | 31.8 | **7.93** | 1,751 | 88 |
 | `*1..2` | 40.8 | 42.6 | **21.6** | 31,176 | 1276 |
 | `*1..3` | 33.0 | 34.3 | **354.6** | 1,726,462 | 1996 |
+
+*Timed iterations per row, after discarded warm-ups: 10 for 1 row, 30 for 5 rows.*
+
 
 ### The IS edge class, for information only
 
@@ -89,10 +101,13 @@ Neo4j: `Neo4j Kernel 2026.07.1 community`
 | `d4-artist-artist` | 49.5 | 41.7 | 1.19x |
 | `d5-artist-artist` | 63.5 | 33.2 | 1.91x |
 | `d6-artist-artist` | 66.6 | 37.2 | 1.79x |
-| `unreachable` | 38.1 | 28.6 | 1.33x |
+| `unreachable` | 29.5 | 28.6 | 1.03x |
 | `explore *1..1` | 30.3 | 29.8 | 1.02x |
 | `explore *1..2` | 40.8 | 40.7 | 1.00x |
 | `explore *1..3` | 33.0 | 39.3 | 0.84x |
+
+*30 timed iterations per row, after discarded warm-ups.*
+
 
 ### The seen set as a relation against an hstore
 
@@ -105,7 +120,10 @@ Neo4j: `Neo4j Kernel 2026.07.1 community`
 | `d4-artist-artist` | 49.5 | 20.1 |
 | `d5-artist-artist` | 63.5 | 38.2 |
 | `d6-artist-artist` | 66.6 | 42.3 |
-| `unreachable` | 38.1 | 9.63 |
+| `unreachable` | 29.5 | 9.63 |
+
+*Timed iterations per row, after discarded warm-ups: 5 for 8 rows, 30 for 8 rows.*
+
 
 ### Verdict gate
 

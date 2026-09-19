@@ -2,9 +2,9 @@
 
 +ProduceResults@neo4j  rows=1  dbHits=0
    nodes, rels
-  +Projection@neo4j  rows=1  dbHits=22
+  +Projection@neo4j  rows=1  dbHits=21
      [node IN nodes(p) | {id: coalesce(node.id, cache[node.name]), name: coalesce(cache[node.name], node.title, $autostring_0), labels: labels(node)}] AS nodes, [rel IN relationships(p) | type(rel)] AS rels
-    +ShortestPath@neo4j  rows=1  dbHits=150158
+    +ShortestPath@neo4j  rows=1  dbHits=150272
        p = (a)-[anon_0:BY|ON|IS|ALIAS_OF|MEMBER_OF|DERIVED_FROM*..10]-(b)
       +CartesianProduct@neo4j  rows=1  dbHits=0
         +NodeIndexSeek@neo4j  rows=1  dbHits=2

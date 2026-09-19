@@ -6,28 +6,28 @@
   "gate_p95_ms": 1000.0,
   "path": {
     "pf-vaat": {
-      "worst_p95_ms": 2379.233,
+      "worst_p95_ms": 1939.901,
       "over_gate": [
         {
-          "workload": "path/d6-artist-artist/pf-vaat",
-          "p95_ms": 2379.233,
-          "case": "d6-artist-artist"
+          "workload": "path/d5-artist-artist/pf-vaat",
+          "p95_ms": 1939.901,
+          "case": "d5-artist-artist"
         },
         {
-          "workload": "path/d5-artist-artist/pf-vaat",
-          "p95_ms": 1585.657,
-          "case": "d5-artist-artist"
+          "workload": "path/d6-artist-artist/pf-vaat",
+          "p95_ms": 1761.013,
+          "case": "d6-artist-artist"
         }
       ],
       "path_go": false,
       "go": false
     },
     "pf-vaat-deg": {
-      "worst_p95_ms": 3442.133,
+      "worst_p95_ms": 2246.436,
       "over_gate": [
         {
           "workload": "path/d6-artist-artist/pf-vaat-deg",
-          "p95_ms": 3442.133,
+          "p95_ms": 2246.436,
           "case": "d6-artist-artist"
         }
       ],
@@ -36,17 +36,17 @@
     }
   },
   "explore": {
-    "worst_p95_ms": 14.933,
+    "worst_p95_ms": 17.285,
     "over_gate": [],
     "go": true
   },
   "variants_passing": [],
   "measured_ceiling": {
     "variant": "pf-vaat",
-    "worst_p95_ms": 2379.233,
+    "worst_p95_ms": 1939.901,
     "cases_over_gate": [
-      "d6-artist-artist",
-      "d5-artist-artist"
+      "d5-artist-artist",
+      "d6-artist-artist"
     ]
   },
   "go": false

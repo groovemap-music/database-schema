@@ -26,7 +26,9 @@ One directory per (scale × mode), each holding the same five things.
 | `plans/` | One capture per headline workload. `EXPLAIN (ANALYZE, BUFFERS, VERBOSE)` for PostgreSQL, Cypher `PROFILE` for Neo4j. |
 | `calibration-*.json` | What the machine could do, measured by `../bench/calibration.py` on the machine itself. |
 | `neo4j-import-*.txt`, `neo4j-stats-*.txt` | The bulk import and the node and relationship counts it produced, so both engines can be shown to hold the same graph. |
-| `unbounded-explore.txt` | What `pf.explore` costs with the row limit removed. The single most load-bearing control in the document. |
+| `hub-expansion.txt` | One Genre vertex scanned, then scanned and inserted, three times each under `EXPLAIN (ANALYZE, BUFFERS)`. The evidence for the claim that a single hub write is the whole remaining gap. |
+| `coverage.txt` | An exhaustive breadth-first search out of the seed artist. The evidence that the catalog's eccentricity is 4, which the depth-cap recommendation rests on. |
+| `explore-row-limit.txt` | `pf.explore` with and without its row limit, in one capture. The single most load-bearing control in the document. |
 
 ## Reading the JSON
 
@@ -42,6 +44,16 @@ jq -r '.results[] | select(.variant=="pf-vaat" and .depth==10)
        | [.case, .answer.work.expanded, .answer.work.seen_rows, .accesses.total_accesses] | @tsv' \
    large-local/postgres-large-local.json
 ```
+
+## The three captures that are not benchmark output
+
+`hub-expansion.txt`, `coverage.txt` and `explore-row-limit.txt` come from
+`../hub-cost.sh` rather than from `../bench/runner.py`, because each answers a
+question about a single statement rather than about a workload's distribution.
+All three were originally run at a psql prompt and quoted from the terminal,
+which is the habit gm-database-schema-9c8.3 was bounced for; they are a committed
+script with committed output now, and every figure the document draws from them
+is a median of three repetitions rather than one sample.
 
 ## Two things a reader should check first
 

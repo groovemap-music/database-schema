@@ -30,7 +30,10 @@ Neo4j: `Neo4j Kernel 2026.07.1 community`
 | `d4-artist-artist` | 4 | 144.1 | 174.1 | **4.78** |
 | `d5-artist-artist` | 5 | 3,875 | 719.1 | **90.9** |
 | `d6-artist-artist` | 6 | 3,911 | 4,479 | **64.7** |
-| `unreachable` | — | 24.5 | 22.2 | **2.29** |
+| `unreachable` | — | 24.6 | 22.0 | **2.53** |
+
+*30 timed iterations per row, after discarded warm-ups.*
+
 
 ### Shortest path, p95 — the Verdict gate is 1000 ms
 
@@ -43,7 +46,10 @@ Neo4j: `Neo4j Kernel 2026.07.1 community`
 | `d4-artist-artist` | 4 | 145.5 | 177.4 | **5.13** |
 | `d5-artist-artist` | 5 | 4,059 | 729.1 | **101.0** |
 | `d6-artist-artist` | 6 | 4,131 | 4,518 | **72.9** |
-| `unreachable` | — | 24.8 | 22.8 | **2.80** |
+| `unreachable` | — | 25.9 | 22.3 | **2.99** |
+
+*30 timed iterations per row, after discarded warm-ups.*
+
 
 ### Work done
 
@@ -70,6 +76,9 @@ Neo4j: `Neo4j Kernel 2026.07.1 community`
 | 8 | 24.3 | 21.8 | **2.32** |
 | 10 | 24.5 | 22.2 | **2.29** |
 
+*30 timed iterations per row, after discarded warm-ups.*
+
+
 ### Bounded explore traversal
 
 | Hops | `pf.explore` p50 | `pf.explore` p95 | Neo4j p50 | Neo4j DbHits | Rows |
@@ -77,6 +86,9 @@ Neo4j: `Neo4j Kernel 2026.07.1 community`
 | `*1..1` | 23.4 | 24.1 | **2.72** | 123 | 2 |
 | `*1..2` | 46.5 | 48.0 | **11.7** | 3,017 | 270 |
 | `*1..3` | 46.9 | 48.7 | **5,295** | 24,902,823 | 2261 |
+
+*Timed iterations per row, after discarded warm-ups: 10 for 1 row, 30 for 5 rows.*
+
 
 ### The IS edge class, for information only
 
@@ -89,10 +101,13 @@ Neo4j: `Neo4j Kernel 2026.07.1 community`
 | `d4-artist-artist` | 144.1 | 101.2 | 1.42x |
 | `d5-artist-artist` | 3,875 | 42.3 | 91.69x |
 | `d6-artist-artist` | 3,911 | 311.2 | 12.57x |
-| `unreachable` | 24.5 | 22.8 | 1.07x |
+| `unreachable` | 24.6 | 22.8 | 1.08x |
 | `explore *1..1` | 23.4 | 22.7 | 1.03x |
 | `explore *1..2` | 46.5 | 39.3 | 1.18x |
 | `explore *1..3` | 46.9 | 38.6 | 1.22x |
+
+*30 timed iterations per row, after discarded warm-ups.*
+
 
 ### The seen set as a relation against an hstore
 
@@ -105,7 +120,10 @@ Neo4j: `Neo4j Kernel 2026.07.1 community`
 | `d4-artist-artist` | 144.1 | 141.7 |
 | `d5-artist-artist` | 3,875 | **QueryCanceled: canceling statement due to ** |
 | `d6-artist-artist` | 3,911 | **QueryCanceled: canceling statement due to ** |
-| `unreachable` | 24.5 | 2.95 |
+| `unreachable` | 24.6 | 2.95 |
+
+*Timed iterations per row, after discarded warm-ups: 5 for 6 rows, 30 for 8 rows.*
+
 
 ### Verdict gate
 

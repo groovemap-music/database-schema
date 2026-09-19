@@ -2,7 +2,7 @@
 
 +ProduceResults@neo4j  rows=100  dbHits=0
    id, name, type, path_names, rel_types, dist
-  +Projection@neo4j  rows=100  dbHits=123
+  +Projection@neo4j  rows=100  dbHits=100
      coalesce(cache[discovered.id], cache[discovered.name]) AS id, best.path_names AS path_names, coalesce(cache[discovered.name], cache[discovered.id]) AS name, best.rel_types AS rel_types, CASE
   WHEN discovered:Artist THEN $autostring_1
   WHEN discovered:Label THEN $autostring_2

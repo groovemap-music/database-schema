@@ -1,6 +1,6 @@
 {
   "calibration_version": 1,
-  "timestamp": "2026-09-19T01:15:02Z",
+  "timestamp": "2026-09-19T04:47:07Z",
   "system": {
     "platform": "Linux-6.8.0-117-generic-aarch64-with-glibc2.41",
     "machine": "aarch64",
@@ -12,45 +12,45 @@
   "benchmarks": {
     "cpu_single_thread": {
       "test": "cpu_single_thread_sha256",
-      "ops": 2305483,
+      "ops": 2382418,
       "duration_sec": 5.0,
-      "ops_per_sec": 461096.6
+      "ops_per_sec": 476483.6
     },
     "cpu_multi_thread": {
       "test": "cpu_multi_thread_sha256",
       "cores": 2,
-      "ops": 3616550,
+      "ops": 3739240,
       "duration_sec": 5.0,
-      "ops_per_sec": 723310.0
+      "ops_per_sec": 747848.0
     },
     "memory_bandwidth": {
       "test": "memory_bandwidth_64mb",
-      "write_mb_per_sec": 83965.7,
-      "read_mb_per_sec": 31606.5
+      "write_mb_per_sec": 87398.2,
+      "read_mb_per_sec": 38827.3
     },
     "disk_sequential_write": {
       "test": "disk_sequential_write",
       "size_mb": 256,
-      "duration_sec": 0.196,
-      "mb_per_sec": 1303.1
+      "duration_sec": 0.199,
+      "mb_per_sec": 1284.4
     },
     "disk_sequential_read": {
       "test": "disk_sequential_read",
       "size_mb": 256,
-      "duration_sec": 0.025,
-      "mb_per_sec": 10371.9
+      "duration_sec": 0.026,
+      "mb_per_sec": 9994.3
     },
     "disk_random_read": {
       "test": "disk_random_read_4k",
       "duration_sec": 5.0,
-      "iops": 455630.6
+      "iops": 492276.6
     },
     "python_sort": {
       "test": "python_sort_1m_floats",
       "elements": 1000000,
       "iterations": 5,
-      "avg_sec": 0.1919,
-      "sorts_per_sec": 5.212
+      "avg_sec": 0.1774,
+      "sorts_per_sec": 5.636
     }
   },
   "label": "Docker Desktop VM (local mode)"

@@ -1,9 +1,9 @@
 == postgres  path/unreachable-cap6/pf-vaat-deg  depth 6
 
-Function Scan on pf.find_path_deg  (cost=0.25..0.26 rows=1 width=61) (actual time=2.255..2.256 rows=1.00 loops=1)
+Function Scan on pf.find_path_deg  (cost=0.25..0.26 rows=1 width=61) (actual time=3.103..3.103 rows=1.00 loops=1)
   Output: found, depth, expanded, probes, seen_rows, levels
   Function Call: pf.find_path_deg('a'::"char", '5665'::text, 'a'::"char", '103111'::text, 6)
-  Buffers: shared hit=269 read=2 dirtied=5 written=3
-  I/O Timings: shared read=0.025 write=0.015
-Planning Time: 0.023 ms
-Execution Time: 2.263 ms
+  Buffers: shared hit=301 read=2 dirtied=5 written=3
+  I/O Timings: shared read=0.027 write=0.021
+Planning Time: 0.028 ms
+Execution Time: 3.119 ms
