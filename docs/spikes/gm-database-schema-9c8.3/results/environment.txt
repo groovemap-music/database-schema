@@ -1,0 +1,24 @@
+== host
+Apple M1 Pro
+cores: 10 physical / 10 logical
+ram: 32 GiB
+ProductName:		macOS
+ProductVersion:		26.6.2
+BuildVersion:		25G83
+
+== docker
+Engine 29.5.2
+VM: 2 vCPU, 8307621888 bytes, kernel 6.8.0-117-generic, Ubuntu 24.04.4 LTS
+
+== postgres
+PostgreSQL 19beta3 on aarch64-unknown-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit
+postgres@sha256:b1692e50613a21e61c424859f943b9e193ae73e5a8c68abd5382dfb235bf15fc
+effective_cache_size=524288
+jit=off
+maintenance_work_mem=524288
+max_parallel_workers=2
+max_parallel_workers_per_gather=2
+random_page_cost=1.1
+shared_buffers=196608
+track_io_timing=on
+work_mem=131072

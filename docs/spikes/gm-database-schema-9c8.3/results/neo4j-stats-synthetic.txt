@@ -1,0 +1,24 @@
+scale: synthetic   heap: 2G   pagecache: 2G
+name, versions, edition
+"Neo4j Kernel", ["2026.07.1"], "community"
+"Cypher", ["5", "25"], ""
+label, nodes
+"Artist", 120000
+"Genre", 15
+"Label", 20000
+"Master", 250000
+"Release", 1000000
+"Style", 440
+type, rels
+"ALIAS_OF", 22453
+"BY", 2320462
+"COLLABORATED_WITH", 36636
+"DERIVED_FROM", 700388
+"FOUNDER_OF", 36317
+"IS", 4887793
+"MEMBER_OF", 58778
+"ON", 1329094
+"SIBLING_OF", 36539
+"SUPPORTING_MUSICIAN", 36527
+"TRIBUTE_TO", 36277
+"VOICE_ACTOR_FOR", 36431

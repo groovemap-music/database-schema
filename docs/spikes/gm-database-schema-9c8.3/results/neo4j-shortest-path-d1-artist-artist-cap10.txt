@@ -1,0 +1,67 @@
+== shortest-path  d1-artist-artist  cap 10
+:param from_id => '5665';
+:param to_id => '9458';
+// find_shortest_path, verbatim from api/queries/neo4j_queries.py:97, with the
+// three values that function interpolates rather than parameterises filled in:
+// the two node labels and the depth. `max_depth` CANNOT be a Cypher parameter —
+// that is the reason the function clamps it to [1, 10] server-side, and the
+// reason this file is a template rather than a query.
+//
+// Artist id Artist id 10
+MATCH (a:Artist {id: $from_id}), (b:Artist {id: $to_id})
+MATCH p = shortestPath((a)-[:BY|ON|IS|ALIAS_OF|MEMBER_OF|DERIVED_FROM*..10]-(b))
+RETURN [node IN nodes(p) | {
+           id: coalesce(node.id, node.name),
+           name: coalesce(node.name, node.title, ''),
+           labels: labels(node)
+       }] AS nodes,
+       [rel IN relationships(p) | type(rel)] AS rels;
+-- PROFILE
++-------------------------------------------------------------------------------------------------------------------------------------+
+| nodes                                                                                                               | rels          |
++-------------------------------------------------------------------------------------------------------------------------------------+
+| [{name: "Willow Union", id: "5665", labels: ["Artist"]}, {name: "Saffron Network", id: "9458", labels: ["Artist"]}] | ["MEMBER_OF"] |
++-------------------------------------------------------------------------------------------------------------------------------------+
+
++-------------------------------------------------------------------------------------------------+
+| Plan      | Statement   | Version | Planner | Runtime   | Time | DbHits | Rows | Memory (Bytes) |
++-------------------------------------------------------------------------------------------------+
+| "PROFILE" | "READ_ONLY" | "25"    | "COST"  | "SLOTTED" | 270  | 13     | 1    | 3040           |
++-------------------------------------------------------------------------------------------------+
+
+
+Cypher 25
+
+Planner COST
+
+Runtime SLOTTED
+
+Runtime version 2026.07.1
+
++-------------------+----+------------------------------------------------------------------------------------------------------+----------------+------+---------+----------------+------------------------+--------------+
+| Operator          | Id | Details                                                                                              | Estimated Rows | Rows | DB Hits | Memory (Bytes) | Page Cache Hits/Misses | Indexes Used |
++-------------------+----+------------------------------------------------------------------------------------------------------+----------------+------+---------+----------------+------------------------+--------------+
+| +ProduceResults   |  0 | nodes, rels                                                                                          |              1 |    1 |       0 |              0 |                    0/0 |              |
+| |                 +----+------------------------------------------------------------------------------------------------------+----------------+------+---------+----------------+------------------------+--------------+
+| +Projection       |  1 | [node IN nodes(p) | {id: coalesce(node.id, cache[node.name]), name: coalesce(cache[node.name], node. |              1 |    1 |       6 |                |                    0/0 |              |
+| |                 |    | title, $autostring_0), labels: labels(node)}] AS nodes,                                              |                |      |         |                |                        |              |
+| |                 |    | [rel IN relationships(p) | type(rel)] AS rels                                                        |                |      |         |                |                        |              |
+| |                 +----+------------------------------------------------------------------------------------------------------+----------------+------+---------+----------------+------------------------+--------------+
+| +ShortestPath     |  2 | p = (a)-[anon_0:BY|ON|IS|ALIAS_OF|MEMBER_OF|DERIVED_FROM*..10]-(b)                                   |              1 |    1 |       3 |           2976 |                    0/0 |              |
+| |                 +----+------------------------------------------------------------------------------------------------------+----------------+------+---------+----------------+------------------------+--------------+
+| +CartesianProduct |  3 |                                                                                                      |              1 |    1 |       0 |                |                    0/0 |              |
+| |\                +----+------------------------------------------------------------------------------------------------------+----------------+------+---------+----------------+------------------------+--------------+
+| | +NodeIndexSeek  |  4 | RANGE INDEX b:Artist(id) WHERE id = $to_id                                                           |              1 |    1 |       2 |                |                    0/0 | artist_id: 1 |
+| |                 +----+------------------------------------------------------------------------------------------------------+----------------+------+---------+----------------+------------------------+--------------+
+| +NodeIndexSeek    |  5 | RANGE INDEX a:Artist(id) WHERE id = $from_id                                                         |              1 |    1 |       2 |                |                    0/0 | artist_id: 1 |
++-------------------+----+------------------------------------------------------------------------------------------------------+----------------+------+---------+----------------+------------------------+--------------+
+
+Total database accesses: 13, total allocated memory: 3040
+
+1 row
+ready to start consuming query after 254 ms, results consumed after another 16 ms
+-- wall clock, one discarded warm-up then 3 timed runs
+ready to start consuming query after 39 ms, results consumed after another 1 ms
+ready to start consuming query after 3 ms, results consumed after another 2 ms
+ready to start consuming query after 2 ms, results consumed after another 3 ms
+ready to start consuming query after 1 ms, results consumed after another 1 ms
