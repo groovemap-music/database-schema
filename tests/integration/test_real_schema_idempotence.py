@@ -108,6 +108,8 @@ EXPECTED_COLUMNS = {
     ("musicbrainz", "release_groups", "discogs_master_id", "bigint"),
     ("musicbrainz", "releases", "discogs_release_id", "bigint"),
     ("musicbrainz", "releases", "media", "jsonb"),
+    ("musicbrainz", "relationships", "updated_at", "timestamp with time zone"),
+    ("musicbrainz", "external_links", "updated_at", "timestamp with time zone"),
 }
 
 # The endpoint-pair indexes every one of the sixteen typed MusicBrainz
@@ -117,6 +119,8 @@ EXPECTED_MUSICBRAINZ_INDEXES = {
     ("musicbrainz", "relationships", "idx_mb_rels_endpoint_target"),
     ("musicbrainz", "relationships", "idx_mb_rels_type"),
     ("musicbrainz", "artists", "idx_mb_artists_discogs_id"),
+    ("musicbrainz", "relationships", "idx_mb_rels_updated_at"),
+    ("musicbrainz", "external_links", "idx_mb_links_updated_at"),
 }
 
 # Native identity keys rely on the engine's built-in uuidv7(), which both the required
