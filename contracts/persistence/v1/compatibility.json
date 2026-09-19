@@ -1,11 +1,5 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "compatibility": {
-    "additive_changes": "compatible",
-    "consumer_rollout": "expand, migrate consumers, then contract",
-    "destructive_changes": "require a new major contract and an explicit migration",
-    "rollback": "every destructive migration requires a tested rollback or restore procedure"
-  },
   "application_runtime": {
     "package": "groovemap-runtime",
     "required_capabilities": [
@@ -13,36 +7,34 @@
       "otel",
       "postgres"
     ],
-    "tested_version": "0.1.0",
-    "tested_commit": "6e84fe9acfd9551bd3bba2f2e78fef0ec1ef38ef"
+    "tested_commit": "6e84fe9acfd9551bd3bba2f2e78fef0ec1ef38ef",
+    "tested_version": "0.1.0"
+  },
+  "compatibility": {
+    "additive_changes": "compatible",
+    "consumer_rollout": "expand, migrate consumers, then contract",
+    "destructive_changes": "require a new major contract and an explicit migration",
+    "rollback": "every destructive migration requires a tested rollback or restore procedure"
   },
   "contract": "groovemap.persistence",
   "graph_schema": {
     "availability": "unconditional",
     "documentation": "docs/architecture.md#graph-schema",
+    "edge_relations": 38,
     "functions": [
       "graph.credit_role_category",
+      "graph.mb_relationship_type",
       "graph.medium_label"
     ],
     "introduced_in_contract_version": 1,
-    "kind": "additive",
-    "note": "Read-only views over tables declared elsewhere in this contract. Nothing is materialized and no base table changes, so a consumer promotes to a commit carrying them without a migration.",
-    "schema": "graph",
-    "vertex_views": 16,
-    "edge_views": 36,
-    "views": 52,
-    "appended_key_columns": {
+    "key_columns": {
       "availability": "unconditional",
-      "columns": [
-        "graph.artist.artist_key",
-        "graph.label.label_key",
-        "graph.master.master_key",
-        "graph.release.release_key"
-      ],
       "kind": "additive",
-      "note": "Appended after the published columns of the four Discogs vertex views on every engine, including PostgreSQL 18 with the property graph switch off. Structural only: each restates its view's <entity>_id as text because PostgreSQL 19 beta 3 rejects a character varying vertex key. Not declared as a property graph property; <entity>_id keeps its published type.",
+      "note": "Every key column of every graph relation is text. PostgreSQL 19 beta 3 cannot resolve an equality operator for a character varying property-graph vertex key, so the four Discogs vertex views publish data_id::text and the loader-written tables are declared text from the start. This retires the graph.artist.artist_key, graph.label.label_key, graph.master.master_key, and graph.release.release_key restatements the phase 0 views appended for the same reason; nothing but CREATE PROPERTY GRAPH ever read them and they were never declared as properties.",
       "type": "text"
     },
+    "kind": "additive",
+    "note": "Twenty relations are loader-written tables and the rest are read-only views over tables declared elsewhere in this contract. Seven further tables hold the counters, degrees, and genre aggregates the graph enrichers compute today. This repository declares every one of them and writes rows into none: the owner named against each relation does that, so an empty table on a fresh database is the expected state rather than a fault.",
     "property_graph": {
       "absent_on": "PostgreSQL 18, and PostgreSQL 19 with the switch off",
       "availability": "conditional",
@@ -52,12 +44,258 @@
       ],
       "consumer_rule": "consumers must not assume it exists; probe pg_class for a relation named catalog in schema graph, of relkind g, and fall back to the views, which are always present",
       "documentation": "docs/architecture.md#property-graph",
-      "edge_tables": 36,
+      "edge_tables": 38,
       "kind": "additive",
       "name": "graph.catalog",
-      "note": "A SQL/PGQ declaration over the graph schema's views, applied after the rest of the PostgreSQL schema. A closed gate is logged and is not a failure. There is no IF NOT EXISTS for a property graph and this initializer never drops one, so an existing graph.catalog is left as it is and a changed declaration does not roll out on its own.",
-      "vertex_tables": 16
+      "note": "A SQL/PGQ declaration over the graph schema's tables and views, applied after the rest of the PostgreSQL schema. A closed gate is logged and is not a failure. There is no IF NOT EXISTS for a property graph and this initializer never drops one except through a shape migration that re-declares it on the same run, so an existing graph.catalog is otherwise left as it is and a changed declaration does not roll out on its own.",
+      "vertex_tables": 21
     },
+    "relation_count": 60,
+    "relations": {
+      "alias_of": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "app_user": {
+        "owner": "catalog-api",
+        "shape": "view"
+      },
+      "artist": {
+        "owner": "discogs-sql-loader",
+        "shape": "view"
+      },
+      "artist_degree": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "artist_genre": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "by_artist": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "catalog_item": {
+        "owner": "catalog-api",
+        "shape": "view"
+      },
+      "collected": {
+        "owner": "catalog-api",
+        "shape": "view"
+      },
+      "company": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "credited_on": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "credited_to": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "derived_from": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "genre": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "genre_stats": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "in_family": {
+        "owner": "discogs-sql-loader, musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "in_genre": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "in_style": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "issued_on": {
+        "owner": "discogs-sql-loader, musicbrainz-sql-loader",
+        "shape": "table"
+      },
+      "label": {
+        "owner": "discogs-sql-loader",
+        "shape": "view"
+      },
+      "label_genre": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "label_stats": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "master": {
+        "owner": "discogs-sql-loader",
+        "shape": "view"
+      },
+      "master_by_artist": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "master_in_genre": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "master_in_style": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "mb_artist": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_label": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_rel_artist_artist": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_rel_artist_label": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_rel_artist_release": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_rel_artist_release_group": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_rel_label_artist": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_rel_label_label": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_rel_label_release": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_rel_label_release_group": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_rel_release_artist": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_rel_release_group_artist": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_rel_release_group_label": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_rel_release_group_release": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_rel_release_group_release_group": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_rel_release_label": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_rel_release_release": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_rel_release_release_group": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_release": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "mb_release_group": {
+        "owner": "musicbrainz-sql-loader",
+        "shape": "view"
+      },
+      "media_family": {
+        "owner": "discogs-sql-loader, musicbrainz-sql-loader",
+        "shape": "table"
+      },
+      "medium": {
+        "owner": "discogs-sql-loader, musicbrainz-sql-loader",
+        "shape": "table"
+      },
+      "member_of": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "on_label": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "owns": {
+        "owner": "catalog-api",
+        "shape": "view"
+      },
+      "part_of": {
+        "owner": "discogs-sql-loader",
+        "shape": "view"
+      },
+      "person": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "release": {
+        "owner": "discogs-sql-loader",
+        "shape": "view"
+      },
+      "release_degree": {
+        "owner": "discogs-sql-loader, catalog-api",
+        "shape": "view"
+      },
+      "release_degree_base": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "same_as": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "style": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "style_stats": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "sublabel_of": {
+        "owner": "discogs-sql-loader",
+        "shape": "view"
+      },
+      "wants": {
+        "owner": "catalog-api",
+        "shape": "view"
+      }
+    },
+    "schema": "graph",
+    "tables": 27,
+    "vertex_relations": 21,
     "view_evolution": {
       "allowed": "appending a column to the end of an existing view",
       "engine_enforcement": "CREATE OR REPLACE VIEW fails the statement outright rather than replacing the view",
@@ -68,8 +306,10 @@
         "retyping a column"
       ],
       "migration": "expand, migrate consumers, then contract, with a coordinated DROP ... CASCADE",
-      "rule": "append-only"
-    }
+      "rule": "append-only",
+      "shape_change": "A relation that becomes a loader-written table is replaced by a guarded migration that drops the view only when one is still there, in the same pass that creates the table. The published column names survive the change; the key columns are retyped from character varying to text, which psycopg returns identically."
+    },
+    "views": 33
   },
   "owners": [
     "database-schema"

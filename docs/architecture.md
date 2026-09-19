@@ -585,14 +585,14 @@ every supported engine gets, and this one is conditional. It is rendered here in
 ```sql
 CREATE PROPERTY GRAPH graph.catalog
     VERTEX TABLES (
-        graph.artist AS artist KEY (artist_key)
-            LABEL artist PROPERTIES (artist_id::text AS artist_id, name, gm_item_id, hash, updated_at),
-        graph.label AS label KEY (label_key)
-            LABEL label PROPERTIES (label_id::text AS label_id, name, gm_item_id, hash, updated_at),
-        graph.master AS master KEY (master_key)
-            LABEL master PROPERTIES (master_id::text AS master_id, title, year, genres, styles, gm_item_id, hash, updated_at),
-        graph.release AS release KEY (release_key)
-            LABEL release PROPERTIES (release_id, title, year, country, genres, styles, media_families, gm_item_id, hash, updated_at),
+        graph.artist AS artist KEY (artist_id)
+            LABEL artist PROPERTIES ALL COLUMNS,
+        graph.label AS label KEY (label_id)
+            LABEL label PROPERTIES ALL COLUMNS,
+        graph.master AS master KEY (master_id)
+            LABEL master PROPERTIES ALL COLUMNS,
+        graph.release AS release KEY (release_id)
+            LABEL release PROPERTIES ALL COLUMNS,
         graph.genre AS genre KEY (name)
             LABEL genre PROPERTIES ALL COLUMNS,
         graph.style AS style KEY (name)
@@ -616,85 +616,103 @@ CREATE PROPERTY GRAPH graph.catalog
         graph.mb_release AS mb_release KEY (mbid)
             LABEL mb_release PROPERTIES ALL COLUMNS,
         graph.mb_release_group AS mb_release_group KEY (mbid)
-            LABEL mb_release_group PROPERTIES ALL COLUMNS
+            LABEL mb_release_group PROPERTIES ALL COLUMNS,
+        graph.genre_stats AS genre_stats KEY (name)
+            LABEL genre_stats PROPERTIES ALL COLUMNS,
+        graph.style_stats AS style_stats KEY (name)
+            LABEL style_stats PROPERTIES ALL COLUMNS,
+        graph.label_stats AS label_stats KEY (label_id)
+            LABEL label_stats PROPERTIES ALL COLUMNS,
+        graph.artist_degree AS artist_degree KEY (artist_id)
+            LABEL artist_degree PROPERTIES ALL COLUMNS,
+        graph.release_degree AS release_degree KEY (release_id)
+            LABEL release_degree PROPERTIES ALL COLUMNS
     )
     EDGE TABLES (
         graph.by_artist AS by_artist KEY (release_id, artist_id)
-            SOURCE KEY (release_id) REFERENCES release (release_key)
-            DESTINATION KEY (artist_id) REFERENCES artist (artist_key)
+            SOURCE KEY (release_id) REFERENCES release (release_id)
+            DESTINATION KEY (artist_id) REFERENCES artist (artist_id)
             LABEL by_artist PROPERTIES ALL COLUMNS,
         graph.on_label AS on_label KEY (release_id, label_id)
-            SOURCE KEY (release_id) REFERENCES release (release_key)
-            DESTINATION KEY (label_id) REFERENCES label (label_key)
+            SOURCE KEY (release_id) REFERENCES release (release_id)
+            DESTINATION KEY (label_id) REFERENCES label (label_id)
             LABEL on_label PROPERTIES ALL COLUMNS,
         graph.derived_from AS derived_from KEY (release_id, master_id)
-            SOURCE KEY (release_id) REFERENCES release (release_key)
-            DESTINATION KEY (master_id) REFERENCES master (master_key)
+            SOURCE KEY (release_id) REFERENCES release (release_id)
+            DESTINATION KEY (master_id) REFERENCES master (master_id)
             LABEL derived_from PROPERTIES ALL COLUMNS,
         graph.in_genre AS in_genre KEY (release_id, genre_name)
-            SOURCE KEY (release_id) REFERENCES release (release_key)
+            SOURCE KEY (release_id) REFERENCES release (release_id)
             DESTINATION KEY (genre_name) REFERENCES genre (name)
             LABEL in_genre PROPERTIES ALL COLUMNS,
         graph.in_style AS in_style KEY (release_id, style_name)
-            SOURCE KEY (release_id) REFERENCES release (release_key)
+            SOURCE KEY (release_id) REFERENCES release (release_id)
             DESTINATION KEY (style_name) REFERENCES style (name)
             LABEL in_style PROPERTIES ALL COLUMNS,
         graph.master_by_artist AS master_by_artist KEY (master_id, artist_id)
-            SOURCE KEY (master_id) REFERENCES master (master_key)
-            DESTINATION KEY (artist_id) REFERENCES artist (artist_key)
-            LABEL master_by_artist PROPERTIES (master_id::text AS master_id, artist_id),
+            SOURCE KEY (master_id) REFERENCES master (master_id)
+            DESTINATION KEY (artist_id) REFERENCES artist (artist_id)
+            LABEL master_by_artist PROPERTIES ALL COLUMNS,
         graph.master_in_genre AS master_in_genre KEY (master_id, genre_name)
-            SOURCE KEY (master_id) REFERENCES master (master_key)
+            SOURCE KEY (master_id) REFERENCES master (master_id)
             DESTINATION KEY (genre_name) REFERENCES genre (name)
-            LABEL master_in_genre PROPERTIES (master_id::text AS master_id, genre_name),
+            LABEL master_in_genre PROPERTIES ALL COLUMNS,
         graph.master_in_style AS master_in_style KEY (master_id, style_name)
-            SOURCE KEY (master_id) REFERENCES master (master_key)
+            SOURCE KEY (master_id) REFERENCES master (master_id)
             DESTINATION KEY (style_name) REFERENCES style (name)
-            LABEL master_in_style PROPERTIES (master_id::text AS master_id, style_name),
+            LABEL master_in_style PROPERTIES ALL COLUMNS,
         graph.part_of AS part_of KEY (style_name, genre_name)
             SOURCE KEY (style_name) REFERENCES style (name)
             DESTINATION KEY (genre_name) REFERENCES genre (name)
             LABEL part_of PROPERTIES ALL COLUMNS,
         graph.member_of AS member_of KEY (member_artist_id, group_artist_id)
-            SOURCE KEY (member_artist_id) REFERENCES artist (artist_key)
-            DESTINATION KEY (group_artist_id) REFERENCES artist (artist_key)
+            SOURCE KEY (member_artist_id) REFERENCES artist (artist_id)
+            DESTINATION KEY (group_artist_id) REFERENCES artist (artist_id)
             LABEL member_of PROPERTIES ALL COLUMNS,
         graph.alias_of AS alias_of KEY (alias_artist_id, artist_id)
-            SOURCE KEY (alias_artist_id) REFERENCES artist (artist_key)
-            DESTINATION KEY (artist_id) REFERENCES artist (artist_key)
-            LABEL alias_of PROPERTIES (alias_artist_id, artist_id::text AS artist_id),
+            SOURCE KEY (alias_artist_id) REFERENCES artist (artist_id)
+            DESTINATION KEY (artist_id) REFERENCES artist (artist_id)
+            LABEL alias_of PROPERTIES ALL COLUMNS,
         graph.sublabel_of AS sublabel_of KEY (sublabel_id, parent_label_id)
-            SOURCE KEY (sublabel_id) REFERENCES label (label_key)
-            DESTINATION KEY (parent_label_id) REFERENCES label (label_key)
+            SOURCE KEY (sublabel_id) REFERENCES label (label_id)
+            DESTINATION KEY (parent_label_id) REFERENCES label (label_id)
             LABEL sublabel_of PROPERTIES ALL COLUMNS,
         graph.credited_on AS credited_on KEY (person_name, release_id, role)
             SOURCE KEY (person_name) REFERENCES person (name)
-            DESTINATION KEY (release_id) REFERENCES release (release_key)
+            DESTINATION KEY (release_id) REFERENCES release (release_id)
             LABEL credited_on PROPERTIES ALL COLUMNS,
         graph.same_as AS same_as KEY (person_name, artist_id)
             SOURCE KEY (person_name) REFERENCES person (name)
-            DESTINATION KEY (artist_id) REFERENCES artist (artist_key)
+            DESTINATION KEY (artist_id) REFERENCES artist (artist_id)
             LABEL same_as PROPERTIES ALL COLUMNS,
         graph.credited_to AS credited_to KEY (release_id, company_id, role, source)
-            SOURCE KEY (release_id) REFERENCES release (release_key)
+            SOURCE KEY (release_id) REFERENCES release (release_id)
             DESTINATION KEY (company_id) REFERENCES company (company_id)
             LABEL credited_to PROPERTIES ALL COLUMNS,
         graph.issued_on AS issued_on KEY (release_id, medium_id, source)
-            SOURCE KEY (release_id) REFERENCES release (release_key)
+            SOURCE KEY (release_id) REFERENCES release (release_id)
             DESTINATION KEY (medium_id) REFERENCES medium (medium_id)
             LABEL issued_on PROPERTIES ALL COLUMNS,
         graph.in_family AS in_family KEY (medium_id, family_name)
             SOURCE KEY (medium_id) REFERENCES medium (medium_id)
             DESTINATION KEY (family_name) REFERENCES media_family (name)
             LABEL in_family PROPERTIES ALL COLUMNS,
+        graph.artist_genre AS artist_genre KEY (artist_id, genre_name)
+            SOURCE KEY (artist_id) REFERENCES artist (artist_id)
+            DESTINATION KEY (genre_name) REFERENCES genre (name)
+            LABEL artist_genre PROPERTIES ALL COLUMNS,
+        graph.label_genre AS label_genre KEY (label_id, genre_name)
+            SOURCE KEY (label_id) REFERENCES label (label_id)
+            DESTINATION KEY (genre_name) REFERENCES genre (name)
+            LABEL label_genre PROPERTIES ALL COLUMNS,
         graph.collected AS collected KEY (collection_id)
             SOURCE KEY (user_id) REFERENCES app_user (user_id)
-            DESTINATION KEY (release_id) REFERENCES release (release_key)
-            LABEL collected PROPERTIES ALL COLUMNS,
+            DESTINATION KEY (release_id) REFERENCES release (release_id)
+            LABEL collected PROPERTIES (collection_id, user_id, release_id::text AS release_id, instance_id, folder_id, condition, rating, date_added),
         graph.wants AS wants KEY (wantlist_id)
             SOURCE KEY (user_id) REFERENCES app_user (user_id)
-            DESTINATION KEY (release_id) REFERENCES release (release_key)
-            LABEL wants PROPERTIES ALL COLUMNS,
+            DESTINATION KEY (release_id) REFERENCES release (release_id)
+            LABEL wants PROPERTIES (wantlist_id, user_id, release_id::text AS release_id, rating, date_added),
         graph.owns AS owns KEY (owned_copy_id)
             SOURCE KEY (user_id) REFERENCES app_user (user_id)
             DESTINATION KEY (item_id) REFERENCES catalog_item (item_id)

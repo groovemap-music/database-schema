@@ -34,22 +34,59 @@ assert contract["sources"] == [
 ]
 
 # The graph schema is recorded as an additive object of contract v1. Every count
-# below is read back from the statement list rather than restated, so a view
-# added or removed in postgres.py fails this check instead of silently making the
-# contract a stale description of the schema consumers read.
+# and every relation below is read back from the statement list rather than
+# restated, so a relation added, removed, or reshaped in postgres.py fails this
+# check instead of silently making the contract a stale description of the schema
+# consumers read.
 graph = contract["graph_schema"]
 statement_names = [name for name, _ in _GRAPH_STATEMENTS]
 view_statements = {name.removesuffix(" view"): body for name, body in _GRAPH_STATEMENTS if name.endswith(" view")}
+table_statements = {name.removesuffix(" table"): body for name, body in _GRAPH_STATEMENTS if name.endswith(" table")}
+declared_shapes = {
+    **{name.removeprefix("graph."): "view" for name in view_statements},
+    **{name.removeprefix("graph."): "table" for name in table_statements},
+}
 
 assert graph["schema"] == PROPERTY_GRAPH_SCHEMA
 assert graph["kind"] == "additive"
 assert graph["availability"] == "unconditional"
 assert graph["introduced_in_contract_version"] == contract["version"]
 assert graph["views"] == len(view_statements)
-assert graph["vertex_views"] == len(_property_graph_vertices())
-assert graph["edge_views"] == len(_property_graph_edges())
-assert graph["vertex_views"] + graph["edge_views"] == graph["views"]
+assert graph["tables"] == len(table_statements)
+assert graph["relation_count"] == len(declared_shapes)
+assert graph["vertex_relations"] == len(_property_graph_vertices())
+assert graph["edge_relations"] == len(_property_graph_edges())
 assert graph["functions"] == sorted(name.removesuffix(" function") for name in statement_names if name.endswith(" function"))
+
+# Every relation carries its shape and the service that writes it. A consumer
+# reading a relation needs both: the shape says whether an index is available,
+# and the owner says who to chase when the relation is empty. The owner is the
+# one thing here the statement list cannot prove, so it is checked for being a
+# known service rather than for being correct.
+OWNERS = {
+    "catalog-api",
+    "discogs-sql-loader",
+    "discogs-sql-loader, catalog-api",
+    "discogs-sql-loader, musicbrainz-sql-loader",
+    "musicbrainz-sql-loader",
+}
+relations = graph["relations"]
+assert set(relations) == set(declared_shapes), set(relations) ^ set(declared_shapes)
+for relation, recorded in relations.items():
+    assert recorded["shape"] == declared_shapes[relation], relation
+    assert recorded["owner"] in OWNERS, relation
+
+# `graph.release_degree` is the one relation the coverage spike records as split
+# across two owners, and it must stay recorded as such: a loader-written base
+# count plus a live count over the personal tables catalog-api writes.
+assert relations["release_degree"]["owner"] == "discogs-sql-loader, catalog-api"
+assert relations["release_degree"]["shape"] == "view"
+assert relations["release_degree_base"]["shape"] == "table"
+
+# The property graph binds every relation except the loader-written half of
+# release degree, which it reaches through the view that sums it.
+element_views = {element.view for element in (*_property_graph_vertices(), *_property_graph_edges())}
+assert element_views == set(declared_shapes) - {"release_degree_base"}
 
 # Appending a column is the only view change safe to ship on its own; the engine
 # enforces the rest by refusing the replacement.
@@ -63,18 +100,16 @@ assert evolution["forbidden"] == [
     "retyping a column",
 ]
 
-# The four appended `<entity>_key` columns are exactly the vertex keys that are a
-# restatement rather than a published id, and they land on every engine.
-appended = graph["appended_key_columns"]
-assert appended["kind"] == "additive"
-assert appended["availability"] == "unconditional"
-assert appended["type"] == "text"
-assert sorted(appended["columns"]) == sorted(
-    f"{PROPERTY_GRAPH_SCHEMA}.{vertex.view}.{column}" for vertex in _property_graph_vertices() for column in vertex.key if column.endswith("_key")
-)
-for qualified in appended["columns"]:
-    view, _, column = qualified.rpartition(".")
-    assert column in view_statements[view], qualified
+# Every vertex key is a published column now, not an appended restatement. The
+# contract records the retirement; this is what proves it happened.
+keys = graph["key_columns"]
+assert keys["kind"] == "additive"
+assert keys["availability"] == "unconditional"
+assert keys["type"] == "text"
+assert not [column for vertex in _property_graph_vertices() for column in vertex.key if column.endswith("_key")]
+for body in (*view_statements.values(), *table_statements.values()):
+    for retired in ("artist_key", "label_key", "master_key", "release_key"):
+        assert retired not in body, retired
 
 # The property graph is conditional on both the server version and the switch, so
 # a consumer that assumes it exists is reading a contract this repository never made.
