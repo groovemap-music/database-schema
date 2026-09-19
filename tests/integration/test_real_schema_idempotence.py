@@ -15,6 +15,7 @@ from psycopg.types.json import Jsonb
 from groovemap_schema import initializer
 from groovemap_schema.neo4j import SCHEMA_STATEMENTS
 from groovemap_schema.postgres import (
+    _BOOTSTRAP_FILL_ORDER,
     _COUNTER_BEARING_VERTICES,
     _EDGE_TABLES,
     _GRAPH_STATEMENTS,
@@ -1499,3 +1500,131 @@ async def postgres_rows_with(query: str, parameters: dict[str, Any]) -> list[tup
     async with connection, connection.cursor() as cursor:
         await cursor.execute(query, parameters)
         return await cursor.fetchall()
+
+
+# What each counter relation's row count has to be, restated independently of
+# how `graph.bootstrap_fill` computes it. The fill reaches these numbers with a
+# `GROUP BY` or a correlated count; each query below is a distinct count of the
+# relation's key instead, so the comparison is a second opinion rather than the
+# fill's own arithmetic read back.
+COUNTER_ROW_COUNTS = {
+    "genre_stats": "SELECT count(*) FROM graph.genre",
+    "style_stats": "SELECT count(*) FROM graph.style",
+    "label_stats": "SELECT count(DISTINCT label_id) FROM graph.on_label",
+    "artist_degree": """
+        SELECT count(*) FROM (
+            SELECT artist_id FROM graph.by_artist
+            UNION SELECT artist_id FROM graph.master_by_artist
+            UNION SELECT artist_id FROM graph.same_as
+            UNION SELECT member_artist_id FROM graph.member_of
+            UNION SELECT group_artist_id FROM graph.member_of
+            UNION SELECT alias_artist_id FROM graph.alias_of
+            UNION SELECT artist_id FROM graph.alias_of
+        ) AS endpoint
+    """,
+    "release_degree_base": """
+        SELECT count(*) FROM (
+            SELECT release_id FROM graph.by_artist
+            UNION SELECT release_id FROM graph.on_label
+            UNION SELECT release_id FROM graph.in_genre
+            UNION SELECT release_id FROM graph.in_style
+            UNION SELECT release_id FROM graph.derived_from
+            UNION SELECT release_id FROM graph.credited_on
+            UNION SELECT release_id FROM graph.credited_to
+            UNION SELECT release_id FROM graph.issued_on
+        ) AS endpoint
+    """,
+    "artist_genre": """
+        SELECT count(*) FROM (
+            SELECT DISTINCT by_artist.artist_id, in_genre.genre_name
+            FROM graph.by_artist AS by_artist
+            JOIN graph.in_genre AS in_genre ON in_genre.release_id = by_artist.release_id
+        ) AS pair
+    """,
+    "label_genre": """
+        SELECT count(*) FROM (
+            SELECT DISTINCT on_label.label_id, in_genre.genre_name
+            FROM graph.on_label AS on_label
+            JOIN graph.in_genre AS in_genre ON in_genre.release_id = on_label.release_id
+        ) AS pair
+    """,
+}
+
+# A row no document justifies. The fill has to remove it, which an upsert never
+# would, and which is the whole reason each step empties its relation first.
+STALE_GENRE = "Not In Any Document"
+
+
+async def run_the_bootstrap_fill() -> dict[str, int]:
+    """Run the fill and return the row count it reports for each relation, in order."""
+    rows = await postgres_rows("SELECT relation, row_count FROM graph.bootstrap_fill()")
+    return {str(relation).removeprefix("graph."): int(count) for relation, count in rows}
+
+
+async def filled_relation_counts() -> dict[str, int]:
+    """Return what each filled relation actually holds, by the engine's own count."""
+    counts: dict[str, int] = {}
+    for relation in _BOOTSTRAP_FILL_ORDER:
+        # `_BOOTSTRAP_FILL_ORDER` is a module constant, not input from a row.
+        rows = await postgres_rows(f"SELECT count(*) FROM graph.{relation}")  # noqa: S608
+        counts[relation] = int(rows[0][0])
+    return counts
+
+
+async def filled_relation_rows() -> dict[str, list[str]]:
+    """Return every row of every filled relation, ordered so two runs compare."""
+    snapshot: dict[str, list[str]] = {}
+    for relation in _BOOTSTRAP_FILL_ORDER:
+        rows = await postgres_rows(f"SELECT * FROM graph.{relation}")  # noqa: S608
+        # Sorted by their rendering rather than by value: several relations mix
+        # a null `first_year` in with integers, and tuple ordering across None
+        # and int raises rather than ordering.
+        snapshot[relation] = sorted(repr(row) for row in rows)
+    return snapshot
+
+
+@pytest.mark.asyncio
+async def test_the_bootstrap_fill_reproduces_the_phase_0_projection() -> None:
+    """The fill is the phase 0 projection of the documents, and re-running converges.
+
+    This is the claim the bootstrap makes and the only one it makes: every
+    loader-owned relation ends up holding exactly what the view that preceded it
+    published, computed once from the documents rather than on every read. The
+    loaders supersede all of it on their first pass.
+    """
+    await apply_schema()
+    await seed_graph_fixtures()
+    await execute_all(phase0_comparison_statements(PHASE0_SCHEMA))
+
+    reported = await run_the_bootstrap_fill()
+    assert list(reported) == list(_BOOTSTRAP_FILL_ORDER)
+
+    stored = await filled_relation_counts()
+    assert reported == stored
+    print("bootstrap_fill row counts: " + ", ".join(f"{relation}={count}" for relation, count in reported.items()))
+
+    # Every vertex and edge relation holds exactly what its retained phase 0
+    # view publishes, which is the definition the fill was rendered from.
+    for relation in _BOOTSTRAP_FILL_ORDER:
+        if relation in COUNTER_ROW_COUNTS:
+            continue
+        # `PHASE0_SCHEMA` and the relation are module constants, not input.
+        expected = await postgres_rows(f"SELECT count(*) FROM {PHASE0_SCHEMA}.{relation}")  # noqa: S608
+        assert stored[relation] == expected[0][0], relation
+
+    for relation, query in COUNTER_ROW_COUNTS.items():
+        expected = await postgres_rows(query)
+        assert stored[relation] == expected[0][0], relation
+
+    # None of the comparisons above is zero agreeing with zero.
+    assert all(count > 0 for count in stored.values()), stored
+
+    # Re-running changes nothing: same reported counts, same rows.
+    before = await filled_relation_rows()
+    assert await run_the_bootstrap_fill() == reported
+    assert await filled_relation_rows() == before
+
+    # And it converges downward, which is what an upsert would not do.
+    await execute_all([("stale row", f"INSERT INTO graph.genre (name) VALUES ('{STALE_GENRE}')")])  # noqa: S608
+    assert await run_the_bootstrap_fill() == reported
+    assert await postgres_rows("SELECT count(*) FROM graph.genre WHERE name = %s", (STALE_GENRE,)) == [(0,)]
