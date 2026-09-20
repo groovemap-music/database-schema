@@ -212,6 +212,10 @@ _ADDED_STATEMENT_NAMES = frozenset(
         "idx_activity_summary_date",
         "idx_releases_identifiers",
         "idx_releases_companies",
+        "musicbrainz.relationships.updated_at column",
+        "musicbrainz.external_links.updated_at column",
+        "idx_mb_rels_updated_at",
+        "idx_mb_links_updated_at",
     }
 )
 

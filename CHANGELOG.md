@@ -4,6 +4,11 @@ All notable changes to the GrooveMap database schema will be documented here.
 
 ## Unreleased
 
+### Feat
+
+- **musicbrainz**: add `updated_at` to `musicbrainz.relationships` and
+  `musicbrainz.external_links` as `musicbrainz-sql-loader`'s delete-reconciliation key
+
 ### Docs
 
 - Document the graph schema's edge model, relation ownership, and the bootstrap fill in

@@ -1252,6 +1252,25 @@ _MUSICBRAINZ_TABLES: list[tuple[str, str]] = [
             UNIQUE (mbid, entity_type, service_name, url)
         )""",
     ),
+    # `musicbrainz-sql-loader` delete-reconciliation key: unlike every other
+    # MusicBrainz entity table, `relationships` and `external_links` were
+    # declared with `created_at` only, so the loader had no column to detect a
+    # row a re-extraction no longer produces. DDL ownership is this repository
+    # alone, so the column is declared here rather than carried as a startup
+    # ALTER in the loader. The loader refreshes `updated_at` on every upsert and
+    # reconciles by deleting rows where `updated_at < run start`, the same
+    # `purge_stale_rows` shape `discogs-sql-loader` already runs against the
+    # Discogs entity tables' own `updated_at` (see `_entity_schema_statements`).
+    # CREATE TABLE IF NOT EXISTS above is a no-op against an existing table, so
+    # the column is added explicitly and idempotently.
+    (
+        "musicbrainz.relationships.updated_at column",
+        "ALTER TABLE musicbrainz.relationships ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+    ),
+    (
+        "musicbrainz.external_links.updated_at column",
+        "ALTER TABLE musicbrainz.external_links ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+    ),
     # Widen Discogs cross-reference IDs from INTEGER (int4, max 2,147,483,647)
     # to BIGINT. Discogs IDs are emitted as i64 by the extractor and release IDs
     # now exceed 2.1B, causing "integer out of range" on INSERT. CREATE TABLE
@@ -1358,6 +1377,17 @@ _MUSICBRAINZ_INDEXES: list[tuple[str, str]] = [
     (
         "idx_mb_links_service",
         "CREATE INDEX IF NOT EXISTS idx_mb_links_service ON musicbrainz.external_links (service_name)",
+    ),
+    # `musicbrainz-sql-loader`'s delete-reconciliation scan filters on
+    # `updated_at < run start`, the same access path `idx_<table>_updated_at`
+    # already serves for the Discogs entity tables in `_entity_schema_statements`.
+    (
+        "idx_mb_rels_updated_at",
+        "CREATE INDEX IF NOT EXISTS idx_mb_rels_updated_at ON musicbrainz.relationships (updated_at)",
+    ),
+    (
+        "idx_mb_links_updated_at",
+        "CREATE INDEX IF NOT EXISTS idx_mb_links_updated_at ON musicbrainz.external_links (updated_at)",
     ),
     (
         "idx_mb_artists_gm_item_id",

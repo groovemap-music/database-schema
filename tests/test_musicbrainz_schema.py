@@ -55,6 +55,8 @@ def test_musicbrainz_indexes_defined():
     assert "idx_mb_releases_discogs_id" in index_names
     assert "idx_mb_rels_source" in index_names
     assert "idx_mb_links_mbid" in index_names
+    assert "idx_mb_rels_updated_at" in index_names
+    assert "idx_mb_links_updated_at" in index_names
 
 
 def test_musicbrainz_indexes_use_if_not_exists():
@@ -90,6 +92,33 @@ def test_relationships_natural_key_migration_present():
     assert "DROP CONSTRAINT" in migration_sql
     assert "ADD CONSTRAINT relationships_natural_key" in migration_sql
     assert "UNIQUE NULLS NOT DISTINCT" in migration_sql
+
+
+def test_relationships_and_external_links_gain_updated_at_column():
+    # Unlike every other MusicBrainz entity table, `relationships` and
+    # `external_links` were declared with `created_at` only. `musicbrainz-sql-loader`
+    # needs `updated_at` as its delete-reconciliation key, spelled exactly like the
+    # loader's own interim startup ALTER so that ALTER is a no-op once this ships.
+    # CREATE TABLE IF NOT EXISTS is a no-op against an existing table, so the
+    # column is added through an explicit, idempotent ALTER.
+    expected = {
+        "musicbrainz.relationships.updated_at column": "ALTER TABLE musicbrainz.relationships ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+        "musicbrainz.external_links.updated_at column": "ALTER TABLE musicbrainz.external_links ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+    }
+    found = dict.fromkeys(expected, False)
+    for name, sql in _MUSICBRAINZ_TABLES:
+        if name in expected:
+            assert sql == expected[name], f"{name} does not match the expected statement"
+            found[name] = True
+    assert all(found.values()), f"missing migrations: {[n for n, ok in found.items() if not ok]}"
+
+
+def test_relationships_and_external_links_updated_at_are_indexed():
+    # The loader's reconciliation scan filters on `updated_at < run start`, the
+    # same access path the Discogs entity tables already index.
+    index_sql = dict(_MUSICBRAINZ_INDEXES)
+    assert index_sql["idx_mb_rels_updated_at"] == "CREATE INDEX IF NOT EXISTS idx_mb_rels_updated_at ON musicbrainz.relationships (updated_at)"
+    assert index_sql["idx_mb_links_updated_at"] == "CREATE INDEX IF NOT EXISTS idx_mb_links_updated_at ON musicbrainz.external_links (updated_at)"
 
 
 class TestWideningGuard:
