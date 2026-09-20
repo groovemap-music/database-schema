@@ -712,6 +712,11 @@ GRAPH_FIXTURE_MASTER = {"id": 55, "title": "Test Master", "year": "1968", "artis
 ARTIST_MBID = "11111111-1111-4111-8111-111111111111"
 OTHER_ARTIST_MBID = "22222222-2222-4222-8222-222222222222"
 DANGLING_MBID = "33333333-3333-4333-8333-333333333333"
+# A MusicBrainz artist whose Discogs counterpart asserts no membership at all:
+# Discogs artist 11 is an alias endpoint and nothing else, so the membership
+# below exists only in `musicbrainz.relationships`. It is what proves the
+# MEMBER_OF union carries a path `graph.member_of` alone does not have.
+MEMBER_ONLY_MBID = "44444444-4444-4444-8444-444444444444"
 
 
 async def seed_graph_fixtures() -> None:
@@ -738,20 +743,32 @@ async def seed_graph_fixtures() -> None:
 
         await cursor.execute(
             """
-            INSERT INTO musicbrainz.artists (mbid, name, discogs_artist_id) VALUES (%s, %s, %s), (%s, %s, %s)
+            INSERT INTO musicbrainz.artists (mbid, name, discogs_artist_id)
+            VALUES (%s, %s, %s), (%s, %s, %s), (%s, %s, %s)
             ON CONFLICT (mbid) DO NOTHING
             """,
-            (ARTIST_MBID, "Alice", 7, OTHER_ARTIST_MBID, "The Band", 10),
+            (ARTIST_MBID, "Alice", 7, OTHER_ARTIST_MBID, "The Band", 10, MEMBER_ONLY_MBID, "Session Player", 11),
         )
         await cursor.execute(
             """
             INSERT INTO musicbrainz.relationships
                 (source_mbid, source_entity_type, target_mbid, target_entity_type, relationship_type, attributes, begin_date, end_date, ended)
             VALUES (%s, 'artist', %s, 'artist', 'member of band', %s, NULL, NULL, FALSE),
+                   (%s, 'artist', %s, 'artist', 'member of band', %s, NULL, NULL, FALSE),
                    (%s, 'artist', %s, 'artist', 'collaboration', %s, NULL, NULL, FALSE)
             ON CONFLICT DO NOTHING
             """,
-            (ARTIST_MBID, OTHER_ARTIST_MBID, Jsonb([]), ARTIST_MBID, DANGLING_MBID, Jsonb([])),
+            (
+                ARTIST_MBID,
+                OTHER_ARTIST_MBID,
+                Jsonb([]),
+                MEMBER_ONLY_MBID,
+                OTHER_ARTIST_MBID,
+                Jsonb([]),
+                ARTIST_MBID,
+                DANGLING_MBID,
+                Jsonb([]),
+            ),
         )
 
         await cursor.execute(
@@ -871,7 +888,10 @@ async def assert_graph_relations_project_the_enricher_rules() -> None:
     # The relationship whose target the loader has not stored is dropped.
     assert await postgres_rows(
         "SELECT source_mbid::text, target_mbid::text, relationship_type, raw_relationship_type FROM graph.mb_rel_artist_artist ORDER BY 1"
-    ) == [(ARTIST_MBID, OTHER_ARTIST_MBID, "MEMBER_OF", "member of band")]
+    ) == [
+        (ARTIST_MBID, OTHER_ARTIST_MBID, "MEMBER_OF", "member of band"),
+        (MEMBER_ONLY_MBID, OTHER_ARTIST_MBID, "MEMBER_OF", "member of band"),
+    ]
     assert await postgres_rows("SELECT count(*) FROM graph.mb_rel_artist_label") == [(0,)]
 
     # A collection row naming a release the catalog does not hold is dropped.
@@ -916,6 +936,85 @@ async def assert_the_counter_relations_sum_the_edge_tables() -> None:
 
     assert await postgres_rows("SELECT artist_id, genre_name, release_count FROM graph.artist_genre ORDER BY 1, 2") == [("7", "Rock", 1)]
     assert await postgres_rows("SELECT label_id, genre_name, release_count FROM graph.label_genre ORDER BY 1, 2") == [("9", "Rock", 1)]
+
+
+# ── The cross-provenance MEMBER_OF union ─────────────────────────────────────
+# Neo4j holds a Discogs band membership and a MusicBrainz "member of band"
+# assertion in one MEMBER_OF relationship space, so `shortestPath` traverses
+# both. `graph.artist_member_of` is that space on the relational side, and this
+# is the proof that both provenances reach it.
+
+UNION_ROWS = "SELECT member_artist_id, group_artist_id, source FROM graph.artist_member_of ORDER BY 1, 2, 3"
+
+# Discogs artist 7 is a member of 10 in BOTH provenances — the artist document
+# says so and so does MusicBrainz — and the two are separate rows because
+# `source` is in the key. (8, 7) is Discogs alone, from the `members` block.
+# (11, 10) is MusicBrainz alone: Discogs artist 11 asserts no membership at all,
+# so a traversal over `graph.member_of` never reaches it.
+EXPECTED_UNION_ROWS = [
+    ("11", "10", "musicbrainz"),
+    ("7", "10", "discogs"),
+    ("7", "10", "musicbrainz"),
+    ("8", "7", "discogs"),
+]
+
+# What the refresh reports, one row per provenance in the order it returns them.
+EXPECTED_UNION_REPORT = [("discogs", 2), ("musicbrainz", 2)]
+
+# A membership no provenance asserts. The refresh has to remove it, which is
+# what truncate-and-insert buys and an upsert would not.
+STALE_MEMBERSHIP = ("999", "998", "discogs")
+
+
+@pytest.mark.asyncio
+async def test_the_member_of_union_holds_both_provenances_and_converges() -> None:
+    """A MusicBrainz-only membership is in the union, and a re-run changes nothing.
+
+    61.6% of the MEMBER_OF edge class is MusicBrainz provenance (spike
+    gm-database-schema-gkt.1), reachable only by crossing to a Discogs id
+    through `musicbrainz.artists.discogs_artist_id`. This is the claim that the
+    crossing happens and that re-running it converges in both directions.
+    """
+    await apply_schema()
+    await seed_graph_fixtures()
+    await bootstrap_the_loader_tables()
+
+    # The bootstrap fill and the refresh share one body, so both answer this.
+    assert await postgres_rows(UNION_ROWS) == EXPECTED_UNION_ROWS
+
+    reported = await postgres_rows("SELECT source, row_count FROM graph.refresh_artist_member_of()")
+    assert reported == EXPECTED_UNION_REPORT
+    assert await postgres_rows(UNION_ROWS) == EXPECTED_UNION_ROWS
+
+    # The MusicBrainz-only membership is the point: `graph.member_of` alone does
+    # not carry it, so a traversal reading that relation returns a different
+    # path set from the Cypher it replaces.
+    assert await postgres_rows("SELECT count(*) FROM graph.member_of WHERE member_artist_id = '11'") == [(0,)]
+    assert await postgres_rows("SELECT count(*) FROM graph.artist_member_of WHERE member_artist_id = '11'") == [(1,)]
+
+    # And the Discogs half is there in full, including the membership both
+    # provenances assert, which is two rows rather than a collision.
+    assert await postgres_rows("SELECT source FROM graph.artist_member_of WHERE member_artist_id = '7' ORDER BY 1") == [
+        ("discogs",),
+        ("musicbrainz",),
+    ]
+
+    # Re-running converges, and a membership nothing asserts is removed.
+    await execute_all([("stale membership", "INSERT INTO graph.artist_member_of VALUES ('999', '998', 'discogs')")])
+    assert await postgres_rows("SELECT source, row_count FROM graph.refresh_artist_member_of()") == EXPECTED_UNION_REPORT
+    assert await postgres_rows(UNION_ROWS) == EXPECTED_UNION_ROWS
+    assert await postgres_rows(
+        "SELECT count(*) FROM graph.artist_member_of WHERE member_artist_id = %s AND group_artist_id = %s",
+        STALE_MEMBERSHIP[:2],
+    ) == [(0,)]
+
+    # Both directions are indexed: an artist-to-artist walk enters this relation
+    # from the group end as often as from the member end.
+    definitions = [
+        row[0] for row in await postgres_rows("SELECT indexdef FROM pg_indexes WHERE schemaname = 'graph' AND tablename = 'artist_member_of'")
+    ]
+    assert any(definition.endswith("(group_artist_id, member_artist_id)") for definition in definitions), definitions
+    assert any("_pkey" in definition for definition in definitions), definitions
 
 
 # The widening guard is proved against one column; the four are generated from
@@ -1089,9 +1188,18 @@ async def test_graph_table_queries_run_over_the_sentinel_rows() -> None:
     # absent, because the edge view inner-joins both endpoint tables. The type
     # reads as the Neo4j name a ported Cypher query asks for, not as the raw
     # MusicBrainz string the loader stored.
-    assert await postgres_rows(MUSICBRAINZ_RELATIONSHIP) == [("Alice", "MEMBER_OF", "The Band")]
-    assert await postgres_rows(MUSICBRAINZ_RELATIONSHIP_SHARED_LABEL) == [("Alice", "MEMBER_OF", "The Band")]
-    assert await postgres_rows(MUSICBRAINZ_RELATIONSHIP_RAW_TYPE) == [("Alice", "member of band", "The Band")]
+    assert await postgres_rows(MUSICBRAINZ_RELATIONSHIP) == [
+        ("Alice", "MEMBER_OF", "The Band"),
+        ("Session Player", "MEMBER_OF", "The Band"),
+    ]
+    assert await postgres_rows(MUSICBRAINZ_RELATIONSHIP_SHARED_LABEL) == [
+        ("Alice", "MEMBER_OF", "The Band"),
+        ("Session Player", "MEMBER_OF", "The Band"),
+    ]
+    assert await postgres_rows(MUSICBRAINZ_RELATIONSHIP_RAW_TYPE) == [
+        ("Alice", "member of band", "The Band"),
+        ("Session Player", "member of band", "The Band"),
+    ]
 
 
 # ── Counters as properties of the label Neo4j carries them on ───────────────
@@ -1550,6 +1658,28 @@ COUNTER_ROW_COUNTS = {
     """,
 }
 
+# What the one derived relation's row count has to be, restated the same way:
+# the Discogs half is `graph.member_of` entire, and the MusicBrainz half is the
+# distinct Discogs pairs the artist-to-artist MEMBER_OF relationships resolve to.
+DERIVED_ROW_COUNTS = {
+    "artist_member_of": """
+        SELECT (SELECT count(*) FROM graph.member_of)
+             + (SELECT count(*) FROM (
+                   SELECT DISTINCT member.discogs_artist_id, band.discogs_artist_id
+                   FROM graph.mb_rel_artist_artist AS relationship
+                   JOIN graph.mb_artist AS member ON member.mbid = relationship.source_mbid
+                   JOIN graph.mb_artist AS band ON band.mbid = relationship.target_mbid
+                   WHERE relationship.relationship_type = 'MEMBER_OF'
+                     AND member.discogs_artist_id IS NOT NULL
+                     AND band.discogs_artist_id IS NOT NULL
+                     AND member.discogs_artist_id <> band.discogs_artist_id
+               ) AS pair)
+    """,
+}
+
+# Every relation the fill computes rather than projects from a retained view.
+COMPUTED_ROW_COUNTS = {**COUNTER_ROW_COUNTS, **DERIVED_ROW_COUNTS}
+
 # A row no document justifies. The fill has to remove it, which an upsert never
 # would, and which is the whole reason each step empties its relation first.
 STALE_GENRE = "Not In Any Document"
@@ -1606,13 +1736,13 @@ async def test_the_bootstrap_fill_reproduces_the_phase_0_projection() -> None:
     # Every vertex and edge relation holds exactly what its retained phase 0
     # view publishes, which is the definition the fill was rendered from.
     for relation in _BOOTSTRAP_FILL_ORDER:
-        if relation in COUNTER_ROW_COUNTS:
+        if relation in COMPUTED_ROW_COUNTS:
             continue
         # `PHASE0_SCHEMA` and the relation are module constants, not input.
         expected = await postgres_rows(f"SELECT count(*) FROM {PHASE0_SCHEMA}.{relation}")  # noqa: S608
         assert stored[relation] == expected[0][0], relation
 
-    for relation, query in COUNTER_ROW_COUNTS.items():
+    for relation, query in COMPUTED_ROW_COUNTS.items():
         expected = await postgres_rows(query)
         assert stored[relation] == expected[0][0], relation
 

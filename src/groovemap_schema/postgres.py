@@ -2580,6 +2580,103 @@ def _edge_table_statements() -> list[tuple[str, str]]:
     return statements
 
 
+# ── The cross-provenance MEMBER_OF union ─────────────────────────────────────
+# `graph.artist_member_of` is the one relation here derived from two others
+# rather than projected from a document, and it exists because Neo4j holds a
+# Discogs band membership and a MusicBrainz "member of band" assertion in ONE
+# relationship type. `shortestPath((a)-[:...|MEMBER_OF|...]-(b))` traverses
+# both without knowing which is which.
+#
+# On the relational side they are two relations in two key spaces.
+# `graph.member_of` is Discogs-only, derived from the artist documents and keyed
+# on Discogs artist ids. The MusicBrainz ones live in `musicbrainz.relationships`
+# keyed on MBIDs, and reach a Discogs id only through
+# `musicbrainz.artists.discogs_artist_id`. Spike gm-database-schema-gkt.1
+# measured the split at 22,577 Discogs rows against 36,189 MusicBrainz ones, so
+# **61.6% of that edge class is MusicBrainz provenance**: a traversal reading
+# `graph.member_of` alone does not return the paths the Cypher it replaces
+# returns. Both spikes say the same thing — gm-database-schema-9c8.3's
+# `augment.sql` prototyped exactly this union and gkt.1 records it as "not
+# optional".
+#
+# The key-space crossing is therefore paid once at build time rather than per
+# traversal step, which is itself the spike's recommendation. `source` is in the
+# key so the same membership asserted by both providers is two rows rather than
+# a collision, and so a consumer can ask what a path is evidenced by; a
+# traversal that does not care simply does not read the column.
+#
+# This is a relation for the path functions, NOT a new label: `graph.catalog`
+# goes on binding `member_of` alone, because a second artist-to-artist edge
+# label overlapping it would double-count every Discogs membership in a pattern
+# that matched both, and Neo4j has no relationship type this union corresponds
+# to.
+_DERIVED_EDGE_TABLES: list[tuple[str, str, str]] = [
+    (
+        "artist_member_of",
+        """
+    member_artist_id text NOT NULL,
+    group_artist_id  text NOT NULL,
+    source           text NOT NULL,
+    PRIMARY KEY (member_artist_id, group_artist_id, source)
+""",
+        "group_artist_id, member_artist_id",
+    ),
+]
+
+# How each derived relation is rebuilt, in the same form `_COUNTER_BOOTSTRAP`
+# uses: one body, read by the refresh function and by `graph.bootstrap_fill()`
+# alike, so the two cannot disagree about what a row means.
+#
+# The Discogs branch is `graph.member_of` verbatim — the relation is the
+# provenance, and filtering it here would make the union disagree with the
+# relation it unions. The MusicBrainz branch reads the shipped views rather
+# than `musicbrainz.relationships` directly, so "artist-to-artist", "both
+# endpoints are stored", and "the type the enricher would have written" stay
+# stated once, in `graph.mb_rel_artist_artist`.
+#
+# Two filters are the crossing's own. `DISTINCT` is required because several
+# MusicBrainz relationships — two membership spans of the same band, or two
+# MBIDs mapped to one Discogs artist — collapse to one Discogs pair, and the
+# primary key would reject the second. Self-membership is dropped for the same
+# reason and only on this branch: two MBIDs resolving to one Discogs id would
+# manufacture an edge from an artist to itself that nobody asserted.
+_DERIVED_EDGE_BOOTSTRAP: dict[str, str] = {
+    "artist_member_of": """
+SELECT member_of.member_artist_id       AS member_artist_id,
+       member_of.group_artist_id        AS group_artist_id,
+       'discogs'::text                  AS source
+FROM graph.member_of AS member_of
+UNION ALL
+SELECT DISTINCT
+       member.discogs_artist_id::text   AS member_artist_id,
+       band.discogs_artist_id::text     AS group_artist_id,
+       'musicbrainz'::text              AS source
+FROM graph.mb_rel_artist_artist AS relationship
+JOIN graph.mb_artist AS member ON member.mbid = relationship.source_mbid
+JOIN graph.mb_artist AS band ON band.mbid = relationship.target_mbid
+WHERE relationship.relationship_type = 'MEMBER_OF'
+  AND member.discogs_artist_id IS NOT NULL
+  AND band.discogs_artist_id IS NOT NULL
+  AND member.discogs_artist_id <> band.discogs_artist_id
+""",
+}
+
+# The columns each derived relation is filled with, in the order its table
+# declares them.
+_DERIVED_EDGE_COLUMNS: dict[str, tuple[str, ...]] = {
+    "artist_member_of": ("member_artist_id", "group_artist_id", "source"),
+}
+
+
+def _derived_edge_table_statements() -> list[tuple[str, str]]:
+    """Return the derived artist-to-artist tables with both directions indexed."""
+    statements: list[tuple[str, str]] = []
+    for relation, columns, reverse in _DERIVED_EDGE_TABLES:
+        statements.append(_table(relation, columns))
+        statements.append(_table_index(relation, "reverse", reverse))
+    return statements
+
+
 # Table 3 of the coverage spike: the pre-computed node properties `graphinator`
 # writes in a post-import pass and that eight catalog-api functions read as if
 # they were free. A graph declared over views has nowhere to put them.
@@ -2680,6 +2777,9 @@ def _counter_table_statements() -> list[tuple[str, str]]:
 # Every relation that stops being a view, in the order its table is created.
 _MATERIALIZED_VERTICES = ("genre", "style", "person", "media_family", "medium", "company")
 _MATERIALIZED_EDGES = tuple(relation for relation, _columns, _reverse, _extras in _EDGE_TABLES)
+# Derived from the relations above rather than from a document, and therefore
+# never a view: nothing retires to make room for one of these names.
+_DERIVED_EDGES = tuple(relation for relation, _columns, _reverse in _DERIVED_EDGE_TABLES)
 
 # The relations that stay views but republish a key column as `text`. The four
 # Discogs vertices do it because a property-graph vertex key cannot be
@@ -2699,7 +2799,13 @@ def _graph_table_statements() -> list[tuple[str, str]]:
     """Return every loader-owned table, preceded by the migrations that free its name."""
     migrations = [_view_to_table_migration(relation) for relation in (*_MATERIALIZED_VERTICES, *_MATERIALIZED_EDGES)]
     migrations.extend(_key_retype_migration(relation, column) for relation, column in _TEXT_KEY_RETYPES)
-    return [*migrations, *_vertex_table_statements(), *_edge_table_statements(), *_counter_table_statements()]
+    return [
+        *migrations,
+        *_vertex_table_statements(),
+        *_edge_table_statements(),
+        *_derived_edge_table_statements(),
+        *_counter_table_statements(),
+    ]
 
 
 # ── Phase 0 definitions, retained for the table-versus-view comparison ───────
@@ -3023,6 +3129,12 @@ def graph_bootstrap_statements(schema: str) -> list[tuple[str, str]]:
         )
         for relation, columns in _BOOTSTRAP_COLUMNS.items()
     ]
+    # The derived relations read the tables filled above rather than SCHEMA, so
+    # they come after them and before the counters, which read neither.
+    statements.extend(
+        (f"graph.{relation} bootstrap", f"INSERT INTO graph.{relation}\n{body.strip()}\nON CONFLICT DO NOTHING")
+        for relation, body in _DERIVED_EDGE_BOOTSTRAP.items()
+    )
     statements.extend(
         (f"graph.{relation} bootstrap", f"INSERT INTO graph.{relation}\n{body.strip()}\nON CONFLICT DO NOTHING")
         for relation, body in _COUNTER_BOOTSTRAP.items()
@@ -3031,9 +3143,10 @@ def graph_bootstrap_statements(schema: str) -> list[tuple[str, str]]:
 
 
 # ── The bootstrap fill (shipped) ─────────────────────────────────────────────
-# Everything above this line is a definition. `graph.bootstrap_fill()` is the
-# one thing in this module that writes a graph row, and it is deliberately a
-# function nobody calls rather than a statement the initializer runs: applying
+# Everything above this line is a definition. `graph.bootstrap_fill()` is one of
+# the two things in this module that write a graph row — the other is
+# `graph.refresh_artist_member_of()` below it — and both are deliberately
+# functions nobody calls rather than statements the initializer runs: applying
 # the schema must stay a declaration, and an environment that wants rows asks
 # for them.
 #
@@ -3044,6 +3157,11 @@ def graph_bootstrap_statements(schema: str) -> list[tuple[str, str]]:
 # This fill exists so an environment can be populated once, before a loader has
 # run, so a read rewrite in `catalog-api` is not blocked on the dual-write. The
 # first loader pass supersedes it.
+#
+# The refresh function is the one exception to "nobody calls it", and only in
+# the sense that it has a named owner: it is derived rather than loaded, so no
+# loader can write it a row at a time, and `discogs-sql-loader` rebuilds it on
+# the `extraction_complete` latch it already handles.
 
 # The counter relations' column lists, in the order each table declares them.
 # The vertex and edge lists are `_BOOTSTRAP_COLUMNS` above; these are separate
@@ -3071,7 +3189,17 @@ _COUNTER_COLUMNS: dict[str, tuple[str, ...]] = {
 #   converged zero.
 # - **`artist_genre` and `label_genre` last**, with the other counters, because
 #   both join `by_artist`/`on_label` to `in_genre`.
-_BOOTSTRAP_FILL_ORDER: tuple[str, ...] = (*_MATERIALIZED_VERTICES, *_MATERIALIZED_EDGES, *tuple(_COUNTER_BOOTSTRAP))
+# - **`artist_member_of` between the two**, because its Discogs half reads
+#   `graph.member_of` — filled before it as an edge table — and its MusicBrainz
+#   half reads the `musicbrainz` tables directly, which no step here writes.
+#   Filled with the edges it would union an empty relation and converge on the
+#   MusicBrainz half alone.
+_BOOTSTRAP_FILL_ORDER: tuple[str, ...] = (
+    *_MATERIALIZED_VERTICES,
+    *_MATERIALIZED_EDGES,
+    *_DERIVED_EDGES,
+    *tuple(_COUNTER_BOOTSTRAP),
+)
 
 
 def _bootstrap_fill_source(relation: str) -> tuple[tuple[str, ...], str]:
@@ -3081,10 +3209,14 @@ def _bootstrap_fill_source(relation: str) -> tuple[tuple[str, ...], str]:
     rather than copied, which is the whole reason those definitions are retained
     in this module instead of in the test tree: the fill and the parity
     comparison cannot disagree about what a relation projects, because there is
-    one text and both read it.
+    one text and both read it. The counters and the derived relations never had
+    a view; their bodies are the definitions the loaders implement, shared with
+    `graph.refresh_artist_member_of()` the same way and for the same reason.
     """
     if relation in _COUNTER_BOOTSTRAP:
         return _COUNTER_COLUMNS[relation], _COUNTER_BOOTSTRAP[relation]
+    if relation in _DERIVED_EDGE_BOOTSTRAP:
+        return _DERIVED_EDGE_COLUMNS[relation], _DERIVED_EDGE_BOOTSTRAP[relation]
     return _BOOTSTRAP_COLUMNS[relation], _phase0_relation_bodies()[relation]
 
 
@@ -3100,9 +3232,13 @@ def _bootstrap_fill_step(relation: str) -> str:
 
     Nothing names a conflict target because nothing can conflict: every body is
     unique on its table's key, by a `DISTINCT`, a `DISTINCT ON`, a `GROUP BY`, or
-    a `UNION` over exactly those columns. A duplicate would raise rather than be
-    dropped in silence, which is the right failure for a projection that claims
-    to be the key.
+    a `UNION` over exactly those columns. `artist_member_of` is unique the same
+    way one branch at a time — the Discogs branch reads a relation already keyed
+    on the pair, the MusicBrainz branch deduplicates the crossing with
+    `DISTINCT` — and the two branches cannot meet, because `source` is in the key
+    and each branch writes its own literal into it. A duplicate would raise
+    rather than be dropped in silence, which is the right failure for a
+    projection that claims to be the key.
     """
     columns, body = _bootstrap_fill_source(relation)
     indented = "\n".join(f"        {line}" if line.strip() else "" for line in body.strip().splitlines())
@@ -3124,7 +3260,7 @@ def _bootstrap_fill_function() -> str:
     """Return `graph.bootstrap_fill()`, the one-off fill of every loader-owned table.
 
     One transaction, because the caller's statement is one: `SELECT * FROM
-    graph.bootstrap_fill()` either replaces all twenty-seven relations or
+    graph.bootstrap_fill()` either replaces all twenty-eight relations or
     replaces none, so a failure half way through cannot leave edges pointing at
     vertices that were truncated and never refilled.
 
@@ -3159,6 +3295,66 @@ BEGIN
 $bootstrap_fill$"""
 
 
+def _refresh_artist_member_of_function() -> str:
+    """Return `graph.refresh_artist_member_of()`, the union's own rebuild.
+
+    The second shipped function that writes a graph row, and the only one with a
+    named refresh owner: **`discogs-sql-loader` calls it on the
+    `extraction_complete` latch it already handles**, which is the same latch
+    the counter relations are recomputed on and the same one `graphinator` uses
+    to start its post-import pass. So the union costs no new scheduler, and it is
+    rebuilt on the pass that has just finished moving the rows it reads. The
+    contract records that owner under `graph_schema.member_of_union`; nothing in
+    this repository calls it either.
+
+    `TRUNCATE` then `INSERT`, for the reason `graph.bootstrap_fill()` has it:
+    the union is a derivation, so a membership the sources no longer state has
+    to leave, and an upsert converges upward only. The whole body is one
+    statement's worth of work in one transaction, so a failure leaves the
+    previous contents rather than an emptied relation.
+
+    It reports one row per provenance rather than one row for the relation,
+    always both, so a rebuild that finds no MusicBrainz half — an environment
+    where `musicbrainz-sql-loader` has not run, or one whose artists carry no
+    `discogs_artist_id` — says so with a zero instead of looking like a relation
+    that is simply smaller than expected.
+
+    The body is `_DERIVED_EDGE_BOOTSTRAP`'s, the same text `graph.bootstrap_fill`
+    inlines, so the one-off fill and the refresh cannot disagree about what a
+    membership is.
+    """
+    body = _DERIVED_EDGE_BOOTSTRAP["artist_member_of"]
+    indented = "\n".join(f"        {line}" if line.strip() else "" for line in body.strip().splitlines())
+    return f"""CREATE OR REPLACE FUNCTION graph.refresh_artist_member_of()
+RETURNS TABLE (source text, row_count bigint)
+LANGUAGE plpgsql
+AS $refresh_artist_member_of$
+#variable_conflict use_column
+-- `source` is both an output column and a column of the relation being built,
+-- so the body resolves it to the column rather than failing on the ambiguity.
+BEGIN
+    TRUNCATE graph.artist_member_of;
+    INSERT INTO graph.artist_member_of (member_artist_id, group_artist_id, source)
+    SELECT member_artist_id, group_artist_id, source
+    FROM (
+{indented}
+    ) AS refresh;
+
+    -- Counted back off the relation rather than off the insert, so a provenance
+    -- that contributed nothing still reports, as a zero.
+    FOR source, row_count IN
+        SELECT provenance.name,
+               (SELECT count(*) FROM graph.artist_member_of AS edge WHERE edge.source = provenance.name)
+        FROM (VALUES ('discogs'), ('musicbrainz')) AS provenance(name)
+        ORDER BY provenance.name
+    LOOP
+        RAISE NOTICE 'refresh_artist_member_of: % <- % row(s)', source, row_count;
+        RETURN NEXT;
+    END LOOP;
+END
+$refresh_artist_member_of$"""  # noqa: S608
+
+
 def _build_graph_statements() -> list[tuple[str, str]]:
     """Return the ordered graph-schema statements: schema, functions, tables, views.
 
@@ -3168,10 +3364,12 @@ def _build_graph_statements() -> list[tuple[str, str]]:
     views, because `part_of`, `in_family`, and `release_degree` now read tables
     rather than documents. Every migration that frees a name precedes the
     relation that takes it, which is what `_graph_table_statements` returns. And
-    `graph.bootstrap_fill` comes last, after every relation it writes or reads —
-    a plpgsql body resolves its names at first call rather than at creation, so
-    the position is a statement about what the function means rather than a
-    requirement, and it is kept honest by a test.
+    the two writing functions come last, after every relation they write or read
+    — `graph.refresh_artist_member_of` reads two MusicBrainz views and
+    `graph.bootstrap_fill` reads all of it — a plpgsql body resolves its names at
+    first call rather than at creation, so the position is a statement about what
+    each function means rather than a requirement, and it is kept honest by a
+    test.
     """
     return [
         _GRAPH_SCHEMA_STATEMENT,
@@ -3188,8 +3386,10 @@ def _build_graph_statements() -> list[tuple[str, str]]:
         *_collection_views(),
         *_credit_views(),
         *_counter_views(),
-        # Last, because it reads all of it: the fill writes the tables above and
-        # its counter bodies read `graph.part_of`, which is one of the views.
+        # Both of these read the relations above rather than being read by one,
+        # so they come after all of them: the union's body reads two MusicBrainz
+        # views, and the fill writes every table and reads `graph.part_of`.
+        ("graph.refresh_artist_member_of function", _refresh_artist_member_of_function()),
         ("graph.bootstrap_fill function", _bootstrap_fill_function()),
     ]
 

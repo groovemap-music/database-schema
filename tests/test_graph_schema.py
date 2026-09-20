@@ -11,6 +11,7 @@ from common.media import medium_ids, medium_label
 from groovemap_schema.postgres import (
     _COUNTER_BEARING_VERTICES,
     _COUNTER_BOOTSTRAP,
+    _DERIVED_EDGE_BOOTSTRAP,
     _EDGE_TABLES,
     _GRAPH_STATEMENTS,
     _TEXT_KEY_RETYPES,
@@ -33,6 +34,10 @@ GRAPH_STATEMENTS = dict(_GRAPH_STATEMENTS)
 MATERIALIZED_VERTICES = ("genre", "style", "person", "media_family", "medium", "company")
 MATERIALIZED_EDGES = tuple(relation for relation, _columns, _reverse, _extras in _EDGE_TABLES)
 
+# The relations derived from other relations rather than from a document.
+# Neither ever published a view, so neither has a phase 0 body or a migration.
+DERIVED_TABLES = ("artist_member_of",)
+
 # Table 3 relations, which replace node properties rather than a phase 0 view.
 COUNTER_TABLES = (
     "genre_stats",
@@ -44,7 +49,11 @@ COUNTER_TABLES = (
     "label_genre",
 )
 
-MATERIALIZED = frozenset((*MATERIALIZED_VERTICES, *MATERIALIZED_EDGES, *COUNTER_TABLES))
+MATERIALIZED = frozenset((*MATERIALIZED_VERTICES, *MATERIALIZED_EDGES, *DERIVED_TABLES, *COUNTER_TABLES))
+
+# The relations that were never a view, and so have no retained phase 0 body
+# and no guarded migration freeing their name.
+NEVER_A_VIEW = frozenset((*DERIVED_TABLES, *COUNTER_TABLES))
 
 # The phase 0 view bodies, retained so the projection rules stay under test
 # after the relation that published them became a table.
@@ -93,6 +102,11 @@ COUNTER_PROPERTIES = {
 # because the label that describes them binds a projection joining the two.
 STORAGE_ONLY = frozenset(
     {
+        # The cross-provenance MEMBER_OF union binds no label of its own for a
+        # different reason: Neo4j has no relationship type it corresponds to, and
+        # a second artist-to-artist edge label overlapping `member_of` would
+        # double-count every Discogs membership a pattern matching both saw.
+        "artist_member_of",
         "genre",
         "style",
         "artist",
@@ -139,7 +153,7 @@ VOCABULARY_FUNCTIONS = {"credit_role_category", "medium_label", "mb_relationship
 # `graph.bootstrap_fill` is the fourth and is not one of them: nothing calls it,
 # it reads and writes the relations rather than being read by one, and it is the
 # only thing the schema declares that writes a graph row.
-EXPECTED_FUNCTIONS = VOCABULARY_FUNCTIONS | {"bootstrap_fill"}
+EXPECTED_FUNCTIONS = VOCABULARY_FUNCTIONS | {"bootstrap_fill", "refresh_artist_member_of"}
 
 MUSICBRAINZ_PAIRS = [
     (source, target) for source in ("artist", "label", "release", "release_group") for target in ("artist", "label", "release", "release_group")
@@ -284,15 +298,15 @@ class TestGraphSchemaStatement:
 
     def test_every_migration_is_guarded_and_names_one_relation(self) -> None:
         migrations = [name for name, _statement in _GRAPH_STATEMENTS if name.endswith(" migration")]
-        expected = {f"graph.{relation} view-to-table migration" for relation in MATERIALIZED - set(COUNTER_TABLES)}
+        expected = {f"graph.{relation} view-to-table migration" for relation in MATERIALIZED - NEVER_A_VIEW}
         expected |= {f"graph.{relation} key-type migration" for relation, _column in _TEXT_KEY_RETYPES}
         assert set(migrations) == expected
         assert len(migrations) == len(expected)
 
     def test_a_counter_relation_never_replaces_a_view(self) -> None:
-        """Table 3 relations are new; nothing of theirs was ever published as a view."""
+        """Table 3 and the derived relations are new; none was ever a view."""
         names = {name for name, _statement in _GRAPH_STATEMENTS}
-        for relation in COUNTER_TABLES:
+        for relation in NEVER_A_VIEW:
             assert f"graph.{relation} view-to-table migration" not in names
 
     def test_every_migration_precedes_the_relation_it_frees(self) -> None:
@@ -709,7 +723,7 @@ class TestPhase0Comparison:
             for name, _statement in phase0_comparison_statements("graph_phase0")
             if name.endswith(" view")
         }
-        assert retained == MATERIALIZED - set(COUNTER_TABLES)
+        assert retained == MATERIALIZED - NEVER_A_VIEW
 
     def test_the_bootstrap_fills_every_loader_written_table(self) -> None:
         filled = {name.removeprefix("graph.").removesuffix(" bootstrap") for name, _statement in graph_bootstrap_statements("graph_phase0")}
@@ -800,7 +814,7 @@ class TestBootstrapFill:
     def test_every_body_is_the_retained_phase_0_definition(self) -> None:
         """The fill and the parity comparison read one text, so they cannot drift."""
         rendered = " ".join(statement_for_function("bootstrap_fill").split())
-        for relation in MATERIALIZED - set(COUNTER_TABLES):
+        for relation in MATERIALIZED - NEVER_A_VIEW:
             body = " ".join(statement_for(relation).split())
             body = body.removeprefix(f"CREATE OR REPLACE VIEW graph_phase0.{relation} AS ")
             assert body in rendered, relation
@@ -811,6 +825,94 @@ class TestBootstrapFill:
         assert "jsonb" not in counters
         assert "public.releases" not in counters
         assert "graph.by_artist" in counters
+
+
+class TestMemberOfUnion:
+    """The one relation derived from two provenances, and the function that rebuilds it."""
+
+    def test_it_keys_on_the_triple_and_indexes_the_reverse(self) -> None:
+        """`source` is in the key so both providers can assert the same membership."""
+        statement = ddl_for("artist_member_of")
+        assert "PRIMARY KEY (member_artist_id, group_artist_id, source)" in statement
+        assert (
+            "CREATE INDEX IF NOT EXISTS artist_member_of_reverse ON graph.artist_member_of (group_artist_id, member_artist_id)"
+            in index_statements_for("artist_member_of")
+        )
+
+    def test_every_column_is_text(self) -> None:
+        statement = ddl_for("artist_member_of")
+        for column in ("member_artist_id", "group_artist_id", "source"):
+            assert re.search(rf"^\s+{column}\s+text NOT NULL", statement, re.MULTILINE), column
+
+    def test_the_discogs_half_is_the_member_of_relation_itself(self) -> None:
+        """The relation is the provenance; filtering it here would make them disagree."""
+        body = _DERIVED_EDGE_BOOTSTRAP["artist_member_of"]
+        assert "FROM graph.member_of AS member_of" in body
+        assert "'discogs'::text" in body
+
+    def test_the_musicbrainz_half_crosses_key_spaces_through_the_mapped_type(self) -> None:
+        """MBIDs reach a Discogs id only through `musicbrainz.artists.discogs_artist_id`."""
+        body = _DERIVED_EDGE_BOOTSTRAP["artist_member_of"]
+        assert "FROM graph.mb_rel_artist_artist AS relationship" in body
+        assert "relationship.relationship_type = 'MEMBER_OF'" in body
+        assert "JOIN graph.mb_artist AS member ON member.mbid = relationship.source_mbid" in body
+        assert "JOIN graph.mb_artist AS band ON band.mbid = relationship.target_mbid" in body
+        assert "member.discogs_artist_id::text" in body
+        assert "band.discogs_artist_id::text" in body
+        assert "member.discogs_artist_id IS NOT NULL" in body
+        assert "band.discogs_artist_id IS NOT NULL" in body
+        assert "'musicbrainz'::text" in body
+
+    def test_the_musicbrainz_half_deduplicates_and_drops_a_self_membership(self) -> None:
+        """Several MusicBrainz rows collapse to one Discogs pair; the key would reject the second."""
+        body = _DERIVED_EDGE_BOOTSTRAP["artist_member_of"]
+        musicbrainz = body[body.index("UNION ALL") :]
+        assert "SELECT DISTINCT" in musicbrainz
+        assert "member.discogs_artist_id <> band.discogs_artist_id" in musicbrainz
+
+    def test_the_union_reads_the_mapped_type_rather_than_the_raw_string(self) -> None:
+        """`member of band` is what the loader stores; `MEMBER_OF` is what a ported query asks for."""
+        body = _DERIVED_EDGE_BOOTSTRAP["artist_member_of"]
+        assert "member of band" not in body
+        assert MUSICBRAINZ_RELATIONSHIP_TYPES["member of band"] == "MEMBER_OF"
+
+    def test_the_refresh_is_declared_as_a_reporting_function(self) -> None:
+        statement = statement_for_function("refresh_artist_member_of")
+        assert statement.startswith("CREATE OR REPLACE FUNCTION graph.refresh_artist_member_of()\n")
+        assert "RETURNS TABLE (source text, row_count bigint)" in statement
+        assert "LANGUAGE plpgsql" in statement
+
+    def test_the_refresh_empties_the_relation_before_it_refills_it(self) -> None:
+        """A derivation has to converge downward too; an upsert converges upward only."""
+        statement = statement_for_function("refresh_artist_member_of")
+        assert statement.index("TRUNCATE graph.artist_member_of;") < statement.index("INSERT INTO graph.artist_member_of (")
+        assert "ON CONFLICT" not in statement
+
+    def test_the_refresh_reports_a_row_per_provenance_including_an_empty_one(self) -> None:
+        """A missing MusicBrainz half reads as a zero rather than as a smaller relation."""
+        statement = statement_for_function("refresh_artist_member_of")
+        assert "(VALUES ('discogs'), ('musicbrainz')) AS provenance(name)" in statement
+        assert statement.count("RETURN NEXT;") == 1
+        assert statement.count("RAISE NOTICE") == 1
+
+    def test_the_refresh_and_the_fill_share_one_body(self) -> None:
+        """Two texts could disagree about what a membership is; there is one."""
+        body = " ".join(_DERIVED_EDGE_BOOTSTRAP["artist_member_of"].split())
+        for function in ("refresh_artist_member_of", "bootstrap_fill"):
+            assert body in " ".join(statement_for_function(function).split()), function
+
+    def test_the_fill_builds_it_after_member_of_and_before_the_counters(self) -> None:
+        """Its Discogs half reads an edge table; filled early it would union an empty relation."""
+        statement = statement_for_function("bootstrap_fill")
+        union = statement.index("TRUNCATE graph.artist_member_of;")
+        assert statement.index("TRUNCATE graph.member_of;") < union
+        assert union < min(statement.index(f"TRUNCATE graph.{relation};") for relation in COUNTER_TABLES)
+
+    def test_it_binds_no_property_graph_label(self) -> None:
+        """A second artist-to-artist label would double-count every Discogs membership."""
+        elements = {element.element for element in (*_property_graph_vertices(), *_property_graph_edges())}
+        assert "artist_member_of" not in elements
+        assert "member_of" in elements
 
 
 class TestCollectionEdgeViews:

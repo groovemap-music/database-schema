@@ -340,8 +340,8 @@ Every index and constraint above is additive within persistence contract v1 — 
 ## Graph schema
 
 The `graph` schema re-presents the catalog as the vertex and edge relations of the property
-graph the Neo4j enrichers already build. Sixty-four relations, declared in
-[`src/groovemap_schema/postgres.py`](../src/groovemap_schema/postgres.py): twenty-seven
+graph the Neo4j enrichers already build. Sixty-five relations, declared in
+[`src/groovemap_schema/postgres.py`](../src/groovemap_schema/postgres.py): twenty-eight
 loader-written tables and thirty-seven read-only views over tables declared elsewhere in the
 same module. The schema is additive within persistence contract v1:
 [the persistence compatibility contract](../contracts/persistence/) records every relation
@@ -365,9 +365,11 @@ target end — reproducing a sequential scan on the traversal direction the port
 most. Spike gm-database-schema-9c8.2 Table 2 and Table 3 fix the shapes, keys, indexes, and
 owners; this schema follows them and does not invent one. Seven further tables hold the
 counters the graph enrichers compute in a post-import pass, which a graph declared over views
-had nowhere to put.
+had nowhere to put. The twenty-eighth is `graph.artist_member_of`, the
+[cross-provenance MEMBER_OF union](#the-member_of-union), which is derived from two of the
+relations above rather than from a document.
 
-Read the section in two halves. The sixty-four relations are unconditional — every supported
+Read the section in two halves. The sixty-five relations are unconditional — every supported
 engine gets all of them, on PostgreSQL 18 and 19 alike. The `CREATE PROPERTY GRAPH`
 declaration layered over them is not: it needs PostgreSQL 19 and an explicit switch, and
 [when it is applied](#when-it-is-applied) is the one place those gates are stated. A consumer
@@ -527,6 +529,7 @@ that second index; the primary key is the key column set in the column before it
 | `(:Master)-[:IS]->(:Style)` | `graph.master_in_style` | **table** | `master_id`, `style_name` | `(style_name, master_id)` | `master_id` → `style_name` | `masters.data->'styles'` |
 | `(:Style)-[:PART_OF]->(:Genre)` | `graph.part_of` | view | `style_name`, `genre_name` | — | `style_name` → `genre_name` | releases and masters carrying exactly one genre |
 | `(:Artist)-[:MEMBER_OF]->(:Artist)` | `graph.member_of` | **table** | `member_artist_id`, `group_artist_id` | `(group_artist_id, member_artist_id)` | `member_artist_id` → `group_artist_id` | `artists.data->'members'` and `->'groups'` |
+| (`MEMBER_OF`, both provenances) | `graph.artist_member_of` | **table** | `member_artist_id`, `group_artist_id`, `source` | `(group_artist_id, member_artist_id)` | `member_artist_id` → `group_artist_id` | `graph.member_of` and `graph.mb_rel_artist_artist` |
 | `(:Artist)-[:ALIAS_OF]->(:Artist)` | `graph.alias_of` | **table** | `alias_artist_id`, `artist_id` | `(artist_id, alias_artist_id)` | `alias_artist_id` → `artist_id` | `artists.data->'aliases'` |
 | `(:Label)-[:SUBLABEL_OF]->(:Label)` | `graph.sublabel_of` | view | `sublabel_id`, `parent_label_id` | — | `sublabel_id` → `parent_label_id` | `labels.data->'parentLabel'` and `->'sublabels'` |
 | `(:Person)-[:CREDITED_ON]->(:Release)` | `graph.credited_on` | **table** | `person_name`, `release_id`, `role` | `(release_id, person_name)` | `person_name` → `release_id` | `releases.data->'extraartists'` |
@@ -692,10 +695,85 @@ it here would key the vertex differently from the node it mirrors.
   requested type is the one it already has, and the graph schema exposes exactly those
   columns as the bridge between the MusicBrainz and Discogs halves of the graph.
 
+### The MEMBER_OF union
+
+`graph.artist_member_of` is the one relation here derived from two others rather than projected
+from a document, and it exists because the two stores disagree about how many relations
+`MEMBER_OF` is.
+
+In Neo4j it is one. A Discogs band membership, written by `graphinator` from an artist
+document's `members` and `groups` blocks, and a MusicBrainz "member of band" assertion, written
+by the graph enricher from `musicbrainz.relationships`, are the same relationship type to the
+expander, so `shortestPath((a)-[:BY|ON|IS|ALIAS_OF|MEMBER_OF|DERIVED_FROM*..d]-(b))` traverses
+both without knowing which is which.
+
+On the relational side it is two relations in two key spaces. `graph.member_of` is Discogs-only
+and keyed on Discogs artist ids. The MusicBrainz half lives in `musicbrainz.relationships`,
+keyed on MBIDs, and reaches a Discogs id only through `musicbrainz.artists.discogs_artist_id`.
+
+**The half that is missing is the larger half.** Spike gm-database-schema-gkt.1 measured the
+split on the production-scale catalog: 22,577 directed rows from Discogs against 36,189 from
+MusicBrainz, so 61.6% of the `MEMBER_OF` edge class has MusicBrainz provenance. A path or alias
+traversal that reads `graph.member_of` alone does not return the paths the Cypher it replaces
+returns — it returns a different, smaller answer, silently. Both spikes reached the same
+conclusion independently: gm-database-schema-9c8.3's `augment.sql` prototyped exactly this
+union so the two engines would hold the same graph, and gkt.1 records it as "not optional".
+
+So the key-space crossing is resolved once, at build time, into a materialized artist-to-artist
+relation, rather than being paid per traversal step. The Discogs half is `graph.member_of`
+entire — the relation is the provenance, and filtering it here would make the union disagree
+with the relation it unions. The MusicBrainz half reads `graph.mb_rel_artist_artist`, so
+"artist-to-artist", "both endpoints are stored", and "the relationship type the enricher would
+have written" stay stated once, in that view, rather than restated here. Two filters are the
+crossing's own: `DISTINCT`, because several MusicBrainz relationships — two membership spans of
+the same band, or two MBIDs mapped to one Discogs artist — collapse to one Discogs pair and the
+primary key would reject the second; and a self-membership guard, because two MBIDs resolving
+to one Discogs id would otherwise manufacture an edge from an artist to itself that nobody
+asserted.
+
+`source` is in the primary key, alongside the pair. The same membership asserted by both
+providers is therefore two rows rather than a collision, a consumer can ask what a path is
+evidenced by, and a traversal that does not care simply does not read the column. The reverse
+index is `(group_artist_id, member_artist_id)`, for the same reason every other edge table
+carries one: a walk enters this relation from the group end as often as from the member end.
+
+**It binds no property-graph label.** `graph.catalog` goes on binding `member_of` alone. A
+second artist-to-artist edge label overlapping it would double-count every Discogs membership
+in a pattern that matched both, and there is no Neo4j relationship type this union corresponds
+to — it is a relation the path functions read directly.
+
+`graph.refresh_artist_member_of()` rebuilds it, and the contract records its owner:
+**`discogs-sql-loader` calls it on the `extraction_complete` latch it already handles**, the
+same latch the counter relations are recomputed on and the same one `graphinator` uses to start
+its post-import pass. So the union costs no new scheduler, and it is rebuilt on the pass that
+has just finished moving the rows it reads. Nothing in this repository calls it either; this is
+a declaration.
+
+```sql
+SELECT * FROM graph.refresh_artist_member_of();
+```
+
+```
+   source    | row_count
+-------------+-----------
+ discogs     |     22577
+ musicbrainz |     36189
+```
+
+It is `TRUNCATE` then `INSERT`, for the reason [the bootstrap fill](#the-bootstrap-fill) has it:
+the relation is a derivation, so a membership the sources no longer state has to leave, and an
+upsert converges upward only. It reports one row per provenance and always both, so a rebuild
+that finds no MusicBrainz half — an environment where `musicbrainz-sql-loader` has not run, or
+one whose artists carry no `discogs_artist_id` — says so with a zero rather than looking like a
+relation that is simply smaller than expected. The body it runs is the same text
+`graph.bootstrap_fill()` inlines, so the one-off fill and the refresh cannot disagree about what
+a membership is.
+
 ### The bootstrap fill
 
-`graph.bootstrap_fill()` derives every one of the twenty-seven loader-written tables from the
-`artists`, `labels`, `masters`, `releases`, and `musicbrainz` documents in one pass. It exists
+`graph.bootstrap_fill()` derives every one of the twenty-eight loader-written tables from the
+`artists`, `labels`, `masters`, `releases`, and `musicbrainz` documents in one pass — and
+[the MEMBER_OF union](#the-member_of-union) from the relations it has just filled. It exists
 for one situation: an environment that has the documents but has not run a loader, where a
 read rewrite in `catalog-api` would otherwise be blocked waiting for the dual-write. Run it
 once and the graph relations are populated.
@@ -732,14 +810,15 @@ for the table-versus-view parity comparison, and the fill inlines the same text 
 copy of it. So "the fill agrees with the definition the relation published" is not a property
 anyone has to check — there is one definition and both read it. The seven counter relations
 never had a view; their bodies are the sums over the edge tables that the loaders implement,
-and they are shared the same way.
+and they are shared the same way. So is `graph.artist_member_of`'s, with
+`graph.refresh_artist_member_of()` rather than with a retained view.
 
 **Each relation is emptied and refilled, in one transaction.** `TRUNCATE` then `INSERT`, not an
 upsert. `ON CONFLICT DO NOTHING` converges upward only: a row the documents no longer justify —
 a release whose genre was corrected, a credit that was removed — would survive every re-run, so
 the relation would drift away from its own definition rather than toward it. Emptying it first
 makes the relation exactly the projection of the documents present, which is what idempotent
-has to mean here. The whole fill is one statement, so it either replaces all twenty-seven
+has to mean here. The whole fill is one statement, so it either replaces all twenty-eight
 relations or replaces none; a failure half way through cannot leave edges pointing at vertices
 that were truncated and never refilled. The cost is that a row a loader wrote which the
 documents do not justify is discarded too, which is a reason to run the bootstrap before the
@@ -769,8 +848,11 @@ divergence: the engine computes it from `role`, which is in the key, so the fill
 same value the loader would.
 
 The integration suite runs the fill against the real-engine fixture, compares every relation's
-row count to the retained phase 0 view, runs it a second time and asserts the rows are
-identical, then writes a row no document justifies and asserts the next run removes it.
+row count to the retained phase 0 view — or, for the counters and the union, to an independent
+restatement of what the count has to be — runs it a second time and asserts the rows are
+identical, then writes a row no document justifies and asserts the next run removes it. The
+union gets the same treatment from its own refresh function, against a fixture carrying a
+membership only MusicBrainz asserts.
 
 ### Property graph
 
@@ -779,17 +861,19 @@ relations that a `GRAPH_TABLE` query pattern-matches. `graph.catalog` declares o
 relation above — 17 vertex element tables and 38 edge element tables — so the same
 relation serves both a `SELECT` and a graph pattern. The declaration itself materializes
 nothing and copies nothing: each element is read from the table or view underneath it at query
-time, and the twenty-seven tables are written by their loaders whether the graph is declared
+time, and the twenty-eight tables are written by their loaders whether the graph is declared
 or not.
 
-Nine relations bind no element. Four hold the rows and four the counters of a label that
+Ten relations bind no element. Four hold the rows and four the counters of a label that
 binds a view joining them — see
-[the counter relations](#the-counter-degree-and-aggregate-relations) — and the ninth is
+[the counter relations](#the-counter-degree-and-aggregate-relations) — the ninth is
 `graph.release_degree_base`, the loader-written half of release degree, which the graph
-reaches through `graph.release_degree`.
+reaches through `graph.release_degree`, and the tenth is
+[`graph.artist_member_of`](#the-member_of-union), which the path functions read directly
+because Neo4j has no relationship type it corresponds to.
 
 It is the one conditional object in this schema. On PostgreSQL 18, and on 19 with the switch
-off, `graph.catalog` does not exist while all sixty-four relations do, so no consumer may assume it
+off, `graph.catalog` does not exist while all sixty-five relations do, so no consumer may assume it
 — [the persistence compatibility contract](../contracts/persistence/) records it as additive
 but conditional for exactly that reason. The gates are stated once, in
 [when it is applied](#when-it-is-applied) below.
