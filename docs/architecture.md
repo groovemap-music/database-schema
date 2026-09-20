@@ -277,7 +277,7 @@ The executable PostgreSQL inventory is in
 - public Discogs document tables: `artists`, `labels`, `masters`, and `releases`;
 - account and operational tables: `users`, `oauth_tokens`, `app_tokens`, `app_config`,
   `user_collections`, `user_wantlists`, `sync_history`, `extraction_history`, `queue_metrics`,
-  `service_health_metrics`, `admin_audit_log`, and `discogs_loader_extraction_latch`;
+  `service_health_metrics`, `admin_audit_log`, and `loader_extraction_latch`;
 - native identity tables (see Identity above): `catalog_items`, `artifacts`, `owned_copies`,
   `collection_snapshots`, `observations`, and `provider_aliases`;
 - insight tables in the `insights` schema: `artist_centrality`, `genre_trends`,
@@ -309,46 +309,56 @@ alone, so the column is declared here rather than carried as a startup `ALTER` i
 
 ### Loader extraction-latch coordination
 
-`discogs_loader_extraction_latch` is `discogs-sql-loader`'s durable, version-keyed latch for
-the post-import pass that refreshes counters and reconciles `member_of`/`same_as` after a
-full Discogs extraction. The loader handles `extraction_complete` once per entity type across
-four independently draining fanout queues, and the derived-relation refresh must not run
-until all four of one extraction's signals have arrived — a per-type refresh would publish
-counts over a half-loaded catalog. One row per extraction (`version`, falling back to
-`started_at` when the message carries no version) records which types have signalled
-(`signals TEXT[]`), whether the refresh pass has completed (`refreshed_at`), and superseded-by
-ordering against a later extraction, so a stale signal from a dump a newer one has replaced is
-never mistaken for the current one's fourth signal. It mirrors `graphinator`'s equivalent
-Neo4j-side latch, and for the same reason: written before the triggering delivery is acked, so
-a restart between signals resumes collection instead of losing the coordination state the ack
-would otherwise destroy.
+`loader_extraction_latch` is the loader family's durable, per-`(loader, extraction)` latch for
+a post-import pass — for `discogs-sql-loader`, the pass that refreshes counters and reconciles
+`member_of`/`same_as` after a full Discogs extraction. A loader handles `extraction_complete`
+once per entity type across independently draining fanout queues, and its derived-relation
+refresh must not run until all of one extraction's signals have arrived — a per-type refresh
+would publish counts over a half-loaded catalog. One row per `(loader, version)` — `version`
+falling back to `started_at` when the message carries no version — records which types have
+signalled (`signals TEXT[]`), whether the refresh pass has completed (`refreshed_at`), and
+superseded-by ordering against a later extraction of the same loader, so a stale signal from a
+dump a newer one has replaced is never mistaken for the current one's final signal. It mirrors
+`graphinator`'s equivalent Neo4j-side latch, and for the same reason: written before the
+triggering delivery is acked, so a restart between signals resumes collection instead of
+losing the coordination state the ack would otherwise destroy.
 
 The table is declared here, in `_USER_TABLES` in
 [`src/groovemap_schema/postgres.py`](../src/groovemap_schema/postgres.py), rather than by a
-runtime `CREATE TABLE` in the loader, because this repository is the sole DDL issuer (the
-loader's review bounced its own runtime `CREATE TABLE IF NOT EXISTS` for exactly that reason).
-The name and column shape (`version TEXT PRIMARY KEY`, `signals TEXT[] NOT NULL DEFAULT '{}'`,
-`created_at`/`updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`, `refreshed_at TIMESTAMPTZ`) are
-copied verbatim from the loader's own `tableinator/extraction_latch.py`, so the loader's edit
-is minimal: it stops issuing its `_CREATE_LATCH_TABLE` statement at startup and otherwise
-reads and writes the same relation unchanged.
+runtime `CREATE TABLE` in a loader, because this repository is the sole DDL issuer (the
+discogs-sql-loader review bounced its own runtime `CREATE TABLE IF NOT EXISTS` for exactly
+that reason). `discogs-sql-loader`'s `tableinator/extraction_latch.py` probes
+`information_schema` at startup for one of `LATCH_CANDIDATES`
+(`public.loader_extraction_latch` first, `graph.extraction_latch` second) and requires the
+five non-key columns at exact `information_schema` types
+(`text`; `ARRAY`/`_text`; `timestamp with time zone` × 3) or it declines the relation and runs
+degraded. This repository declares the first candidate name, so no fallback is needed:
 
-This is deliberately the loader's own relation rather than a shared
-`public.loader_extraction_latch(loader, extraction_key, ...)` table with a composite key. A
-shared relation was considered: it would let `musicbrainz-sql-loader` reuse the identical
-table by adding a `loader` column. It was rejected for this pass because it would force every
-one of the loader's SQL statements to change, not only the table name — the `INSERT` column
-list, the `ON CONFLICT` target, the `prior` CTE's `WHERE` predicate, and the `superseded`
-`EXISTS` subquery's `WHERE` predicate in `_RECORD_SIGNAL`, plus `_MARK_REFRESHED`'s `WHERE`
-clause, would each need an added `loader = 'discogs'` predicate, and every call site would need
-a new parameter threaded through — well past "only the table name" changing. When
-`musicbrainz-sql-loader` needs the same coordination pattern, it gets its own
-analogously-named, identically-shaped relation declared here (for example
-`musicbrainz_loader_extraction_latch`), not a write into this one. See `extraction_latch` in
-[the persistence compatibility contract](../contracts/persistence/) for the recorded decision.
+```sql
+CREATE TABLE IF NOT EXISTS loader_extraction_latch (
+    loader       TEXT NOT NULL,
+    version      TEXT NOT NULL,
+    signals      TEXT[] NOT NULL DEFAULT '{}',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    refreshed_at TIMESTAMPTZ,
+    CONSTRAINT loader_extraction_latch_pkey PRIMARY KEY (loader, version)
+)
+```
 
-`discogs_loader_extraction_latch` is storage-only: a plain `public` schema table, not part of
-the `graph` schema and not a property-graph element.
+It is named for the loader family, not for one loader, and carries the optional `loader`
+discriminator column the probe honours: when present, the loader keys and scopes every
+statement on it (its `_key_columns()` returns `(loader, version)` rather than `(version,)`),
+which is why the primary key is declared on `(loader, version)` up front — the loader's
+`ON CONFLICT` upsert and its own primary-key probe both depend on that composite key existing
+from the start, not added later. `discogs-sql-loader` writes `loader = 'discogs'`;
+`musicbrainz-sql-loader` may adopt the same pattern and write `loader = 'musicbrainz'` rows
+into this same relation, without this repository declaring a second table. See
+`extraction_latch` in [the persistence compatibility contract](../contracts/persistence/) for
+the full column and primary-key record.
+
+`loader_extraction_latch` is storage-only: a plain `public` schema table, not part of the
+`graph` schema and not a property-graph element.
 
 ## Catalog identifiers, manufacturing credits, and release country
 

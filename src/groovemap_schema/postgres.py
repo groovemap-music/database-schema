@@ -571,30 +571,36 @@ _USER_TABLES: list[tuple[str, str]] = [
         "idx_admin_audit_log_admin_id",
         "CREATE INDEX IF NOT EXISTS idx_admin_audit_log_admin_id ON admin_audit_log (admin_id)",
     ),
-    # discogs-sql-loader's durable, version-keyed extraction latch (bead
-    # gm-discogs-sql-loader-2eg.3): one row per extraction, recording which of
-    # the four Discogs entity types have signalled `extraction_complete` and
-    # whether the derived-relation refresh pass has completed for it. Written
-    # before the delivery is acked so a restart resumes collection instead of
-    # losing already-collected signals.
+    # The loader family's durable, version-keyed extraction latch (bead
+    # gm-discogs-sql-loader-2eg.3): one row per (loader, extraction), recording
+    # which of a loader's entity types have signalled `extraction_complete` and
+    # whether that loader's derived-relation refresh pass has completed for it.
+    # Written before the delivery is acked so a restart resumes collection
+    # instead of losing already-collected signals.
     #
-    # Declared here rather than by a runtime CREATE TABLE in the loader because
+    # Declared here rather than by a runtime CREATE TABLE in a loader because
     # this repository is the sole DDL issuer (see docs/architecture.md and
-    # contracts/persistence/v1/compatibility.json). The name and column shape
-    # are copied verbatim from tableinator/extraction_latch.py in
-    # discogs-sql-loader, so the loader's own edit is minimal: it stops issuing
-    # `_CREATE_LATCH_TABLE` at runtime and otherwise reads/writes exactly the
-    # relation this statement creates. See the "loader coordination" note in
-    # docs/architecture.md for why this is not a shared `loader text` relation.
+    # contracts/persistence/v1/compatibility.json). discogs-sql-loader probes
+    # `information_schema` at startup for one of `LATCH_CANDIDATES`
+    # (`public.loader_extraction_latch` first) in its
+    # `tableinator/extraction_latch.py`, requires the five non-key columns
+    # below with these exact `information_schema` types, and honours the
+    # `loader` discriminator column, keying and scoping every statement on it
+    # when present — which is why it is declared here rather than omitted.
+    # The relation is named for the loader family, not for one loader, so
+    # musicbrainz-sql-loader can share it under the same `loader` value
+    # convention ('discogs', 'musicbrainz'); see docs/architecture.md.
     (
-        "discogs_loader_extraction_latch table",
+        "loader_extraction_latch table",
         """
-        CREATE TABLE IF NOT EXISTS discogs_loader_extraction_latch (
-            version      TEXT PRIMARY KEY,
+        CREATE TABLE IF NOT EXISTS loader_extraction_latch (
+            loader       TEXT NOT NULL,
+            version      TEXT NOT NULL,
             signals      TEXT[] NOT NULL DEFAULT '{}',
             created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            refreshed_at TIMESTAMPTZ
+            refreshed_at TIMESTAMPTZ,
+            CONSTRAINT loader_extraction_latch_pkey PRIMARY KEY (loader, version)
         )
         """,
     ),

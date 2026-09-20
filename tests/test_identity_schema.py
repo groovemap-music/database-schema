@@ -216,7 +216,7 @@ _ADDED_STATEMENT_NAMES = frozenset(
         "musicbrainz.external_links.updated_at column",
         "idx_mb_rels_updated_at",
         "idx_mb_links_updated_at",
-        "discogs_loader_extraction_latch table",
+        "loader_extraction_latch table",
     }
 )
 

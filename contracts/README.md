@@ -58,20 +58,21 @@ already runs against the Discogs entity tables' own `updated_at`. DDL ownership 
 repository, so the column is declared here rather than carried as a startup `ALTER` in the
 loader.
 
-`extraction_latch` records `public.discogs_loader_extraction_latch`, `discogs-sql-loader`'s
-durable, version-keyed latch for its post-import derived-relation refresh: one row per
-extraction, recording which of the four Discogs entity types have signalled
-`extraction_complete` and whether the refresh pass has completed (`refreshed_at`), written
+`extraction_latch` records `public.loader_extraction_latch`, the loader family's durable,
+per-`(loader, extraction)` latch for a post-import derived-relation refresh: one row per
+loader per extraction, recording which of that loader's entity types have signalled
+`extraction_complete` and whether its refresh pass has completed (`refreshed_at`), written
 before the triggering delivery is acked so a restart resumes collection. It mirrors
-`graphinator`'s Neo4j-side latch and is declared here — matching the name and column shape the
-loader's own `tableinator/extraction_latch.py` already used at runtime — rather than as a
-runtime `CREATE TABLE` in the loader, because DDL ownership stays with this repository. It is
-kept as the loader's own exact relation rather than a shared `loader text` relation: a shared
-key would force every one of the loader's statements to change beyond the table name (see
-`design_decision` in the contract). `musicbrainz-sql-loader` may adopt the same pattern with
-its own analogously-named relation when it needs one; it does not write this one. Storage-only:
-`discogs_loader_extraction_latch` is a plain `public` table, not a `graph` schema relation, and
-is not a property-graph element.
+`graphinator`'s Neo4j-side latch and is declared here — matching the name (the first of
+`discogs-sql-loader`'s `LATCH_CANDIDATES`), the five required columns' types, the `loader`
+discriminator, and the `loader_extraction_latch_pkey` primary key on `(loader, version)` that
+`tableinator/extraction_latch.py`'s startup probe and `ON CONFLICT` upsert require — rather
+than as a runtime `CREATE TABLE` in the loader, because DDL ownership stays with this
+repository. `discogs-sql-loader` is the writer today (`loader = 'discogs'`); the relation is
+named for the loader family, not for one loader, so `musicbrainz-sql-loader` can write its own
+rows (`loader = 'musicbrainz'`) into the same relation when it adopts the pattern; see
+`design_decision` in the contract. Storage-only: `loader_extraction_latch` is a plain `public`
+table, not a `graph` schema relation, and is not a property-graph element.
 
 Catalog event shapes are not owned here. Discogs events belong to
 [`discogs-ingestion`](https://github.com/groovemap-music/discogs-ingestion), and MusicBrainz
