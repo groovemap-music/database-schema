@@ -6,6 +6,11 @@ All notable changes to the GrooveMap database schema will be documented here.
 
 ### Feat
 
+- **loader-latch**: add `loader_extraction_latch` as the loader family's durable
+  extraction-complete latch, keyed on `(loader, version)`, for `discogs-sql-loader`'s
+  post-import counter refresh and reconciliation pass, matching the exact name, column
+  types, and primary key its startup probe requires so DDL ownership moves here and
+  `musicbrainz-sql-loader` can share the same relation
 - **musicbrainz**: add `updated_at` to `musicbrainz.relationships` and
   `musicbrainz.external_links` as `musicbrainz-sql-loader`'s delete-reconciliation key
 

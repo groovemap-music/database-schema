@@ -62,6 +62,7 @@ EXPECTED_POSTGRES_TABLES = {
         "collection_snapshots",
         "extraction_history",
         "labels",
+        "loader_extraction_latch",
         "masters",
         "oauth_tokens",
         "observations",
@@ -110,6 +111,15 @@ EXPECTED_COLUMNS = {
     ("musicbrainz", "releases", "media", "jsonb"),
     ("musicbrainz", "relationships", "updated_at", "timestamp with time zone"),
     ("musicbrainz", "external_links", "updated_at", "timestamp with time zone"),
+    # discogs-sql-loader's startup probe requires exactly these `information_schema`
+    # types (`REQUIRED_COLUMNS` in `tableinator/extraction_latch.py`) or it declines
+    # the relation and runs degraded.
+    ("public", "loader_extraction_latch", "loader", "text"),
+    ("public", "loader_extraction_latch", "version", "text"),
+    ("public", "loader_extraction_latch", "signals", "ARRAY"),
+    ("public", "loader_extraction_latch", "created_at", "timestamp with time zone"),
+    ("public", "loader_extraction_latch", "updated_at", "timestamp with time zone"),
+    ("public", "loader_extraction_latch", "refreshed_at", "timestamp with time zone"),
 }
 
 # The endpoint-pair indexes every one of the sixteen typed MusicBrainz
@@ -423,6 +433,27 @@ async def assert_expected_postgres_schema() -> None:
             ],
         )
     ]
+
+    # The loader's startup probe declines the relation unless it carries a
+    # primary key (or unique constraint) on exactly its key columns, since its
+    # `ON CONFLICT (loader, version)` upsert depends on one existing. This is
+    # a `contype = 'p'` check, not a name-only one, so a plain index with the
+    # same name would not satisfy it.
+    latch_key = await postgres_rows(
+        """
+        SELECT array_agg(attribute.attname ORDER BY key_column.ordinality)
+        FROM pg_constraint AS constraint_row
+        JOIN pg_class AS table_class ON table_class.oid = constraint_row.conrelid
+        JOIN pg_namespace AS namespace ON namespace.oid = table_class.relnamespace
+        CROSS JOIN LATERAL unnest(constraint_row.conkey) WITH ORDINALITY AS key_column(attnum, ordinality)
+        JOIN pg_attribute AS attribute
+          ON attribute.attrelid = table_class.oid AND attribute.attnum = key_column.attnum
+        WHERE namespace.nspname = 'public'
+          AND table_class.relname = 'loader_extraction_latch'
+          AND constraint_row.contype = 'p'
+        """
+    )
+    assert latch_key == [(["loader", "version"],)]
 
 
 # ── The catalog property graph ───────────────────────────────────────────────
