@@ -2707,6 +2707,192 @@ def _derived_edge_table_statements() -> list[tuple[str, str]]:
     return statements
 
 
+# ── The traversal surface's per-vertex degree ────────────────────────────────
+# `graph.vertex_degree` is one `bigint` per vertex of the path traversal
+# surface, and it exists to decide EXPANSION ORDER — which side of a
+# bidirectional search to expand next, and which vertex of that side's frontier
+# to expand first. It is not an access path and it changes no answer.
+#
+# Spike gm-database-schema-gkt.1 measured it. Expanding the smaller-degree
+# frontier first removed the distance-5 variance outright, 1,774 ms to 334 ms,
+# while returning the same paths; it does not help distance 6 and made it
+# slightly worse, so this is a variance reducer and must not be sold as a fix.
+# What makes it worth building anyway is the price: one bigint per vertex is
+# 97 MB at catalog scale, against the 1,649 MB the earlier spike
+# gm-database-schema-9c8.3 priced for a dense adjacency copy that bought 1.3x.
+# `docs/spikes/gm-database-schema-gkt.1/sql/degree.sql` is the prototype and
+# this is the same relation, keyed the same way.
+#
+# **`kind` is a single-character discriminator, not a prefix on the key.** The
+# pathfinder's node identity is the pair `(kind, key)`, because an equality on a
+# concatenated token — `'a:' || artist_id` — cannot use the text indexes the
+# edge tables carry, so every frontier step would degrade to a scan. `"char"` is
+# PostgreSQL's one-byte internal type: the whole point of a 97 MB relation is
+# that a vertex costs a byte and a bigint rather than a row of text.
+#
+# **It is storage-only, like `graph.artist_member_of`.** It binds no
+# property-graph label. There is no Neo4j node property it corresponds to,
+# nothing in `graph.catalog` would read it, and a label over it would publish a
+# second identity for every vertex the graph already binds under its own label.
+_VERTEX_KIND_NAMES: dict[str, str] = {
+    "a": "artist",
+    "g": "genre",
+    "l": "label",
+    "m": "master",
+    "r": "release",
+    "s": "style",
+}
+
+# The ten relations the spike's pathfinder traverses, each as (relation, source
+# kind, source column, target kind, target column). Eight are the Discogs
+# relations `docs/spikes/gm-database-schema-9c8.1/materialize.sql` builds both
+# directions of; the other two are the artist-to-artist pair, `alias_of` and the
+# cross-provenance MEMBER_OF union.
+#
+# This list is exactly `pf.edge` in
+# `docs/spikes/gm-database-schema-gkt.1/sql/edges.sql`, which is exactly the six
+# relationship types `_PATH_REL_TYPES` names in `catalog-api` — BY, ON, IS,
+# ALIAS_OF, MEMBER_OF, DERIVED_FROM. `part_of`, `sublabel_of`, `same_as`,
+# `credited_on`, `credited_to`, and `issued_on` are deliberately absent: a path
+# query does not traverse them, so an endpoint of one is not a neighbour the
+# expansion would ever have to visit and counting it would misorder the
+# frontier rather than describe it.
+_PATH_RELATIONS: tuple[tuple[str, str, str, str, str], ...] = (
+    ("by_artist", "r", "release_id", "a", "artist_id"),
+    ("master_by_artist", "m", "master_id", "a", "artist_id"),
+    ("on_label", "r", "release_id", "l", "label_id"),
+    ("in_genre", "r", "release_id", "g", "genre_name"),
+    ("in_style", "r", "release_id", "s", "style_name"),
+    ("master_in_genre", "m", "master_id", "g", "genre_name"),
+    ("master_in_style", "m", "master_id", "s", "style_name"),
+    ("derived_from", "r", "release_id", "m", "master_id"),
+    ("alias_of", "a", "alias_artist_id", "a", "artist_id"),
+    ("artist_member_of", "a", "member_artist_id", "a", "group_artist_id"),
+)
+
+# Every vertex kind that can carry an edge, in the order the refresh reports
+# them. Read out of the relation list rather than restated, so a relation added
+# with a new kind reports without anything else moving.
+_VERTEX_KINDS: tuple[str, ...] = tuple(sorted({kind for _relation, source, _sc, target, _tc in _PATH_RELATIONS for kind in (source, target)}))
+
+
+def _vertex_degree_endpoints() -> list[tuple[str, str, str]]:
+    """Return every (kind, column, relation) endpoint the degree sums, both directions."""
+    return [
+        (kind, column, relation)
+        for relation, source_kind, source_column, target_kind, target_column in _PATH_RELATIONS
+        for kind, column in ((source_kind, source_column), (target_kind, target_column))
+    ]
+
+
+def _vertex_degree_body() -> str:
+    """Return the body summing both directions of the ten path relations.
+
+    Twenty branches over ten relations, each relation once per direction, so a
+    row of an edge table contributes one to each of its two endpoints and the
+    result is the undirected degree. It is the spike's
+    `SELECT src_kind, src_key, count(*) FROM pf.edge GROUP BY 1, 2` over a view
+    that already listed both directions, written out here because this schema
+    has no such view and does not want one.
+
+    Only vertices that carry an edge get a row. A genre nothing is filed under
+    has no row rather than a zero, which is what keeps the relation the size of
+    the traversal surface rather than the size of the catalog; a lookup that
+    misses reads as degree zero, which is what it is.
+
+    **A membership both provenances assert counts twice**, because
+    `graph.artist_member_of` carries `source` in its key and really does return
+    two rows for it. The number is therefore the rows an expansion of that
+    vertex will scan, which is the quantity the ordering decision is comparing;
+    counting the distinct neighbour instead would understate the work by exactly
+    the rows the scan still has to read. The spike's prototype counts it twice
+    for the same reason — its `pf.edge` unions `path.member_of` and
+    `path.mb_member_of` with `UNION ALL` — so this relation reproduces the
+    measurement rather than a variant of it. The cost of the choice is that a
+    dual-provenance artist looks marginally busier than it is, which can only
+    make the search expand the other side first; no answer moves.
+    """
+    endpoints = _vertex_degree_endpoints()
+    width = max(len(column) for _kind, column, _relation in endpoints)
+    (first_kind, first_column, first_relation), rest = endpoints[0], endpoints[1:]
+    branches = [f"""    SELECT '{first_kind}'::"char" AS kind, {first_column:<{width}} AS key FROM graph.{first_relation}"""]  # noqa: S608
+    branches.extend(
+        f"""    UNION ALL SELECT '{kind}'::"char", {column:<{width}}       FROM graph.{relation}"""  # noqa: S608
+        for kind, column, relation in rest
+    )
+    rendered = "\n".join(branches)
+    return f"""
+SELECT endpoint.kind AS kind,
+       endpoint.key  AS key,
+       count(*)      AS degree
+FROM (
+{rendered}
+) AS endpoint
+GROUP BY endpoint.kind, endpoint.key
+"""  # noqa: S608
+
+
+def _refresh_vertex_degree_function() -> str:
+    """Return `graph.refresh_vertex_degree()`, the degree relation's own rebuild.
+
+    The third shipped function that writes a graph row, and the second with a
+    named refresh owner: like the MEMBER_OF union and the counter relations it
+    sums, **`discogs-sql-loader` rebuilds it on the `extraction_complete` latch
+    it already handles**, after `graph.refresh_artist_member_of()` and with the
+    rest of the post-import pass. It is a sum over relations a loader writes a
+    row at a time, so no loader can maintain it incrementally, and it costs no
+    new scheduler. The contract records that owner under
+    `graph_schema.vertex_degree`; nothing in this repository calls it.
+
+    `TRUNCATE` then `INSERT`, for the reason `graph.bootstrap_fill()` has it: a
+    vertex whose last edge was removed has to lose its row, and an upsert
+    converges upward only — it would leave that vertex looking like a hub
+    forever and the search would keep expanding the wrong frontier. The whole
+    body is one statement's worth of work in one transaction, so a failure
+    leaves the previous contents rather than an emptied relation.
+
+    It reports a row per vertex kind rather than one row for the relation,
+    always every kind, so a rebuild that finds no masters — an environment where
+    the masters dump has not been ingested — says so with a zero instead of
+    looking like a relation that is simply smaller than expected.
+
+    The body is `_COUNTER_BOOTSTRAP`'s, the same text `graph.bootstrap_fill()`
+    inlines, so the one-off fill and the refresh cannot disagree about what a
+    degree counts.
+    """
+    body = _COUNTER_BOOTSTRAP["vertex_degree"]
+    indented = "\n".join(f"        {line}" if line.strip() else "" for line in body.strip().splitlines())
+    kinds = ", ".join(f"""('{kind}'::"char")""" for kind in _VERTEX_KINDS)
+    return f"""CREATE OR REPLACE FUNCTION graph.refresh_vertex_degree()
+RETURNS TABLE (kind "char", row_count bigint)
+LANGUAGE plpgsql
+AS $refresh_vertex_degree$
+#variable_conflict use_column
+-- `kind` is both an output column and a column of the relation being built, so
+-- the body resolves it to the column rather than failing on the ambiguity.
+BEGIN
+    TRUNCATE graph.vertex_degree;
+    INSERT INTO graph.vertex_degree (kind, key, degree)
+    SELECT kind, key, degree
+    FROM (
+{indented}
+    ) AS refresh;
+
+    -- Counted back off the relation rather than off the insert, so a kind that
+    -- contributed nothing still reports, as a zero.
+    FOR kind, row_count IN
+        SELECT vertex.kind,
+               (SELECT count(*) FROM graph.vertex_degree AS degree WHERE degree.kind = vertex.kind)
+        FROM (VALUES {kinds}) AS vertex(kind)
+        ORDER BY vertex.kind
+    LOOP
+        RAISE NOTICE 'refresh_vertex_degree: % <- % row(s)', kind, row_count;
+        RETURN NEXT;
+    END LOOP;
+END
+$refresh_vertex_degree$"""  # noqa: S608
+
+
 # Table 3 of the coverage spike: the pre-computed node properties `graphinator`
 # writes in a post-import pass and that eight catalog-api functions read as if
 # they were free. A graph declared over views has nowhere to put them.
@@ -2775,6 +2961,19 @@ def _counter_table_statements() -> list[tuple[str, str]]:
             """
     release_id text PRIMARY KEY,
     degree     bigint NOT NULL DEFAULT 0
+""",
+        ),
+        # One row per vertex of the path traversal surface. `(kind, key)` is the
+        # pathfinder's node identity and therefore the key; no secondary index,
+        # because every read is a point lookup on that pair and the whole reason
+        # this relation is affordable is that it holds nothing else.
+        _table(
+            "vertex_degree",
+            """
+    kind   "char" NOT NULL,
+    key    text   NOT NULL,
+    degree bigint NOT NULL DEFAULT 0,
+    PRIMARY KEY (kind, key)
 """,
         ),
         # The two aggregates that have no Neo4j counterpart at all. Both are
@@ -3109,6 +3308,13 @@ FROM (
 ) AS endpoint
 GROUP BY endpoint.release_id
 """,
+    # Not a Neo4j node property at all, and the only entry here that is an
+    # ordering heuristic rather than a counter a query reads. It is refreshed
+    # with the counters because it is the same kind of thing operationally — a
+    # sum over the edge tables, on the same latch — and the body is rendered
+    # rather than written out so the twenty branches cannot drift from the ten
+    # relations they are supposed to cover.
+    "vertex_degree": _vertex_degree_body(),
     "artist_genre": """
 SELECT by_artist.artist_id AS artist_id,
        in_genre.genre_name AS genre_name,
@@ -3174,11 +3380,11 @@ def graph_bootstrap_statements(schema: str) -> list[tuple[str, str]]:
 
 # ── The bootstrap fill (shipped) ─────────────────────────────────────────────
 # Everything above this line is a definition. `graph.bootstrap_fill()` is one of
-# the two things in this module that write a graph row — the other is
-# `graph.refresh_artist_member_of()` below it — and both are deliberately
-# functions nobody calls rather than statements the initializer runs: applying
-# the schema must stay a declaration, and an environment that wants rows asks
-# for them.
+# the three things in this module that write a graph row — the others are
+# `graph.refresh_artist_member_of()` and `graph.refresh_vertex_degree()` below
+# it — and all three are deliberately functions nobody calls rather than
+# statements the initializer runs: applying the schema must stay a declaration,
+# and an environment that wants rows asks for them.
 #
 # **It is not authoritative.** The SQL loaders own every relation it touches —
 # `discogs-sql-loader` writes an edge in the same transaction as the document it
@@ -3188,10 +3394,10 @@ def graph_bootstrap_statements(schema: str) -> list[tuple[str, str]]:
 # run, so a read rewrite in `catalog-api` is not blocked on the dual-write. The
 # first loader pass supersedes it.
 #
-# The refresh function is the one exception to "nobody calls it", and only in
-# the sense that it has a named owner: it is derived rather than loaded, so no
-# loader can write it a row at a time, and `discogs-sql-loader` rebuilds it on
-# the `extraction_complete` latch it already handles.
+# The two refresh functions are the exception to "nobody calls it", and only in
+# the sense that they have a named owner: both are derived rather than loaded,
+# so no loader can write either a row at a time, and `discogs-sql-loader`
+# rebuilds both on the `extraction_complete` latch it already handles.
 
 # The counter relations' column lists, in the order each table declares them.
 # The vertex and edge lists are `_BOOTSTRAP_COLUMNS` above; these are separate
@@ -3203,6 +3409,7 @@ _COUNTER_COLUMNS: dict[str, tuple[str, ...]] = {
     "label_stats": ("label_id", "release_count", "artist_count", "genre_count"),
     "artist_degree": ("artist_id", "degree"),
     "release_degree_base": ("release_id", "degree"),
+    "vertex_degree": ("kind", "key", "degree"),
     "artist_genre": ("artist_id", "genre_name", "release_count"),
     "label_genre": ("label_id", "genre_name", "release_count"),
 }
@@ -3224,6 +3431,10 @@ _COUNTER_COLUMNS: dict[str, tuple[str, ...]] = {
 #   half reads the `musicbrainz` tables directly, which no step here writes.
 #   Filled with the edges it would union an empty relation and converge on the
 #   MusicBrainz half alone.
+# - **`vertex_degree` after `artist_member_of`**, which the group above already
+#   gives it: the union is one of the ten relations it sums, so filled with the
+#   counters it is filled after the union in any case, and filled earlier it
+#   would count a MEMBER_OF class that was still empty.
 _BOOTSTRAP_FILL_ORDER: tuple[str, ...] = (
     *_MATERIALIZED_VERTICES,
     *_MATERIALIZED_EDGES,
@@ -3290,7 +3501,7 @@ def _bootstrap_fill_function() -> str:
     """Return `graph.bootstrap_fill()`, the one-off fill of every loader-owned table.
 
     One transaction, because the caller's statement is one: `SELECT * FROM
-    graph.bootstrap_fill()` either replaces all twenty-eight relations or
+    graph.bootstrap_fill()` either replaces all twenty-nine relations or
     replaces none, so a failure half way through cannot leave edges pointing at
     vertices that were truncated and never refilled.
 
@@ -3328,8 +3539,8 @@ $bootstrap_fill$"""
 def _refresh_artist_member_of_function() -> str:
     """Return `graph.refresh_artist_member_of()`, the union's own rebuild.
 
-    The second shipped function that writes a graph row, and the only one with a
-    named refresh owner: **`discogs-sql-loader` calls it on the
+    The second shipped function that writes a graph row, and one of the two with
+    a named refresh owner: **`discogs-sql-loader` calls it on the
     `extraction_complete` latch it already handles**, which is the same latch
     the counter relations are recomputed on and the same one `graphinator` uses
     to start its post-import pass. So the union costs no new scheduler, and it is
@@ -3395,8 +3606,9 @@ def _build_graph_statements() -> list[tuple[str, str]]:
     rather than documents. Every migration that frees a name precedes the
     relation that takes it, which is what `_graph_table_statements` returns. And
     the two writing functions come last, after every relation they write or read
-    — `graph.refresh_artist_member_of` reads two MusicBrainz views and
-    `graph.bootstrap_fill` reads all of it — a plpgsql body resolves its names at
+    — `graph.refresh_artist_member_of` reads two MusicBrainz views,
+    `graph.refresh_vertex_degree` reads the ten path relations including the
+    union that function writes, and `graph.bootstrap_fill` reads all of it — a plpgsql body resolves its names at
     first call rather than at creation, so the position is a statement about what
     each function means rather than a requirement, and it is kept honest by a
     test.
@@ -3416,10 +3628,12 @@ def _build_graph_statements() -> list[tuple[str, str]]:
         *_collection_views(),
         *_credit_views(),
         *_counter_views(),
-        # Both of these read the relations above rather than being read by one,
-        # so they come after all of them: the union's body reads two MusicBrainz
-        # views, and the fill writes every table and reads `graph.part_of`.
+        # All three of these read the relations above rather than being read by
+        # one, so they come after all of them: the union's body reads two
+        # MusicBrainz views, the degree's reads ten relations including that
+        # union, and the fill writes every table and reads `graph.part_of`.
         ("graph.refresh_artist_member_of function", _refresh_artist_member_of_function()),
+        ("graph.refresh_vertex_degree function", _refresh_vertex_degree_function()),
         ("graph.bootstrap_fill function", _bootstrap_fill_function()),
     ]
 

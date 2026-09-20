@@ -8,6 +8,8 @@ from groovemap_schema import __version__
 from groovemap_schema.postgres import (
     _BOOTSTRAP_FILL_ORDER,
     _GRAPH_STATEMENTS,
+    _PATH_RELATIONS,
+    _VERTEX_KIND_NAMES,
     PROPERTY_GRAPH_MINIMUM_SERVER_VERSION,
     PROPERTY_GRAPH_NAME,
     PROPERTY_GRAPH_SCHEMA,
@@ -124,6 +126,7 @@ assert storage_only == {
     "release_degree_base",
     "style",
     "style_stats",
+    "vertex_degree",
 }, storage_only
 
 # The cross-provenance MEMBER_OF union. It is a table the path functions read
@@ -151,6 +154,42 @@ for source in union["sources"]:
 assert union["key"] == ["member_artist_id", "group_artist_id", "source"]
 assert f"PRIMARY KEY ({', '.join(union['key'])})" in table_statements[union["relation"]]
 assert f"ON {union['relation']} {union['reverse_index']}" in "\n".join(statement for name, statement in _GRAPH_STATEMENTS if name.endswith(" index"))
+
+# The per-vertex degree that orders frontier expansion. It is derived from ten
+# relations rather than written a row at a time, so — like the MEMBER_OF union —
+# the contract has to name who rebuilds it and on what latch. Every source and
+# every vertex kind is read back out of the relation list rather than restated,
+# so a path relation added to or dropped from the traversal surface fails this
+# check instead of leaving the contract describing a surface that moved.
+degree = graph["vertex_degree"]
+assert degree["kind"] == "additive"
+assert degree["availability"] == "unconditional"
+assert degree["relation"] == f"{PROPERTY_GRAPH_SCHEMA}.vertex_degree"
+assert degree["function"] == f"{PROPERTY_GRAPH_SCHEMA}.refresh_vertex_degree"
+assert degree["function"] in graph["functions"]
+assert degree["refresh_owner"] in OWNERS
+assert degree["refresh_owner"] == "discogs-sql-loader"
+assert degree["refresh_latch"] == "extraction_complete"
+assert degree["refresh_latch"] == union["refresh_latch"]
+assert degree["relation"].removeprefix(f"{PROPERTY_GRAPH_SCHEMA}.") in storage_only
+assert declared_shapes[degree["relation"].removeprefix(f"{PROPERTY_GRAPH_SCHEMA}.")] == "table"
+assert relations["vertex_degree"]["owner"] == degree["refresh_owner"]
+assert degree["key"] == ["kind", "key"]
+assert f"PRIMARY KEY ({', '.join(degree['key'])})" in table_statements[degree["relation"]]
+# The ten relations it sums, both directions of each, and nothing else.
+assert degree["sources"] == [f"{PROPERTY_GRAPH_SCHEMA}.{relation}" for relation, _sk, _sc, _tk, _tc in _PATH_RELATIONS]
+assert len(degree["sources"]) == 10
+# The union is one of them, which is why the refresh runs after the union's.
+assert f"{PROPERTY_GRAPH_SCHEMA}.artist_member_of" in degree["sources"]
+degree_body = dict(_GRAPH_STATEMENTS)[f"{PROPERTY_GRAPH_SCHEMA}.refresh_vertex_degree function"]
+for source in degree["sources"]:
+    assert degree_body.count(f"FROM {source}\n") == 2, source
+assert degree["vertex_kinds"] == _VERTEX_KIND_NAMES
+assert {kind for _r, source, _sc, target, _tc in _PATH_RELATIONS for kind in (source, target)} == set(degree["vertex_kinds"])
+# The one judgement call the relation makes, recorded rather than inferred: the
+# union keys on `source`, so a membership both provenances assert is two rows
+# and an expansion of that vertex really does scan both.
+assert degree["counts_a_dual_provenance_membership"] == "twice"
 
 # Appending a column is the only view change safe to ship on its own; the engine
 # enforces the rest by refusing the replacement.
