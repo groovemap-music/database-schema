@@ -108,8 +108,8 @@ for label, recorded in counters["labels"].items():
 assert "release_degree" in vertices_by_label
 assert not set(vertices_by_label) & {recorded["counters"].removeprefix("graph.") for recorded in counters["labels"].values()}
 
-# The property graph binds every relation except the nine that hold rows or
-# counters for a label that binds a projection over them, plus the loader-written
+# Every declared relation is exposed by the property graph except the nine
+# storage-only row/counter tables behind projected labels, plus the loader-written
 # half of release degree.
 element_relations = {element.element for element in (*_property_graph_vertices(), *_property_graph_edges())}
 storage_only = set(declared_shapes) - element_relations
