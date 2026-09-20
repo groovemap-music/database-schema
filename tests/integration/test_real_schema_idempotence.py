@@ -143,9 +143,10 @@ EXPECTED_GRAPH_VIEWS = {name.removeprefix("graph.").removesuffix(" view") for na
 EXPECTED_GRAPH_TABLES = {name.removeprefix("graph.").removesuffix(" table") for name, _statement in _GRAPH_STATEMENTS if name.endswith(" table")}
 EXPECTED_GRAPH_RELATIONS = EXPECTED_GRAPH_VIEWS | EXPECTED_GRAPH_TABLES
 
-# Every element of `graph.catalog`, and the nine relations that bind none: they
-# hold rows or counters for a label that binds a view joining them, plus the
-# loader-written half of release degree.
+# Every element of `graph.catalog`, and the eleven relations that bind none:
+# they hold rows or counters for a label that binds a view joining them, plus
+# the loader-written half of release degree, the MEMBER_OF union, and the
+# per-vertex degree the path functions order their expansion by.
 DECLARED_ELEMENTS = (*_property_graph_vertices(), *_property_graph_edges())
 STORAGE_ONLY_RELATIONS = EXPECTED_GRAPH_RELATIONS - {element.element for element in DECLARED_ELEMENTS}
 
@@ -216,6 +217,12 @@ EXPECTED_GRAPH_COLUMNS = {
     ("graph", "artist_vertex", "artist_id", "text"),
     ("graph", "artist_vertex", "degree", "bigint"),
     ("graph", "release_degree_base", "degree", "bigint"),
+    # The per-vertex degree. `kind` is the one-byte internal type on purpose:
+    # the whole argument for a 97 MB relation is that a vertex costs a byte
+    # and a bigint rather than a row of text.
+    ("graph", "vertex_degree", "kind", '"char"'),
+    ("graph", "vertex_degree", "key", "text"),
+    ("graph", "vertex_degree", "degree", "bigint"),
     ("graph", "release_degree", "degree", "bigint"),
     ("graph", "artist_genre", "genre_name", "text"),
     ("graph", "label_genre", "label_id", "text"),
@@ -1021,6 +1028,200 @@ async def test_the_member_of_union_holds_both_provenances_and_converges() -> Non
     assert any("_pkey" in definition for definition in definitions), definitions
 
 
+# ── The per-vertex degree that orders frontier expansion ─────────────────────
+# `graph.vertex_degree` holds one bigint per vertex of the path traversal
+# surface. It decides which side of a bidirectional search to expand next and
+# which vertex of that side's frontier to expand first, and it changes no
+# answer. Spike gm-database-schema-gkt.1 measured the distance-5 variance
+# falling from 1,774 ms to 334 ms with it, answers unchanged.
+
+DEGREE_ROWS = "SELECT kind, key, degree FROM graph.vertex_degree ORDER BY 1, 2"
+
+# What the graph fixture's ten edges make of it, counted by hand.
+#
+# - `r`/`111` carries six: one `by_artist`, one `on_label`, one `derived_from`,
+#   one `in_genre`, two `in_style`. Release 222 is malformed and carries none,
+#   so it has no row at all rather than a zero.
+# - `a`/`7` carries six: one `by_artist`, one `master_by_artist`, one `alias_of`
+#   as the alias target, and three `artist_member_of` — `(7, 10)` under both
+#   provenances plus `(8, 7)` from the group end.
+# - `a`/`10` carries three, every one of them a membership: `(7, 10)` twice and
+#   `(11, 10)` once. `a`/`11` carries two, its alias edge and the
+#   MusicBrainz-only membership `graph.member_of` does not have.
+# - `m`/`55` carries four, `g`/`Rock` two, `s`/`Prog Rock` two — each of those
+#   is one release edge and one master edge — and `s`/`Psychedelic` one.
+EXPECTED_DEGREE_ROWS = [
+    ("a", "10", 3),
+    ("a", "11", 2),
+    ("a", "7", 6),
+    ("a", "8", 1),
+    ("g", "Rock", 2),
+    ("l", "9", 1),
+    ("m", "55", 4),
+    ("r", "111", 6),
+    ("s", "Prog Rock", 2),
+    ("s", "Psychedelic", 1),
+]
+
+# What the refresh reports, a row per vertex kind in the order it returns them.
+EXPECTED_DEGREE_REPORT = [("a", 4), ("g", 1), ("l", 1), ("m", 1), ("r", 1), ("s", 2)]
+
+# A vertex no edge justifies. The refresh has to remove it, which is what
+# truncate-and-insert buys and an upsert would not: a vertex that kept a stale
+# degree would go on looking like a hub and the search would keep expanding the
+# wrong frontier.
+STALE_VERTEX = ("a", "997")
+
+# The artist rows of `graph.vertex_degree` against `graph.artist_degree`, which
+# counts the same artist the way Neo4j's `COUNT { (a)--() }` does. The two are
+# the same sum with two deliberate substitutions, and this states them as
+# arithmetic rather than as prose:
+#
+# - **`same_as` is subtracted.** `graph.artist_degree` counts the person-to-artist
+#   edge because a Neo4j `:Artist` node carries it. No path query traverses it —
+#   it is not one of the six types `_PATH_REL_TYPES` names — so an expansion
+#   would never visit a `:Person` through it and counting it would misorder the
+#   frontier rather than describe it.
+# - **`member_of` is swapped for `artist_member_of`.** `graph.artist_degree`
+#   counts the Discogs relation; the traversal surface reads the cross-provenance
+#   union, where 61.6% of the edge class lives and where a membership both
+#   providers assert is two rows because `source` is in the key. That dual
+#   provenance counting twice is the deliberate choice this relation makes: the
+#   number is the rows an expansion of that vertex will scan.
+#
+# Everything else is identical, so the query below has to return no rows.
+DEGREE_AGREES_WITH_ARTIST_DEGREE = """
+SELECT artist.artist_id,
+       artist.degree AS artist_degree,
+       COALESCE(vertex.degree, 0) AS vertex_degree,
+       adjusted.expected
+FROM graph.artist_degree AS artist
+CROSS JOIN LATERAL (
+    SELECT artist.degree
+         - (SELECT count(*) FROM graph.same_as AS person WHERE person.artist_id = artist.artist_id)
+         - (SELECT count(*) FROM graph.member_of AS discogs
+             WHERE discogs.member_artist_id = artist.artist_id OR discogs.group_artist_id = artist.artist_id)
+         + (SELECT count(*) FROM graph.artist_member_of AS union_edge
+             WHERE union_edge.member_artist_id = artist.artist_id OR union_edge.group_artist_id = artist.artist_id)
+      AS expected
+) AS adjusted
+LEFT JOIN graph.vertex_degree AS vertex ON vertex.kind = 'a' AND vertex.key = artist.artist_id
+WHERE COALESCE(vertex.degree, 0) <> adjusted.expected
+"""
+
+# Every artist the traversal surface knows must be an artist the counter knows:
+# the surface adds a relation to `artist_degree`'s set, it never adds a vertex,
+# because every relation it reads that `artist_degree` does not — the union —
+# has both endpoints in `graph.member_of`'s key space.
+DEGREE_KNOWS_NO_UNCOUNTED_ARTIST = """
+SELECT vertex.key
+FROM graph.vertex_degree AS vertex
+LEFT JOIN graph.artist_degree AS artist ON artist.artist_id = vertex.key
+WHERE vertex.kind = 'a' AND artist.artist_id IS NULL
+"""
+
+
+@pytest.mark.asyncio
+async def test_the_vertex_degree_sums_both_directions_of_the_traversal_surface() -> None:
+    """One bigint per vertex, summed over the ten relations a path query walks."""
+    await apply_schema()
+    await seed_graph_fixtures()
+    await bootstrap_the_loader_tables()
+
+    # The bootstrap fill and the refresh share one body, so both answer this.
+    assert await postgres_rows(DEGREE_ROWS) == EXPECTED_DEGREE_ROWS
+
+    # A vertex with no edge has no row rather than a zero, which is what keeps
+    # the relation the size of the traversal surface rather than of the catalog.
+    # Release 222 is in `graph.release` and carries nothing.
+    assert await postgres_rows("SELECT count(*) FROM graph.release WHERE release_id = '222'") == [(1,)]
+    assert await postgres_rows("SELECT count(*) FROM graph.vertex_degree WHERE kind = 'r' AND key = '222'") == [(0,)]
+
+    # `kind` is a discriminator alongside the key, not a prefix on it: the
+    # pathfinder's node identity is the pair, and an equality on a concatenated
+    # token could not use the text indexes the edge tables carry.
+    assert await postgres_rows("SELECT count(*) FROM graph.vertex_degree WHERE strpos(key, ':') > 0") == [(0,)]
+    assert await postgres_rows(
+        """
+        SELECT data_type FROM information_schema.columns
+        WHERE table_schema = 'graph' AND table_name = 'vertex_degree' AND column_name = 'kind'
+        """
+    ) == [('"char"',)]
+
+    # The MusicBrainz-only membership is in the count, which is the whole reason
+    # the surface reads the union: artist 11 has an alias edge and nothing else
+    # in `graph.member_of`, so a degree over that relation would read 1.
+    assert await postgres_rows("SELECT degree FROM graph.vertex_degree WHERE kind = 'a' AND key = '11'") == [(2,)]
+    assert await postgres_rows("SELECT count(*) FROM graph.member_of WHERE member_artist_id = '11' OR group_artist_id = '11'") == [(0,)]
+
+
+@pytest.mark.asyncio
+async def test_the_vertex_degree_agrees_with_artist_degree_on_every_artist() -> None:
+    """The artist rows are `graph.artist_degree` with two deliberate substitutions."""
+    await apply_schema()
+    await seed_graph_fixtures()
+    await bootstrap_the_loader_tables()
+
+    # Neither comparison below is empty agreeing with empty.
+    assert await postgres_rows("SELECT count(*) FROM graph.artist_degree") == [(4,)]
+    assert await postgres_rows("SELECT count(*) FROM graph.vertex_degree WHERE kind = 'a'") == [(4,)]
+
+    assert await postgres_rows(DEGREE_AGREES_WITH_ARTIST_DEGREE) == []
+    assert await postgres_rows(DEGREE_KNOWS_NO_UNCOUNTED_ARTIST) == []
+
+    # Artist 8 is the case where both substitutions are inert — it is in no
+    # `same_as` row, and its one membership is Discogs-only, so the union holds
+    # exactly the row `graph.member_of` does. There the two relations agree
+    # outright, which is what says the adjustment above is an adjustment rather
+    # than a licence to differ.
+    assert await postgres_rows("SELECT degree FROM graph.artist_degree WHERE artist_id = '8'") == [(1,)]
+    assert await postgres_rows("SELECT degree FROM graph.vertex_degree WHERE kind = 'a' AND key = '8'") == [(1,)]
+
+    # And these are the two artists that deliberately differ, with the reason.
+    # Artist 10 is asserted a member by both providers and by two artists, so
+    # the union holds three rows where `graph.member_of` holds one — the dual
+    # provenance counts twice, because an expansion really does scan both rows.
+    assert await postgres_rows("SELECT degree FROM graph.artist_degree WHERE artist_id = '10'") == [(1,)]
+    assert await postgres_rows("SELECT degree FROM graph.vertex_degree WHERE kind = 'a' AND key = '10'") == [(3,)]
+    assert await postgres_rows("SELECT count(*) FROM graph.artist_member_of WHERE group_artist_id = '10'") == [(3,)]
+
+    # Artist 7 is the case where the two substitutions cancel: it loses one
+    # `same_as` edge and swaps two Discogs memberships for three union rows.
+    assert await postgres_rows("SELECT count(*) FROM graph.same_as WHERE artist_id = '7'") == [(1,)]
+    assert await postgres_rows("SELECT degree FROM graph.artist_degree WHERE artist_id = '7'") == [(6,)]
+    assert await postgres_rows("SELECT degree FROM graph.vertex_degree WHERE kind = 'a' AND key = '7'") == [(6,)]
+
+
+@pytest.mark.asyncio
+async def test_the_vertex_degree_refresh_reports_every_kind_and_converges() -> None:
+    """Re-running changes nothing, and a vertex no edge justifies is removed."""
+    await apply_schema()
+    await seed_graph_fixtures()
+    await bootstrap_the_loader_tables()
+
+    reported = await postgres_rows("SELECT kind, row_count FROM graph.refresh_vertex_degree()")
+    assert reported == EXPECTED_DEGREE_REPORT
+    assert await postgres_rows(DEGREE_ROWS) == EXPECTED_DEGREE_ROWS
+
+    # Re-running converges, and a vertex nothing asserts is removed.
+    await execute_all([("stale vertex", "INSERT INTO graph.vertex_degree VALUES ('a', '997', 99)")])
+    assert await postgres_rows("SELECT kind, row_count FROM graph.refresh_vertex_degree()") == EXPECTED_DEGREE_REPORT
+    assert await postgres_rows(DEGREE_ROWS) == EXPECTED_DEGREE_ROWS
+    assert await postgres_rows(
+        "SELECT count(*) FROM graph.vertex_degree WHERE kind = %s AND key = %s",
+        STALE_VERTEX,
+    ) == [(0,)]
+
+    # The pair is the key, so the pathfinder's lookup is a point read on the
+    # primary key and the relation carries nothing else. That is the whole
+    # argument for it: one bigint per vertex against a second copy of the edges.
+    definitions = [
+        row[0] for row in await postgres_rows("SELECT indexdef FROM pg_indexes WHERE schemaname = 'graph' AND tablename = 'vertex_degree'")
+    ]
+    assert len(definitions) == 1, definitions
+    assert definitions[0].endswith("(kind, key)"), definitions
+
+
 # The widening guard is proved against one column; the four are generated from
 # the same helper, so what holds for this one holds for all of them.
 WIDENED_TABLE = "labels"
@@ -1645,6 +1846,32 @@ COUNTER_ROW_COUNTS = {
             UNION SELECT release_id FROM graph.credited_to
             UNION SELECT release_id FROM graph.issued_on
         ) AS endpoint
+    """,
+    # The distinct vertices of the traversal surface, by a UNION of the same
+    # twenty branches rather than by the fill's GROUP BY.
+    "vertex_degree": """
+        SELECT count(*) FROM (
+            SELECT 'r'::"char" AS kind, release_id AS key FROM graph.by_artist
+            UNION SELECT 'a'::"char", artist_id FROM graph.by_artist
+            UNION SELECT 'm'::"char", master_id FROM graph.master_by_artist
+            UNION SELECT 'a'::"char", artist_id FROM graph.master_by_artist
+            UNION SELECT 'r'::"char", release_id FROM graph.on_label
+            UNION SELECT 'l'::"char", label_id FROM graph.on_label
+            UNION SELECT 'r'::"char", release_id FROM graph.in_genre
+            UNION SELECT 'g'::"char", genre_name FROM graph.in_genre
+            UNION SELECT 'r'::"char", release_id FROM graph.in_style
+            UNION SELECT 's'::"char", style_name FROM graph.in_style
+            UNION SELECT 'm'::"char", master_id FROM graph.master_in_genre
+            UNION SELECT 'g'::"char", genre_name FROM graph.master_in_genre
+            UNION SELECT 'm'::"char", master_id FROM graph.master_in_style
+            UNION SELECT 's'::"char", style_name FROM graph.master_in_style
+            UNION SELECT 'r'::"char", release_id FROM graph.derived_from
+            UNION SELECT 'm'::"char", master_id FROM graph.derived_from
+            UNION SELECT 'a'::"char", alias_artist_id FROM graph.alias_of
+            UNION SELECT 'a'::"char", artist_id FROM graph.alias_of
+            UNION SELECT 'a'::"char", member_artist_id FROM graph.artist_member_of
+            UNION SELECT 'a'::"char", group_artist_id FROM graph.artist_member_of
+        ) AS vertex
     """,
     "artist_genre": """
         SELECT count(*) FROM (
