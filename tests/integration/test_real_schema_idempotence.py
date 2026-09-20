@@ -19,6 +19,7 @@ from groovemap_schema.postgres import (
     _COUNTER_BEARING_VERTICES,
     _EDGE_TABLES,
     _GRAPH_STATEMENTS,
+    _VERTEX_KIND_NAMES,
     MUSICBRAINZ_RELATIONSHIP_TYPES,
     PROPERTY_GRAPH_MINIMUM_SERVER_VERSION,
     PROPERTY_GRAPH_RELATION,
@@ -2030,3 +2031,378 @@ async def test_label_stats_release_count_does_not_fan_out_over_artists_and_genre
         "SELECT release_count, artist_count, genre_count FROM graph.label_stats WHERE label_id = %s",
         (FANOUT_FIXTURE_LABEL_ID,),
     ) == [(1, 2, 2)]
+
+
+# ── The shortest path across the traversal surface ───────────────────────────
+# `graph.find_shortest_path` is the vertex-at-a-time bidirectional search spike
+# gm-database-schema-gkt.1 prototyped. These are its answers, on a real engine,
+# against a hand-computed table.
+#
+# **How the spike's endpoints map onto this fixture.** They do not, and the
+# spike says why: `sql/pick-endpoints.sql` records that its ids are catalog-scale
+# ids — artist 5665 of 120,000 at the synthetic scale, artist 1 of 1,500 at its
+# own fixture scale — and that measuring them against a catalog that does not
+# hold them "would be measuring nothing eight times". This fixture is five
+# documents. So what is carried across is the CASE LIST rather than the ids:
+# `bench/workloads.py` names eight cases — `d1-artist-artist`,
+# `d1-artist-release`, `d2` through `d6` artist-to-artist, and `unreachable` —
+# and every one of them is reproduced here as the same case shape over vertices
+# this fixture really has, with the depth computed by hand from the ten edges
+# the graph fixture seeds rather than read back from the function.
+#
+# The seeded graph is ten vertices and fourteen edges, and its eccentricity is
+# 3: there is no pair at distance 4 in it and no pair that cannot reach each
+# other. So the four shallow cases are fixture-native and the rest need a
+# subgraph, which `seed_path_fixture` builds — an eleven-hop chain of Discogs
+# memberships and one two-artist component nothing else touches. The chain is
+# written into `graph.member_of`, which is a relation a loader owns, and the
+# union and the degree are then REBUILT from it by their own refresh functions,
+# so the fixture is assembled the way production assembles it rather than by
+# writing rows into a derived relation behind the refresh's back.
+#
+# The fixture graph, for the hand computation. Artist 7 is on release 111 and
+# master 55; release 111 carries label 9, genre Rock, and styles Prog Rock and
+# Psychedelic, and derives from master 55; master 55 carries Rock and Prog Rock;
+# artist 11 is an alias of 7; artist 8 is a member of 7; artist 7 is a member of
+# 10 under BOTH provenances and artist 11 is a member of 10 under MusicBrainz
+# alone.
+PATH_CHAIN_HOPS = 11
+PATH_CHAIN_HEAD = "9000"
+PATH_ISOLATED_PAIR = ("9101", "9102")
+
+
+def path_chain_artist(offset: int) -> str:
+    """Return the id of the chain artist OFFSET hops from the head."""
+    return str(int(PATH_CHAIN_HEAD) + offset)
+
+
+async def seed_path_fixture() -> None:
+    """Write the Discogs memberships the deep and unreachable cases need, then rebuild.
+
+    An eleven-hop chain, so a pair at every distance from 1 to 11 exists, and one
+    two-artist component nothing else in the fixture touches, so an unreachable
+    pair exists. Both go into `graph.member_of`, which `discogs-sql-loader` owns;
+    `graph.artist_member_of` and `graph.vertex_degree` are then rebuilt from it
+    by the functions the contract names, so nothing here writes a derived
+    relation directly and a later rebuild would reproduce exactly this graph.
+
+    Re-running it is a no-op: the inserts are ON CONFLICT DO NOTHING and both
+    refreshes are truncate-and-insert.
+    """
+    connection = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params())
+    async with connection, connection.cursor() as cursor:
+        await cursor.execute(
+            """
+            INSERT INTO graph.member_of (member_artist_id, group_artist_id)
+            SELECT (%s::bigint + hop)::text, (%s::bigint + hop + 1)::text
+            FROM generate_series(0, %s - 1) AS hop
+            ON CONFLICT DO NOTHING
+            """,
+            (PATH_CHAIN_HEAD, PATH_CHAIN_HEAD, PATH_CHAIN_HOPS),
+        )
+        await cursor.execute(
+            "INSERT INTO graph.member_of (member_artist_id, group_artist_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+            PATH_ISOLATED_PAIR,
+        )
+        await cursor.execute("SELECT count(*) FROM graph.refresh_artist_member_of()")
+        await cursor.execute("SELECT count(*) FROM graph.refresh_vertex_degree()")
+        await connection.commit()
+
+
+# The answer set: one row per case, with the distance computed by hand from the
+# graph above and never read back from the function. `None` for a depth means
+# the case has no answer within its cap.
+#
+# The first block is the spike's four shallow cases over fixture vertices, and it
+# deliberately crosses every vertex kind the surface carries — artist, release,
+# master, label, genre, style — because the spike's own cases are artist-to-artist
+# and artist-to-release and would exercise two of the six.
+#
+# The second block is the depth cases and the cap, on the chain. The third is
+# what the clamp does at each end of `[1, 10]`. The fourth is the unreachable
+# pair, in all three ways a pair can fail to be connected.
+PATH_CASES: list[tuple[str, str, str, str, str, int | None, bool, int | None]] = [
+    # name                          from            to               cap   found  depth
+    ("identity", "a", "8", "a", "8", 6, True, 0),
+    ("d1-artist-artist", "a", "8", "a", "7", 6, True, 1),
+    ("d1-artist-release", "a", "7", "r", "111", 6, True, 1),
+    # Artist 11 reaches 10 only through the MusicBrainz half of the union: it
+    # asserts no Discogs membership at all, so this hop does not exist in
+    # `graph.member_of` and a search over that relation alone would not find it.
+    ("d1-artist-artist-musicbrainz", "a", "11", "a", "10", 6, True, 1),
+    ("d1-release-genre", "r", "111", "g", "Rock", 6, True, 1),
+    ("d1-master-style", "m", "55", "s", "Prog Rock", 6, True, 1),
+    ("d2-artist-artist", "a", "8", "a", "10", 6, True, 2),
+    ("d2-artist-release", "a", "8", "r", "111", 6, True, 2),
+    # master 55 → release 111 → label 9. The master carries no label itself.
+    ("d2-master-label", "m", "55", "l", "9", 6, True, 2),
+    # Distance 3 is the fixture graph's eccentricity, and every pair that far
+    # apart crosses a vertex kind: artist 8 reaches every other artist in two.
+    # The spike's `d3-artist-artist` is therefore a chain case, with `d4`
+    # through `d6`, and these are what distance 3 looks like on the fixture.
+    ("d3-artist-artist", "a", PATH_CHAIN_HEAD, "a", path_chain_artist(3), 6, True, 3),
+    ("d3-artist-label", "a", "8", "l", "9", 6, True, 3),
+    ("d3-artist-genre", "a", "8", "g", "Rock", 6, True, 3),
+    ("d3-label-artist", "l", "9", "a", "10", 6, True, 3),
+    # style Psychedelic is on release 111 alone, so it is three hops from the
+    # alias endpoint: Psychedelic → 111 → artist 7 → artist 11.
+    ("d3-style-artist", "s", "Psychedelic", "a", "11", 6, True, 3),
+    ("d4-artist-artist", "a", PATH_CHAIN_HEAD, "a", path_chain_artist(4), 6, True, 4),
+    ("d5-artist-artist", "a", PATH_CHAIN_HEAD, "a", path_chain_artist(5), 6, True, 5),
+    ("d6-artist-artist", "a", PATH_CHAIN_HEAD, "a", path_chain_artist(6), 6, True, 6),
+    # The default of 6 is a real bound, not a suggestion.
+    ("d7-beyond-the-default", "a", PATH_CHAIN_HEAD, "a", path_chain_artist(7), 6, False, None),
+    ("d7-under-a-raised-cap", "a", PATH_CHAIN_HEAD, "a", path_chain_artist(7), 7, True, 7),
+    # The clamp, at both ends. 99 becomes 10, which answers distance 10 and not
+    # distance 11; 0 becomes 1, which answers distance 1 and not distance 2; and
+    # a null max_depth is the default of 6 rather than no bound at all.
+    ("d10-at-the-ceiling", "a", PATH_CHAIN_HEAD, "a", path_chain_artist(10), 99, True, 10),
+    ("d11-past-the-ceiling", "a", PATH_CHAIN_HEAD, "a", path_chain_artist(11), 99, False, None),
+    ("d1-at-the-floor", "a", PATH_CHAIN_HEAD, "a", path_chain_artist(1), 0, True, 1),
+    ("d2-under-the-floor", "a", PATH_CHAIN_HEAD, "a", path_chain_artist(2), 0, False, None),
+    ("d2-with-a-null-cap", "a", PATH_CHAIN_HEAD, "a", path_chain_artist(2), None, True, 2),
+    ("d7-with-a-null-cap", "a", PATH_CHAIN_HEAD, "a", path_chain_artist(7), None, False, None),
+    # Unreachable three ways: two live components, the chain against the
+    # isolated pair, and a vertex the catalog does not hold at all.
+    ("unreachable-across-components", "a", "8", "a", PATH_ISOLATED_PAIR[0], 6, False, None),
+    ("unreachable-from-the-chain", "a", PATH_CHAIN_HEAD, "a", PATH_ISOLATED_PAIR[0], 6, False, None),
+    ("unreachable-absent-vertex", "a", "8", "a", "424242", 6, False, None),
+]
+
+FIND_SHORTEST_PATH = 'SELECT found, depth, nodes, rels FROM graph.find_shortest_path(%s::"char", %s, %s::"char", %s, %s)'
+
+# The paths themselves, for the cases where the fixture admits exactly one and
+# the answer is therefore not a tie broken arbitrarily. `shortestPath` promises
+# nothing about which of several equal-length paths it returns, so the answer
+# set above compares distances — which is the rule `bench/compare.py` states in
+# code — and only these are pinned whole.
+PATH_ROUTES: dict[str, tuple[list[str], list[str]]] = {
+    "identity": (["a:8"], []),
+    "d1-artist-artist": (["a:8", "a:7"], ["MEMBER_OF"]),
+    "d1-artist-release": (["a:7", "r:111"], ["BY"]),
+    "d1-artist-artist-musicbrainz": (["a:11", "a:10"], ["MEMBER_OF"]),
+    "d2-artist-artist": (["a:8", "a:7", "a:10"], ["MEMBER_OF", "MEMBER_OF"]),
+    "d2-artist-release": (["a:8", "a:7", "r:111"], ["MEMBER_OF", "BY"]),
+    "d2-master-label": (["m:55", "r:111", "l:9"], ["DERIVED_FROM", "ON"]),
+    "d3-artist-label": (["a:8", "a:7", "r:111", "l:9"], ["MEMBER_OF", "BY", "ON"]),
+    "d3-style-artist": (["s:Psychedelic", "r:111", "a:7", "a:11"], ["IS", "BY", "ALIAS_OF"]),
+    "d3-label-artist": (["l:9", "r:111", "a:7", "a:10"], ["ON", "BY", "MEMBER_OF"]),
+}
+
+
+@pytest.mark.asyncio
+async def test_the_shortest_path_answers_the_spike_case_set_at_fixture_scale() -> None:
+    """Every case in the spike's list, at this fixture's scale, against a hand-computed table."""
+    await apply_schema()
+    await seed_graph_fixtures()
+    await bootstrap_the_loader_tables()
+    await seed_path_fixture()
+
+    # Neither half of the fixture is empty agreeing with empty.
+    assert await postgres_rows("SELECT count(*) FROM graph.artist_member_of WHERE member_artist_id >= '9000'") == [(PATH_CHAIN_HOPS + 1,)]
+    assert await postgres_rows("SELECT count(*) FROM graph.vertex_degree WHERE kind = 'a' AND key >= '9000'") == [(PATH_CHAIN_HOPS + 3,)]
+
+    answers: dict[str, tuple[bool, int | None]] = {}
+    for name, from_kind, from_key, to_kind, to_key, cap, _found, _depth in PATH_CASES:
+        rows = await postgres_rows(FIND_SHORTEST_PATH, (from_kind, from_key, to_kind, to_key, cap))
+        # One row always, even when there is no path: the caller asked a
+        # question and "no path within this depth" is an answer to it.
+        assert len(rows) == 1, name
+        found, depth, nodes, rels = rows[0]
+        answers[name] = (found, depth)
+
+        if not found:
+            assert (depth, nodes, rels) == (None, None, None), name
+            continue
+
+        # `nodes` is one longer than `rels`, and both agree with the depth.
+        assert len(nodes) == depth + 1, name
+        assert len(rels) == depth, name
+        # Every vertex is the `kind:key` pair, and no vertex repeats — a
+        # membership both provenances assert is two rows of the union and one
+        # visited vertex, which is what the seen set being keyed on the vertex
+        # buys.
+        assert len(set(nodes)) == len(nodes), name
+        for node in nodes:
+            kind, _, key = node.partition(":")
+            assert kind in _VERTEX_KIND_NAMES, name
+            assert key, name
+        # `rels` carries the Neo4j relationship type and never the provenance.
+        assert set(rels) <= {"BY", "ON", "IS", "ALIAS_OF", "MEMBER_OF", "DERIVED_FROM"}, name
+        assert nodes[0] == f"{from_kind}:{from_key}", name
+        assert nodes[-1] == f"{to_kind}:{to_key}", name
+
+        if name in PATH_ROUTES:
+            assert (nodes, rels) == PATH_ROUTES[name], name
+
+    expected = {name: (found, depth) for name, _fk, _fkey, _tk, _tkey, _cap, found, depth in PATH_CASES}
+    assert answers == expected
+
+
+@pytest.mark.asyncio
+async def test_the_shortest_path_reaches_a_membership_only_musicbrainz_asserts() -> None:
+    """MEMBER_OF crosses both provenances, so the union is what is walked, not graph.member_of."""
+    await apply_schema()
+    await seed_graph_fixtures()
+    await bootstrap_the_loader_tables()
+    await seed_path_fixture()
+
+    # Artist 11 asserts no Discogs membership at all, so this hop exists only in
+    # the union. 61.6% of the MEMBER_OF edge class is MusicBrainz provenance.
+    assert await postgres_rows("SELECT count(*) FROM graph.member_of WHERE member_artist_id = '11' OR group_artist_id = '11'") == [(0,)]
+    assert await postgres_rows(FIND_SHORTEST_PATH, ("a", "11", "a", "10", 6)) == [(True, 1, ["a:11", "a:10"], ["MEMBER_OF"])]
+
+    # And the membership BOTH provenances assert is two rows of the union and
+    # one hop of one path, reported as the type rather than as either provider.
+    assert await postgres_rows("SELECT count(*) FROM graph.artist_member_of WHERE member_artist_id = '7' AND group_artist_id = '10'") == [(2,)]
+    rows = await postgres_rows(FIND_SHORTEST_PATH, ("a", "7", "a", "10", 6))
+    assert rows == [(True, 1, ["a:7", "a:10"], ["MEMBER_OF"])]
+
+
+@pytest.mark.asyncio
+async def test_the_shortest_path_walks_no_relation_a_path_query_never_traverses() -> None:
+    """`same_as`, `part_of`, `sublabel_of`, `credited_on`, `issued_on` are not path edges."""
+    await apply_schema()
+    await seed_graph_fixtures()
+    await bootstrap_the_loader_tables()
+    await seed_path_fixture()
+
+    # Person "Alice" is `same_as` artist 7 and `credited_on` release 111, so a
+    # search that walked either would reach her; `:Person` is not on the
+    # traversal surface, so nothing reaches her and no path runs through her.
+    assert await postgres_rows("SELECT count(*) FROM graph.same_as WHERE person_name = 'Alice'") == [(1,)]
+    assert await postgres_rows(FIND_SHORTEST_PATH, ("a", "7", "a", "8", 6)) == [(True, 1, ["a:7", "a:8"], ["MEMBER_OF"])]
+
+    # Style "Prog Rock" is `part_of` genre "Rock". Walking that edge would make
+    # them adjacent; the real distance is two, through release 111 or master 55.
+    assert await postgres_rows("SELECT count(*) FROM graph.part_of WHERE style_name = 'Prog Rock' AND genre_name = 'Rock'") == [(1,)]
+    found, depth, nodes, _rels = (await postgres_rows(FIND_SHORTEST_PATH, ("s", "Prog Rock", "g", "Rock", 6)))[0]
+    assert (found, depth) == (True, 2)
+    assert nodes[1] in {"r:111", "m:55"}
+
+    # Label 9 is `sublabel_of` label 12. Walking that edge would put 12 one hop
+    # from label 9; nothing on the surface reaches it, so it is unreachable.
+    assert await postgres_rows("SELECT count(*) FROM graph.sublabel_of WHERE sublabel_id = '9' AND parent_label_id = '12'") == [(1,)]
+    assert await postgres_rows(FIND_SHORTEST_PATH, ("l", "9", "l", "12", 6)) == [(False, None, None, None)]
+
+
+# ── Two sessions searching at once ───────────────────────────────────────────
+# The seen set is `TEMPORARY`, and the spike is explicit that this is the whole
+# reason: its own harness used `UNLOGGED` so plans could be captured from a
+# second connection, and it records that "two concurrent path requests against
+# one unlogged table would corrupt each other's search". This is the proof that
+# the shipped relation is per-session — that two searches running at the same
+# time hold two different relations in two different temporary schemas, cannot
+# see each other's rows, and answer their own question.
+
+SEEN_SET_IDENTITY = """
+SELECT namespace.nspname, relation.oid::bigint
+FROM pg_class AS relation
+JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+WHERE relation.oid = to_regclass('pg_temp.graph_path_seen')
+"""
+
+SEEN_SET_ROWS = "SELECT count(*) FROM pg_temp.graph_path_seen"
+
+# Two searches whose seen sets are different sizes and whose answers differ, so
+# a shared relation could not produce both.
+CONCURRENT_SEARCHES = (
+    ("a", PATH_CHAIN_HEAD, "a", path_chain_artist(6), 6, (True, 6)),
+    ("a", "8", "a", "9", 6, (False, None)),
+)
+
+
+async def rows_on(connection: psycopg.AsyncConnection[Any], query: str, parameters: tuple[Any, ...] = ()) -> list[tuple[Any, ...]]:
+    """Run one query on an already-open connection, so the session is the unit."""
+    async with connection.cursor() as cursor:
+        await cursor.execute(query, parameters)
+        return await cursor.fetchall()
+
+
+@pytest.mark.asyncio
+async def test_two_sessions_search_at_once_without_cross_talk() -> None:
+    """Two concurrent searches hold two seen sets, and each answers its own question."""
+    await apply_schema()
+    await seed_graph_fixtures()
+    await bootstrap_the_loader_tables()
+    await seed_path_fixture()
+
+    parameters = initializer._postgres_connection_params()
+    first = await psycopg.AsyncConnection.connect(**parameters)
+    second = await psycopg.AsyncConnection.connect(**parameters)
+    try:
+        # 1. In flight at the same time, many times over. Each round issues both
+        # searches concurrently and commits both, so every round also re-enters
+        # a seen set the previous round's commit has just emptied.
+        for _round in range(25):
+            results = await asyncio.gather(
+                *(
+                    rows_on(connection, FIND_SHORTEST_PATH, (from_kind, from_key, to_kind, to_key, cap))
+                    for connection, (from_kind, from_key, to_kind, to_key, cap, _expected) in zip((first, second), CONCURRENT_SEARCHES, strict=True)
+                )
+            )
+            for rows, (_fk, _fkey, _tk, _tkey, _cap, expected) in zip(results, CONCURRENT_SEARCHES, strict=True):
+                assert len(rows) == 1
+                assert (rows[0][0], rows[0][1]) == expected
+            await asyncio.gather(first.commit(), second.commit())
+
+        # 2. The two seen sets are two relations, in two temporary schemas.
+        # A session cannot even name the other's: `pg_temp` is its own.
+        ((first_schema, first_oid),) = await rows_on(first, SEEN_SET_IDENTITY)
+        ((second_schema, second_oid),) = await rows_on(second, SEEN_SET_IDENTITY)
+        assert first_schema.startswith("pg_temp"), first_schema
+        assert second_schema.startswith("pg_temp"), second_schema
+        assert first_schema != second_schema
+        assert first_oid != second_oid
+
+        # 3. With both transactions held open, neither sees the other's rows.
+        # The chain search seeds two endpoints and discovers five more vertices
+        # before it touches; the unreachable search closes the component around
+        # artist 9, which nothing on the surface holds, after seeding two. A
+        # shared relation would make these two numbers the same.
+        await asyncio.gather(
+            *(
+                rows_on(connection, FIND_SHORTEST_PATH, (from_kind, from_key, to_kind, to_key, cap))
+                for connection, (from_kind, from_key, to_kind, to_key, cap, _expected) in zip((first, second), CONCURRENT_SEARCHES, strict=True)
+            )
+        )
+        first_rows = (await rows_on(first, SEEN_SET_ROWS))[0][0]
+        second_rows = (await rows_on(second, SEEN_SET_ROWS))[0][0]
+        assert first_rows > second_rows > 0, (first_rows, second_rows)
+
+        # 4. And the commit is what empties them, not the next call: that is the
+        # per-call TRUNCATE the spike measured at about 4 ms of a 5.2 ms floor,
+        # retired. Both are non-empty until they commit, and empty afterwards.
+        await asyncio.gather(first.commit(), second.commit())
+        assert await rows_on(first, SEEN_SET_ROWS) == [(0,)]
+        assert await rows_on(second, SEEN_SET_ROWS) == [(0,)]
+    finally:
+        await first.close()
+        await second.close()
+
+
+@pytest.mark.asyncio
+async def test_two_searches_in_one_transaction_do_not_pollute_each_other() -> None:
+    """The commit empties the seen set, so a second call in one transaction must too."""
+    await apply_schema()
+    await seed_graph_fixtures()
+    await bootstrap_the_loader_tables()
+    await seed_path_fixture()
+
+    connection = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params())
+    async with connection:
+        deep = ("a", PATH_CHAIN_HEAD, "a", path_chain_artist(6), 6)
+        shallow = ("a", PATH_CHAIN_HEAD, "a", path_chain_artist(2), 6)
+        assert await rows_on(connection, FIND_SHORTEST_PATH, deep) == [
+            (True, 6, [f"a:{path_chain_artist(hop)}" for hop in range(7)], ["MEMBER_OF"] * 6)
+        ]
+        # Same transaction, no commit between: the first search's seen set is
+        # still in the relation when the second one starts, and the second
+        # answer has to be the second question's.
+        assert (await rows_on(connection, SEEN_SET_ROWS))[0][0] > 0
+        assert await rows_on(connection, FIND_SHORTEST_PATH, shallow) == [
+            (True, 2, [f"a:{path_chain_artist(hop)}" for hop in range(3)], ["MEMBER_OF"] * 2)
+        ]
+        # And the deep one still answers deeply afterwards.
+        assert (await rows_on(connection, FIND_SHORTEST_PATH, deep))[0][1] == 6
+        await connection.commit()
