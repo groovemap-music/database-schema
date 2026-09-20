@@ -377,7 +377,8 @@ counters the graph enrichers compute in a post-import pass, which a graph declar
 had nowhere to put. The twenty-eighth is `graph.artist_member_of`, the
 [cross-provenance MEMBER_OF union](#the-member_of-union), and the twenty-ninth is
 `graph.vertex_degree`, [the per-vertex degree](#the-per-vertex-degree) that orders frontier
-expansion. Both are derived from the relations above them rather than from a document.
+expansion. Both are derived from the relations above them rather than from a document, and
+both exist for [the shortest-path function](#the-shortest-path) that reads them.
 
 Read the section in two halves. The sixty-six relations are unconditional — every supported
 engine gets all of them, on PostgreSQL 18 and 19 alike. The `CREATE PROPERTY GRAPH`
@@ -885,6 +886,157 @@ always every kind, so a rebuild that finds no masters says so with a zero rather
 like a relation that is simply smaller than expected. The body it runs is the same text
 `graph.bootstrap_fill()` inlines, so the one-off fill and the refresh cannot disagree about
 what a degree counts.
+
+### The shortest path
+
+`graph.find_shortest_path` is the one Cypher call in this graph that cannot be a view:
+
+```cypher
+shortestPath((a)-[:BY|ON|IS|ALIAS_OF|MEMBER_OF|DERIVED_FROM*..d]-(b))
+```
+
+```sql
+graph.find_shortest_path(
+    from_kind  "char",      -- a g l m r s, the vertex discriminator
+    from_key   text,
+    to_kind    "char",
+    to_key     text,
+    max_depth  int DEFAULT 6   -- clamped server-side to [1, 10]
+) RETURNS TABLE (found boolean, depth int, nodes text[], rels text[])
+```
+
+It is spike gm-database-schema-gkt.1's prototype, ported with the argument that makes it
+correct. It reads the ten relations [the per-vertex degree](#the-per-vertex-degree) sums,
+undirected, so MEMBER_OF crosses both provenances through
+[the union](#the-member_of-union) and never `graph.member_of` alone. It writes no graph
+relation and no persistent relation of any kind.
+
+`(kind, key)` is two arguments rather than one `'a:5665'` token, for the reason the degree is
+keyed the same way: an equality on a concatenation cannot use the `text` indexes the edge
+tables already carry. `nodes` returns that identity, one `kind:key` entry per vertex from the
+source to the target; the key half is exactly what the Cypher returns per node —
+`coalesce(node.id, node.name)`, so a Genre or a Style is its name and every other vertex is
+its Discogs id — and the pair is what keeps the answer unambiguous, because an Artist and a
+Release can hold the same numeric key. `rels` is one entry shorter and carries the
+relationship type of each hop, **never the provenance**: Neo4j holds both halves of MEMBER_OF
+in one relationship space and reports one type, and projecting `source` would cost a heap
+fetch on every backward hop, because the reverse index `(group_artist_id, member_artist_id)`
+does not cover it. A search that finds nothing returns one row with `found` false and the
+other three columns null, where the Cypher returns no row at all.
+
+#### Why a procedural body
+
+Spike gm-database-schema-9c8.3 measured three level-synchronous searches and concluded that
+what separates PostgreSQL from Neo4j here is not storage and not the index but that "Neo4j's
+shortest-path expander can stop in the middle of a level and a SQL statement cannot". That is
+true of a SQL statement. It is not true of a PL/pgSQL loop.
+
+A level-synchronous expansion is one statement per level: it joins the whole frontier against
+the whole edge surface and produces the whole next level. At level 3 out of that spike's seed
+artist the frontier is 1,251,839 vertices, the join yields 11,006,163 candidate arrivals, and
+1.3% of them are new — while the answer was inside the first fraction of that level and the
+statement had no way to say so. Here the unit of work is **one vertex**, and two statements
+run for each of them:
+
+- a **touch probe**, a LATERAL subquery carrying its own `LIMIT` so the planner cannot pull it
+  up into a join and must probe the seen set's primary key once per candidate neighbour, with
+  an outer `LIMIT 1` that stops the scan at the first hit;
+- an **expansion**, `INSERT … ON CONFLICT DO NOTHING` of the neighbours neither side has seen.
+
+If the probe hits, the function returns and the rest of the level is never materialised. Both
+statements are plain SQL inside PL/pgSQL, so a search that expands 3,000 vertices pays for two
+plans rather than six thousand.
+
+#### Why first touch is exact
+
+9c8.3 warns that "stopping the moment the frontiers touch is the version of this algorithm
+that is off by one", and it is right about the version it describes — one that compares the
+two **frontiers**. This one compares each newly reachable vertex against the whole of the
+opposite **seen** set.
+
+Let `df` and `db` be the depths to which the forward and backward searches are **complete**,
+and let the invariant be: no path of length `df + db` or shorter exists. Suppose the forward
+side expands level `df + 1` and a probe on a frontier vertex finds a neighbour in the backward
+seen set at depth `b ≤ db`. That witnesses a walk of length `df + 1 + b`. By the invariant the
+true distance is at least `df + db + 1`, and `df + 1 + b ≤ df + 1 + db`. So the witnessed walk
+has length exactly `df + db + 1`, which is the true distance. Every touch found anywhere in
+that level has the same length, so there is no better one to look for — and, incidentally, the
+order within a level is free.
+
+Three things in the body are that argument's preconditions rather than incidental structure:
+
+- **A completed depth advances only after its level finishes.** `df` and `db` are what the
+  invariant is stated over; advancing one mid-level would assert a completeness the search has
+  not reached.
+- **The opposite seen set is frozen for the duration of a level.** The expansion writes rows
+  for the side being expanded and no other, so `b ≤ db` holds for every probe in the level
+  rather than for the first one only.
+- **The distance is derived from the recorded depths**, not from `df + db + 1`. The two are
+  equal by the argument above; reading it off the data means a mistake in the argument shows
+  up as a disagreement with Neo4j instead of as a silently wrong answer.
+
+#### The seen set
+
+One request-scoped relation, and the spike is emphatic about all three of its properties.
+
+| | |
+| --- | --- |
+| Relation | `pg_temp.graph_path_seen`, created on the session's first call |
+| Shape | `TEMPORARY … ON COMMIT DELETE ROWS` |
+| Key | `(side, kind, key)` |
+| Secondary index | `(side, depth, kind, key)` |
+
+**`TEMPORARY`, not `UNLOGGED`.** The spike's harness used `UNLOGGED` only so plans could be
+captured from a second connection, and it says so; two concurrent path requests against one
+unlogged table would corrupt each other's search. A temporary relation is per-session, which
+is what makes concurrent searches independent — the integration suite runs two at once in two
+sessions and reads back two relations in two temporary schemas.
+
+**`ON COMMIT DELETE ROWS`**, because the spike's per-call `TRUNCATE` was about 4 ms of a 5.2 ms
+floor, paid by every call including the ones that expand nothing. The emptying is the commit's
+work now. A second call inside the same transaction still clears the relation first, with a
+`DELETE` that costs nothing in the ordinary case because there is nothing in it.
+
+**No second frontier relation.** The frontier is `side = s AND depth = d` over the relation
+being written anyway, which the secondary index makes an index-only scan of the level. An
+earlier revision of the spike's harness kept a separate queue — the obvious shape — and it
+cost a second heap insert, a second index insert, and a sequence `nextval` for every vertex
+discovered; dropping it cut the worst measured case by about two fifths.
+
+**Not an hstore and not an array.** A PL/pgSQL variable is passed into a SQL statement by value
+and re-serialised on every statement, so an hstore seen set is three to six times faster below
+a few thousand vertices and does not finish at all above a hundred thousand. The crossover is
+inside the range this workload visits, and the spike measured the hstore variant rather than
+asserting it.
+
+#### Expansion order
+
+The search expands one vertex of the smaller frontier at a time, in ascending
+`graph.vertex_degree` order, and chooses the side whose frontier has the smaller summed
+degree. **Neither choice can change an answer** — the order within a level is free, by the
+argument above — and both change the cost enormously, because a level here mixes vertices of
+degree 4 with Genre vertices of degree ~137,000 and the search pays for whatever it expands
+*before* it touches. Expanding cheap vertices first is free insurance: if a cheap vertex
+touches, the hub is never expanded at all, and if none does, the hub is expanded exactly as it
+would have been. A vertex with no row in the degree relation reads as degree zero, so a degree
+relation that has never been refreshed degrades the ordering to arbitrary rather than breaking
+the search.
+
+#### The depth cap, and where it diverges from the spike
+
+`[1, 10]` with a default of 6, clamped server-side. That is `MIN_PATH_DEPTH`, `MAX_PATH_DEPTH`,
+and `DEFAULT_PATH_DEPTH` in `catalog-api`'s `neo4j_queries.py`, unchanged: the Cypher clamps
+because it interpolates the number as a literal and an unbounded value produces an exhaustive
+bidirectional search, and this clamps so the replacement cannot be asked for something the
+Cypher would have refused.
+
+**This is not the spike's recommendation.** gm-database-schema-gkt.1 recommended a cap of 4,
+and called it its strongest single recommendation: at cap 10 a distance-6 pair costs 4.1 s on
+its cloud machine against 10.5 ms at cap 4, and nothing in this catalog is answerable at 5 or 6
+inside the request budget on either engine. The owner chose 10 anyway, for exact parity with
+the Cypher this replaces — a caller that asks for 10 today gets the answer for 10 — and accepts
+seconds beyond depth 4 for it. Lowering the default is a change to the callers' contract rather
+than to this function, and the spike's argument for making it is on the record.
 
 ### The bootstrap fill
 
