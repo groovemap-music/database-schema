@@ -571,6 +571,39 @@ _USER_TABLES: list[tuple[str, str]] = [
         "idx_admin_audit_log_admin_id",
         "CREATE INDEX IF NOT EXISTS idx_admin_audit_log_admin_id ON admin_audit_log (admin_id)",
     ),
+    # The loader family's durable, version-keyed extraction latch (bead
+    # gm-discogs-sql-loader-2eg.3): one row per (loader, extraction), recording
+    # which of a loader's entity types have signalled `extraction_complete` and
+    # whether that loader's derived-relation refresh pass has completed for it.
+    # Written before the delivery is acked so a restart resumes collection
+    # instead of losing already-collected signals.
+    #
+    # Declared here rather than by a runtime CREATE TABLE in a loader because
+    # this repository is the sole DDL issuer (see docs/architecture.md and
+    # contracts/persistence/v1/compatibility.json). discogs-sql-loader probes
+    # `information_schema` at startup for one of `LATCH_CANDIDATES`
+    # (`public.loader_extraction_latch` first) in its
+    # `tableinator/extraction_latch.py`, requires the five non-key columns
+    # below with these exact `information_schema` types, and honours the
+    # `loader` discriminator column, keying and scoping every statement on it
+    # when present — which is why it is declared here rather than omitted.
+    # The relation is named for the loader family, not for one loader, so
+    # musicbrainz-sql-loader can share it under the same `loader` value
+    # convention ('discogs', 'musicbrainz'); see docs/architecture.md.
+    (
+        "loader_extraction_latch table",
+        """
+        CREATE TABLE IF NOT EXISTS loader_extraction_latch (
+            loader       TEXT NOT NULL,
+            version      TEXT NOT NULL,
+            signals      TEXT[] NOT NULL DEFAULT '{}',
+            created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            refreshed_at TIMESTAMPTZ,
+            CONSTRAINT loader_extraction_latch_pkey PRIMARY KEY (loader, version)
+        )
+        """,
+    ),
 ]
 
 

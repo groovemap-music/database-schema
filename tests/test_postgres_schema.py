@@ -189,6 +189,59 @@ class TestAppTokensTable:
         assert "DROP" not in stmt.upper()
 
 
+class TestExtractionLatchTable:
+    """The loader family's durable extraction latch (bead gm-database-schema-fyl).
+
+    The name (`public.loader_extraction_latch`, the first of discogs-sql-loader's
+    `LATCH_CANDIDATES`) and the five required columns' types are pinned to what
+    `tableinator/extraction_latch.py`'s `REQUIRED_COLUMNS` and startup probe
+    demand, so a relation this schema declares is never silently declined by
+    the loader. The `loader` discriminator and its `PRIMARY KEY (loader,
+    version)` are what the probe requires for `ON CONFLICT` before it will key
+    and scope statements on the column.
+    """
+
+    def _user_tables_dict(self) -> dict[str, str]:
+        return dict(_USER_TABLES)
+
+    def test_table_defined(self) -> None:
+        assert "loader_extraction_latch table" in self._user_tables_dict()
+
+    def test_required_columns(self) -> None:
+        stmt = self._user_tables_dict()["loader_extraction_latch table"]
+        for column in ("loader", "version", "signals", "created_at", "updated_at", "refreshed_at"):
+            assert column in stmt, f"Missing column '{column}' in loader_extraction_latch schema"
+
+    def test_loader_and_version_are_not_null(self) -> None:
+        """Both key columns must be populated; `PRIMARY KEY (loader, version)` also implies this."""
+        stmt = self._user_tables_dict()["loader_extraction_latch table"]
+        assert "loader       TEXT NOT NULL" in stmt or "loader TEXT NOT NULL" in stmt
+        assert "version      TEXT NOT NULL" in stmt or "version TEXT NOT NULL" in stmt
+
+    def test_primary_key_is_loader_and_version(self) -> None:
+        """Matches the loader's `_key_columns()` and its `ON CONFLICT (loader, version)` upsert."""
+        stmt = self._user_tables_dict()["loader_extraction_latch table"]
+        assert "PRIMARY KEY (loader, version)" in stmt
+        assert "CONSTRAINT loader_extraction_latch_pkey" in stmt
+
+    def test_signals_is_a_text_array_defaulting_empty(self) -> None:
+        stmt = self._user_tables_dict()["loader_extraction_latch table"]
+        assert "signals      TEXT[] NOT NULL DEFAULT '{}'" in stmt or "signals TEXT[] NOT NULL DEFAULT '{}'" in stmt
+
+    def test_refreshed_at_is_nullable(self) -> None:
+        """Unset until the derived-relation pass completes for the extraction."""
+        stmt = self._user_tables_dict()["loader_extraction_latch table"]
+        assert "refreshed_at TIMESTAMPTZ,\n" in stmt
+
+    def test_no_drop_in_schema(self) -> None:
+        stmt = self._user_tables_dict()["loader_extraction_latch table"]
+        assert "DROP" not in stmt.upper()
+
+    def test_is_idempotent(self) -> None:
+        stmt = self._user_tables_dict()["loader_extraction_latch table"]
+        assert "IF NOT EXISTS" in stmt.upper()
+
+
 class TestCreatePostgresSchema:
     """Test create_postgres_schema with a mock pool."""
 
