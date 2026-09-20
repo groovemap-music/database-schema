@@ -298,6 +298,15 @@ attributes. These statements intentionally run with the table/index declarations
 `CREATE TABLE IF NOT EXISTS` cannot update an existing table. Do not translate them into an
 out-of-band migration or remove retained provenance fields.
 
+`musicbrainz.relationships` and `musicbrainz.external_links` were declared with `created_at`
+only, unlike every other MusicBrainz entity table, so an additive `updated_at TIMESTAMPTZ NOT
+NULL DEFAULT NOW()` column (with a plain index, `idx_mb_rels_updated_at` and
+`idx_mb_links_updated_at`) closes the gap. `musicbrainz-sql-loader` is the consumer:
+delete-reconciliation, modelled on `discogs-sql-loader`'s `purge_stale_rows` over the Discogs
+entity tables' own `updated_at`, refreshes the column on every upsert and deletes rows where
+`updated_at < run start` at the end of a full re-extraction. DDL ownership is this repository
+alone, so the column is declared here rather than carried as a startup `ALTER` in the loader.
+
 ## Catalog identifiers, manufacturing credits, and release country
 
 [ADR 0011](https://github.com/groovemap-music/design/blob/main/docs/adr/0011-catalog-identifiers-and-manufacturing-credits.md)
