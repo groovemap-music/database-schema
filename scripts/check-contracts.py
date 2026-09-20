@@ -9,7 +9,12 @@ from groovemap_schema.postgres import (
     _BOOTSTRAP_FILL_ORDER,
     _GRAPH_STATEMENTS,
     _PATH_RELATIONS,
+    _PATH_RELATIONSHIP_TYPES,
     _VERTEX_KIND_NAMES,
+    PATH_DEFAULT_DEPTH,
+    PATH_MAX_DEPTH,
+    PATH_MIN_DEPTH,
+    PATH_SEEN_RELATION,
     PROPERTY_GRAPH_MINIMUM_SERVER_VERSION,
     PROPERTY_GRAPH_NAME,
     PROPERTY_GRAPH_SCHEMA,
@@ -190,6 +195,57 @@ assert {kind for _r, source, _sc, target, _tc in _PATH_RELATIONS for kind in (so
 # union keys on `source`, so a membership both provenances assert is two rows
 # and an expansion of that vertex really does scan both.
 assert degree["counts_a_dual_provenance_membership"] == "twice"
+
+# The shortest-path function. It is the one declared object that READS the
+# traversal surface rather than writing it, so what the contract has to record
+# is not an owner but what it walks, what it returns, and the state it needs —
+# and every one of those is read back out of the rendered function rather than
+# restated, so a relation dropped from the surface or a bound moved in the clamp
+# fails this check instead of leaving the contract describing a function that
+# moved underneath it.
+path_function = graph["path_function"]
+path_body = dict(_GRAPH_STATEMENTS)[f"{PROPERTY_GRAPH_SCHEMA}.find_shortest_path function"]
+assert path_function["kind"] == "additive"
+assert path_function["availability"] == "unconditional"
+assert path_function["function"] == f"{PROPERTY_GRAPH_SCHEMA}.find_shortest_path"
+assert path_function["function"] in graph["functions"]
+assert path_function["declared_as"].startswith(f"{path_function['function']}(")
+# The clamp `catalog-api` applies to the same argument, with the same bounds.
+assert path_function["clamped_to"] == [PATH_MIN_DEPTH, PATH_MAX_DEPTH]
+assert path_function["default_max_depth"] == PATH_DEFAULT_DEPTH
+assert f"cap := greatest({PATH_MIN_DEPTH}, least(coalesce(max_depth, {PATH_DEFAULT_DEPTH}), {PATH_MAX_DEPTH}));" in path_body
+assert f"max_depth int DEFAULT {PATH_DEFAULT_DEPTH}" in path_body
+assert "RETURNS TABLE (found boolean, depth int, nodes text[], rels text[])" in path_body
+# The same ten relations the degree sums, and both directions of each, because
+# the surface is undirected and the degree that orders the walk is a sum over
+# exactly what the walk traverses.
+assert path_function["traverses"] == degree["sources"]
+assert path_function["undirected"] is True
+for source in path_function["traverses"]:
+    assert path_body.count(f"FROM {source} AS edge\n") == 4, source
+# It reads the degree to order its expansion, and writes nothing at all.
+assert path_function["reads"] == [degree["relation"]]
+assert path_function["writes"] == "nothing"
+for relation in declared_shapes:
+    for verb in ("INSERT INTO", "UPDATE", "DELETE FROM"):
+        assert f"{verb} {PROPERTY_GRAPH_SCHEMA}.{relation}" not in path_body, f"{verb} {relation}"
+# One request-scoped relation, and the three properties the spike is emphatic
+# about: session-scoped, emptied by the commit, and no second frontier relation.
+seen_set = path_function["seen_set"]
+assert seen_set["relation"] == f"pg_temp.{PATH_SEEN_RELATION}"
+assert seen_set["shape"] == "TEMPORARY table, ON COMMIT DELETE ROWS"
+assert f"CREATE TEMPORARY TABLE {PATH_SEEN_RELATION} (" in path_body
+assert ") ON COMMIT DELETE ROWS;" in path_body
+assert path_body.count("CREATE TEMPORARY TABLE") == 1
+assert f"PRIMARY KEY ({', '.join(seen_set['key'])})" in path_body
+assert f"CREATE INDEX {PATH_SEEN_RELATION}_level ON pg_temp.{PATH_SEEN_RELATION} {seen_set['secondary_index']};" in path_body
+# Every one of the six relationship types `rels[]` can report is named, and each
+# is a type a path query traverses rather than a provenance.
+assert set(_PATH_RELATIONSHIP_TYPES) == {relation.removeprefix(f"{PROPERTY_GRAPH_SCHEMA}.") for relation in path_function["traverses"]}
+for relationship in set(_PATH_RELATIONSHIP_TYPES.values()):
+    assert relationship in path_function["rels"], relationship
+    assert f"'{relationship}'::text AS rel" in path_body, relationship
+assert "edge.source" not in path_body
 
 # Appending a column is the only view change safe to ship on its own; the engine
 # enforces the rest by refusing the replacement.
