@@ -19,6 +19,14 @@ All notable changes to the GrooveMap database schema will be documented here.
 - Document the graph schema's edge model, relation ownership, and the bootstrap fill in
   `docs/architecture.md`, `docs/runtime-configuration.md`, and the README, and complete the
   `groovemap.persistence` v1 contract metadata to match.
+- **loader-latch**: correct the `extraction_latch` contract's `design_decision`, the
+  `loader_extraction_latch` DDL comment, and the schema test docstring, which still
+  described `discogs-sql-loader` probing a two-name `LATCH_CANDIDATES` list and honouring
+  the `loader` discriminator "when present." The loader now probes only
+  `public.loader_extraction_latch`, requires `loader` via `REQUIRED_COLUMNS`, scopes every
+  statement to `loader = 'discogs'`, and verifies via `pg_constraint` a PRIMARY KEY or
+  UNIQUE constraint over exactly `(loader, version)`; `musicbrainz-sql-loader` will write
+  `loader = 'musicbrainz'` rows into the same relation when it adopts it.
 
 ### Fix
 
