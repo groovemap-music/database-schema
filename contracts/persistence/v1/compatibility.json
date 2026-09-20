@@ -26,6 +26,7 @@
         "alias_of",
         "artist_degree",
         "artist_genre",
+        "artist_member_of",
         "by_artist",
         "company",
         "credited_on",
@@ -53,7 +54,7 @@
       ],
       "function": "graph.bootstrap_fill",
       "kind": "additive",
-      "note": "A one-off fill deriving every loader-written table from the catalog documents, using the same definitions those relations published as views before they were tables. It is NOT authoritative: the owner recorded against each relation writes it and supersedes this fill on its first pass. It exists so an environment can be populated once, before a loader has run, so a read rewrite is not blocked on the dual-write. Nothing calls it; applying the schema declares it and writes no row. Each relation is emptied and refilled in one transaction, so re-running converges in both directions and a row no document justifies is removed. It reports a row count per relation. One known divergence: a company with no Discogs id is keyed on its name case-folded, and this fill folds with SQL lower where the loader applies Python casefold, so a handful of characters key differently and the loader's row is the correct one."
+      "note": "A one-off fill deriving every loader-written table from the catalog documents, using the same definitions those relations published as views before they were tables. It is NOT authoritative: the owner recorded against each relation writes it and supersedes this fill on its first pass. It exists so an environment can be populated once, before a loader has run, so a read rewrite is not blocked on the dual-write. Nothing calls it; applying the schema declares it and writes no row. Each relation is emptied and refilled in one transaction, so re-running converges in both directions and a row no document justifies is removed. It reports a row count per relation. graph.artist_member_of is derived from the relations above it rather than from a document, so the fill shares one body with graph.refresh_artist_member_of and the two cannot disagree; that relation alone has a named refresh owner, which the fill does not supersede. One known divergence: a company with no Discogs id is keyed on its name case-folded, and this fill folds with SQL lower where the loader applies Python casefold, so a handful of characters key differently and the loader's row is the correct one."
     },
     "counter_properties": {
       "availability": "unconditional",
@@ -106,7 +107,8 @@
       "graph.bootstrap_fill",
       "graph.credit_role_category",
       "graph.mb_relationship_type",
-      "graph.medium_label"
+      "graph.medium_label",
+      "graph.refresh_artist_member_of"
     ],
     "introduced_in_contract_version": 1,
     "key_columns": {
@@ -116,7 +118,26 @@
       "type": "text"
     },
     "kind": "additive",
-    "note": "Twenty relations are loader-written tables replacing a view that computed the same rows on every read, seven more hold the counters, degrees, and genre aggregates the graph enrichers compute today, and the rest are read-only views over tables declared elsewhere in this contract. This repository declares every one of them and writes rows into none: the owner named against each relation does that, so an empty table on a fresh database is the expected state rather than a fault.",
+    "member_of_union": {
+      "availability": "unconditional",
+      "function": "graph.refresh_artist_member_of",
+      "key": [
+        "member_artist_id",
+        "group_artist_id",
+        "source"
+      ],
+      "kind": "additive",
+      "note": "Neo4j holds a Discogs band membership and a MusicBrainz member-of-band assertion in one MEMBER_OF relationship space, so shortestPath traverses both without knowing which is which. On the relational side they are two relations in two key spaces: graph.member_of is Discogs-only and keyed on Discogs artist ids, while the MusicBrainz half lives in musicbrainz.relationships keyed on MBIDs and reaches a Discogs id only through musicbrainz.artists.discogs_artist_id. Spike gm-database-schema-gkt.1 measured 22,577 Discogs rows against 36,189 MusicBrainz ones, so 61.6% of that edge class is MusicBrainz provenance and a traversal over graph.member_of alone returns different paths from the Cypher it replaces. This relation resolves the crossing once at build time, with source in the key so the same membership asserted by both providers is two rows rather than a collision. It binds no property-graph label: a second artist-to-artist edge label overlapping member_of would double-count every Discogs membership in a pattern that matched both. The refresh is truncate-and-insert, so it converges in both directions and reports a row count per provenance; discogs-sql-loader calls it on the extraction_complete latch it already handles, the same latch the counter relations are recomputed on.",
+      "refresh_latch": "extraction_complete",
+      "refresh_owner": "discogs-sql-loader",
+      "relation": "graph.artist_member_of",
+      "reverse_index": "(group_artist_id, member_artist_id)",
+      "sources": [
+        "graph.member_of",
+        "graph.mb_rel_artist_artist"
+      ]
+    },
+    "note": "Twenty relations are loader-written tables replacing a view that computed the same rows on every read, seven more hold the counters, degrees, and genre aggregates the graph enrichers compute today, one more is the cross-provenance MEMBER_OF union recorded under graph_schema.member_of_union, and the rest are read-only views over tables declared elsewhere in this contract. This repository declares every one of them and writes rows into none: the owner named against each relation does that, so an empty table on a fresh database is the expected state rather than a fault.",
     "property_graph": {
       "absent_on": "PostgreSQL 18, and PostgreSQL 19 with the switch off",
       "availability": "conditional",
@@ -127,13 +148,13 @@
       "consumer_rule": "consumers must not assume it exists; probe pg_class for a relation named catalog in schema graph, of relkind g, and fall back to the views, which are always present",
       "documentation": "docs/architecture.md#property-graph",
       "edge_tables": 38,
-      "element_tables": "Fifty-five of the sixty-four graph relations. The nine that bind no element hold rows or counters for a label that binds a view joining them, plus graph.release_degree_base, whose rows the graph reaches through graph.release_degree.",
+      "element_tables": "Fifty-five of the sixty-five graph relations. The ten that bind no element hold rows or counters for a label that binds a view joining them, plus graph.release_degree_base, whose rows the graph reaches through graph.release_degree, and graph.artist_member_of, which is a union built for the path functions rather than a relationship type Neo4j carries.",
       "kind": "additive",
       "name": "graph.catalog",
       "note": "A SQL/PGQ declaration over the graph schema's tables and views, applied after the rest of the PostgreSQL schema. A closed gate is logged and is not a failure. There is no IF NOT EXISTS for a property graph and this initializer never drops one except through a shape migration that re-declares it on the same run, so an existing graph.catalog is otherwise left as it is and a changed declaration does not roll out on its own.",
       "vertex_tables": 17
     },
-    "relation_count": 64,
+    "relation_count": 65,
     "relations": {
       "alias_of": {
         "owner": "discogs-sql-loader",
@@ -152,6 +173,10 @@
         "shape": "table"
       },
       "artist_genre": {
+        "owner": "discogs-sql-loader",
+        "shape": "table"
+      },
+      "artist_member_of": {
         "owner": "discogs-sql-loader",
         "shape": "table"
       },
@@ -393,7 +418,7 @@
       }
     },
     "schema": "graph",
-    "tables": 27,
+    "tables": 28,
     "vertex_relations": 17,
     "view_evolution": {
       "allowed": "appending a column to the end of an existing view",

@@ -116,6 +116,7 @@ storage_only = set(declared_shapes) - element_relations
 assert storage_only == {
     "artist",
     "artist_degree",
+    "artist_member_of",
     "genre",
     "genre_stats",
     "label",
@@ -124,6 +125,32 @@ assert storage_only == {
     "style",
     "style_stats",
 }, storage_only
+
+# The cross-provenance MEMBER_OF union. It is a table the path functions read
+# rather than a relationship type Neo4j carries, so it binds no label, and it is
+# the one relation with a refresh owner distinct from the loader that writes the
+# rows it reads: nothing writes it a row at a time, so the contract has to name
+# who rebuilds it and on what.
+union = graph["member_of_union"]
+assert union["kind"] == "additive"
+assert union["availability"] == "unconditional"
+assert union["relation"] == f"{PROPERTY_GRAPH_SCHEMA}.artist_member_of"
+assert union["function"] == f"{PROPERTY_GRAPH_SCHEMA}.refresh_artist_member_of"
+assert union["function"] in graph["functions"]
+assert union["refresh_owner"] in OWNERS
+assert union["refresh_owner"] == "discogs-sql-loader"
+assert union["refresh_latch"] == "extraction_complete"
+assert union["relation"].removeprefix(f"{PROPERTY_GRAPH_SCHEMA}.") in storage_only
+assert declared_shapes[union["relation"].removeprefix(f"{PROPERTY_GRAPH_SCHEMA}.")] == "table"
+assert relations["artist_member_of"]["owner"] == union["refresh_owner"]
+# Both provenances are named, and both are read out of the relation body rather
+# than restated: a source the union stopped reading fails this check.
+union_body = dict(_GRAPH_STATEMENTS)[f"{PROPERTY_GRAPH_SCHEMA}.refresh_artist_member_of function"]
+for source in union["sources"]:
+    assert f"FROM {source} AS" in union_body or f"JOIN {source} AS" in union_body, source
+assert union["key"] == ["member_artist_id", "group_artist_id", "source"]
+assert f"PRIMARY KEY ({', '.join(union['key'])})" in table_statements[union["relation"]]
+assert f"ON {union['relation']} {union['reverse_index']}" in "\n".join(statement for name, statement in _GRAPH_STATEMENTS if name.endswith(" index"))
 
 # Appending a column is the only view change safe to ship on its own; the engine
 # enforces the rest by refusing the replacement.
