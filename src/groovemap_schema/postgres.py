@@ -571,6 +571,33 @@ _USER_TABLES: list[tuple[str, str]] = [
         "idx_admin_audit_log_admin_id",
         "CREATE INDEX IF NOT EXISTS idx_admin_audit_log_admin_id ON admin_audit_log (admin_id)",
     ),
+    # discogs-sql-loader's durable, version-keyed extraction latch (bead
+    # gm-discogs-sql-loader-2eg.3): one row per extraction, recording which of
+    # the four Discogs entity types have signalled `extraction_complete` and
+    # whether the derived-relation refresh pass has completed for it. Written
+    # before the delivery is acked so a restart resumes collection instead of
+    # losing already-collected signals.
+    #
+    # Declared here rather than by a runtime CREATE TABLE in the loader because
+    # this repository is the sole DDL issuer (see docs/architecture.md and
+    # contracts/persistence/v1/compatibility.json). The name and column shape
+    # are copied verbatim from tableinator/extraction_latch.py in
+    # discogs-sql-loader, so the loader's own edit is minimal: it stops issuing
+    # `_CREATE_LATCH_TABLE` at runtime and otherwise reads/writes exactly the
+    # relation this statement creates. See the "loader coordination" note in
+    # docs/architecture.md for why this is not a shared `loader text` relation.
+    (
+        "discogs_loader_extraction_latch table",
+        """
+        CREATE TABLE IF NOT EXISTS discogs_loader_extraction_latch (
+            version      TEXT PRIMARY KEY,
+            signals      TEXT[] NOT NULL DEFAULT '{}',
+            created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            refreshed_at TIMESTAMPTZ
+        )
+        """,
+    ),
 ]
 
 

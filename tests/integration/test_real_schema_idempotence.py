@@ -60,6 +60,7 @@ EXPECTED_POSTGRES_TABLES = {
         "artists",
         "catalog_items",
         "collection_snapshots",
+        "discogs_loader_extraction_latch",
         "extraction_history",
         "labels",
         "masters",

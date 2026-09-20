@@ -17,6 +17,25 @@
     "rollback": "every destructive migration requires a tested rollback or restore procedure"
   },
   "contract": "groovemap.persistence",
+  "extraction_latch": {
+    "columns": {
+      "discogs_loader_extraction_latch.created_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+      "discogs_loader_extraction_latch.refreshed_at": "TIMESTAMPTZ",
+      "discogs_loader_extraction_latch.signals": "TEXT[] NOT NULL DEFAULT '{}'",
+      "discogs_loader_extraction_latch.updated_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+      "discogs_loader_extraction_latch.version": "TEXT PRIMARY KEY"
+    },
+    "consumer": "discogs-sql-loader",
+    "design_decision": "Named and shaped exactly as discogs-sql-loader's tableinator/extraction_latch.py already declared it at runtime (before its review bounced the runtime CREATE TABLE, since this repository is the sole DDL issuer), rather than as a shared public.loader_extraction_latch(loader, extraction_key, ...) relation with a composite key. A shared relation was considered and rejected for this pass: it would force every one of the loader's SQL statements to change, not only the table name — the INSERT column list, the ON CONFLICT target, the `prior` CTE's WHERE predicate, and the `superseded` EXISTS subquery's WHERE predicate in `_RECORD_SIGNAL`, plus `_MARK_REFRESHED`'s WHERE clause, would all need a `loader = 'discogs'` predicate added, and every call site would need a new parameter threaded through. Keeping the loader's exact name and shape makes the loader's own edit minimal: stop issuing `_CREATE_LATCH_TABLE` at runtime (this repository now owns that DDL) and otherwise read/write the relation unchanged.",
+    "introduced_in_contract_version": 1,
+    "kind": "additive",
+    "note": "A durable, version-keyed latch recording which of the four Discogs entity types have signalled one extraction's `extraction_complete`, and whether the post-import derived-relation refresh has completed for it (`refreshed_at`). Written before the triggering delivery is acked, so a restart resumes signal collection instead of losing it. Mirrors graphinator's Neo4j-side latch. This repository writes no row; discogs-sql-loader is the sole writer today.",
+    "musicbrainz_reuse": "musicbrainz-sql-loader may adopt the same latch pattern when it needs one, by having its own analogously-named relation (for example musicbrainz_loader_extraction_latch, same column shape) declared additively here — not by writing into discogs_loader_extraction_latch, for the reason recorded under design_decision.",
+    "relation": "discogs_loader_extraction_latch",
+    "schema": "public",
+    "shape": "table",
+    "storage_only": true
+  },
   "graph_schema": {
     "availability": "unconditional",
     "bootstrap": {

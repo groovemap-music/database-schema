@@ -189,6 +189,49 @@ class TestAppTokensTable:
         assert "DROP" not in stmt.upper()
 
 
+class TestExtractionLatchTable:
+    """discogs-sql-loader's durable extraction latch (bead gm-database-schema-fyl).
+
+    The name and column shape are copied verbatim from the loader's own
+    `tableinator/extraction_latch.py` (`_CREATE_LATCH_TABLE`, at branch
+    wt/bead/issue/gm-discogs-sql-loader-2eg.3), so this test pins that shape
+    rather than the loader's private DDL.
+    """
+
+    def _user_tables_dict(self) -> dict[str, str]:
+        return dict(_USER_TABLES)
+
+    def test_table_defined(self) -> None:
+        assert "discogs_loader_extraction_latch table" in self._user_tables_dict()
+
+    def test_required_columns(self) -> None:
+        stmt = self._user_tables_dict()["discogs_loader_extraction_latch table"]
+        for column in ("version", "signals", "created_at", "updated_at", "refreshed_at"):
+            assert column in stmt, f"Missing column '{column}' in discogs_loader_extraction_latch schema"
+
+    def test_version_is_the_primary_key(self) -> None:
+        """Keyed on `version` alone, matching the loader's `ON CONFLICT (version)` upsert."""
+        stmt = self._user_tables_dict()["discogs_loader_extraction_latch table"]
+        assert "version      TEXT PRIMARY KEY" in stmt or "version TEXT PRIMARY KEY" in stmt
+
+    def test_signals_is_a_text_array_defaulting_empty(self) -> None:
+        stmt = self._user_tables_dict()["discogs_loader_extraction_latch table"]
+        assert "signals      TEXT[] NOT NULL DEFAULT '{}'" in stmt or "signals TEXT[] NOT NULL DEFAULT '{}'" in stmt
+
+    def test_refreshed_at_is_nullable(self) -> None:
+        """Unset until the derived-relation pass completes for the extraction."""
+        stmt = self._user_tables_dict()["discogs_loader_extraction_latch table"]
+        assert "refreshed_at TIMESTAMPTZ\n" in stmt or stmt.rstrip().endswith("refreshed_at TIMESTAMPTZ")
+
+    def test_no_drop_in_schema(self) -> None:
+        stmt = self._user_tables_dict()["discogs_loader_extraction_latch table"]
+        assert "DROP" not in stmt.upper()
+
+    def test_is_idempotent(self) -> None:
+        stmt = self._user_tables_dict()["discogs_loader_extraction_latch table"]
+        assert "IF NOT EXISTS" in stmt.upper()
+
+
 class TestCreatePostgresSchema:
     """Test create_postgres_schema with a mock pool."""
 
