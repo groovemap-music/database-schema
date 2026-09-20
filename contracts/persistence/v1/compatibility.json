@@ -107,6 +107,7 @@
     "functions": [
       "graph.bootstrap_fill",
       "graph.credit_role_category",
+      "graph.find_shortest_path",
       "graph.mb_relationship_type",
       "graph.medium_label",
       "graph.refresh_artist_member_of",
@@ -140,6 +141,49 @@
       ]
     },
     "note": "Twenty relations are loader-written tables replacing a view that computed the same rows on every read, seven more hold the counters, degrees, and genre aggregates the graph enrichers compute today, one more is the cross-provenance MEMBER_OF union recorded under graph_schema.member_of_union, one more is the per-vertex degree recorded under graph_schema.vertex_degree, and the rest are read-only views over tables declared elsewhere in this contract. This repository declares every one of them and writes rows into none: the owner named against each relation does that, so an empty table on a fresh database is the expected state rather than a fault.",
+    "path_function": {
+      "availability": "unconditional",
+      "clamped_to": [
+        1,
+        10
+      ],
+      "declared_as": "graph.find_shortest_path(from_kind \"char\", from_key text, to_kind \"char\", to_key text, max_depth int DEFAULT 6) RETURNS TABLE (found boolean, depth int, nodes text[], rels text[])",
+      "default_max_depth": 6,
+      "function": "graph.find_shortest_path",
+      "kind": "additive",
+      "nodes": "One entry per vertex from the source to the target, each the pair kind:key. The key half is what the Cypher returns per node, coalesce(node.id, node.name), so a Genre or a Style is its name and every other vertex is its Discogs id; the kind half is the one-byte discriminator graph.vertex_degree is keyed on. The pair is what makes the answer unambiguous, because an Artist and a Release can hold the same numeric key and a bare id could not say which vertex a hop went through.",
+      "note": "The one Cypher call this schema cannot express as a view: shortestPath over BY|ON|IS|ALIAS_OF|MEMBER_OF|DERIVED_FROM, ported from spike gm-database-schema-gkt.1's prototype. It is a vertex-at-a-time bidirectional search. It expands one vertex of the smaller-summed-degree frontier at a time in ascending graph.vertex_degree order, probes each expanded vertex against the whole of the opposite seen set, and returns at first touch. First touch is exact because the probe compares against the opposite SEEN set rather than the opposite FRONTIER: with df and db the depths each side is complete to, a touch at depth b <= db from a frontier vertex at df witnesses a walk of length df + 1 + b, the invariant says no path of length <= df + db exists, and the two bounds meet at df + db + 1. A side's completed depth therefore advances only when its level finishes, the expansion writes rows for the side being expanded and no other so the opposite seen set is frozen for the level, and the distance is read off the recorded depths rather than asserted, so a mistake in that argument shows up as a disagreement with Neo4j instead of as a silently wrong answer. It writes no graph relation and no persistent relation of any kind: its only state is one session-scoped seen set. A search that finds nothing returns one row with found false and the other three columns null, where the Cypher returns no row at all. The depth clamp is catalog-api's MIN_PATH_DEPTH, MAX_PATH_DEPTH and DEFAULT_PATH_DEPTH unchanged; spike gm-database-schema-gkt.1 recommended a cap of 4 instead, because at cap 10 a distance-6 pair costs 4.1 s on its cloud machine against 10.5 ms at cap 4 and nothing in the catalog is answerable at 5 or 6 inside the request budget. The owner chose 10 anyway, for exact parity with the Cypher this replaces, and accepts seconds beyond depth 4 for it; lowering the default is a change to the callers' contract rather than to this function.",
+      "reads": [
+        "graph.vertex_degree"
+      ],
+      "rels": "One entry per hop, so one shorter than nodes, each the Neo4j relationship type of that hop: BY, ON, IS, ALIAS_OF, MEMBER_OF, or DERIVED_FROM. It is the type and never the provenance. graph.artist_member_of carries source, but Neo4j holds both provenances in one relationship space and reports one type, and projecting source would cost a heap fetch on every backward hop because the reverse index (group_artist_id, member_artist_id) does not cover it.",
+      "seen_set": {
+        "created_by": "graph.find_shortest_path, on its first call in a session",
+        "key": [
+          "side",
+          "kind",
+          "key"
+        ],
+        "note": "One request-scoped relation and no second frontier relation: the frontier is side = s AND depth = d over the relation being written anyway, which the secondary index makes an index-only scan of the level. The spike measured a separate queue costing a second heap insert, a second index insert and a sequence nextval for every vertex discovered, and dropping it cut the worst measured case by about two fifths. It is TEMPORARY rather than UNLOGGED because two concurrent searches against one unlogged table would corrupt each other, and ON COMMIT DELETE ROWS because the spike's per-call TRUNCATE was about 4 ms of a 5.2 ms floor. It is not an hstore and not an array: a PL/pgSQL variable is passed into a SQL statement by value and re-serialised on every statement, so those representations are faster below a few thousand vertices and do not finish at all above a hundred thousand. A consumer never names this relation; it is recorded so that a session holding one after a search is understood as expected state rather than as a leak.",
+        "relation": "pg_temp.graph_path_seen",
+        "secondary_index": "(side, depth, kind, key)",
+        "shape": "TEMPORARY table, ON COMMIT DELETE ROWS"
+      },
+      "traverses": [
+        "graph.by_artist",
+        "graph.master_by_artist",
+        "graph.on_label",
+        "graph.in_genre",
+        "graph.in_style",
+        "graph.master_in_genre",
+        "graph.master_in_style",
+        "graph.derived_from",
+        "graph.alias_of",
+        "graph.artist_member_of"
+      ],
+      "undirected": true,
+      "writes": "nothing"
+    },
     "property_graph": {
       "absent_on": "PostgreSQL 18, and PostgreSQL 19 with the switch off",
       "availability": "conditional",

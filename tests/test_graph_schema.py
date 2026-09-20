@@ -16,12 +16,18 @@ from groovemap_schema.postgres import (
     _EDGE_TABLES,
     _GRAPH_STATEMENTS,
     _PATH_RELATIONS,
+    _PATH_RELATIONSHIP_TYPES,
     _TEXT_KEY_RETYPES,
     _VERTEX_KIND_NAMES,
     _VERTEX_KINDS,
     MUSICBRAINZ_RELATIONSHIP_LABEL,
     MUSICBRAINZ_RELATIONSHIP_TYPES,
+    PATH_DEFAULT_DEPTH,
+    PATH_MAX_DEPTH,
+    PATH_MIN_DEPTH,
+    PATH_SEEN_RELATION,
     PROPERTY_GRAPH_STATEMENT,
+    _path_neighbour_branches,
     _property_graph_edges,
     _property_graph_vertices,
     _role_category_branches,
@@ -167,7 +173,11 @@ VOCABULARY_FUNCTIONS = {"credit_role_category", "medium_label", "mb_relationship
 # `graph.bootstrap_fill` is the fourth and is not one of them: nothing calls it,
 # it reads and writes the relations rather than being read by one, and it is the
 # only thing the schema declares that writes a graph row.
-EXPECTED_FUNCTIONS = VOCABULARY_FUNCTIONS | {"bootstrap_fill", "refresh_artist_member_of", "refresh_vertex_degree"}
+#
+# `graph.find_shortest_path` is the fifth, and the only one that READS the
+# traversal surface rather than writing it: the one Cypher call this schema
+# cannot express as a view, ported from spike gm-database-schema-gkt.1.
+EXPECTED_FUNCTIONS = VOCABULARY_FUNCTIONS | {"bootstrap_fill", "refresh_artist_member_of", "refresh_vertex_degree", "find_shortest_path"}
 
 MUSICBRAINZ_PAIRS = [
     (source, target) for source in ("artist", "label", "release", "release_group") for target in ("artist", "label", "release", "release_group")
@@ -1051,6 +1061,220 @@ class TestVertexDegree:
         """It is an ordering heuristic for the path functions, not a node property."""
         elements = {element.element for element in (*_property_graph_vertices(), *_property_graph_edges())}
         assert "vertex_degree" not in elements
+
+
+def executable_sql(statement: str) -> str:
+    """Return one statement with its `--` commentary removed.
+
+    Several assertions about `graph.find_shortest_path` are about what it does
+    NOT do — no per-call TRUNCATE, no hstore seen set, no distance asserted from
+    `df + db + 1` — and the prose that explains why it does not do them names
+    every one of those things. Stripping the commentary is what keeps those
+    assertions about the code rather than about the argument beside it.
+    """
+    return "\n".join(line for line in statement.splitlines() if not line.lstrip().startswith("--"))
+
+
+class TestShortestPath:
+    """The vertex-at-a-time bidirectional search, and the shape its exactness needs."""
+
+    # The six relationship types `_PATH_REL_TYPES` names in `catalog-api`, and
+    # which of the ten relations carries each. Spelled out rather than read from
+    # `_PATH_RELATIONSHIP_TYPES`, because this mapping is the claim the function
+    # makes about what a hop of its answer means.
+    RELATIONSHIP_TYPES: ClassVar[dict[str, str]] = {
+        "by_artist": "BY",
+        "master_by_artist": "BY",
+        "on_label": "ON",
+        "in_genre": "IS",
+        "in_style": "IS",
+        "master_in_genre": "IS",
+        "master_in_style": "IS",
+        "derived_from": "DERIVED_FROM",
+        "alias_of": "ALIAS_OF",
+        "artist_member_of": "MEMBER_OF",
+    }
+
+    def test_the_signature_mirrors_the_cypher_it_replaces(self) -> None:
+        """Two endpoints as `(kind, key)` pairs, a depth, and the four answer columns."""
+        statement = statement_for_function("find_shortest_path")
+        assert statement.startswith("CREATE OR REPLACE FUNCTION graph.find_shortest_path(\n")
+        for argument in ('from_kind "char"', "from_key  text", 'to_kind   "char"', "to_key    text"):
+            assert argument in statement, argument
+        assert f"max_depth int DEFAULT {PATH_DEFAULT_DEPTH}" in statement
+        assert "RETURNS TABLE (found boolean, depth int, nodes text[], rels text[])" in statement
+        assert "LANGUAGE plpgsql" in statement
+
+    def test_the_depth_bounds_are_the_ones_catalog_api_clamps_to(self) -> None:
+        """The Cypher interpolates the number as a literal and clamps it; so does this."""
+        assert (PATH_MIN_DEPTH, PATH_DEFAULT_DEPTH, PATH_MAX_DEPTH) == (1, 6, 10)
+        statement = statement_for_function("find_shortest_path")
+        assert f"cap := greatest({PATH_MIN_DEPTH}, least(coalesce(max_depth, {PATH_DEFAULT_DEPTH}), {PATH_MAX_DEPTH}));" in statement
+
+    def test_the_clamp_runs_before_anything_reads_the_depth(self) -> None:
+        """A caller that asks for 10,000 is answered for 10, not started on 10,000."""
+        statement = statement_for_function("find_shortest_path")
+        body = executable_sql(statement)
+        assert body.index("cap := greatest(") < body.index("WHILE forward_depth + backward_depth < cap")
+        assert body.count("max_depth") == 2
+
+    def test_the_seen_set_is_temporary_and_emptied_by_the_commit(self) -> None:
+        """Per-session, so concurrent searches are independent, and no per-call TRUNCATE."""
+        statement = statement_for_function("find_shortest_path")
+        assert f"CREATE TEMPORARY TABLE {PATH_SEEN_RELATION} (" in statement
+        assert ") ON COMMIT DELETE ROWS;" in statement
+        assert "UNLOGGED" not in executable_sql(statement)
+        assert "TRUNCATE" not in executable_sql(statement)
+
+    def test_the_seen_set_is_keyed_on_the_side_and_the_vertex(self) -> None:
+        """One row per (side, vertex): a dual-provenance membership is one visited vertex."""
+        statement = statement_for_function("find_shortest_path")
+        assert "PRIMARY KEY (side, kind, key)" in statement
+        assert "ON CONFLICT (side, kind, key) DO NOTHING" in statement
+
+    def test_the_frontier_is_derived_from_the_seen_set_rather_than_a_second_relation(self) -> None:
+        """A separate queue costs a heap insert, an index insert and a nextval per vertex."""
+        statement = statement_for_function("find_shortest_path")
+        assert statement.count("CREATE TEMPORARY TABLE") == 1
+        assert f"CREATE INDEX {PATH_SEEN_RELATION}_level ON pg_temp.{PATH_SEEN_RELATION} (side, depth, kind, key);" in statement
+        assert "WHERE seen.side = this_side AND seen.depth = this_gen" in statement
+
+    def test_the_seen_set_is_a_relation_rather_than_an_hstore_or_an_array(self) -> None:
+        """A PL/pgSQL variable is re-serialised into every statement it is passed to."""
+        body = executable_sql(statement_for_function("find_shortest_path"))
+        for representation in ("hstore", "@>", "? ", "= ANY(", "akeys(", "exist("):
+            assert representation not in body, representation
+        # Membership is tested by the relation's own primary key, twice: the
+        # touch probe reads it and the expansion conflicts on it.
+        assert "ON CONFLICT (side, kind, key) DO NOTHING" in body
+        assert "WHERE seen.side = other_side AND seen.kind = candidate.dst_kind AND seen.key = candidate.dst_key" in body
+
+    def test_it_traverses_both_directions_of_every_path_relation_and_nothing_else(self) -> None:
+        """Twenty branches over ten relations: the surface `graph.vertex_degree` counts."""
+        statement = statement_for_function("find_shortest_path")
+        surface = _path_neighbour_branches("frontier_kind", "frontier_key", "")
+        for relation, (source_kind, source_column, target_kind, target_column) in TestVertexDegree.PATH_RELATIONS.items():
+            for from_kind, from_column in ((source_kind, source_column), (target_kind, target_column)):
+                branch = f"""FROM graph.{relation} AS edge\nWHERE frontier_kind = '{from_kind}'::"char" AND edge.{from_column} = frontier_key"""
+                assert branch in surface, f"{relation} is missing its {from_kind}/{from_column} direction"
+        assert surface.count("FROM graph.") == 2 * len(TestVertexDegree.PATH_RELATIONS)
+        # Once for the touch probe and once for the expansion, and nowhere else.
+        assert statement.count("FROM graph.") == 4 * len(TestVertexDegree.PATH_RELATIONS)
+
+    def test_the_surface_is_generated_from_the_same_list_the_degree_sums(self) -> None:
+        """A relation added to one and not the other would misorder the walk it walks."""
+        assert set(_PATH_RELATIONSHIP_TYPES) == {relation for relation, _sk, _sc, _tk, _tc in _PATH_RELATIONS}
+        assert _PATH_RELATIONSHIP_TYPES == self.RELATIONSHIP_TYPES
+
+    def test_it_reports_the_six_neo4j_relationship_types(self) -> None:
+        """`rels[]` is what `[rel IN relationships(p) | type(rel)]` returns."""
+        assert set(_PATH_RELATIONSHIP_TYPES.values()) == {"BY", "ON", "IS", "ALIAS_OF", "MEMBER_OF", "DERIVED_FROM"}
+        surface = _path_neighbour_branches("frontier_kind", "frontier_key", "")
+        for relation, relationship in self.RELATIONSHIP_TYPES.items():
+            assert surface.count(f"'{relationship}'::text AS rel\nFROM graph.{relation} AS edge") == 2, relation
+
+    def test_it_traverses_no_relation_a_path_query_never_walks(self) -> None:
+        body = executable_sql(statement_for_function("find_shortest_path"))
+        for relation in TestVertexDegree.NOT_TRAVERSED:
+            assert f"graph.{relation}" not in body, relation
+
+    def test_member_of_crosses_both_provenances_without_projecting_one(self) -> None:
+        """One relationship space in Neo4j, and the reverse index does not cover `source`."""
+        statement = statement_for_function("find_shortest_path")
+        body = executable_sql(statement)
+        assert "graph.artist_member_of AS edge" in body
+        assert "graph.member_of AS edge" not in body
+        assert "edge.source" not in body
+        assert "'discogs'" not in body
+        assert "'musicbrainz'" not in body
+
+    def test_it_expands_one_vertex_at_a_time_in_ascending_degree_order(self) -> None:
+        """Expanding cheap vertices first is free insurance: no answer moves, hubs may not be expanded."""
+        statement = statement_for_function("find_shortest_path")
+        assert "ORDER BY coalesce(degree.degree, 0), seen.kind, seen.key" in statement
+        assert "LEFT JOIN graph.vertex_degree AS degree ON degree.kind = seen.kind AND degree.key = seen.key" in statement
+
+    def test_it_expands_the_side_whose_frontier_costs_less(self) -> None:
+        """The cost of a level is the work its vertices make the expansion do, not their count."""
+        statement = statement_for_function("find_shortest_path")
+        assert "IF forward_cost <= backward_cost THEN" in statement
+        assert "coalesce(sum(coalesce(degree.degree, 0)) FILTER (WHERE seen.side = 0 AND seen.depth = forward_depth), 0)" in statement
+        # Cardinality is read beside the cost, because "exhausted" is a count.
+        assert "EXIT search WHEN forward_size = 0 OR backward_size = 0;" in statement
+
+    def test_the_touch_probe_is_a_lateral_carrying_its_own_limit(self) -> None:
+        """A LATERAL with a LIMIT cannot be pulled up, so the planner cannot hash the seen set."""
+        statement = statement_for_function("find_shortest_path")
+        body = executable_sql(statement)
+        probe = body[body.index("SELECT candidate.dst_kind") : body.index("GET DIAGNOSTICS probe_rows")]
+        assert "LATERAL (" in probe
+        assert probe.count("LIMIT 1") == 2
+        assert "WHERE seen.side = other_side AND seen.kind = candidate.dst_kind AND seen.key = candidate.dst_key" in probe
+
+    def test_it_returns_at_first_touch(self) -> None:
+        """Every touch anywhere in a level has the same length, so there is no better one."""
+        statement = statement_for_function("find_shortest_path")
+        assert statement.index("IF probe_rows > 0 THEN") < statement.index("-- 2. THE EXPANSION")
+        assert executable_sql(statement).count("EXIT search;") == 1
+
+    def test_the_distance_is_derived_from_the_recorded_depths(self) -> None:
+        """A mistake in the exactness argument then shows up as a disagreement, not a wrong answer."""
+        statement = statement_for_function("find_shortest_path")
+        assert "answer_depth := this_gen + 1 + hit.other_depth;" in statement
+        assert "forward_depth + backward_depth + 1" not in executable_sql(statement)
+
+    def test_a_completed_depth_advances_only_after_its_level_finishes(self) -> None:
+        """`df` and `db` are what the invariant is stated over; advancing early would break it."""
+        statement = statement_for_function("find_shortest_path")
+        body = executable_sql(statement)
+        assert body.count("IF this_side = 0 THEN forward_depth := next_gen; ELSE backward_depth := next_gen; END IF;") == 1
+        assert body.index("END LOOP;") < body.index("IF this_side = 0 THEN forward_depth := next_gen;")
+
+    def test_a_level_writes_only_the_side_it_expands(self) -> None:
+        """The opposite seen set is frozen, so `b <= db` holds for every probe in the level."""
+        statement = statement_for_function("find_shortest_path")
+        body = executable_sql(statement)
+        inserts = re.findall(r"INSERT INTO pg_temp\.\w+ \([^)]*\)[\s\S]*?;", body)
+        # One seeds both endpoints before the search starts; the other is the
+        # level's expansion, and it writes `this_side` and reads no other.
+        assert len(inserts) == 2, inserts
+        assert "SELECT this_side, candidate.dst_kind, candidate.dst_key, next_gen, frontier_kind, frontier_key, candidate.rel" in inserts[1]
+        assert "other_side" not in inserts[1]
+        # `other_side` is read by the touch probe and written by nothing.
+        assert "WHERE seen.side = other_side" in body
+        assert re.search(r"(INSERT|UPDATE|DELETE)[^;]*other_side", body) is None
+
+    def test_the_answer_carries_the_kind_and_key_pair_for_every_vertex(self) -> None:
+        """An Artist and a Release can hold the same numeric key; a bare id is ambiguous."""
+        statement = statement_for_function("find_shortest_path")
+        assert executable_sql(statement).count("step.kind::text || ':' || step.key") == 2
+        assert "ARRAY[from_kind::text || ':' || from_key]" in statement
+
+    def test_the_backward_half_is_reversed_so_the_path_reads_source_to_target(self) -> None:
+        statement = statement_for_function("find_shortest_path")
+        assert "ORDER BY step.depth DESC" in statement
+        assert "answer_nodes := head_nodes || tail_nodes;" in statement
+        assert "answer_rels  := head_rels || ARRAY[hit.rel] || tail_rels;" in statement
+
+    def test_it_writes_no_graph_relation(self) -> None:
+        """It reads the traversal surface; the only thing it writes is its own session state."""
+        body = executable_sql(statement_for_function("find_shortest_path"))
+        assert "INSERT INTO graph." not in body
+        assert "UPDATE graph." not in body
+        assert "DELETE FROM graph." not in body
+
+    def test_it_is_declared_after_the_relations_it_reads_and_before_the_fill(self) -> None:
+        """It reads the MEMBER_OF union and the degree, and the fill stays last."""
+        names = [name for name, _statement in _GRAPH_STATEMENTS]
+        for earlier in ("graph.refresh_artist_member_of function", "graph.refresh_vertex_degree function"):
+            assert names.index(earlier) < names.index("graph.find_shortest_path function"), earlier
+        assert names.index("graph.find_shortest_path function") < names.index("graph.bootstrap_fill function")
+
+    def test_it_binds_no_property_graph_label(self) -> None:
+        """A function is not a relation; `graph.catalog` has nothing to bind here."""
+        elements = {element.element for element in (*_property_graph_vertices(), *_property_graph_edges())}
+        assert "find_shortest_path" not in elements
+        assert "find_shortest_path" not in view_names()
 
 
 class TestCollectionEdgeViews:
