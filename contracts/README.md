@@ -14,9 +14,9 @@ services never require lockstep source checkouts.
 
 The `graph` schema is recorded in
 [`persistence/v1/compatibility.json`](persistence/v1/compatibility.json) under `graph_schema`
-as an additive object of contract version 1: sixty-five relations — twenty-eight loader-written
+as an additive object of contract version 1: sixty-six relations — twenty-nine loader-written
 tables and thirty-seven read-only views over tables the same contract already declares — plus
-five functions. Four of those views exist so a vertex label can publish the counters
+six functions. Four of those views exist so a vertex label can publish the counters
 Neo4j carries on the node of the same name; `graph_schema.counter_properties` records which
 label carries which. The contract lists every relation with its shape and the service
 that writes it, because a consumer reading one needs both: the shape says whether an index is

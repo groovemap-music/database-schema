@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import ClassVar
 
 from common.credit_roles import ROLE_CATEGORIES, categorize_role
 from common.media import medium_ids, medium_label
@@ -14,7 +15,10 @@ from groovemap_schema.postgres import (
     _DERIVED_EDGE_BOOTSTRAP,
     _EDGE_TABLES,
     _GRAPH_STATEMENTS,
+    _PATH_RELATIONS,
     _TEXT_KEY_RETYPES,
+    _VERTEX_KIND_NAMES,
+    _VERTEX_KINDS,
     MUSICBRAINZ_RELATIONSHIP_LABEL,
     MUSICBRAINZ_RELATIONSHIP_TYPES,
     PROPERTY_GRAPH_STATEMENT,
@@ -45,6 +49,11 @@ COUNTER_TABLES = (
     "label_stats",
     "artist_degree",
     "release_degree_base",
+    # Not a Table 3 relation and not a node property at all: the per-vertex
+    # degree that orders frontier expansion. It is grouped with the counters
+    # because it is refreshed with them, on the same latch, from the same edge
+    # tables, and therefore has to fill after every one of them.
+    "vertex_degree",
     "artist_genre",
     "label_genre",
 )
@@ -107,6 +116,11 @@ STORAGE_ONLY = frozenset(
         # a second artist-to-artist edge label overlapping `member_of` would
         # double-count every Discogs membership a pattern matching both saw.
         "artist_member_of",
+        # The per-vertex degree binds none for a third reason: it is an ordering
+        # heuristic for the path functions, not a property of any Neo4j node, and
+        # a label over it would publish a second identity for every vertex the
+        # graph already binds under its own label.
+        "vertex_degree",
         "genre",
         "style",
         "artist",
@@ -153,7 +167,7 @@ VOCABULARY_FUNCTIONS = {"credit_role_category", "medium_label", "mb_relationship
 # `graph.bootstrap_fill` is the fourth and is not one of them: nothing calls it,
 # it reads and writes the relations rather than being read by one, and it is the
 # only thing the schema declares that writes a graph row.
-EXPECTED_FUNCTIONS = VOCABULARY_FUNCTIONS | {"bootstrap_fill", "refresh_artist_member_of"}
+EXPECTED_FUNCTIONS = VOCABULARY_FUNCTIONS | {"bootstrap_fill", "refresh_artist_member_of", "refresh_vertex_degree"}
 
 MUSICBRAINZ_PAIRS = [
     (source, target) for source in ("artist", "label", "release", "release_group") for target in ("artist", "label", "release", "release_group")
@@ -415,6 +429,7 @@ class TestVertexViews:
             "label_stats": ("label_id", "release_count", "artist_count", "genre_count"),
             "artist_degree": ("artist_id", "degree"),
             "release_degree_base": ("release_id", "degree"),
+            "vertex_degree": ("kind", "key", "degree"),
             "artist_genre": ("artist_id", "genre_name", "release_count"),
             "label_genre": ("label_id", "genre_name", "release_count"),
         }
@@ -913,6 +928,129 @@ class TestMemberOfUnion:
         elements = {element.element for element in (*_property_graph_vertices(), *_property_graph_edges())}
         assert "artist_member_of" not in elements
         assert "member_of" in elements
+
+
+class TestVertexDegree:
+    """The per-vertex degree that orders frontier expansion, and its rebuild."""
+
+    # The ten relations spike gm-database-schema-gkt.1's pathfinder traverses:
+    # the eight Discogs relations `gm-database-schema-9c8.1/materialize.sql`
+    # builds both directions of, plus the two artist-to-artist ones. Spelled out
+    # here rather than read from `_PATH_RELATIONS`, because this list is the
+    # claim the relation makes and a test that read the same tuple the code does
+    # would assert nothing.
+    PATH_RELATIONS: ClassVar[dict[str, tuple[str, str, str, str]]] = {
+        "by_artist": ("r", "release_id", "a", "artist_id"),
+        "master_by_artist": ("m", "master_id", "a", "artist_id"),
+        "on_label": ("r", "release_id", "l", "label_id"),
+        "in_genre": ("r", "release_id", "g", "genre_name"),
+        "in_style": ("r", "release_id", "s", "style_name"),
+        "master_in_genre": ("m", "master_id", "g", "genre_name"),
+        "master_in_style": ("m", "master_id", "s", "style_name"),
+        "derived_from": ("r", "release_id", "m", "master_id"),
+        "alias_of": ("a", "alias_artist_id", "a", "artist_id"),
+        "artist_member_of": ("a", "member_artist_id", "a", "group_artist_id"),
+    }
+
+    # Edge relations a path query never traverses. `_PATH_REL_TYPES` in
+    # `catalog-api` names six relationship types and none of these is one of
+    # them, so an endpoint of one is not a neighbour an expansion would ever
+    # visit; counting it would misorder the frontier rather than describe it.
+    NOT_TRAVERSED: ClassVar[tuple[str, ...]] = ("part_of", "sublabel_of", "same_as", "credited_on", "credited_to", "issued_on", "in_family")
+
+    def test_it_keys_on_the_kind_and_key_pair(self) -> None:
+        """`(kind, key)` is the pathfinder's node identity, so it is the key."""
+        statement = ddl_for("vertex_degree")
+        assert re.search(r'^\s+kind\s+"char" NOT NULL', statement, re.MULTILINE), statement
+        assert re.search(r"^\s+key\s+text\s+NOT NULL", statement, re.MULTILINE), statement
+        assert re.search(r"^\s+degree bigint NOT NULL DEFAULT 0", statement, re.MULTILINE), statement
+        assert "PRIMARY KEY (kind, key)" in statement
+
+    def test_the_kind_is_a_discriminator_rather_than_a_prefix_on_the_key(self) -> None:
+        """An equality on a concatenated token cannot use the edge tables' text indexes."""
+        body = _COUNTER_BOOTSTRAP["vertex_degree"]
+        assert "||" not in body
+        assert "concat" not in body
+        for kind in _VERTEX_KINDS:
+            assert f"'{kind}:'" not in body, kind
+        assert "GROUP BY endpoint.kind, endpoint.key" in body
+
+    def test_it_carries_no_secondary_index(self) -> None:
+        """One bigint per vertex is the whole argument; an index would be a second copy."""
+        assert index_statements_for("vertex_degree") == []
+
+    def test_it_sums_both_directions_of_every_path_relation(self) -> None:
+        """A row of an edge table contributes one to each of its two endpoints."""
+        body = _COUNTER_BOOTSTRAP["vertex_degree"]
+        for relation, (source_kind, source_column, target_kind, target_column) in self.PATH_RELATIONS.items():
+            for kind, column in ((source_kind, source_column), (target_kind, target_column)):
+                literal = f"'{kind}'"
+                branch = f'{literal}::"char"'
+                assert re.search(rf"{re.escape(branch)},?\s+(AS kind, )?{column}\b[^\n]*FROM graph\.{relation}$", body, re.MULTILINE), (
+                    f"{relation} is missing its {kind}/{column} direction"
+                )
+        assert body.count("FROM graph.") == 2 * len(self.PATH_RELATIONS)
+
+    def test_the_relation_list_is_exactly_the_traversal_surface(self) -> None:
+        assert {relation for relation, _sk, _sc, _tk, _tc in _PATH_RELATIONS} == set(self.PATH_RELATIONS)
+
+    def test_it_counts_no_relation_a_path_query_never_traverses(self) -> None:
+        body = _COUNTER_BOOTSTRAP["vertex_degree"]
+        for relation in self.NOT_TRAVERSED:
+            assert f"graph.{relation}" not in body, relation
+
+    def test_it_reads_the_member_of_union_rather_than_the_discogs_relation(self) -> None:
+        """61.6% of that edge class is MusicBrainz provenance; the union is what is traversed."""
+        body = _COUNTER_BOOTSTRAP["vertex_degree"]
+        assert "graph.artist_member_of" in body
+        assert "FROM graph.member_of" not in body
+
+    def test_every_kind_it_emits_is_a_named_vertex_kind(self) -> None:
+        """The single-char set is the spike's, and each character means one thing."""
+        assert set(_VERTEX_KINDS) <= set(_VERTEX_KIND_NAMES)
+        assert tuple(sorted(_VERTEX_KIND_NAMES)) == _VERTEX_KINDS
+        assert _VERTEX_KIND_NAMES == {"a": "artist", "g": "genre", "l": "label", "m": "master", "r": "release", "s": "style"}
+        for _relation, source_kind, _source_column, target_kind, _target_column in _PATH_RELATIONS:
+            assert source_kind in _VERTEX_KIND_NAMES
+            assert target_kind in _VERTEX_KIND_NAMES
+
+    def test_the_refresh_is_declared_as_a_reporting_function(self) -> None:
+        statement = statement_for_function("refresh_vertex_degree")
+        assert statement.startswith("CREATE OR REPLACE FUNCTION graph.refresh_vertex_degree()\n")
+        assert 'RETURNS TABLE (kind "char", row_count bigint)' in statement
+        assert "LANGUAGE plpgsql" in statement
+
+    def test_the_refresh_empties_the_relation_before_it_refills_it(self) -> None:
+        """A vertex whose last edge went has to lose its row; an upsert converges upward only."""
+        statement = statement_for_function("refresh_vertex_degree")
+        assert statement.index("TRUNCATE graph.vertex_degree;") < statement.index("INSERT INTO graph.vertex_degree (")
+        assert "ON CONFLICT" not in statement
+
+    def test_the_refresh_reports_a_row_per_kind_including_an_empty_one(self) -> None:
+        """A catalog with no masters reads as a zero rather than as a smaller relation."""
+        statement = statement_for_function("refresh_vertex_degree")
+        values = ", ".join(f"""('{kind}'::"char")""" for kind in _VERTEX_KINDS)
+        assert f"FROM (VALUES {values}) AS vertex(kind)" in statement
+        assert statement.count("RETURN NEXT;") == 1
+        assert statement.count("RAISE NOTICE") == 1
+
+    def test_the_refresh_and_the_fill_share_one_body(self) -> None:
+        """Two texts could disagree about what a degree counts; there is one."""
+        body = " ".join(_COUNTER_BOOTSTRAP["vertex_degree"].split())
+        for function in ("refresh_vertex_degree", "bootstrap_fill"):
+            assert body in " ".join(statement_for_function(function).split()), function
+
+    def test_the_fill_builds_it_after_every_relation_it_sums(self) -> None:
+        """Filled early it would count an edge class that was still empty."""
+        statement = statement_for_function("bootstrap_fill")
+        degree = statement.index("TRUNCATE graph.vertex_degree;")
+        for relation in self.PATH_RELATIONS:
+            assert statement.index(f"TRUNCATE graph.{relation};") < degree, relation
+
+    def test_it_binds_no_property_graph_label(self) -> None:
+        """It is an ordering heuristic for the path functions, not a node property."""
+        elements = {element.element for element in (*_property_graph_vertices(), *_property_graph_edges())}
+        assert "vertex_degree" not in elements
 
 
 class TestCollectionEdgeViews:

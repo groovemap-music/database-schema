@@ -349,8 +349,8 @@ Every index and constraint above is additive within persistence contract v1 — 
 ## Graph schema
 
 The `graph` schema re-presents the catalog as the vertex and edge relations of the property
-graph the Neo4j enrichers already build. Sixty-five relations, declared in
-[`src/groovemap_schema/postgres.py`](../src/groovemap_schema/postgres.py): twenty-eight
+graph the Neo4j enrichers already build. Sixty-six relations, declared in
+[`src/groovemap_schema/postgres.py`](../src/groovemap_schema/postgres.py): twenty-nine
 loader-written tables and thirty-seven read-only views over tables declared elsewhere in the
 same module. The schema is additive within persistence contract v1:
 [the persistence compatibility contract](../contracts/persistence/) records every relation
@@ -375,10 +375,11 @@ most. Spike gm-database-schema-9c8.2 Table 2 and Table 3 fix the shapes, keys, i
 owners; this schema follows them and does not invent one. Seven further tables hold the
 counters the graph enrichers compute in a post-import pass, which a graph declared over views
 had nowhere to put. The twenty-eighth is `graph.artist_member_of`, the
-[cross-provenance MEMBER_OF union](#the-member_of-union), which is derived from two of the
-relations above rather than from a document.
+[cross-provenance MEMBER_OF union](#the-member_of-union), and the twenty-ninth is
+`graph.vertex_degree`, [the per-vertex degree](#the-per-vertex-degree) that orders frontier
+expansion. Both are derived from the relations above them rather than from a document.
 
-Read the section in two halves. The sixty-five relations are unconditional — every supported
+Read the section in two halves. The sixty-six relations are unconditional — every supported
 engine gets all of them, on PostgreSQL 18 and 19 alike. The `CREATE PROPERTY GRAPH`
 declaration layered over them is not: it needs PostgreSQL 19 and an explicit switch, and
 [when it is applied](#when-it-is-applied) is the one place those gates are stated. A consumer
@@ -778,9 +779,116 @@ relation that is simply smaller than expected. The body it runs is the same text
 `graph.bootstrap_fill()` inlines, so the one-off fill and the refresh cannot disagree about what
 a membership is.
 
+### The per-vertex degree
+
+`graph.vertex_degree` is one `bigint` per vertex of the path traversal surface, holding its
+undirected degree. It buys exactly two things, and both are ordering decisions rather than
+access paths: which side of a bidirectional search to expand next, and which vertex of that
+side's frontier to expand first. **Neither changes an answer.**
+
+Spike gm-database-schema-gkt.1 measured it. Expanding the smaller-degree frontier first
+removed the distance-5 variance outright — 1,774 ms down to 334 ms — with every path it
+returned unchanged. It does not help distance 6 and made it slightly worse, so this is a
+variance reducer and must not be sold as a fix. What makes it worth building anyway is the
+price. One bigint per vertex is **97 MB** at catalog scale. The dense adjacency copy the
+earlier spike gm-database-schema-9c8.3 priced is **1,649 MB**, kept current against a growing
+catalog, for 1.3× to 1.4×, and that spike's own verdict did not turn on it. Build the cheap
+one.
+
+| Relation | Key | Holds | Indexes |
+| --- | --- | --- | --- |
+| `graph.vertex_degree` | `(kind, key)` | `degree` | the primary key, and nothing else |
+
+**`kind` is a one-byte discriminator, not a prefix on the key.** The pathfinder's node
+identity is the pair `(kind, key)`, and it has to stay a pair: an equality on a concatenated
+token — `'a:' || artist_id` — cannot use the text indexes the edge tables carry, so every
+frontier step would degrade to a scan. `"char"` is PostgreSQL's one-byte internal type, which
+is the whole point of a 97 MB relation: a vertex costs a byte and a bigint rather than a row
+of text. The alphabet is the spike's own.
+
+| `kind` | Vertex |
+| --- | --- |
+| `a` | artist |
+| `g` | genre |
+| `l` | label |
+| `m` | master |
+| `r` | release |
+| `s` | style |
+
+**It sums both directions of ten relations**, which are the traversal surface and nothing
+else: the eight Discogs relations spike gm-database-schema-9c8.1's `materialize.sql` indexes
+both ways — `by_artist`, `master_by_artist`, `on_label`, `in_genre`, `in_style`,
+`master_in_genre`, `master_in_style`, `derived_from` — plus the two artist-to-artist ones,
+`alias_of` and [the MEMBER_OF union](#the-member_of-union). Those are the six relationship
+types `_PATH_REL_TYPES` names in `catalog-api`: `BY`, `ON`, `IS`, `ALIAS_OF`, `MEMBER_OF`,
+`DERIVED_FROM`. `part_of`, `sublabel_of`, `same_as`, `credited_on`, `credited_to`, and
+`issued_on` are deliberately absent — a path query does not traverse them, so an endpoint of
+one is not a neighbour an expansion would ever visit and counting it would misorder the
+frontier rather than describe it.
+
+Only a vertex that carries an edge gets a row. A genre nothing is filed under is absent
+rather than zero, which is what keeps the relation the size of the traversal surface rather
+than the size of the catalog; a lookup that misses reads as degree zero, which is what it is.
+
+**A membership both provenances assert counts twice.** `graph.artist_member_of` carries
+`source` in its key, so a band membership the Discogs documents and MusicBrainz both state is
+two rows, and an expansion of that artist really does scan two rows. The number this relation
+holds is therefore the rows an expansion will read, which is the quantity the ordering
+decision is comparing; counting the distinct neighbour instead would understate the work by
+exactly the rows the scan still has to do. The spike's prototype counts it the same way — its
+`pf.edge` unions the Discogs and MusicBrainz halves with `UNION ALL` — so this relation
+reproduces the measurement rather than a variant of it. The cost is that a dual-provenance
+artist looks marginally busier than it is, which can only make the search expand the other
+side first. No answer moves.
+
+That is also the first of the two reasons its artist rows are **not** identical to
+`graph.artist_degree`, which counts an artist the way Neo4j's `COUNT { (a)--() }` does. The
+second is `same_as`: that counter includes the person-to-artist edge, because a `:Artist` node
+carries it, and no path query traverses it. So the two are the same sum with two deliberate
+substitutions, and the integration suite states them as arithmetic rather than as prose —
+`vertex_degree = artist_degree − same_as + (artist_member_of − member_of)` holds for every
+artist on the fixture, and where both substitutions are inert the two relations agree
+outright.
+
+**It binds no property-graph label**, for the same kind of reason
+[`graph.artist_member_of`](#the-member_of-union) binds none: there is no Neo4j node property it
+corresponds to, nothing in `graph.catalog` would read it, and a label over it would publish a
+second identity for every vertex the graph already binds under its own label.
+
+`graph.refresh_vertex_degree()` rebuilds it, and the contract records its owner under
+`graph_schema.vertex_degree`: **`discogs-sql-loader` calls it on the `extraction_complete`
+latch it already handles**, with the counter relations and after
+`graph.refresh_artist_member_of()`, which writes one of the ten relations it sums. It is a sum
+over relations a loader writes a row at a time, so no loader can maintain it incrementally,
+and running it on that latch costs no new scheduler. Nothing in this repository calls it.
+
+```sql
+SELECT * FROM graph.refresh_vertex_degree();
+```
+
+```
+ kind | row_count
+------+-----------
+ a    |       …
+ g    |      16
+ l    |       …
+ m    |       …
+ r    |       …
+ s    |     757
+```
+
+It is `TRUNCATE` then `INSERT` in one transaction, for the reason
+[the bootstrap fill](#the-bootstrap-fill) has it: a vertex whose last edge was removed has to
+lose its row, and an upsert converges upward only — that vertex would go on looking like a hub
+and the search would keep expanding the wrong frontier. It reports one row per vertex kind and
+always every kind, so a rebuild that finds no masters says so with a zero rather than looking
+like a relation that is simply smaller than expected. The body it runs is the same text
+`graph.bootstrap_fill()` inlines, so the one-off fill and the refresh cannot disagree about
+what a degree counts.
+
 ### The bootstrap fill
 
-`graph.bootstrap_fill()` derives every one of the twenty-eight loader-written tables from the
+`graph.bootstrap_fill()` derives every one of the twenty-nine loader-written tables from the
 `artists`, `labels`, `masters`, `releases`, and `musicbrainz` documents in one pass — and
 [the MEMBER_OF union](#the-member_of-union) from the relations it has just filled. It exists
 for one situation: an environment that has the documents but has not run a loader, where a
@@ -827,7 +935,7 @@ upsert. `ON CONFLICT DO NOTHING` converges upward only: a row the documents no l
 a release whose genre was corrected, a credit that was removed — would survive every re-run, so
 the relation would drift away from its own definition rather than toward it. Emptying it first
 makes the relation exactly the projection of the documents present, which is what idempotent
-has to mean here. The whole fill is one statement, so it either replaces all twenty-eight
+has to mean here. The whole fill is one statement, so it either replaces all twenty-nine
 relations or replaces none; a failure half way through cannot leave edges pointing at vertices
 that were truncated and never refilled. The cost is that a row a loader wrote which the
 documents do not justify is discarded too, which is a reason to run the bootstrap before the
@@ -870,19 +978,20 @@ relations that a `GRAPH_TABLE` query pattern-matches. `graph.catalog` declares o
 relation above — 17 vertex element tables and 38 edge element tables — so the same
 relation serves both a `SELECT` and a graph pattern. The declaration itself materializes
 nothing and copies nothing: each element is read from the table or view underneath it at query
-time, and the twenty-eight tables are written by their loaders whether the graph is declared
+time, and the twenty-nine tables are written by their loaders whether the graph is declared
 or not.
 
-Ten relations bind no element. Four hold the rows and four the counters of a label that
+Eleven relations bind no element. Four hold the rows and four the counters of a label that
 binds a view joining them — see
 [the counter relations](#the-counter-degree-and-aggregate-relations) — the ninth is
 `graph.release_degree_base`, the loader-written half of release degree, which the graph
-reaches through `graph.release_degree`, and the tenth is
-[`graph.artist_member_of`](#the-member_of-union), which the path functions read directly
-because Neo4j has no relationship type it corresponds to.
+reaches through `graph.release_degree`, and the last two are read directly by the path
+functions: [`graph.artist_member_of`](#the-member_of-union), because Neo4j has no
+relationship type it corresponds to, and [`graph.vertex_degree`](#the-per-vertex-degree),
+because it is an expansion-ordering heuristic rather than a property of any node.
 
 It is the one conditional object in this schema. On PostgreSQL 18, and on 19 with the switch
-off, `graph.catalog` does not exist while all sixty-five relations do, so no consumer may assume it
+off, `graph.catalog` does not exist while all sixty-six relations do, so no consumer may assume it
 — [the persistence compatibility contract](../contracts/persistence/) records it as additive
 but conditional for exactly that reason. The gates are stated once, in
 [when it is applied](#when-it-is-applied) below.
@@ -1250,12 +1359,17 @@ The loaders write them into relations of their own:
 | `graph.label_stats` | `Label.release_count`, `.artist_count`, `.genre_count` | `label_id` | `(release_count)` |
 | `graph.artist_degree` | `size([(a)-[]-() \| 1])`, `COUNT { (a)--() }` | `artist_id` | `(degree DESC)` |
 | `graph.release_degree_base` | the catalog half of `COUNT { (r)--() }` | `release_id` | — |
+| [`graph.vertex_degree`](#the-per-vertex-degree) | nothing — an expansion-ordering heuristic with no Neo4j counterpart | `(kind, key)` | — |
 | `graph.artist_genre` | a two-hop expansion `catalog-api` walks today | `(artist_id, genre_name)` | `(genre_name, artist_id)` |
 | `graph.label_genre` | the same for labels | `(label_id, genre_name)` | `(genre_name, label_id)` |
 
 `discogs-sql-loader` refreshes all of them on the `extraction_complete` message it already
 handles, which is the same latch `graphinator` uses to start its own post-import pass — so
-they cost no new scheduler. Every count is a sum over the edge tables and none re-reads a
+they cost no new scheduler. [`graph.vertex_degree`](#the-per-vertex-degree) is refreshed on
+that same latch and is listed above for that reason, but it is the one entry here that is not
+a counter: nothing reads it as a property, it exists to order frontier expansion in the path
+functions, and it has its own rebuild in `graph.refresh_vertex_degree()` because it is derived
+rather than written a row at a time. Every count is a sum over the edge tables and none re-reads a
 JSONB document directly — `genre_stats` and `style_stats` do join `graph.release` for
 `first_year`, a document-backed view, but that lookup is a `min` over an indexed column, not a
 count — which is what keeps the pass affordable.

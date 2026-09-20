@@ -314,6 +314,7 @@ _GRAPH_STATEMENT_NAMES = frozenset(
         "graph.artist_degree table",
         "graph.artist_degree_degree index",
         "graph.release_degree_base table",
+        "graph.vertex_degree table",
         "graph.artist_genre table",
         "graph.artist_genre_reverse index",
         "graph.label_genre table",
@@ -356,6 +357,7 @@ _GRAPH_STATEMENT_NAMES = frozenset(
         "graph.artist_vertex view",
         "graph.release_degree view",
         "graph.refresh_artist_member_of function",
+        "graph.refresh_vertex_degree function",
         "graph.bootstrap_fill function",
     }
 )
