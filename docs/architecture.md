@@ -328,11 +328,10 @@ The table is declared here, in `_USER_TABLES` in
 runtime `CREATE TABLE` in a loader, because this repository is the sole DDL issuer (the
 discogs-sql-loader review bounced its own runtime `CREATE TABLE IF NOT EXISTS` for exactly
 that reason). `discogs-sql-loader`'s `tableinator/extraction_latch.py` probes
-`information_schema` at startup for one of `LATCH_CANDIDATES`
-(`public.loader_extraction_latch` first, `graph.extraction_latch` second) and requires the
-five non-key columns at exact `information_schema` types
-(`text`; `ARRAY`/`_text`; `timestamp with time zone` × 3) or it declines the relation and runs
-degraded. This repository declares the first candidate name, so no fallback is needed:
+`information_schema` at startup for `public.loader_extraction_latch` and requires the
+`loader` column (its `REQUIRED_COLUMNS`) along with the other columns at exact
+`information_schema` types (`text`; `ARRAY`/`_text`; `timestamp with time zone` × 3), or it
+declines the relation and runs degraded. This repository declares exactly that relation:
 
 ```sql
 CREATE TABLE IF NOT EXISTS loader_extraction_latch (
@@ -346,12 +345,14 @@ CREATE TABLE IF NOT EXISTS loader_extraction_latch (
 )
 ```
 
-It is named for the loader family, not for one loader, and carries the optional `loader`
-discriminator column the probe honours: when present, the loader keys and scopes every
-statement on it (its `_key_columns()` returns `(loader, version)` rather than `(version,)`),
-which is why the primary key is declared on `(loader, version)` up front — the loader's
-`ON CONFLICT` upsert and its own primary-key probe both depend on that composite key existing
-from the start, not added later. `discogs-sql-loader` writes `loader = 'discogs'`;
+It is named for the loader family, not for one loader, and carries the mandatory `loader`
+discriminator column the probe requires: the loader keys and scopes every statement on it to
+`loader = 'discogs'` (its `_key_columns()` returns `(loader, version)` rather than
+`(version,)`), which is why the primary key is declared on `(loader, version)` up front. The
+probe verifies via `pg_constraint` that a PRIMARY KEY or UNIQUE constraint spans exactly those
+two columns — a bare unique index is declined by design — before its `ON CONFLICT` upsert
+runs, so that constraint must exist from the start, not be added later.
+`discogs-sql-loader` writes `loader = 'discogs'`;
 `musicbrainz-sql-loader` may adopt the same pattern and write `loader = 'musicbrainz'` rows
 into this same relation, without this repository declaring a second table. See
 `extraction_latch` in [the persistence compatibility contract](../contracts/persistence/) for
