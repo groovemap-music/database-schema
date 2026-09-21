@@ -1092,6 +1092,62 @@ the Cypher this replaces — a caller that asks for 10 today gets the answer for
 seconds beyond depth 4 for it. Lowering the default is a change to the callers' contract rather
 than to this function, and the spike's argument for making it is on the record.
 
+### The bounded Explore traversal
+
+`graph.explore_traversal` replaces `catalog-api`'s other variable-length Cypher workload. It
+starts at one vertex, walks the same ten undirected relations as the shortest-path function,
+and returns the nearest discovered Artist, Label, Genre, and Style vertices with the path that
+reached each one:
+
+```sql
+graph.explore_traversal(
+    from_kind  "char",      -- a g l m r s, the vertex discriminator
+    from_key   text,
+    hops       int DEFAULT 2,   -- clamped server-side to [1, 3]
+    row_limit  int DEFAULT 100  -- mandatory: NULL is rejected
+) RETURNS TABLE (
+    id text, name text, type text, path_names text[], rel_types text[], dist int
+)
+```
+
+The walk is breadth-first. A newly discovered vertex records its parent and the relationship
+used to reach it in the same session-local `pg_temp.graph_path_seen` relation described above;
+a recursive walk back through those parent pointers produces `path_names` and `rel_types`.
+`dist` is the recorded breadth-first depth, `id` is the Discogs id for Artist and Label or the
+name for Genre and Style, and `name` falls back to that id when the graph relation has no name
+row. As with `graph.find_shortest_path`, the relationship array reports `BY`, `ON`, `IS`,
+`ALIAS_OF`, `MEMBER_OF`, or `DERIVED_FROM`, never the MEMBER_OF provenance.
+
+`hops` is clamped to `[1, 3]`, with a default of 2. The upper bound is intentionally the
+product's existing Explore cap: spike gm-database-schema-gkt.1 measured the procedural
+`*1..3` walk at 14.9 ms p95 locally and 48.7 ms p95 on its cloud machine, so it did not find a
+reason to reduce the supported depth. Raising the cap is a separate performance decision the
+spike did not measure.
+
+**The row limit is part of the safety contract, not a presentation option.** The function
+defaults it to 100 and rejects `NULL`; a non-negative value is required. The earlier relational
+translation took 21.4 seconds at three hops because it materialised the full traversal before
+applying the limit. Breadth-first discovery produces vertices in non-decreasing distance order,
+so this implementation stops expanding as soon as it has discovered enough qualifying rows,
+then applies the requested limit to the deterministic `(dist, kind, key)` order. The spike
+measured that bounded form at roughly 15 ms locally — about 1,400 times faster — and records the
+limit as the entire reason the three-hop workload passes.
+
+The function creates no second queue and no persistent state. It reuses
+`pg_temp.graph_path_seen`, keyed by `(side, kind, key)` and indexed by
+`(side, depth, kind, key)`, as both the visited set and the frontier. The relation remains
+`TEMPORARY ... ON COMMIT DELETE ROWS`, so concurrent sessions cannot see one another's walk;
+each call clears any rows left by an earlier call in the same transaction before inserting its
+start vertex.
+
+Both functions depend on loader-refreshed relations whose ownership is explicit rather than
+implied. `graph.artist_member_of`, rebuilt by `graph.refresh_artist_member_of()`, supplies the
+Discogs-plus-MusicBrainz MEMBER_OF union; `graph.vertex_degree`, rebuilt by
+`graph.refresh_vertex_degree()`, orders shortest-path expansion. **`discogs-sql-loader` owns
+both refreshes** and calls them on its `extraction_complete` latch, with the degree refresh
+after the MEMBER_OF refresh. Explore reads the union but does not read the degree, because a
+one-sided breadth-first walk has no choice of search side to optimise.
+
 ### The bootstrap fill
 
 `graph.bootstrap_fill()` derives every one of the twenty-nine loader-written tables from the

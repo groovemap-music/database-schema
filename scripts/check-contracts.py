@@ -11,6 +11,10 @@ from groovemap_schema.postgres import (
     _PATH_RELATIONS,
     _PATH_RELATIONSHIP_TYPES,
     _VERTEX_KIND_NAMES,
+    EXPLORE_DEFAULT_HOPS,
+    EXPLORE_DEFAULT_ROW_LIMIT,
+    EXPLORE_MAX_HOPS,
+    EXPLORE_MIN_HOPS,
     PATH_DEFAULT_DEPTH,
     PATH_MAX_DEPTH,
     PATH_MIN_DEPTH,
@@ -246,6 +250,44 @@ for relationship in set(_PATH_RELATIONSHIP_TYPES.values()):
     assert relationship in path_function["rels"], relationship
     assert f"'{relationship}'::text AS rel" in path_body, relationship
 assert "edge.source" not in path_body
+
+# The bounded Explore function walks the same surface with the same temporary
+# relation, but it is a one-sided breadth-first walk and therefore does not read
+# vertex_degree. Its row limit is a safety boundary: allowing NULL would restore
+# the full three-hop traversal the spike measured at 21.4 seconds.
+explore_function = graph["explore_function"]
+explore_body = dict(_GRAPH_STATEMENTS)[f"{PROPERTY_GRAPH_SCHEMA}.explore_traversal function"]
+assert explore_function["kind"] == "additive"
+assert explore_function["availability"] == "unconditional"
+assert explore_function["function"] == f"{PROPERTY_GRAPH_SCHEMA}.explore_traversal"
+assert explore_function["function"] in graph["functions"]
+assert explore_function["declared_as"].startswith(f"{explore_function['function']}(")
+assert explore_function["clamped_to"] == [EXPLORE_MIN_HOPS, EXPLORE_MAX_HOPS]
+assert explore_function["default_hops"] == EXPLORE_DEFAULT_HOPS
+assert explore_function["default_row_limit"] == EXPLORE_DEFAULT_ROW_LIMIT
+assert f"hops      int DEFAULT {EXPLORE_DEFAULT_HOPS}" in explore_body
+assert f"row_limit int DEFAULT {EXPLORE_DEFAULT_ROW_LIMIT}" in explore_body
+assert "RETURNS TABLE (id text, name text, type text, path_names text[], rel_types text[], dist int)" in explore_body
+assert f"cap := greatest({EXPLORE_MIN_HOPS}, least(coalesce(hops, {EXPLORE_DEFAULT_HOPS}), {EXPLORE_MAX_HOPS}));" in explore_body
+assert explore_function["traverses"] == degree["sources"]
+assert explore_function["undirected"] is True
+for source in explore_function["traverses"]:
+    assert explore_body.count(f"FROM {source} AS edge\n") == 2, source
+assert explore_function["seen_set"] == seen_set["relation"]
+assert f"CREATE TEMPORARY TABLE {PATH_SEEN_RELATION} (" in explore_body
+assert explore_body.count("CREATE TEMPORARY TABLE") == 1
+assert explore_function["writes"] == "nothing"
+for relation in declared_shapes:
+    for verb in ("INSERT INTO", "UPDATE", "DELETE FROM"):
+        assert f"{verb} {PROPERTY_GRAPH_SCHEMA}.{relation}" not in explore_body, f"{verb} {relation}"
+assert explore_function["row_limit"] == {"mandatory": True, "minimum": 0, "null_rejected": True}
+assert "IF row_limit IS NULL THEN" in explore_body
+assert "IF row_limit < 0 THEN" in explore_body
+assert "EXIT walk WHEN qualifying >= row_limit;" in explore_body
+assert "LIMIT row_limit" in explore_body
+assert explore_function["qualifying_vertex_kinds"] == ["artist", "label", "genre", "style"]
+assert "WITH RECURSIVE back AS" in explore_body
+assert "graph.vertex_degree" not in explore_body
 
 # Appending a column is the only view change safe to ship on its own; the engine
 # enforces the rest by refusing the replacement.
