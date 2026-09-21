@@ -263,6 +263,14 @@ def test_integration_runs_a_required_and_an_advisory_engine_tier() -> None:
     assert "NEO4J_INTEGRATION_IMAGE" not in justfile
 
 
+def test_integration_cleanup_removes_test_container_anonymous_volumes() -> None:
+    script = (ROOT / "scripts" / "test-integration.sh").read_text()
+
+    assert 'docker rm --force --volumes "${postgres_container}" "${neo4j_container}"' in script
+    assert "docker volume prune" not in script
+    assert "docker volume rm" not in script
+
+
 def test_release_is_tag_only_and_uses_repository_named_image() -> None:
     workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()
 
