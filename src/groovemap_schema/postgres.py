@@ -606,6 +606,89 @@ _USER_TABLES: list[tuple[str, str]] = [
         )
         """,
     ),
+    # Existing latch rows predate the durable scheduler and have no generation.
+    # The later loader cutover must reconcile them before it acknowledges a
+    # terminal signal; making this nullable preserves the existing writer and
+    # its startup probe during the additive schema rollout.
+    (
+        "loader_extraction_latch generation column",
+        "ALTER TABLE loader_extraction_latch ADD COLUMN IF NOT EXISTS generation BIGINT",
+    ),
+    (
+        "idx_loader_extraction_latch_generation",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_loader_extraction_latch_generation ON loader_extraction_latch (loader, generation) WHERE generation IS NOT NULL",
+    ),
+    (
+        "idx_loader_extraction_latch_job_generation",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_loader_extraction_latch_job_generation ON loader_extraction_latch (loader, version, generation)",
+    ),
+    # Lock one row per loader before advancing its generation at the FIRST
+    # accepted signal of a new extraction. The refresh worker locks this same
+    # row immediately before commit and compares its generation with the job's.
+    # A later extraction can therefore fence an older in-flight pass.
+    (
+        "loader_derived_refresh_cursor table",
+        """
+        CREATE TABLE IF NOT EXISTS loader_derived_refresh_cursor (
+            loader             TEXT PRIMARY KEY,
+            generation         BIGINT NOT NULL DEFAULT 0 CHECK (generation >= 0),
+            version            TEXT,
+            created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT loader_derived_refresh_cursor_version_check
+                CHECK ((generation = 0 AND version IS NULL) OR (generation > 0 AND version IS NOT NULL))
+        )
+        """,
+    ),
+    # This is storage, not a queue trigger. The future loader creates a pending
+    # row in the same transaction as the fourth signal, then a scanner claims
+    # due rows with FOR UPDATE SKIP LOCKED. The lease epoch/token and cursor
+    # generation must both match before the refresh+stamp+completion commit.
+    (
+        "loader_derived_refresh_job table",
+        """
+        CREATE TABLE IF NOT EXISTS loader_derived_refresh_job (
+            loader           TEXT NOT NULL,
+            version          TEXT NOT NULL,
+            generation       BIGINT NOT NULL CHECK (generation > 0),
+            state            TEXT NOT NULL DEFAULT 'pending'
+                             CHECK (state IN ('pending', 'leased', 'retry', 'completed', 'superseded')),
+            attempt_count    INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+            next_attempt_at  TIMESTAMPTZ DEFAULT NOW(),
+            lease_owner      TEXT,
+            lease_token      UUID,
+            lease_epoch      BIGINT NOT NULL DEFAULT 0 CHECK (lease_epoch >= 0),
+            lease_expires_at TIMESTAMPTZ,
+            last_error       TEXT CHECK (last_error IS NULL OR char_length(last_error) <= 1024),
+            created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            started_at       TIMESTAMPTZ,
+            completed_at     TIMESTAMPTZ,
+            superseded_at    TIMESTAMPTZ,
+            CONSTRAINT loader_derived_refresh_job_pkey PRIMARY KEY (loader, version),
+            CONSTRAINT loader_derived_refresh_job_generation_key UNIQUE (loader, generation),
+            CONSTRAINT loader_derived_refresh_job_latch_fkey
+                FOREIGN KEY (loader, version, generation) REFERENCES loader_extraction_latch (loader, version, generation),
+            CONSTRAINT loader_derived_refresh_job_lease_check CHECK (
+                (state = 'leased' AND lease_owner IS NOT NULL AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL
+                 AND next_attempt_at IS NULL)
+                OR (state <> 'leased' AND lease_owner IS NULL AND lease_token IS NULL AND lease_expires_at IS NULL)
+            ),
+            CONSTRAINT loader_derived_refresh_job_due_check CHECK (
+                (state IN ('pending', 'retry') AND next_attempt_at IS NOT NULL)
+                OR (state IN ('leased', 'completed', 'superseded') AND next_attempt_at IS NULL)
+            )
+        )
+        """,
+    ),
+    (
+        "idx_loader_derived_refresh_job_due",
+        "CREATE INDEX IF NOT EXISTS idx_loader_derived_refresh_job_due ON loader_derived_refresh_job (next_attempt_at, loader, generation) WHERE state IN ('pending', 'retry')",
+    ),
+    (
+        "idx_loader_derived_refresh_job_lease_expiry",
+        "CREATE INDEX IF NOT EXISTS idx_loader_derived_refresh_job_lease_expiry ON loader_derived_refresh_job (lease_expires_at, loader, generation) WHERE state = 'leased'",
+    ),
 ]
 
 

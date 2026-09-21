@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
+from uuid import uuid4
 
 import psycopg
 import pytest
@@ -64,6 +65,8 @@ EXPECTED_POSTGRES_TABLES = {
         "extraction_history",
         "labels",
         "loader_extraction_latch",
+        "loader_derived_refresh_cursor",
+        "loader_derived_refresh_job",
         "masters",
         "oauth_tokens",
         "observations",
@@ -121,6 +124,24 @@ EXPECTED_COLUMNS = {
     ("public", "loader_extraction_latch", "created_at", "timestamp with time zone"),
     ("public", "loader_extraction_latch", "updated_at", "timestamp with time zone"),
     ("public", "loader_extraction_latch", "refreshed_at", "timestamp with time zone"),
+    ("public", "loader_extraction_latch", "generation", "bigint"),
+    ("public", "loader_derived_refresh_cursor", "loader", "text"),
+    ("public", "loader_derived_refresh_cursor", "generation", "bigint"),
+    ("public", "loader_derived_refresh_cursor", "version", "text"),
+    ("public", "loader_derived_refresh_job", "loader", "text"),
+    ("public", "loader_derived_refresh_job", "version", "text"),
+    ("public", "loader_derived_refresh_job", "generation", "bigint"),
+    ("public", "loader_derived_refresh_job", "state", "text"),
+    ("public", "loader_derived_refresh_job", "attempt_count", "integer"),
+    ("public", "loader_derived_refresh_job", "next_attempt_at", "timestamp with time zone"),
+    ("public", "loader_derived_refresh_job", "lease_owner", "text"),
+    ("public", "loader_derived_refresh_job", "lease_token", "uuid"),
+    ("public", "loader_derived_refresh_job", "lease_epoch", "bigint"),
+    ("public", "loader_derived_refresh_job", "lease_expires_at", "timestamp with time zone"),
+    ("public", "loader_derived_refresh_job", "last_error", "text"),
+    ("public", "loader_derived_refresh_job", "started_at", "timestamp with time zone"),
+    ("public", "loader_derived_refresh_job", "completed_at", "timestamp with time zone"),
+    ("public", "loader_derived_refresh_job", "superseded_at", "timestamp with time zone"),
 }
 
 # The endpoint-pair indexes every one of the sixteen typed MusicBrainz
@@ -687,6 +708,92 @@ async def test_both_schema_initializers_are_real_engine_idempotent() -> None:
     assert await neo4j_snapshot() == first_neo4j
     assert await property_graph_snapshot() == first_property_graph
     await assert_sentinels_survive()
+
+
+@pytest.mark.asyncio
+async def test_derived_refresh_job_keys_claim_locks_and_repeated_initialization() -> None:
+    """Two workers cannot claim one job, and an old generation cannot masquerade as current."""
+    await apply_schema()
+    loader = f"job-test-{uuid4().hex}"
+    first, second = f"first-{uuid4().hex}", f"second-{uuid4().hex}"
+    connection_a = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params(), autocommit=True)
+    connection_b = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params(), autocommit=True)
+    async with connection_a, connection_b:
+        async with connection_a.transaction(), connection_a.cursor() as cursor:
+            await cursor.execute(
+                "INSERT INTO loader_derived_refresh_cursor (loader, generation, version) VALUES (%s, 1, %s)",
+                (loader, first),
+            )
+            await cursor.execute(
+                "INSERT INTO loader_extraction_latch (loader, version, generation) VALUES (%s, %s, 1)",
+                (loader, first),
+            )
+            await cursor.execute(
+                "INSERT INTO loader_derived_refresh_job (loader, version, generation) VALUES (%s, %s, 1)",
+                (loader, first),
+            )
+
+        try:
+            # A second initializer does not wipe a durably scheduled job.
+            await apply_schema()
+            assert await postgres_rows("SELECT state, attempt_count FROM loader_derived_refresh_job WHERE loader = %s", (loader,)) == [("pending", 0)]
+
+            async with connection_a.transaction(), connection_a.cursor() as cursor_a:
+                await cursor_a.execute(
+                    "SELECT version FROM loader_derived_refresh_job WHERE loader = %s AND state = 'pending' FOR UPDATE SKIP LOCKED",
+                    (loader,),
+                )
+                assert await cursor_a.fetchall() == [(first,)]
+                async with connection_b.transaction(), connection_b.cursor() as cursor_b:
+                    await cursor_b.execute(
+                        "SELECT version FROM loader_derived_refresh_job WHERE loader = %s AND state = 'pending' FOR UPDATE SKIP LOCKED",
+                        (loader,),
+                    )
+                    assert await cursor_b.fetchall() == []
+                await cursor_a.execute(
+                    "UPDATE loader_derived_refresh_job SET state = 'leased', next_attempt_at = NULL, "
+                    "lease_owner = 'worker-a', lease_token = %s, lease_epoch = lease_epoch + 1, "
+                    "lease_expires_at = NOW() + INTERVAL '1 minute' WHERE loader = %s AND version = %s",
+                    (uuid4(), loader, first),
+                )
+
+            async with connection_a.transaction(), connection_a.cursor() as cursor_a:
+                await cursor_a.execute("SELECT generation FROM loader_derived_refresh_cursor WHERE loader = %s FOR UPDATE", (loader,))
+                assert await cursor_a.fetchone() == (1,)
+                async with connection_b.transaction(), connection_b.cursor() as cursor_b:
+                    await cursor_b.execute(
+                        "SELECT generation FROM loader_derived_refresh_cursor WHERE loader = %s FOR UPDATE SKIP LOCKED",
+                        (loader,),
+                    )
+                    assert await cursor_b.fetchall() == []
+
+            # The next extraction can advance the cursor and fence the old job.
+            async with connection_b.transaction(), connection_b.cursor() as cursor_b:
+                await cursor_b.execute(
+                    "INSERT INTO loader_extraction_latch (loader, version, generation) VALUES (%s, %s, 2)",
+                    (loader, second),
+                )
+                await cursor_b.execute(
+                    "UPDATE loader_derived_refresh_cursor SET generation = 2, version = %s WHERE loader = %s",
+                    (second, loader),
+                )
+            assert await postgres_rows(
+                "SELECT job.generation = cursor.generation AND job.version = cursor.version "
+                "FROM loader_derived_refresh_job AS job JOIN loader_derived_refresh_cursor AS cursor USING (loader) "
+                "WHERE job.loader = %s",
+                (loader,),
+            ) == [(False,)]
+
+            with pytest.raises(psycopg.errors.ForeignKeyViolation):
+                async with connection_b.transaction(), connection_b.cursor() as cursor_b:
+                    await cursor_b.execute(
+                        "INSERT INTO loader_derived_refresh_job (loader, version, generation) VALUES (%s, %s, 3)",
+                        (loader, second),
+                    )
+        finally:
+            await connection_a.execute("DELETE FROM loader_derived_refresh_job WHERE loader = %s", (loader,))
+            await connection_a.execute("DELETE FROM loader_extraction_latch WHERE loader = %s", (loader,))
+            await connection_a.execute("DELETE FROM loader_derived_refresh_cursor WHERE loader = %s", (loader,))
 
 
 # ── Graph projection fixtures ────────────────────────────────────────────────

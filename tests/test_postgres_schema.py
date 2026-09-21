@@ -244,6 +244,48 @@ class TestExtractionLatchTable:
         assert "IF NOT EXISTS" in stmt.upper()
 
 
+class TestDurableDerivedRefreshJob:
+    """The schema owns job DDL while the current loader stays inline."""
+
+    def test_additive_latch_generation_and_cursor(self) -> None:
+        statements = dict(_USER_TABLES)
+        assert "ADD COLUMN IF NOT EXISTS generation BIGINT" in statements["loader_extraction_latch generation column"]
+        assert "(loader, generation) WHERE generation IS NOT NULL" in statements["idx_loader_extraction_latch_generation"]
+        cursor = statements["loader_derived_refresh_cursor table"]
+        assert "loader             TEXT PRIMARY KEY" in cursor
+        assert "generation         BIGINT NOT NULL DEFAULT 0" in cursor
+        assert "version            TEXT" in cursor
+        assert "loader_derived_refresh_cursor_version_check" in cursor
+
+    def test_job_has_durable_claim_and_fence_fields(self) -> None:
+        statements = dict(_USER_TABLES)
+        job = statements["loader_derived_refresh_job table"]
+        for field in (
+            "state",
+            "attempt_count",
+            "next_attempt_at",
+            "lease_owner",
+            "lease_token",
+            "lease_epoch",
+            "lease_expires_at",
+            "last_error",
+            "created_at",
+            "updated_at",
+            "started_at",
+            "completed_at",
+            "superseded_at",
+        ):
+            assert field in job
+        assert "PRIMARY KEY (loader, version)" in job
+        assert "UNIQUE (loader, generation)" in job
+        assert "FOREIGN KEY (loader, version, generation) REFERENCES loader_extraction_latch (loader, version, generation)" in job
+        assert "char_length(last_error) <= 1024" in job
+        assert "loader_derived_refresh_job_lease_check" in job
+        assert "loader_derived_refresh_job_due_check" in job
+        assert "WHERE state IN ('pending', 'retry')" in statements["idx_loader_derived_refresh_job_due"]
+        assert "WHERE state = 'leased'" in statements["idx_loader_derived_refresh_job_lease_expiry"]
+
+
 class TestCreatePostgresSchema:
     """Test create_postgres_schema with a mock pool."""
 

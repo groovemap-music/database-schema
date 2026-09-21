@@ -361,6 +361,55 @@ the full column and primary-key record.
 `loader_extraction_latch` is storage-only: a plain `public` schema table, not part of the
 `graph` schema and not a property-graph element.
 
+### Durable derived-refresh job state
+
+The measured million-release refresh did not certify the full Discogs dump against
+RabbitMQ's 1,800-second acknowledgement timeout. The schema therefore also declares
+`public.loader_derived_refresh_cursor` and `public.loader_derived_refresh_job`, plus a
+nullable `generation BIGINT` on the existing latch. This is an **additive schema-only
+prerequisite**: the current loader still refreshes inline and acknowledges only after
+the transaction commits. No database trigger or schema initializer starts a job.
+
+The cursor has one row per loader and records its latest accepted `(generation,
+version)`. The future loader must compare source extraction order before advancing
+that cursor: an old signal arriving first *at this consumer* is not thereby a new
+extraction. Discogs' producer sends its ordered dump version and `started_at`;
+another loader must establish an equally reliable ordering rule. It must serialize
+first-signal generation assignment with `SELECT ... FOR UPDATE` on the cursor row,
+write the assigned generation on the latch, and never reassign it for a replay of
+the same version. Legacy latch rows remain `NULL` until the loader cutover
+reconciles unfinished versions; this additive migration does not manufacture a
+job from an old row or silently acknowledge its terminal delivery.
+
+On the fourth signal the loader commits the latch update and one `pending` job,
+keyed by `(loader, version)`, **before** it acknowledges the delivery. A job's
+generation must equal its latch's generation (a composite foreign key enforces
+that), and only one version per loader may use any non-null generation. The job
+can be `pending`, `leased`, `retry`, `completed`, or `superseded`; it records
+attempt count, due time, lease owner/token/epoch/expiry, bounded sanitized error,
+and lifecycle timestamps. Partial indexes support due-job and expired-lease
+scans. The loader, not this repository, owns scheduling, retry policy, and the
+health surface. `discogs-sql-loader` writes only `loader = 'discogs'` rows and
+`musicbrainz-sql-loader` only its own discriminator.
+
+A worker may claim a due row transactionally with `FOR UPDATE SKIP LOCKED`, increment
+its lease epoch, and set a fresh token. It must also scan expired leases on startup
+and periodically, rather than rely on a live notification. Before the refresh
+transaction commits it must lock the loader cursor and require its generation and
+version to match the job, and require the job's lease token and epoch still to
+match. The graph refresh, latch `refreshed_at`, and `completed` transition then
+commit together; a stale generation rolls back and becomes `superseded`, never
+stamps the old latch. A failure leaves a durable retry obligation, and a later
+extraction cannot be undone by a slow old worker. The worker must make pending
+age, lease expiry, retry due, last sanitized failure, and newest completed
+version visible in health; an acknowledged but stuck job is degraded health, not
+success. The full transition and crash-injection requirements are in the
+[`discogs-sql-loader` measurement](https://github.com/groovemap-music/discogs-sql-loader/blob/bd0a32b/docs/derived-refresh-ack-budget.md).
+
+The old inline loader can run against this expanded schema unchanged. Rollback of
+the future worker is to restore inline behavior while retaining these unused
+additive relations; dropping them would be a separate contract migration.
+
 ## Catalog identifiers, manufacturing credits, and release country
 
 [ADR 0011](https://github.com/groovemap-music/design/blob/main/docs/adr/0011-catalog-identifiers-and-manufacturing-credits.md)

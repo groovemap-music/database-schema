@@ -10,6 +10,7 @@ from groovemap_schema.postgres import (
     _GRAPH_STATEMENTS,
     _PATH_RELATIONS,
     _PATH_RELATIONSHIP_TYPES,
+    _USER_TABLES,
     _VERTEX_KIND_NAMES,
     EXPLORE_DEFAULT_HOPS,
     EXPLORE_DEFAULT_ROW_LIMIT,
@@ -44,6 +45,27 @@ assert contract["sources"] == [
     "src/groovemap_schema/neo4j.py",
     "src/groovemap_schema/postgres.py",
 ]
+
+# The additive durable scheduler is a loader-owned data contract, not loader DDL.
+# Pin its key and claim/fence columns to the initializer's actual statements.
+jobs = contract["derived_refresh_job"]
+user_statements = dict(_USER_TABLES)
+assert jobs["kind"] == "additive"
+assert jobs["introduced_in_contract_version"] == contract["version"]
+assert jobs["cursor"]["relation"] == "public.loader_derived_refresh_cursor"
+assert jobs["job"]["relation"] == "public.loader_derived_refresh_job"
+assert jobs["job"]["states"] == ["pending", "leased", "retry", "completed", "superseded"]
+assert "ADD COLUMN IF NOT EXISTS generation BIGINT" in user_statements["loader_extraction_latch generation column"]
+assert "PRIMARY KEY (loader, version)" in user_statements["loader_derived_refresh_job table"]
+assert "UNIQUE (loader, generation)" in user_statements["loader_derived_refresh_job table"]
+assert (
+    "FOREIGN KEY (loader, version, generation) REFERENCES loader_extraction_latch (loader, version, generation)"
+    in user_statements["loader_derived_refresh_job table"]
+)
+for column in jobs["job"]["columns"]:
+    assert column in user_statements["loader_derived_refresh_job table"], column
+assert "WHERE state IN ('pending', 'retry')" in user_statements["idx_loader_derived_refresh_job_due"]
+assert "WHERE state = 'leased'" in user_statements["idx_loader_derived_refresh_job_lease_expiry"]
 
 # The graph schema is recorded as an additive object of contract v1. Every count
 # and every relation below is read back from the statement list rather than
