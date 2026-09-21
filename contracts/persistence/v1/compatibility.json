@@ -137,6 +137,45 @@
     },
     "documentation": "docs/architecture.md#graph-schema",
     "edge_relations": 38,
+    "explore_function": {
+      "availability": "unconditional",
+      "clamped_to": [
+        1,
+        3
+      ],
+      "declared_as": "graph.explore_traversal(from_kind \"char\", from_key text, hops int DEFAULT 2, row_limit int DEFAULT 100) RETURNS TABLE (id text, name text, type text, path_names text[], rel_types text[], dist int)",
+      "default_hops": 2,
+      "default_row_limit": 100,
+      "function": "graph.explore_traversal",
+      "kind": "additive",
+      "note": "The bounded breadth-first replacement for catalog-api's get_explore_traversal Cypher. It walks the same undirected BY, ON, IS, ALIAS_OF, MEMBER_OF, and DERIVED_FROM surface as graph.find_shortest_path, recording one parent pointer per discovered vertex and walking those pointers back to project path_names and rel_types. It returns only Artist, Label, Genre, and Style discoveries; Release and Master vertices remain valid intermediate path nodes. Breadth-first discovery is non-decreasing by distance, so the walk stops once row_limit qualifying vertices have been discovered rather than materialising the full three-hop traversal before limiting. The row limit is mandatory: NULL is rejected because the spike measured the unbounded three-hop translation at 21.4 seconds and the bounded procedural form at roughly 15 ms locally, about 1,400 times faster. hops is clamped to [1, 3], preserving catalog-api's existing Explore contract. The function reuses the session-local graph_path_seen relation as its seen set and frontier, creates no persistent relation, reads graph.artist_member_of for the cross-provenance MEMBER_OF edge, and does not read graph.vertex_degree because a one-sided breadth-first walk has no search side to choose.",
+      "qualifying_vertex_kinds": [
+        "artist",
+        "label",
+        "genre",
+        "style"
+      ],
+      "row_limit": {
+        "mandatory": true,
+        "minimum": 0,
+        "null_rejected": true
+      },
+      "seen_set": "pg_temp.graph_path_seen",
+      "traverses": [
+        "graph.by_artist",
+        "graph.master_by_artist",
+        "graph.on_label",
+        "graph.in_genre",
+        "graph.in_style",
+        "graph.master_in_genre",
+        "graph.master_in_style",
+        "graph.derived_from",
+        "graph.alias_of",
+        "graph.artist_member_of"
+      ],
+      "undirected": true,
+      "writes": "nothing"
+    },
     "functions": [
       "graph.bootstrap_fill",
       "graph.credit_role_category",

@@ -16,7 +16,7 @@ The `graph` schema is recorded in
 [`persistence/v1/compatibility.json`](persistence/v1/compatibility.json) under `graph_schema`
 as an additive object of contract version 1: sixty-six relations — twenty-nine loader-written
 tables and thirty-seven read-only views over tables the same contract already declares — plus
-six functions. Four of those views exist so a vertex label can publish the counters
+eight functions. Four of those views exist so a vertex label can publish the counters
 Neo4j carries on the node of the same name; `graph_schema.counter_properties` records which
 label carries which. The contract lists every relation with its shape and the service
 that writes it, because a consumer reading one needs both: the shape says whether an index is
@@ -30,6 +30,15 @@ an environment can be populated once before a loader has run; **it is not author
 owner recorded against each relation supersedes it on that owner's first pass.** Nothing calls
 it — applying the schema declares it and writes nothing — so an empty table on a fresh database
 is still the expected state.
+
+The remaining four functions are the two loader-owned refreshes and the two procedural read
+functions. `graph_schema.member_of_union` and `graph_schema.vertex_degree` name
+`discogs-sql-loader` as the refresh owner for `graph.refresh_artist_member_of()` and
+`graph.refresh_vertex_degree()`. `graph_schema.path_function` records the exact
+`graph.find_shortest_path` signature, depth clamp, traversal surface, and temporary seen-set
+contract; `graph_schema.explore_function` records the corresponding
+`graph.explore_traversal` signature, hop clamp, parent-pointer projection, and mandatory row
+limit. All four are additive objects of contract version 1.
 
 The views carry a stricter rule than the contract's general one. `CREATE OR REPLACE VIEW` may
 only append a column, and PostgreSQL refuses to drop, rename, reorder, or retype one a view

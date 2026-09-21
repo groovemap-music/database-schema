@@ -16,6 +16,12 @@ All notable changes to the GrooveMap database schema will be documented here.
 
 ### Docs
 
+- Document `graph.find_shortest_path` and `graph.explore_traversal`, including their caps,
+  shared temporary seen-set design, the mandatory Explore row limit, and the owner's decision
+  to retain shortest-path parity through depth 10 despite the measured cost beyond depth 4.
+- Record both procedural functions and the loader ownership of
+  `graph.refresh_artist_member_of()` and `graph.refresh_vertex_degree()` in the additive
+  `groovemap.persistence` v1 contract metadata.
 - Document the graph schema's edge model, relation ownership, and the bootstrap fill in
   `docs/architecture.md`, `docs/runtime-configuration.md`, and the README, and complete the
   `groovemap.persistence` v1 contract metadata to match.
