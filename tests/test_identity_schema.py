@@ -217,6 +217,13 @@ _ADDED_STATEMENT_NAMES = frozenset(
         "idx_mb_rels_updated_at",
         "idx_mb_links_updated_at",
         "loader_extraction_latch table",
+        "loader_extraction_latch generation column",
+        "idx_loader_extraction_latch_generation",
+        "idx_loader_extraction_latch_job_generation",
+        "loader_derived_refresh_cursor table",
+        "loader_derived_refresh_job table",
+        "idx_loader_derived_refresh_job_due",
+        "idx_loader_derived_refresh_job_lease_expiry",
     }
 )
 
