@@ -304,6 +304,8 @@ _GRAPH_STATEMENT_NAMES = frozenset(
         "graph.issued_on table",
         "graph.issued_on_reverse index",
         "graph.issued_on_source index",
+        "graph.artist_member_of table",
+        "graph.artist_member_of_reverse index",
         "graph.genre_stats table",
         "graph.genre_stats_first_year index",
         "graph.style_stats table",
@@ -313,6 +315,7 @@ _GRAPH_STATEMENT_NAMES = frozenset(
         "graph.artist_degree table",
         "graph.artist_degree_degree index",
         "graph.release_degree_base table",
+        "graph.vertex_degree table",
         "graph.artist_genre table",
         "graph.artist_genre_reverse index",
         "graph.label_genre table",
@@ -354,6 +357,10 @@ _GRAPH_STATEMENT_NAMES = frozenset(
         "graph.label_vertex view",
         "graph.artist_vertex view",
         "graph.release_degree view",
+        "graph.refresh_artist_member_of function",
+        "graph.refresh_vertex_degree function",
+        "graph.find_shortest_path function",
+        "graph.explore_traversal function",
         "graph.bootstrap_fill function",
     }
 )

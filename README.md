@@ -32,8 +32,8 @@ non-required job that reports without blocking. See the
 [integration tiers](docs/architecture.md#integration-tiers) for what each tier proves and
 how the beta tier is promoted at PostgreSQL 19 general availability.
 
-The PostgreSQL schema includes a `graph` schema: sixty-four relations re-presenting the catalog
-as the vertex and edge relations the Neo4j enrichers build. Twenty-seven are tables the ingestion
+The PostgreSQL schema includes a `graph` schema: sixty-six relations re-presenting the catalog
+as the vertex and edge relations the Neo4j enrichers build. Twenty-nine are tables the ingestion
 loaders write and thirty-seven are read-only views; this repository declares all of them and
 writes rows into none. `discogs-sql-loader` owns most of them, `musicbrainz-sql-loader` owns the
 MusicBrainz half and co-owns the shared medium vocabulary, `catalog-api` owns the

@@ -2645,6 +2645,289 @@ def _edge_table_statements() -> list[tuple[str, str]]:
     return statements
 
 
+# ── The cross-provenance MEMBER_OF union ─────────────────────────────────────
+# `graph.artist_member_of` is the one relation here derived from two others
+# rather than projected from a document, and it exists because Neo4j holds a
+# Discogs band membership and a MusicBrainz "member of band" assertion in ONE
+# relationship type. `shortestPath((a)-[:...|MEMBER_OF|...]-(b))` traverses
+# both without knowing which is which.
+#
+# On the relational side they are two relations in two key spaces.
+# `graph.member_of` is Discogs-only, derived from the artist documents and keyed
+# on Discogs artist ids. The MusicBrainz ones live in `musicbrainz.relationships`
+# keyed on MBIDs, and reach a Discogs id only through
+# `musicbrainz.artists.discogs_artist_id`. Spike gm-database-schema-gkt.1
+# measured the split at 22,577 Discogs rows against 36,189 MusicBrainz ones, so
+# **61.6% of that edge class is MusicBrainz provenance**: a traversal reading
+# `graph.member_of` alone does not return the paths the Cypher it replaces
+# returns. Both spikes say the same thing — gm-database-schema-9c8.3's
+# `augment.sql` prototyped exactly this union and gkt.1 records it as "not
+# optional".
+#
+# The key-space crossing is therefore paid once at build time rather than per
+# traversal step, which is itself the spike's recommendation. `source` is in the
+# key so the same membership asserted by both providers is two rows rather than
+# a collision, and so a consumer can ask what a path is evidenced by; a
+# traversal that does not care simply does not read the column.
+#
+# This is a relation for the path functions, NOT a new label: `graph.catalog`
+# goes on binding `member_of` alone, because a second artist-to-artist edge
+# label overlapping it would double-count every Discogs membership in a pattern
+# that matched both, and Neo4j has no relationship type this union corresponds
+# to.
+_DERIVED_EDGE_TABLES: list[tuple[str, str, str]] = [
+    (
+        "artist_member_of",
+        """
+    member_artist_id text NOT NULL,
+    group_artist_id  text NOT NULL,
+    source           text NOT NULL,
+    PRIMARY KEY (member_artist_id, group_artist_id, source)
+""",
+        "group_artist_id, member_artist_id",
+    ),
+]
+
+# How each derived relation is rebuilt, in the same form `_COUNTER_BOOTSTRAP`
+# uses: one body, read by the refresh function and by `graph.bootstrap_fill()`
+# alike, so the two cannot disagree about what a row means.
+#
+# The Discogs branch is `graph.member_of` verbatim — the relation is the
+# provenance, and filtering it here would make the union disagree with the
+# relation it unions. The MusicBrainz branch reads the shipped views rather
+# than `musicbrainz.relationships` directly, so "artist-to-artist", "both
+# endpoints are stored", and "the type the enricher would have written" stay
+# stated once, in `graph.mb_rel_artist_artist`.
+#
+# Two filters are the crossing's own. `DISTINCT` is required because several
+# MusicBrainz relationships — two membership spans of the same band, or two
+# MBIDs mapped to one Discogs artist — collapse to one Discogs pair, and the
+# primary key would reject the second. Self-membership is dropped for the same
+# reason and only on this branch: two MBIDs resolving to one Discogs id would
+# manufacture an edge from an artist to itself that nobody asserted.
+_DERIVED_EDGE_BOOTSTRAP: dict[str, str] = {
+    "artist_member_of": """
+SELECT member_of.member_artist_id       AS member_artist_id,
+       member_of.group_artist_id        AS group_artist_id,
+       'discogs'::text                  AS source
+FROM graph.member_of AS member_of
+UNION ALL
+SELECT DISTINCT
+       member.discogs_artist_id::text   AS member_artist_id,
+       band.discogs_artist_id::text     AS group_artist_id,
+       'musicbrainz'::text              AS source
+FROM graph.mb_rel_artist_artist AS relationship
+JOIN graph.mb_artist AS member ON member.mbid = relationship.source_mbid
+JOIN graph.mb_artist AS band ON band.mbid = relationship.target_mbid
+WHERE relationship.relationship_type = 'MEMBER_OF'
+  AND member.discogs_artist_id IS NOT NULL
+  AND band.discogs_artist_id IS NOT NULL
+  AND member.discogs_artist_id <> band.discogs_artist_id
+""",
+}
+
+# The columns each derived relation is filled with, in the order its table
+# declares them.
+_DERIVED_EDGE_COLUMNS: dict[str, tuple[str, ...]] = {
+    "artist_member_of": ("member_artist_id", "group_artist_id", "source"),
+}
+
+
+def _derived_edge_table_statements() -> list[tuple[str, str]]:
+    """Return the derived artist-to-artist tables with both directions indexed."""
+    statements: list[tuple[str, str]] = []
+    for relation, columns, reverse in _DERIVED_EDGE_TABLES:
+        statements.append(_table(relation, columns))
+        statements.append(_table_index(relation, "reverse", reverse))
+    return statements
+
+
+# ── The traversal surface's per-vertex degree ────────────────────────────────
+# `graph.vertex_degree` is one `bigint` per vertex of the path traversal
+# surface, and it exists to decide EXPANSION ORDER — which side of a
+# bidirectional search to expand next, and which vertex of that side's frontier
+# to expand first. It is not an access path and it changes no answer.
+#
+# Spike gm-database-schema-gkt.1 measured it. Expanding the smaller-degree
+# frontier first removed the distance-5 variance outright, 1,774 ms to 334 ms,
+# while returning the same paths; it does not help distance 6 and made it
+# slightly worse, so this is a variance reducer and must not be sold as a fix.
+# What makes it worth building anyway is the price: one bigint per vertex is
+# 97 MB at catalog scale, against the 1,649 MB the earlier spike
+# gm-database-schema-9c8.3 priced for a dense adjacency copy that bought 1.3x.
+# `docs/spikes/gm-database-schema-gkt.1/sql/degree.sql` is the prototype and
+# this is the same relation, keyed the same way.
+#
+# **`kind` is a single-character discriminator, not a prefix on the key.** The
+# pathfinder's node identity is the pair `(kind, key)`, because an equality on a
+# concatenated token — `'a:' || artist_id` — cannot use the text indexes the
+# edge tables carry, so every frontier step would degrade to a scan. `"char"` is
+# PostgreSQL's one-byte internal type: the whole point of a 97 MB relation is
+# that a vertex costs a byte and a bigint rather than a row of text.
+#
+# **It is storage-only, like `graph.artist_member_of`.** It binds no
+# property-graph label. There is no Neo4j node property it corresponds to,
+# nothing in `graph.catalog` would read it, and a label over it would publish a
+# second identity for every vertex the graph already binds under its own label.
+_VERTEX_KIND_NAMES: dict[str, str] = {
+    "a": "artist",
+    "g": "genre",
+    "l": "label",
+    "m": "master",
+    "r": "release",
+    "s": "style",
+}
+
+# The ten relations the spike's pathfinder traverses, each as (relation, source
+# kind, source column, target kind, target column). Eight are the Discogs
+# relations `docs/spikes/gm-database-schema-9c8.1/materialize.sql` builds both
+# directions of; the other two are the artist-to-artist pair, `alias_of` and the
+# cross-provenance MEMBER_OF union.
+#
+# This list is exactly `pf.edge` in
+# `docs/spikes/gm-database-schema-gkt.1/sql/edges.sql`, which is exactly the six
+# relationship types `_PATH_REL_TYPES` names in `catalog-api` — BY, ON, IS,
+# ALIAS_OF, MEMBER_OF, DERIVED_FROM. `part_of`, `sublabel_of`, `same_as`,
+# `credited_on`, `credited_to`, and `issued_on` are deliberately absent: a path
+# query does not traverse them, so an endpoint of one is not a neighbour the
+# expansion would ever have to visit and counting it would misorder the
+# frontier rather than describe it.
+_PATH_RELATIONS: tuple[tuple[str, str, str, str, str], ...] = (
+    ("by_artist", "r", "release_id", "a", "artist_id"),
+    ("master_by_artist", "m", "master_id", "a", "artist_id"),
+    ("on_label", "r", "release_id", "l", "label_id"),
+    ("in_genre", "r", "release_id", "g", "genre_name"),
+    ("in_style", "r", "release_id", "s", "style_name"),
+    ("master_in_genre", "m", "master_id", "g", "genre_name"),
+    ("master_in_style", "m", "master_id", "s", "style_name"),
+    ("derived_from", "r", "release_id", "m", "master_id"),
+    ("alias_of", "a", "alias_artist_id", "a", "artist_id"),
+    ("artist_member_of", "a", "member_artist_id", "a", "group_artist_id"),
+)
+
+# Every vertex kind that can carry an edge, in the order the refresh reports
+# them. Read out of the relation list rather than restated, so a relation added
+# with a new kind reports without anything else moving.
+_VERTEX_KINDS: tuple[str, ...] = tuple(sorted({kind for _relation, source, _sc, target, _tc in _PATH_RELATIONS for kind in (source, target)}))
+
+
+def _vertex_degree_endpoints() -> list[tuple[str, str, str]]:
+    """Return every (kind, column, relation) endpoint the degree sums, both directions."""
+    return [
+        (kind, column, relation)
+        for relation, source_kind, source_column, target_kind, target_column in _PATH_RELATIONS
+        for kind, column in ((source_kind, source_column), (target_kind, target_column))
+    ]
+
+
+def _vertex_degree_body() -> str:
+    """Return the body summing both directions of the ten path relations.
+
+    Twenty branches over ten relations, each relation once per direction, so a
+    row of an edge table contributes one to each of its two endpoints and the
+    result is the undirected degree. It is the spike's
+    `SELECT src_kind, src_key, count(*) FROM pf.edge GROUP BY 1, 2` over a view
+    that already listed both directions, written out here because this schema
+    has no such view and does not want one.
+
+    Only vertices that carry an edge get a row. A genre nothing is filed under
+    has no row rather than a zero, which is what keeps the relation the size of
+    the traversal surface rather than the size of the catalog; a lookup that
+    misses reads as degree zero, which is what it is.
+
+    **A membership both provenances assert counts twice**, because
+    `graph.artist_member_of` carries `source` in its key and really does return
+    two rows for it. The number is therefore the rows an expansion of that
+    vertex will scan, which is the quantity the ordering decision is comparing;
+    counting the distinct neighbour instead would understate the work by exactly
+    the rows the scan still has to read. The spike's prototype counts it twice
+    for the same reason — its `pf.edge` unions `path.member_of` and
+    `path.mb_member_of` with `UNION ALL` — so this relation reproduces the
+    measurement rather than a variant of it. The cost of the choice is that a
+    dual-provenance artist looks marginally busier than it is, which can only
+    make the search expand the other side first; no answer moves.
+    """
+    endpoints = _vertex_degree_endpoints()
+    width = max(len(column) for _kind, column, _relation in endpoints)
+    (first_kind, first_column, first_relation), rest = endpoints[0], endpoints[1:]
+    branches = [f"""    SELECT '{first_kind}'::"char" AS kind, {first_column:<{width}} AS key FROM graph.{first_relation}"""]  # noqa: S608
+    branches.extend(
+        f"""    UNION ALL SELECT '{kind}'::"char", {column:<{width}}       FROM graph.{relation}"""  # noqa: S608
+        for kind, column, relation in rest
+    )
+    rendered = "\n".join(branches)
+    return f"""
+SELECT endpoint.kind AS kind,
+       endpoint.key  AS key,
+       count(*)      AS degree
+FROM (
+{rendered}
+) AS endpoint
+GROUP BY endpoint.kind, endpoint.key
+"""  # noqa: S608
+
+
+def _refresh_vertex_degree_function() -> str:
+    """Return `graph.refresh_vertex_degree()`, the degree relation's own rebuild.
+
+    The third shipped function that writes a graph row, and the second with a
+    named refresh owner: like the MEMBER_OF union and the counter relations it
+    sums, **`discogs-sql-loader` rebuilds it on the `extraction_complete` latch
+    it already handles**, after `graph.refresh_artist_member_of()` and with the
+    rest of the post-import pass. It is a sum over relations a loader writes a
+    row at a time, so no loader can maintain it incrementally, and it costs no
+    new scheduler. The contract records that owner under
+    `graph_schema.vertex_degree`; nothing in this repository calls it.
+
+    `TRUNCATE` then `INSERT`, for the reason `graph.bootstrap_fill()` has it: a
+    vertex whose last edge was removed has to lose its row, and an upsert
+    converges upward only — it would leave that vertex looking like a hub
+    forever and the search would keep expanding the wrong frontier. The whole
+    body is one statement's worth of work in one transaction, so a failure
+    leaves the previous contents rather than an emptied relation.
+
+    It reports a row per vertex kind rather than one row for the relation,
+    always every kind, so a rebuild that finds no masters — an environment where
+    the masters dump has not been ingested — says so with a zero instead of
+    looking like a relation that is simply smaller than expected.
+
+    The body is `_COUNTER_BOOTSTRAP`'s, the same text `graph.bootstrap_fill()`
+    inlines, so the one-off fill and the refresh cannot disagree about what a
+    degree counts.
+    """
+    body = _COUNTER_BOOTSTRAP["vertex_degree"]
+    indented = "\n".join(f"        {line}" if line.strip() else "" for line in body.strip().splitlines())
+    kinds = ", ".join(f"""('{kind}'::"char")""" for kind in _VERTEX_KINDS)
+    return f"""CREATE OR REPLACE FUNCTION graph.refresh_vertex_degree()
+RETURNS TABLE (kind "char", row_count bigint)
+LANGUAGE plpgsql
+AS $refresh_vertex_degree$
+#variable_conflict use_column
+-- `kind` is both an output column and a column of the relation being built, so
+-- the body resolves it to the column rather than failing on the ambiguity.
+BEGIN
+    TRUNCATE graph.vertex_degree;
+    INSERT INTO graph.vertex_degree (kind, key, degree)
+    SELECT kind, key, degree
+    FROM (
+{indented}
+    ) AS refresh;
+
+    -- Counted back off the relation rather than off the insert, so a kind that
+    -- contributed nothing still reports, as a zero.
+    FOR kind, row_count IN
+        SELECT vertex.kind,
+               (SELECT count(*) FROM graph.vertex_degree AS degree WHERE degree.kind = vertex.kind)
+        FROM (VALUES {kinds}) AS vertex(kind)
+        ORDER BY vertex.kind
+    LOOP
+        RAISE NOTICE 'refresh_vertex_degree: % <- % row(s)', kind, row_count;
+        RETURN NEXT;
+    END LOOP;
+END
+$refresh_vertex_degree$"""  # noqa: S608
+
+
 # Table 3 of the coverage spike: the pre-computed node properties `graphinator`
 # writes in a post-import pass and that eight catalog-api functions read as if
 # they were free. A graph declared over views has nowhere to put them.
@@ -2715,6 +2998,19 @@ def _counter_table_statements() -> list[tuple[str, str]]:
     degree     bigint NOT NULL DEFAULT 0
 """,
         ),
+        # One row per vertex of the path traversal surface. `(kind, key)` is the
+        # pathfinder's node identity and therefore the key; no secondary index,
+        # because every read is a point lookup on that pair and the whole reason
+        # this relation is affordable is that it holds nothing else.
+        _table(
+            "vertex_degree",
+            """
+    kind   "char" NOT NULL,
+    key    text   NOT NULL,
+    degree bigint NOT NULL DEFAULT 0,
+    PRIMARY KEY (kind, key)
+""",
+        ),
         # The two aggregates that have no Neo4j counterpart at all. Both are
         # keyed on the pair and carry the reverse index, so "which genres does
         # this artist release in" and "which artists release in this genre" are
@@ -2745,6 +3041,9 @@ def _counter_table_statements() -> list[tuple[str, str]]:
 # Every relation that stops being a view, in the order its table is created.
 _MATERIALIZED_VERTICES = ("genre", "style", "person", "media_family", "medium", "company")
 _MATERIALIZED_EDGES = tuple(relation for relation, _columns, _reverse, _extras in _EDGE_TABLES)
+# Derived from the relations above rather than from a document, and therefore
+# never a view: nothing retires to make room for one of these names.
+_DERIVED_EDGES = tuple(relation for relation, _columns, _reverse in _DERIVED_EDGE_TABLES)
 
 # The relations that stay views but republish a key column as `text`. The four
 # Discogs vertices do it because a property-graph vertex key cannot be
@@ -2764,7 +3063,13 @@ def _graph_table_statements() -> list[tuple[str, str]]:
     """Return every loader-owned table, preceded by the migrations that free its name."""
     migrations = [_view_to_table_migration(relation) for relation in (*_MATERIALIZED_VERTICES, *_MATERIALIZED_EDGES)]
     migrations.extend(_key_retype_migration(relation, column) for relation, column in _TEXT_KEY_RETYPES)
-    return [*migrations, *_vertex_table_statements(), *_edge_table_statements(), *_counter_table_statements()]
+    return [
+        *migrations,
+        *_vertex_table_statements(),
+        *_edge_table_statements(),
+        *_derived_edge_table_statements(),
+        *_counter_table_statements(),
+    ]
 
 
 # ── Phase 0 definitions, retained for the table-versus-view comparison ───────
@@ -3038,6 +3343,13 @@ FROM (
 ) AS endpoint
 GROUP BY endpoint.release_id
 """,
+    # Not a Neo4j node property at all, and the only entry here that is an
+    # ordering heuristic rather than a counter a query reads. It is refreshed
+    # with the counters because it is the same kind of thing operationally — a
+    # sum over the edge tables, on the same latch — and the body is rendered
+    # rather than written out so the twenty branches cannot drift from the ten
+    # relations they are supposed to cover.
+    "vertex_degree": _vertex_degree_body(),
     "artist_genre": """
 SELECT by_artist.artist_id AS artist_id,
        in_genre.genre_name AS genre_name,
@@ -3088,6 +3400,12 @@ def graph_bootstrap_statements(schema: str) -> list[tuple[str, str]]:
         )
         for relation, columns in _BOOTSTRAP_COLUMNS.items()
     ]
+    # The derived relations read the tables filled above rather than SCHEMA, so
+    # they come after them and before the counters, which read neither.
+    statements.extend(
+        (f"graph.{relation} bootstrap", f"INSERT INTO graph.{relation}\n{body.strip()}\nON CONFLICT DO NOTHING")
+        for relation, body in _DERIVED_EDGE_BOOTSTRAP.items()
+    )
     statements.extend(
         (f"graph.{relation} bootstrap", f"INSERT INTO graph.{relation}\n{body.strip()}\nON CONFLICT DO NOTHING")
         for relation, body in _COUNTER_BOOTSTRAP.items()
@@ -3096,11 +3414,12 @@ def graph_bootstrap_statements(schema: str) -> list[tuple[str, str]]:
 
 
 # ── The bootstrap fill (shipped) ─────────────────────────────────────────────
-# Everything above this line is a definition. `graph.bootstrap_fill()` is the
-# one thing in this module that writes a graph row, and it is deliberately a
-# function nobody calls rather than a statement the initializer runs: applying
-# the schema must stay a declaration, and an environment that wants rows asks
-# for them.
+# Everything above this line is a definition. `graph.bootstrap_fill()` is one of
+# the three things in this module that write a graph row — the others are
+# `graph.refresh_artist_member_of()` and `graph.refresh_vertex_degree()` below
+# it — and all three are deliberately functions nobody calls rather than
+# statements the initializer runs: applying the schema must stay a declaration,
+# and an environment that wants rows asks for them.
 #
 # **It is not authoritative.** The SQL loaders own every relation it touches —
 # `discogs-sql-loader` writes an edge in the same transaction as the document it
@@ -3109,6 +3428,11 @@ def graph_bootstrap_statements(schema: str) -> list[tuple[str, str]]:
 # This fill exists so an environment can be populated once, before a loader has
 # run, so a read rewrite in `catalog-api` is not blocked on the dual-write. The
 # first loader pass supersedes it.
+#
+# The two refresh functions are the exception to "nobody calls it", and only in
+# the sense that they have a named owner: both are derived rather than loaded,
+# so no loader can write either a row at a time, and `discogs-sql-loader`
+# rebuilds both on the `extraction_complete` latch it already handles.
 
 # The counter relations' column lists, in the order each table declares them.
 # The vertex and edge lists are `_BOOTSTRAP_COLUMNS` above; these are separate
@@ -3120,6 +3444,7 @@ _COUNTER_COLUMNS: dict[str, tuple[str, ...]] = {
     "label_stats": ("label_id", "release_count", "artist_count", "genre_count"),
     "artist_degree": ("artist_id", "degree"),
     "release_degree_base": ("release_id", "degree"),
+    "vertex_degree": ("kind", "key", "degree"),
     "artist_genre": ("artist_id", "genre_name", "release_count"),
     "label_genre": ("label_id", "genre_name", "release_count"),
 }
@@ -3136,7 +3461,21 @@ _COUNTER_COLUMNS: dict[str, tuple[str, ...]] = {
 #   converged zero.
 # - **`artist_genre` and `label_genre` last**, with the other counters, because
 #   both join `by_artist`/`on_label` to `in_genre`.
-_BOOTSTRAP_FILL_ORDER: tuple[str, ...] = (*_MATERIALIZED_VERTICES, *_MATERIALIZED_EDGES, *tuple(_COUNTER_BOOTSTRAP))
+# - **`artist_member_of` between the two**, because its Discogs half reads
+#   `graph.member_of` — filled before it as an edge table — and its MusicBrainz
+#   half reads the `musicbrainz` tables directly, which no step here writes.
+#   Filled with the edges it would union an empty relation and converge on the
+#   MusicBrainz half alone.
+# - **`vertex_degree` after `artist_member_of`**, which the group above already
+#   gives it: the union is one of the ten relations it sums, so filled with the
+#   counters it is filled after the union in any case, and filled earlier it
+#   would count a MEMBER_OF class that was still empty.
+_BOOTSTRAP_FILL_ORDER: tuple[str, ...] = (
+    *_MATERIALIZED_VERTICES,
+    *_MATERIALIZED_EDGES,
+    *_DERIVED_EDGES,
+    *tuple(_COUNTER_BOOTSTRAP),
+)
 
 
 def _bootstrap_fill_source(relation: str) -> tuple[tuple[str, ...], str]:
@@ -3146,10 +3485,14 @@ def _bootstrap_fill_source(relation: str) -> tuple[tuple[str, ...], str]:
     rather than copied, which is the whole reason those definitions are retained
     in this module instead of in the test tree: the fill and the parity
     comparison cannot disagree about what a relation projects, because there is
-    one text and both read it.
+    one text and both read it. The counters and the derived relations never had
+    a view; their bodies are the definitions the loaders implement, shared with
+    `graph.refresh_artist_member_of()` the same way and for the same reason.
     """
     if relation in _COUNTER_BOOTSTRAP:
         return _COUNTER_COLUMNS[relation], _COUNTER_BOOTSTRAP[relation]
+    if relation in _DERIVED_EDGE_BOOTSTRAP:
+        return _DERIVED_EDGE_COLUMNS[relation], _DERIVED_EDGE_BOOTSTRAP[relation]
     return _BOOTSTRAP_COLUMNS[relation], _phase0_relation_bodies()[relation]
 
 
@@ -3165,9 +3508,13 @@ def _bootstrap_fill_step(relation: str) -> str:
 
     Nothing names a conflict target because nothing can conflict: every body is
     unique on its table's key, by a `DISTINCT`, a `DISTINCT ON`, a `GROUP BY`, or
-    a `UNION` over exactly those columns. A duplicate would raise rather than be
-    dropped in silence, which is the right failure for a projection that claims
-    to be the key.
+    a `UNION` over exactly those columns. `artist_member_of` is unique the same
+    way one branch at a time — the Discogs branch reads a relation already keyed
+    on the pair, the MusicBrainz branch deduplicates the crossing with
+    `DISTINCT` — and the two branches cannot meet, because `source` is in the key
+    and each branch writes its own literal into it. A duplicate would raise
+    rather than be dropped in silence, which is the right failure for a
+    projection that claims to be the key.
     """
     columns, body = _bootstrap_fill_source(relation)
     indented = "\n".join(f"        {line}" if line.strip() else "" for line in body.strip().splitlines())
@@ -3189,7 +3536,7 @@ def _bootstrap_fill_function() -> str:
     """Return `graph.bootstrap_fill()`, the one-off fill of every loader-owned table.
 
     One transaction, because the caller's statement is one: `SELECT * FROM
-    graph.bootstrap_fill()` either replaces all twenty-seven relations or
+    graph.bootstrap_fill()` either replaces all twenty-nine relations or
     replaces none, so a failure half way through cannot leave edges pointing at
     vertices that were truncated and never refilled.
 
@@ -3224,6 +3571,719 @@ BEGIN
 $bootstrap_fill$"""
 
 
+def _refresh_artist_member_of_function() -> str:
+    """Return `graph.refresh_artist_member_of()`, the union's own rebuild.
+
+    The second shipped function that writes a graph row, and one of the two with
+    a named refresh owner: **`discogs-sql-loader` calls it on the
+    `extraction_complete` latch it already handles**, which is the same latch
+    the counter relations are recomputed on and the same one `graphinator` uses
+    to start its post-import pass. So the union costs no new scheduler, and it is
+    rebuilt on the pass that has just finished moving the rows it reads. The
+    contract records that owner under `graph_schema.member_of_union`; nothing in
+    this repository calls it either.
+
+    `TRUNCATE` then `INSERT`, for the reason `graph.bootstrap_fill()` has it:
+    the union is a derivation, so a membership the sources no longer state has
+    to leave, and an upsert converges upward only. The whole body is one
+    statement's worth of work in one transaction, so a failure leaves the
+    previous contents rather than an emptied relation.
+
+    It reports one row per provenance rather than one row for the relation,
+    always both, so a rebuild that finds no MusicBrainz half — an environment
+    where `musicbrainz-sql-loader` has not run, or one whose artists carry no
+    `discogs_artist_id` — says so with a zero instead of looking like a relation
+    that is simply smaller than expected.
+
+    The body is `_DERIVED_EDGE_BOOTSTRAP`'s, the same text `graph.bootstrap_fill`
+    inlines, so the one-off fill and the refresh cannot disagree about what a
+    membership is.
+    """
+    body = _DERIVED_EDGE_BOOTSTRAP["artist_member_of"]
+    indented = "\n".join(f"        {line}" if line.strip() else "" for line in body.strip().splitlines())
+    return f"""CREATE OR REPLACE FUNCTION graph.refresh_artist_member_of()
+RETURNS TABLE (source text, row_count bigint)
+LANGUAGE plpgsql
+AS $refresh_artist_member_of$
+#variable_conflict use_column
+-- `source` is both an output column and a column of the relation being built,
+-- so the body resolves it to the column rather than failing on the ambiguity.
+BEGIN
+    TRUNCATE graph.artist_member_of;
+    INSERT INTO graph.artist_member_of (member_artist_id, group_artist_id, source)
+    SELECT member_artist_id, group_artist_id, source
+    FROM (
+{indented}
+    ) AS refresh;
+
+    -- Counted back off the relation rather than off the insert, so a provenance
+    -- that contributed nothing still reports, as a zero.
+    FOR source, row_count IN
+        SELECT provenance.name,
+               (SELECT count(*) FROM graph.artist_member_of AS edge WHERE edge.source = provenance.name)
+        FROM (VALUES ('discogs'), ('musicbrainz')) AS provenance(name)
+        ORDER BY provenance.name
+    LOOP
+        RAISE NOTICE 'refresh_artist_member_of: % <- % row(s)', source, row_count;
+        RETURN NEXT;
+    END LOOP;
+END
+$refresh_artist_member_of$"""  # noqa: S608
+
+
+# ── The shortest path across the traversal surface ───────────────────────────
+# `graph.find_shortest_path` is the relational answer to the one Cypher call
+# this schema cannot express as a view:
+#
+#     shortestPath((a)-[:BY|ON|IS|ALIAS_OF|MEMBER_OF|DERIVED_FROM*..d]-(b))
+#
+# It is the vertex-at-a-time bidirectional search spike
+# gm-database-schema-gkt.1 prototyped in
+# `docs/spikes/gm-database-schema-gkt.1/sql/pathfinder.sql.in`, ported here with
+# its exactness argument intact. Everything below that reads like prose is that
+# argument; a Verdict rested on the search being RIGHT rather than merely fast,
+# and the argument is the only thing that makes first touch safe.
+#
+# ── Why a procedural body at all ─────────────────────────────────────────────
+# Spike gm-database-schema-9c8.3 measured three level-synchronous searches and
+# concluded that what separates PostgreSQL from Neo4j here is not storage and
+# not the index but that "Neo4j's shortest-path expander can stop in the middle
+# of a level and a SQL statement cannot". That is true of a SQL statement. It is
+# not true of a PL/pgSQL loop, and this function is the difference.
+#
+# A level-synchronous expansion is one statement per level: it joins the whole
+# frontier against the whole edge surface and produces the whole next level. At
+# level 3 out of the spike's seed artist the frontier is 1,251,839 vertices, the
+# join yields 11,006,163 candidate arrivals, and 1.3% of them are new — while
+# the answer was inside the first fraction of that level and the statement had
+# no way to say so. Here the unit of work is ONE VERTEX, and two statements run
+# for each of them: a touch probe, and an expansion. If the probe hits, the
+# function returns and the rest of the level is never materialised.
+#
+# ── Why first touch is the shortest path, and not one hop too long ───────────
+# 9c8.3 warns that "stopping the moment the frontiers touch is the version of
+# this algorithm that is off by one", and it is right about the version it
+# describes — one that compares the two FRONTIERS. This one compares each newly
+# reachable vertex against the whole of the opposite SEEN set, and that version
+# is exact:
+#
+#   Let df and db be the depths to which the forward and backward searches are
+#   COMPLETE, and let the invariant be: no path of length <= df + db exists. It
+#   holds at the start, when df = db = 0 and the source-equals-target case has
+#   already been answered.
+#
+#   Suppose the forward side now expands level df + 1 and a probe on a frontier
+#   vertex v (at depth df) finds a neighbour w in the backward seen set at depth
+#   b <= db. That witnesses a walk of length df + 1 + b. By the invariant no
+#   path of length <= df + db exists, so the true distance is at least
+#   df + db + 1. And df + 1 + b <= df + 1 + db. So the witnessed walk has length
+#   exactly df + db + 1, which IS the true distance. FIRST TOUCH IS EXACT — and,
+#   incidentally, every touch found anywhere in this level has the same length,
+#   which is why the loop does not have to keep looking for a better one.
+#
+#   The invariant survives a level that finds nothing. Take a shortest path P of
+#   length L <= df + 1 + db and let x be the vertex on P at distance
+#   min(df + 1, L) from the source. If L >= df + 1 then x is at forward depth
+#   df + 1 and at backward depth L - (df + 1) <= db, so x is in the backward
+#   seen set and the probe on x's forward parent would have found it. If
+#   L < df + 1 then x is the target, at backward depth 0, and an earlier level
+#   would have found it. Either way the level cannot have found nothing.
+#
+# Three things in the body are that argument's preconditions rather than
+# incidental structure, and each is commented where it happens:
+#
+# - **The completed depth advances only after a level FINISHES.** `df` and `db`
+#   are what the invariant is stated over. Advancing one mid-level would assert
+#   a completeness the search has not reached and the bound would be wrong.
+# - **The opposite side's seen set is frozen for the duration of a level.** The
+#   expansion writes rows for the side being expanded and no other, so `b <= db`
+#   holds for every probe in the level rather than for the first one only.
+# - **The distance is derived from the recorded depths**, `this_gen + 1 +
+#   other_depth`, and not from `df + db + 1`. The two are equal by the argument
+#   above; reading it off the data means a mistake in the argument shows up as a
+#   disagreement with Neo4j instead of as a silently wrong answer.
+#
+# ── The seen set ─────────────────────────────────────────────────────────────
+# One request-scoped relation, and the spike is emphatic about all three of its
+# properties:
+#
+# - **`TEMPORARY ... ON COMMIT DELETE ROWS`, not `UNLOGGED`.** The harness used
+#   `UNLOGGED` only so plans could be captured from a second connection, and it
+#   says so; two concurrent path requests against one unlogged table would
+#   corrupt each other's search. A temporary relation is per-session, which is
+#   what makes concurrent searches independent. `ON COMMIT DELETE ROWS` is also
+#   what retires the spike's per-call `TRUNCATE`: that truncate was about 4 ms
+#   of a 5.2 ms floor, paid by every call including the ones that expand nothing.
+# - **No second frontier relation.** The frontier is `WHERE side = s AND
+#   depth = d` over the relation being written anyway, which the secondary index
+#   on `(side, depth, kind, key)` makes an index-only scan of the level. An
+#   earlier revision of the harness kept a separate queue — the obvious shape —
+#   and it cost a second heap insert, a second index insert and a sequence
+#   `nextval` for every vertex discovered. Dropping it cut the worst measured
+#   case by about two fifths.
+# - **Not an hstore and not an array.** A PL/pgSQL variable is passed into a SQL
+#   statement by value and re-serialised on every statement, so an hstore seen
+#   set is three to six times faster below a few thousand vertices and does not
+#   finish at all above a hundred thousand. The crossover is inside the range
+#   this workload visits. The spike measured the hstore variant rather than
+#   asserting this.
+#
+# The relation is created on demand because a temporary relation cannot be
+# declared by a schema: it belongs to the session that uses it, and the session
+# that applied the schema is long gone. `IF NOT EXISTS` makes that a first-call
+# cost rather than a per-call one.
+#
+# ── The two statements ───────────────────────────────────────────────────────
+# The touch probe is a LATERAL subquery carrying its own `LIMIT`. That is not
+# decoration: a LATERAL with a LIMIT cannot be pulled up into a join, so the
+# planner is left with a nested loop that probes the seen set's primary key once
+# per candidate neighbour, and the outer `LIMIT 1` stops the whole scan at the
+# first hit. Written as a plain join the planner is free to hash the entire seen
+# set — which at 1.25 million rows is the level-synchronous cost this function
+# exists to avoid, reintroduced through the back door. The seen set's statistics
+# are worthless by construction, so forcing the access path through the query's
+# shape rather than trusting the planner is the only way to get a stable plan.
+#
+# The expansion is an `INSERT ... ON CONFLICT DO NOTHING`, and the conflict IS
+# the seen check: one probe against the primary key that is being maintained
+# anyway, and what survives it is by construction the set of vertices whose
+# shortest distance from this end is the next depth. It is also what collapses a
+# dual-provenance membership — two rows of `graph.artist_member_of` for one pair
+# — into one visited vertex, because the seen set is keyed on the vertex and not
+# on the edge.
+#
+# Both statements are plain SQL inside PL/pgSQL, so PostgreSQL prepares and
+# caches each one per session on first execution and reuses the plan for every
+# vertex afterwards: a search that expands 3,000 vertices pays for two plans,
+# not six thousand.
+#
+# ── The depth cap ────────────────────────────────────────────────────────────
+# `[1, 10]` with a default of 6, clamped server-side, which is
+# `MIN_PATH_DEPTH` / `MAX_PATH_DEPTH` / `DEFAULT_PATH_DEPTH` in
+# `catalog-api`'s `api/queries/neo4j_queries.py` unchanged. The Cypher clamps
+# because it interpolates the number as a literal and an unbounded value
+# produces an exhaustive bidirectional search; this clamps so that the
+# replacement cannot be asked for something the Cypher would have refused.
+#
+# **This is not the spike's recommendation, and the divergence is deliberate.**
+# gkt.1 recommended a cap of 4, because at cap 10 a distance-6 pair costs 4.1 s
+# on its cloud machine against 10.5 ms at cap 4, and nothing in the catalog is
+# answerable at 5 or 6 inside the request budget. The owner chose 10 anyway, for
+# exact parity with the Cypher this function replaces: a caller that asks for 10
+# today gets the answer for 10, and accepts seconds beyond depth 4 for it.
+# Lowering the default is a change to the callers' contract, not to this
+# function, and the spike's argument for making it is on the record.
+PATH_MIN_DEPTH = 1
+PATH_MAX_DEPTH = 10
+PATH_DEFAULT_DEPTH = 6
+
+# The session-scoped seen set, by name, so the tests and the concurrency proof
+# name the same relation this renders.
+PATH_SEEN_RELATION = "graph_path_seen"
+
+# The Neo4j relationship type each path relation carries, which is what `rels[]`
+# reports. Six types over ten relations — `BY`, `ON`, `IS`, `ALIAS_OF`,
+# `MEMBER_OF`, `DERIVED_FROM` — exactly `_PATH_REL_TYPES` in `catalog-api`.
+#
+# **The type is reported, not the provenance.** `graph.artist_member_of` carries
+# `source`, and a path through it is a `MEMBER_OF` hop whichever provider
+# asserted it — Neo4j has one relationship space for both and reports one type.
+# Projecting `source` would also cost a heap fetch on every backward hop: the
+# reverse index is `(group_artist_id, member_artist_id)` and does not cover it,
+# so a walk entering the relation from the group end would leave an index-only
+# scan for a fetch it has no use for.
+_PATH_RELATIONSHIP_TYPES: dict[str, str] = {
+    "by_artist": "BY",
+    "master_by_artist": "BY",
+    "on_label": "ON",
+    "in_genre": "IS",
+    "in_style": "IS",
+    "master_in_genre": "IS",
+    "master_in_style": "IS",
+    "derived_from": "DERIVED_FROM",
+    "alias_of": "ALIAS_OF",
+    "artist_member_of": "MEMBER_OF",
+}
+
+
+def _path_neighbour_branches(kind_variable: str, key_variable: str, indent: str) -> str:
+    """Return the neighbours of one vertex as a UNION ALL over the traversal surface.
+
+    Twenty branches over the ten relations of `_PATH_RELATIONS`, each relation
+    once per direction, so the surface is undirected without a row being stored
+    for the reverse of anything. Both directions of all ten are already indexed
+    — every edge table carries its primary key and a reverse index — so every
+    branch is an index scan on the column the search arrived by.
+
+    The predicate is pushed INTO each branch rather than applied over the union.
+    `{kind} = 'r'` holds no column reference, only a parameter and a constant, so
+    the planner renders it a one-time filter and skips the branch outright for a
+    vertex of the wrong kind; written outside, the same qual would have to be
+    pushed down before it could do that.
+
+    This is the spike's `pf.edge` narrowed to one vertex, and it is the same
+    surface `graph.vertex_degree` counts — both are generated from
+    `_PATH_RELATIONS`, so the degree that orders an expansion cannot come to
+    describe a different set of edges from the one the expansion walks.
+    """
+    branches: list[str] = []
+    for relation, source_kind, source_column, target_kind, target_column in _PATH_RELATIONS:
+        relationship = _PATH_RELATIONSHIP_TYPES[relation]
+        for from_kind, from_column, to_kind, to_column in (
+            (source_kind, source_column, target_kind, target_column),
+            (target_kind, target_column, source_kind, source_column),
+        ):
+            branches.append(
+                f"""SELECT '{to_kind}'::"char" AS dst_kind, edge.{to_column} AS dst_key, '{relationship}'::text AS rel
+FROM graph.{relation} AS edge
+WHERE {kind_variable} = '{from_kind}'::"char" AND edge.{from_column} = {key_variable}"""  # noqa: S608
+            )
+    body = "\nUNION ALL\n".join(branches)
+    return "\n".join(f"{indent}{line}" if line else "" for line in body.splitlines())
+
+
+def _find_shortest_path_function() -> str:
+    """Return `graph.find_shortest_path()`, the vertex-at-a-time bidirectional search.
+
+    The signature mirrors `find_shortest_path` in `catalog-api`'s
+    `api/queries/neo4j_queries.py`: two endpoints and a maximum depth clamped
+    server-side to `[1, 10]` with a default of 6.
+
+    `(kind, key)` is two arguments rather than one `'a:5665'` token, for the
+    reason `graph.vertex_degree` is keyed the same way: an equality on a
+    concatenation cannot use the `text` indexes the edge tables already carry,
+    so every frontier step would degrade to a scan and the surface would need an
+    expression index on all ten relations in both directions.
+
+    `nodes[]` carries that identity back as `kind:key`, one entry per vertex from
+    the source to the target. The key half is exactly what the Cypher returns per
+    node — `coalesce(node.id, node.name)`, so a Genre or a Style is its name and
+    everything else is its Discogs id — and the kind half is the label that node
+    carried, one-byte-encoded. The pair is what makes the answer unambiguous: an
+    Artist and a Release can hold the same numeric key, and a bare id could not
+    tell a caller which vertex a hop went through.
+
+    `rels[]` carries the relationship type of each hop, so it is one entry
+    shorter than `nodes[]` and reads `BY`, `ON`, `IS`, `ALIAS_OF`, `MEMBER_OF`,
+    or `DERIVED_FROM` — the Neo4j type, never the provenance.
+
+    A search that finds nothing returns one row with `found` false and the other
+    three columns null, rather than no row at all: the caller asked a question
+    and "there is no path within this depth" is an answer to it. The Cypher
+    returns no row instead, which a caller has to distinguish from a failure.
+
+    The frontier is expanded ONE VERTEX AT A TIME, in ascending
+    `graph.vertex_degree` order, and the side expanded next is the one whose
+    frontier has the smaller summed degree. Neither choice can change an answer —
+    the exactness argument above shows every touch anywhere in a level reports
+    the same distance, so a level may be expanded in any order — and both change
+    the cost enormously: a level here mixes vertices of degree 4 with Genre
+    vertices of degree ~137,000, and the search pays for whatever it expands
+    BEFORE it touches. Expanding cheap vertices first is free insurance. If a
+    cheap vertex touches, the hub is never expanded at all; if none does, the hub
+    is expanded exactly as it would have been. The spike measured the
+    distance-5 variance falling from 1,774 ms to 334 ms with this ordering and
+    every path it returned unchanged.
+
+    A vertex with no row in `graph.vertex_degree` reads as degree zero, which is
+    what it is — that relation holds only vertices carrying an edge — so a
+    degree relation that has never been refreshed degrades the ordering to
+    arbitrary rather than breaking the search.
+    """
+    seen = PATH_SEEN_RELATION
+    neighbours_probe = _path_neighbour_branches("frontier_kind", "frontier_key", " " * 16)
+    neighbours_expand = _path_neighbour_branches("frontier_kind", "frontier_key", " " * 16)
+    return f"""CREATE OR REPLACE FUNCTION graph.find_shortest_path(
+    from_kind "char",
+    from_key  text,
+    to_kind   "char",
+    to_key    text,
+    max_depth int DEFAULT {PATH_DEFAULT_DEPTH}
+)
+RETURNS TABLE (found boolean, depth int, nodes text[], rels text[])
+LANGUAGE plpgsql
+AS $find_shortest_path$
+DECLARE
+    -- The clamp `catalog-api` applies to the same argument, for the same
+    -- reason, with the same bounds.
+    cap            int;
+    -- `df` and `db` of the exactness argument: the depths to which each side is
+    -- COMPLETE. They advance only when a level finishes, which is what makes
+    -- "no path of length <= df + db exists" true when a probe reads it.
+    forward_depth  int := 0;
+    backward_depth int := 0;
+    this_side      smallint;
+    other_side     smallint;
+    this_gen       int;
+    next_gen       int;
+    -- The summed degree of each frontier, which is what chooses a side, beside
+    -- its cardinality, which is what "this component is exhausted" means.
+    forward_cost   bigint;
+    backward_cost  bigint;
+    forward_size   bigint;
+    backward_size  bigint;
+    frontier       record;
+    frontier_kind  "char";
+    frontier_key   text;
+    hit            record;
+    probe_rows     bigint;
+    fwd_kind       "char";
+    fwd_key        text;
+    bwd_kind       "char";
+    bwd_key        text;
+    head_nodes     text[];
+    head_rels      text[];
+    tail_nodes     text[];
+    tail_rels      text[];
+    -- The answer is assembled in locals and returned once at the end. The four
+    -- output columns are PL/pgSQL variables too, and one of them is named
+    -- `found`, which would otherwise shadow the statement-result flag of the
+    -- same name; nothing below reads either.
+    answer_found   boolean := false;
+    answer_depth   int;
+    answer_nodes   text[];
+    answer_rels    text[];
+BEGIN
+    cap := greatest({PATH_MIN_DEPTH}, least(coalesce(max_depth, {PATH_DEFAULT_DEPTH}), {PATH_MAX_DEPTH}));
+
+    -- The seen set. TEMPORARY, so two sessions searching at once cannot see or
+    -- corrupt each other's state, and ON COMMIT DELETE ROWS, so the emptying is
+    -- the commit's work rather than a per-call TRUNCATE — which the spike
+    -- measured at about 4 ms of a 5.2 ms floor. A schema cannot declare this
+    -- relation, because it belongs to the session; the guard makes it a
+    -- first-call cost rather than a per-call one. `to_regclass` rather than
+    -- IF NOT EXISTS, which would raise a NOTICE on every call after the first
+    -- and put one line of noise per path lookup into the server log.
+    IF to_regclass('pg_temp.{seen}') IS NULL THEN
+        CREATE TEMPORARY TABLE {seen} (
+            side     smallint NOT NULL,
+            kind     "char"   NOT NULL,
+            key      text     NOT NULL,
+            depth    int      NOT NULL,
+            par_kind "char",
+            par_key  text,
+            rel      text,
+            PRIMARY KEY (side, kind, key)
+        ) ON COMMIT DELETE ROWS;
+
+        -- The frontier is not a second relation: it is `side = s AND depth = d`
+        -- over the relation being written anyway, and this index is what makes
+        -- that a scan of the level rather than of the table. It leads on the two
+        -- columns the predicate fixes and carries the two the scan reads, so it
+        -- is index-only and touches no heap page.
+        CREATE INDEX {seen}_level ON pg_temp.{seen} (side, depth, kind, key);
+    END IF;
+
+    -- ON COMMIT DELETE ROWS empties this at every commit, so in the ordinary
+    -- one-call-per-transaction case this deletes from an empty relation and
+    -- costs nothing. It is here for the other case: two calls inside ONE
+    -- transaction, where the second would otherwise start from the first's
+    -- seen set. DELETE rather than TRUNCATE precisely because the empty case is
+    -- the common one and TRUNCATE is the 4 ms this design set out to remove.
+    DELETE FROM pg_temp.{seen};
+
+    -- Answered before the invariant is stated, because the invariant assumes it.
+    IF from_kind = to_kind AND from_key = to_key THEN
+        RETURN QUERY SELECT true, 0, ARRAY[from_kind::text || ':' || from_key], ARRAY[]::text[];
+        RETURN;
+    END IF;
+
+    INSERT INTO pg_temp.{seen} (side, kind, key, depth)
+    VALUES (0, from_kind, from_key, 0), (1, to_kind, to_key, 0);
+
+    <<search>>
+    WHILE forward_depth + backward_depth < cap LOOP
+        -- Which side to expand, and whether either has run out. Against a graph
+        -- with hub vertices the two ends grow at wildly different rates, and the
+        -- cost of a level is the work its vertices will make the expansion do —
+        -- which is their summed degree, not how many of them there are.
+        SELECT coalesce(sum(coalesce(degree.degree, 0)) FILTER (WHERE seen.side = 0 AND seen.depth = forward_depth), 0),
+               coalesce(sum(coalesce(degree.degree, 0)) FILTER (WHERE seen.side = 1 AND seen.depth = backward_depth), 0),
+               count(*) FILTER (WHERE seen.side = 0 AND seen.depth = forward_depth),
+               count(*) FILTER (WHERE seen.side = 1 AND seen.depth = backward_depth)
+          INTO forward_cost, backward_cost, forward_size, backward_size
+          FROM pg_temp.{seen} AS seen
+          LEFT JOIN graph.vertex_degree AS degree ON degree.kind = seen.kind AND degree.key = seen.key;
+
+        -- One side has nothing left to expand: its component is closed and no
+        -- path exists at any depth, so the cap never enters into it.
+        EXIT search WHEN forward_size = 0 OR backward_size = 0;
+
+        IF forward_cost <= backward_cost THEN
+            this_side := 0; other_side := 1; this_gen := forward_depth; next_gen := forward_depth + 1;
+        ELSE
+            this_side := 1; other_side := 0; this_gen := backward_depth; next_gen := backward_depth + 1;
+        END IF;
+
+        -- ---- the level, one vertex at a time -------------------------------
+        -- Ascending degree. Correctness does not care about the order — every
+        -- touch anywhere in this level reports the same distance — and cost
+        -- cares enormously, because the search pays for what it expands BEFORE
+        -- it touches.
+        FOR frontier IN
+            SELECT seen.kind AS kind, seen.key AS key
+            FROM pg_temp.{seen} AS seen
+            LEFT JOIN graph.vertex_degree AS degree ON degree.kind = seen.kind AND degree.key = seen.key
+            WHERE seen.side = this_side AND seen.depth = this_gen
+            ORDER BY coalesce(degree.degree, 0), seen.kind, seen.key
+        LOOP
+            frontier_kind := frontier.kind;
+            frontier_key  := frontier.key;
+
+            -- 1. THE TOUCH PROBE. Does this vertex have a neighbour the OTHER
+            -- side has already seen? The LATERAL carries its own LIMIT so the
+            -- planner cannot pull it up into a join and must probe the seen
+            -- set's primary key once per candidate neighbour; the outer LIMIT 1
+            -- stops the whole scan at the first hit.
+            SELECT candidate.dst_kind, candidate.dst_key, candidate.rel, opposite.depth AS other_depth
+              INTO hit
+              FROM (
+{neighbours_probe}
+              ) AS candidate,
+              LATERAL (
+                  SELECT seen.depth
+                  FROM pg_temp.{seen} AS seen
+                  WHERE seen.side = other_side AND seen.kind = candidate.dst_kind AND seen.key = candidate.dst_key
+                  LIMIT 1
+              ) AS opposite
+             LIMIT 1;
+
+            GET DIAGNOSTICS probe_rows = ROW_COUNT;
+
+            IF probe_rows > 0 THEN
+                answer_found := true;
+                -- The distance, read off the recorded depths rather than
+                -- asserted as `forward_depth + backward_depth + 1`. The two are
+                -- equal by the argument this function is documented with, and
+                -- deriving it means a mistake in that argument shows up as a
+                -- disagreement with Neo4j rather than as a silently wrong answer.
+                answer_depth := this_gen + 1 + hit.other_depth;
+
+                IF this_side = 0 THEN
+                    fwd_kind := frontier_kind;  fwd_key := frontier_key;
+                    bwd_kind := hit.dst_kind;   bwd_key := hit.dst_key;
+                ELSE
+                    fwd_kind := hit.dst_kind;   fwd_key := hit.dst_key;
+                    bwd_kind := frontier_kind;  bwd_key := frontier_key;
+                END IF;
+
+                -- Both halves of the path, walked back up the parent pointers.
+                -- One statement over both sides, joined on `side`, so the two
+                -- traces cannot drift apart in anything.
+                WITH RECURSIVE endpoint (side, kind, key) AS (
+                    VALUES (0::smallint, fwd_kind::"char", fwd_key::text),
+                           (1::smallint, bwd_kind::"char", bwd_key::text)
+                ),
+                back AS (
+                    SELECT seen.side, seen.kind, seen.key, seen.depth, seen.par_kind, seen.par_key, seen.rel
+                    FROM pg_temp.{seen} AS seen
+                    JOIN endpoint ON endpoint.side = seen.side AND endpoint.kind = seen.kind AND endpoint.key = seen.key
+                    UNION ALL
+                    SELECT parent.side, parent.kind, parent.key, parent.depth, parent.par_kind, parent.par_key, parent.rel
+                    FROM back
+                    JOIN pg_temp.{seen} AS parent
+                      ON parent.side = back.side AND parent.kind = back.par_kind AND parent.key = back.par_key
+                )
+                SELECT (SELECT array_agg(step.kind::text || ':' || step.key ORDER BY step.depth)
+                          FROM back AS step WHERE step.side = 0),
+                       (SELECT coalesce(array_remove(array_agg(step.rel ORDER BY step.depth), NULL), ARRAY[]::text[])
+                          FROM back AS step WHERE step.side = 0),
+                       -- The backward trace runs target-first, so it is reversed
+                       -- here and the returned path reads source to target like
+                       -- the Cypher's does.
+                       (SELECT array_agg(step.kind::text || ':' || step.key ORDER BY step.depth DESC)
+                          FROM back AS step WHERE step.side = 1),
+                       (SELECT coalesce(array_remove(array_agg(step.rel ORDER BY step.depth DESC), NULL), ARRAY[]::text[])
+                          FROM back AS step WHERE step.side = 1)
+                  INTO head_nodes, head_rels, tail_nodes, tail_rels;
+
+                answer_nodes := head_nodes || tail_nodes;
+                answer_rels  := head_rels || ARRAY[hit.rel] || tail_rels;
+                EXIT search;
+            END IF;
+
+            -- 2. THE EXPANSION. `ON CONFLICT DO NOTHING` is the seen check: one
+            -- probe against the primary key that is being maintained anyway, and
+            -- what survives it is by construction the set of vertices whose
+            -- shortest distance from this end is `next_gen`. It writes rows for
+            -- `this_side` and no other, which is what FREEZES the opposite
+            -- side's seen set for the duration of this level — the `b <= db` the
+            -- exactness argument needs holds for every probe in the level, not
+            -- only for the first. It is also what collapses a membership both
+            -- provenances assert, two rows of `graph.artist_member_of` for one
+            -- pair, into one visited vertex.
+            INSERT INTO pg_temp.{seen} (side, kind, key, depth, par_kind, par_key, rel)
+            SELECT this_side, candidate.dst_kind, candidate.dst_key, next_gen, frontier_kind, frontier_key, candidate.rel
+            FROM (
+{neighbours_expand}
+            ) AS candidate
+            ON CONFLICT (side, kind, key) DO NOTHING;
+        END LOOP;
+
+        -- The level is over, and only now is this side complete to `next_gen`.
+        IF this_side = 0 THEN forward_depth := next_gen; ELSE backward_depth := next_gen; END IF;
+    END LOOP search;
+
+    RETURN QUERY SELECT answer_found, answer_depth, answer_nodes, answer_rels;
+END
+$find_shortest_path$"""  # noqa: S608
+
+
+EXPLORE_MIN_HOPS = 1
+EXPLORE_MAX_HOPS = 3
+EXPLORE_DEFAULT_HOPS = 2
+EXPLORE_DEFAULT_ROW_LIMIT = 100
+
+
+def _explore_traversal_function() -> str:
+    """Return the bounded breadth-first traversal used by catalog-api Explore.
+
+    Breadth-first discovery is already ordered by distance, so once the requested
+    number of qualifying vertices has been discovered, no later vertex can displace
+    one of them from ``ORDER BY dist LIMIT row_limit``. Parent pointers in the shared
+    session-local seen relation reconstruct the same path-name and relationship-type
+    arrays as the Cypher query.
+    """
+    seen = PATH_SEEN_RELATION
+    neighbours = _path_neighbour_branches("frontier_kind", "frontier_key", " " * 16)
+    return f"""CREATE OR REPLACE FUNCTION graph.explore_traversal(
+    from_kind "char",
+    from_key  text,
+    hops      int DEFAULT {EXPLORE_DEFAULT_HOPS},
+    row_limit int DEFAULT {EXPLORE_DEFAULT_ROW_LIMIT}
+)
+RETURNS TABLE (id text, name text, type text, path_names text[], rel_types text[], dist int)
+LANGUAGE plpgsql
+AS $explore_traversal$
+DECLARE
+    cap           int;
+    current_depth int;
+    frontier      record;
+    frontier_kind "char";
+    frontier_key  text;
+    added         bigint;
+    qualifying    bigint := 0;
+BEGIN
+    IF row_limit IS NULL THEN
+        RAISE EXCEPTION 'row_limit must not be null' USING ERRCODE = '22004';
+    END IF;
+    IF row_limit < 0 THEN
+        RAISE EXCEPTION 'row_limit must be non-negative' USING ERRCODE = '22023';
+    END IF;
+
+    cap := greatest({EXPLORE_MIN_HOPS}, least(coalesce(hops, {EXPLORE_DEFAULT_HOPS}), {EXPLORE_MAX_HOPS}));
+
+    IF to_regclass('pg_temp.{seen}') IS NULL THEN
+        CREATE TEMPORARY TABLE {seen} (
+            side     smallint NOT NULL,
+            kind     "char"   NOT NULL,
+            key      text     NOT NULL,
+            depth    int      NOT NULL,
+            par_kind "char",
+            par_key  text,
+            rel      text,
+            PRIMARY KEY (side, kind, key)
+        ) ON COMMIT DELETE ROWS;
+        CREATE INDEX {seen}_level ON pg_temp.{seen} (side, depth, kind, key);
+    END IF;
+
+    DELETE FROM pg_temp.{seen};
+    INSERT INTO pg_temp.{seen} (side, kind, key, depth)
+    VALUES (0, from_kind, from_key, 0);
+
+    IF row_limit > 0 THEN
+        <<walk>>
+        FOR current_depth IN 1..cap LOOP
+            FOR frontier IN
+                SELECT visited.kind, visited.key
+                FROM pg_temp.{seen} AS visited
+                WHERE visited.side = 0 AND visited.depth = current_depth - 1
+                ORDER BY visited.kind, visited.key
+            LOOP
+                frontier_kind := frontier.kind;
+                frontier_key := frontier.key;
+
+                WITH inserted AS (
+                    INSERT INTO pg_temp.{seen} (side, kind, key, depth, par_kind, par_key, rel)
+                    SELECT 0, candidate.dst_kind, candidate.dst_key, current_depth,
+                           frontier_kind, frontier_key, candidate.rel
+                    FROM (
+{neighbours}
+                    ) AS candidate
+                    ON CONFLICT (side, kind, key) DO NOTHING
+                    RETURNING kind
+                )
+                SELECT count(*) FILTER (WHERE kind IN ('a', 'l', 'g', 's'))
+                INTO added
+                FROM inserted;
+
+                qualifying := qualifying + added;
+                EXIT walk WHEN qualifying >= row_limit;
+            END LOOP;
+        END LOOP walk;
+    END IF;
+
+    RETURN QUERY
+    WITH discovered AS (
+        SELECT visited.kind, visited.key, visited.depth
+        FROM pg_temp.{seen} AS visited
+        WHERE visited.side = 0
+          AND visited.depth > 0
+          AND visited.kind IN ('a', 'l', 'g', 's')
+        ORDER BY visited.depth, visited.kind, visited.key
+        LIMIT row_limit
+    )
+    SELECT discovered.key,
+           coalesce(
+               CASE discovered.kind
+                   WHEN 'a' THEN (SELECT artist.name FROM graph.artist AS artist WHERE artist.artist_id = discovered.key)
+                   WHEN 'l' THEN (SELECT label.name FROM graph.label AS label WHERE label.label_id = discovered.key)
+                   ELSE discovered.key
+               END,
+               discovered.key
+           ),
+           CASE discovered.kind
+               WHEN 'a' THEN 'artist'
+               WHEN 'l' THEN 'label'
+               WHEN 'g' THEN 'genre'
+               ELSE 'style'
+           END,
+           trace.path_names,
+           trace.rel_types,
+           discovered.depth
+    FROM discovered
+    CROSS JOIN LATERAL (
+        WITH RECURSIVE back AS (
+            SELECT visited.kind, visited.key, visited.depth, visited.par_kind, visited.par_key, visited.rel
+            FROM pg_temp.{seen} AS visited
+            WHERE visited.side = 0 AND visited.kind = discovered.kind AND visited.key = discovered.key
+            UNION ALL
+            SELECT parent.kind, parent.key, parent.depth, parent.par_kind, parent.par_key, parent.rel
+            FROM back
+            JOIN pg_temp.{seen} AS parent
+              ON parent.side = 0 AND parent.kind = back.par_kind AND parent.key = back.par_key
+        )
+        SELECT array_agg(
+                   coalesce(
+                       CASE back.kind
+                           WHEN 'a' THEN (SELECT artist.name FROM graph.artist AS artist WHERE artist.artist_id = back.key)
+                           WHEN 'l' THEN (SELECT label.name FROM graph.label AS label WHERE label.label_id = back.key)
+                           WHEN 'r' THEN (SELECT release.title FROM graph.release AS release WHERE release.release_id = back.key)
+                           WHEN 'm' THEN (SELECT master.title FROM graph.master AS master WHERE master.master_id = back.key)
+                           ELSE back.key
+                       END,
+                       back.key
+                   )
+                   ORDER BY back.depth
+               ) AS path_names,
+               coalesce(array_remove(array_agg(back.rel ORDER BY back.depth), NULL), ARRAY[]::text[]) AS rel_types
+        FROM back
+    ) AS trace
+    ORDER BY discovered.depth, discovered.kind, discovered.key;
+END
+$explore_traversal$"""  # noqa: S608
+
+
 def _build_graph_statements() -> list[tuple[str, str]]:
     """Return the ordered graph-schema statements: schema, functions, tables, views.
 
@@ -3233,10 +4293,13 @@ def _build_graph_statements() -> list[tuple[str, str]]:
     views, because `part_of`, `in_family`, and `release_degree` now read tables
     rather than documents. Every migration that frees a name precedes the
     relation that takes it, which is what `_graph_table_statements` returns. And
-    `graph.bootstrap_fill` comes last, after every relation it writes or reads —
-    a plpgsql body resolves its names at first call rather than at creation, so
-    the position is a statement about what the function means rather than a
-    requirement, and it is kept honest by a test.
+    the two writing functions come last, after every relation they write or read
+    — `graph.refresh_artist_member_of` reads two MusicBrainz views,
+    `graph.refresh_vertex_degree` reads the ten path relations including the
+    union that function writes, and `graph.bootstrap_fill` reads all of it — a plpgsql body resolves its names at
+    first call rather than at creation, so the position is a statement about what
+    each function means rather than a requirement, and it is kept honest by a
+    test.
     """
     return [
         _GRAPH_SCHEMA_STATEMENT,
@@ -3253,8 +4316,20 @@ def _build_graph_statements() -> list[tuple[str, str]]:
         *_collection_views(),
         *_credit_views(),
         *_counter_views(),
-        # Last, because it reads all of it: the fill writes the tables above and
-        # its counter bodies read `graph.part_of`, which is one of the views.
+        # All three of these read the relations above rather than being read by
+        # one, so they come after all of them: the union's body reads two
+        # MusicBrainz views, the degree's reads ten relations including that
+        # union, and the fill writes every table and reads `graph.part_of`.
+        ("graph.refresh_artist_member_of function", _refresh_artist_member_of_function()),
+        ("graph.refresh_vertex_degree function", _refresh_vertex_degree_function()),
+        # The one declared object that READS the traversal surface rather than
+        # writing it, and the only one that reads `graph.vertex_degree` at all.
+        # It comes after the two refreshes because it reads what they write —
+        # the MEMBER_OF union is one of the ten relations it walks and the
+        # degree is what orders the walk — and before the fill, which is last
+        # because it writes every table in the schema.
+        ("graph.find_shortest_path function", _find_shortest_path_function()),
+        ("graph.explore_traversal function", _explore_traversal_function()),
         ("graph.bootstrap_fill function", _bootstrap_fill_function()),
     ]
 
