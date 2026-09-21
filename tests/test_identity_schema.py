@@ -360,6 +360,7 @@ _GRAPH_STATEMENT_NAMES = frozenset(
         "graph.refresh_artist_member_of function",
         "graph.refresh_vertex_degree function",
         "graph.find_shortest_path function",
+        "graph.explore_traversal function",
         "graph.bootstrap_fill function",
     }
 )

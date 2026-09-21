@@ -20,6 +20,10 @@ from groovemap_schema.postgres import (
     _TEXT_KEY_RETYPES,
     _VERTEX_KIND_NAMES,
     _VERTEX_KINDS,
+    EXPLORE_DEFAULT_HOPS,
+    EXPLORE_DEFAULT_ROW_LIMIT,
+    EXPLORE_MAX_HOPS,
+    EXPLORE_MIN_HOPS,
     MUSICBRAINZ_RELATIONSHIP_LABEL,
     MUSICBRAINZ_RELATIONSHIP_TYPES,
     PATH_DEFAULT_DEPTH,
@@ -177,7 +181,13 @@ VOCABULARY_FUNCTIONS = {"credit_role_category", "medium_label", "mb_relationship
 # `graph.find_shortest_path` is the fifth, and the only one that READS the
 # traversal surface rather than writing it: the one Cypher call this schema
 # cannot express as a view, ported from spike gm-database-schema-gkt.1.
-EXPECTED_FUNCTIONS = VOCABULARY_FUNCTIONS | {"bootstrap_fill", "refresh_artist_member_of", "refresh_vertex_degree", "find_shortest_path"}
+EXPECTED_FUNCTIONS = VOCABULARY_FUNCTIONS | {
+    "bootstrap_fill",
+    "refresh_artist_member_of",
+    "refresh_vertex_degree",
+    "find_shortest_path",
+    "explore_traversal",
+}
 
 MUSICBRAINZ_PAIRS = [
     (source, target) for source in ("artist", "label", "release", "release_group") for target in ("artist", "label", "release", "release_group")
@@ -1275,6 +1285,50 @@ class TestShortestPath:
         elements = {element.element for element in (*_property_graph_vertices(), *_property_graph_edges())}
         assert "find_shortest_path" not in elements
         assert "find_shortest_path" not in view_names()
+
+
+class TestExploreTraversal:
+    """The bounded breadth-first Explore query over the same traversal surface."""
+
+    def test_the_signature_matches_catalog_api(self) -> None:
+        statement = statement_for_function("explore_traversal")
+        assert statement.startswith("CREATE OR REPLACE FUNCTION graph.explore_traversal(\n")
+        assert f"hops      int DEFAULT {EXPLORE_DEFAULT_HOPS}" in statement
+        assert f"row_limit int DEFAULT {EXPLORE_DEFAULT_ROW_LIMIT}" in statement
+        assert "RETURNS TABLE (id text, name text, type text, path_names text[], rel_types text[], dist int)" in statement
+
+    def test_hops_are_clamped_and_a_null_limit_is_rejected(self) -> None:
+        statement = statement_for_function("explore_traversal")
+        assert (EXPLORE_MIN_HOPS, EXPLORE_DEFAULT_HOPS, EXPLORE_MAX_HOPS) == (1, 2, 3)
+        assert f"cap := greatest({EXPLORE_MIN_HOPS}, least(coalesce(hops, {EXPLORE_DEFAULT_HOPS}), {EXPLORE_MAX_HOPS}));" in statement
+        assert "IF row_limit IS NULL THEN" in statement
+        assert "ERRCODE = '22004'" in statement
+
+    def test_it_stops_the_walk_when_the_limit_is_met(self) -> None:
+        statement = executable_sql(statement_for_function("explore_traversal"))
+        assert "qualifying := qualifying + added;" in statement
+        assert "EXIT walk WHEN qualifying >= row_limit;" in statement
+        assert "LIMIT row_limit" in statement
+
+    def test_it_uses_parent_pointers_to_project_the_cypher_shape(self) -> None:
+        statement = statement_for_function("explore_traversal")
+        assert "WITH RECURSIVE back AS" in statement
+        assert "ORDER BY back.depth" in statement
+        assert "AS path_names" in statement
+        assert "AS rel_types" in statement
+        for kind in ("artist", "label", "genre", "style"):
+            assert f"'{kind}'" in statement
+
+    def test_it_walks_the_same_twenty_directional_branches_as_shortest_path(self) -> None:
+        statement = statement_for_function("explore_traversal")
+        assert statement.count("FROM graph.") == 2 * len(TestVertexDegree.PATH_RELATIONS) + 6
+        for relation in _PATH_RELATIONSHIP_TYPES:
+            assert statement.count(f"FROM graph.{relation} AS edge") == 2
+
+    def test_it_is_declared_with_the_other_procedural_path_function(self) -> None:
+        names = [name for name, _statement in _GRAPH_STATEMENTS]
+        assert names.index("graph.find_shortest_path function") < names.index("graph.explore_traversal function")
+        assert names.index("graph.explore_traversal function") < names.index("graph.bootstrap_fill function")
 
 
 class TestCollectionEdgeViews:

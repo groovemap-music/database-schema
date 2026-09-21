@@ -4127,6 +4127,161 @@ END
 $find_shortest_path$"""  # noqa: S608
 
 
+EXPLORE_MIN_HOPS = 1
+EXPLORE_MAX_HOPS = 3
+EXPLORE_DEFAULT_HOPS = 2
+EXPLORE_DEFAULT_ROW_LIMIT = 100
+
+
+def _explore_traversal_function() -> str:
+    """Return the bounded breadth-first traversal used by catalog-api Explore.
+
+    Breadth-first discovery is already ordered by distance, so once the requested
+    number of qualifying vertices has been discovered, no later vertex can displace
+    one of them from ``ORDER BY dist LIMIT row_limit``. Parent pointers in the shared
+    session-local seen relation reconstruct the same path-name and relationship-type
+    arrays as the Cypher query.
+    """
+    seen = PATH_SEEN_RELATION
+    neighbours = _path_neighbour_branches("frontier_kind", "frontier_key", " " * 16)
+    return f"""CREATE OR REPLACE FUNCTION graph.explore_traversal(
+    from_kind "char",
+    from_key  text,
+    hops      int DEFAULT {EXPLORE_DEFAULT_HOPS},
+    row_limit int DEFAULT {EXPLORE_DEFAULT_ROW_LIMIT}
+)
+RETURNS TABLE (id text, name text, type text, path_names text[], rel_types text[], dist int)
+LANGUAGE plpgsql
+AS $explore_traversal$
+DECLARE
+    cap           int;
+    current_depth int;
+    frontier      record;
+    frontier_kind "char";
+    frontier_key  text;
+    added         bigint;
+    qualifying    bigint := 0;
+BEGIN
+    IF row_limit IS NULL THEN
+        RAISE EXCEPTION 'row_limit must not be null' USING ERRCODE = '22004';
+    END IF;
+    IF row_limit < 0 THEN
+        RAISE EXCEPTION 'row_limit must be non-negative' USING ERRCODE = '22023';
+    END IF;
+
+    cap := greatest({EXPLORE_MIN_HOPS}, least(coalesce(hops, {EXPLORE_DEFAULT_HOPS}), {EXPLORE_MAX_HOPS}));
+
+    IF to_regclass('pg_temp.{seen}') IS NULL THEN
+        CREATE TEMPORARY TABLE {seen} (
+            side     smallint NOT NULL,
+            kind     "char"   NOT NULL,
+            key      text     NOT NULL,
+            depth    int      NOT NULL,
+            par_kind "char",
+            par_key  text,
+            rel      text,
+            PRIMARY KEY (side, kind, key)
+        ) ON COMMIT DELETE ROWS;
+        CREATE INDEX {seen}_level ON pg_temp.{seen} (side, depth, kind, key);
+    END IF;
+
+    DELETE FROM pg_temp.{seen};
+    INSERT INTO pg_temp.{seen} (side, kind, key, depth)
+    VALUES (0, from_kind, from_key, 0);
+
+    IF row_limit > 0 THEN
+        <<walk>>
+        FOR current_depth IN 1..cap LOOP
+            FOR frontier IN
+                SELECT visited.kind, visited.key
+                FROM pg_temp.{seen} AS visited
+                WHERE visited.side = 0 AND visited.depth = current_depth - 1
+                ORDER BY visited.kind, visited.key
+            LOOP
+                frontier_kind := frontier.kind;
+                frontier_key := frontier.key;
+
+                WITH inserted AS (
+                    INSERT INTO pg_temp.{seen} (side, kind, key, depth, par_kind, par_key, rel)
+                    SELECT 0, candidate.dst_kind, candidate.dst_key, current_depth,
+                           frontier_kind, frontier_key, candidate.rel
+                    FROM (
+{neighbours}
+                    ) AS candidate
+                    ON CONFLICT (side, kind, key) DO NOTHING
+                    RETURNING kind
+                )
+                SELECT count(*) FILTER (WHERE kind IN ('a', 'l', 'g', 's'))
+                INTO added
+                FROM inserted;
+
+                qualifying := qualifying + added;
+                EXIT walk WHEN qualifying >= row_limit;
+            END LOOP;
+        END LOOP walk;
+    END IF;
+
+    RETURN QUERY
+    WITH discovered AS (
+        SELECT visited.kind, visited.key, visited.depth
+        FROM pg_temp.{seen} AS visited
+        WHERE visited.side = 0
+          AND visited.depth > 0
+          AND visited.kind IN ('a', 'l', 'g', 's')
+        ORDER BY visited.depth, visited.kind, visited.key
+        LIMIT row_limit
+    )
+    SELECT discovered.key,
+           coalesce(
+               CASE discovered.kind
+                   WHEN 'a' THEN (SELECT artist.name FROM graph.artist AS artist WHERE artist.artist_id = discovered.key)
+                   WHEN 'l' THEN (SELECT label.name FROM graph.label AS label WHERE label.label_id = discovered.key)
+                   ELSE discovered.key
+               END,
+               discovered.key
+           ),
+           CASE discovered.kind
+               WHEN 'a' THEN 'artist'
+               WHEN 'l' THEN 'label'
+               WHEN 'g' THEN 'genre'
+               ELSE 'style'
+           END,
+           trace.path_names,
+           trace.rel_types,
+           discovered.depth
+    FROM discovered
+    CROSS JOIN LATERAL (
+        WITH RECURSIVE back AS (
+            SELECT visited.kind, visited.key, visited.depth, visited.par_kind, visited.par_key, visited.rel
+            FROM pg_temp.{seen} AS visited
+            WHERE visited.side = 0 AND visited.kind = discovered.kind AND visited.key = discovered.key
+            UNION ALL
+            SELECT parent.kind, parent.key, parent.depth, parent.par_kind, parent.par_key, parent.rel
+            FROM back
+            JOIN pg_temp.{seen} AS parent
+              ON parent.side = 0 AND parent.kind = back.par_kind AND parent.key = back.par_key
+        )
+        SELECT array_agg(
+                   coalesce(
+                       CASE back.kind
+                           WHEN 'a' THEN (SELECT artist.name FROM graph.artist AS artist WHERE artist.artist_id = back.key)
+                           WHEN 'l' THEN (SELECT label.name FROM graph.label AS label WHERE label.label_id = back.key)
+                           WHEN 'r' THEN (SELECT release.title FROM graph.release AS release WHERE release.release_id = back.key)
+                           WHEN 'm' THEN (SELECT master.title FROM graph.master AS master WHERE master.master_id = back.key)
+                           ELSE back.key
+                       END,
+                       back.key
+                   )
+                   ORDER BY back.depth
+               ) AS path_names,
+               coalesce(array_remove(array_agg(back.rel ORDER BY back.depth), NULL), ARRAY[]::text[]) AS rel_types
+        FROM back
+    ) AS trace
+    ORDER BY discovered.depth, discovered.kind, discovered.key;
+END
+$explore_traversal$"""  # noqa: S608
+
+
 def _build_graph_statements() -> list[tuple[str, str]]:
     """Return the ordered graph-schema statements: schema, functions, tables, views.
 
@@ -4172,6 +4327,7 @@ def _build_graph_statements() -> list[tuple[str, str]]:
         # degree is what orders the walk — and before the fill, which is last
         # because it writes every table in the schema.
         ("graph.find_shortest_path function", _find_shortest_path_function()),
+        ("graph.explore_traversal function", _explore_traversal_function()),
         ("graph.bootstrap_fill function", _bootstrap_fill_function()),
     ]
 
