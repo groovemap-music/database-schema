@@ -9,7 +9,7 @@ neo4j_image="${NEO4J_INTEGRATION_IMAGE:-neo4j:2026-community@sha256:dbc377fb9cd8
 password="${SCHEMA_INTEGRATION_PASSWORD:-integration-test-password}"
 
 cleanup() {
-    docker rm --force "${postgres_container}" "${neo4j_container}" >/dev/null 2>&1 || true
+    docker rm --force --volumes "${postgres_container}" "${neo4j_container}" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
