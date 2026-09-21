@@ -2140,6 +2140,20 @@ async def seed_path_fixture() -> None:
         await connection.commit()
 
 
+async def seed_explore_fixture() -> None:
+    """Build the complete, engine-independent fixture behind Explore's answers.
+
+    Artist 4 is reached through the pilot collaboration neighbourhood, while
+    the other expected vertices come from the graph and path fixtures.  Seed
+    all three explicitly so this test does not depend on a PostgreSQL-19-only
+    pilot test having run earlier in the session.
+    """
+    await seed_graph_fixtures()
+    await seed_pilot_fixtures()
+    await bootstrap_the_loader_tables()
+    await seed_path_fixture()
+
+
 # The answer set: one row per case, with the distance computed by hand from the
 # graph above and never read back from the function. `None` for a depth means
 # the case has no answer within its cap.
@@ -2201,6 +2215,7 @@ PATH_CASES: list[tuple[str, str, str, str, str, int | None, bool, int | None]] =
 ]
 
 FIND_SHORTEST_PATH = 'SELECT found, depth, nodes, rels FROM graph.find_shortest_path(%s::"char", %s, %s::"char", %s, %s)'
+EXPLORE_TRAVERSAL = 'SELECT id, name, type, path_names, rel_types, dist FROM graph.explore_traversal(%s::"char", %s, %s, %s)'
 
 # The paths themselves, for the cases where the fixture admits exactly one and
 # the answer is therefore not a tie broken arbitrarily. `shortestPath` promises
@@ -2315,6 +2330,55 @@ async def test_the_shortest_path_walks_no_relation_a_path_query_never_traverses(
     # from label 9; nothing on the surface reaches it, so it is unreachable.
     assert await postgres_rows("SELECT count(*) FROM graph.sublabel_of WHERE sublabel_id = '9' AND parent_label_id = '12'") == [(1,)]
     assert await postgres_rows(FIND_SHORTEST_PATH, ("l", "9", "l", "12", 6)) == [(False, None, None, None)]
+
+
+@pytest.mark.asyncio
+async def test_explore_traversal_matches_the_fixture_discovery_sets() -> None:
+    """The spike's *1..1 through *1..3 case shape, as exact fixture-scale sets."""
+    await apply_schema()
+    await seed_explore_fixture()
+
+    expected = {
+        1: {("7", "artist", 1)},
+        2: {("7", "artist", 1), ("10", "artist", 2), ("11", "artist", 2)},
+        3: {
+            ("7", "artist", 1),
+            ("10", "artist", 2),
+            ("11", "artist", 2),
+            ("4", "artist", 3),
+            ("9", "label", 3),
+            ("Rock", "genre", 3),
+            ("Prog Rock", "style", 3),
+            ("Psychedelic", "style", 3),
+        },
+    }
+
+    for hops, discoveries in expected.items():
+        rows = await postgres_rows(EXPLORE_TRAVERSAL, ("a", "8", hops, 100))
+        assert {(row[0], row[2], row[5]) for row in rows} == discoveries
+        for _id, _name, _type, path_names, rel_types, dist in rows:
+            assert len(path_names) == dist + 1
+            assert len(rel_types) == dist
+            assert path_names[0] == "8"
+            assert set(rel_types) <= {"BY", "ON", "IS", "ALIAS_OF", "MEMBER_OF", "DERIVED_FROM"}
+
+
+@pytest.mark.asyncio
+async def test_explore_traversal_enforces_its_caps_and_mandatory_limit() -> None:
+    await apply_schema()
+    await seed_explore_fixture()
+
+    # The hop argument is clamped at both ends and the row limit is a hard cap.
+    floor = await postgres_rows(EXPLORE_TRAVERSAL, ("a", "8", 0, 100))
+    ceiling = await postgres_rows(EXPLORE_TRAVERSAL, ("a", "8", 99, 100))
+    assert {(row[0], row[5]) for row in floor} == {("7", 1)}
+    assert len(ceiling) == 8
+    assert len(await postgres_rows(EXPLORE_TRAVERSAL, ("a", "8", 3, 2))) == 2
+
+    connection = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params())
+    async with connection, connection.cursor() as cursor:
+        with pytest.raises(psycopg.errors.NullValueNotAllowed):
+            await cursor.execute(EXPLORE_TRAVERSAL, ("a", "8", 2, None))
 
 
 # ── Two sessions searching at once ───────────────────────────────────────────

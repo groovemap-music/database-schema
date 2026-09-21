@@ -140,6 +140,7 @@
     "functions": [
       "graph.bootstrap_fill",
       "graph.credit_role_category",
+      "graph.explore_traversal",
       "graph.find_shortest_path",
       "graph.mb_relationship_type",
       "graph.medium_label",
