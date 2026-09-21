@@ -387,7 +387,7 @@ class TestGraphSchemaStatement:
         assert names.index("graph.mb_rel_artist_artist view") > last_vocabulary
 
     def test_the_bootstrap_fill_is_declared_after_everything_it_touches(self) -> None:
-        """It writes every table and its counter bodies read `graph.part_of`."""
+        """Its counter bodies read the populated vertex and edge relations."""
         names = [name for name, _statement in _GRAPH_STATEMENTS]
         assert names[-1] == "graph.bootstrap_fill function"
 
@@ -781,22 +781,44 @@ class TestPhase0Comparison:
             assert "public.releases" not in statement, relation
             assert "graph.by_artist" in statement, relation
 
-    def test_label_stats_release_count_does_not_fan_out_over_the_left_joins(self) -> None:
+    def test_label_stats_release_count_does_not_fan_out_over_the_correlated_joins(self) -> None:
         """A label's release_count must be over its own distinct releases.
 
-        `label_stats.release_count` is `on_label` LEFT JOINed to both
-        `by_artist` and `in_genre`, which multiplies one release's row into
-        one per (artist, genre) pair. `artist_count` and `genre_count` already
-        deduplicate with DISTINCT on the column they name; release_count has
-        to as well, or a release with several artists and genres is counted
-        several times over instead of once. The real-engine proof is
+        The artist and genre subqueries join a label's releases to their other
+        edges. Every aggregate stays DISTINCT on the entity it names, so a
+        release with several artists and genres is counted once. The real-engine proof is
         `test_label_stats_release_count_does_not_fan_out_over_artists_and_genres`
         in `tests/integration/test_real_schema_idempotence.py`.
         """
         statement = _COUNTER_BOOTSTRAP["label_stats"]
-        assert "count(DISTINCT on_label.release_id) AS release_count" in statement
-        assert "count(DISTINCT by_artist.artist_id) AS artist_count" in statement
-        assert "count(DISTINCT in_genre.genre_name) AS genre_count" in statement
+        assert "count(DISTINCT on_label.release_id)" in statement
+        assert "count(DISTINCT by_artist.artist_id)" in statement
+        assert "count(DISTINCT in_genre.genre_name)" in statement
+
+    def test_label_stats_drives_from_every_imported_label(self) -> None:
+        """A label without a release still receives graphinator's explicit zero row."""
+        statement = _COUNTER_BOOTSTRAP["label_stats"]
+        assert "FROM graph.label AS label" in statement
+        assert "WHERE on_label.label_id = label.label_id" in statement
+        assert "GROUP BY on_label.label_id" not in statement
+
+    def test_genre_and_style_counts_use_normalized_release_cooccurrence(self) -> None:
+        """Counters mirror graphinator while `part_of` keeps its stricter taxonomy meaning."""
+        genre = _COUNTER_BOOTSTRAP["genre_stats"]
+        style = _COUNTER_BOOTSTRAP["style_stats"]
+        assert "count(DISTINCT in_style.style_name)" in genre
+        assert "JOIN graph.in_style AS in_style ON in_style.release_id = in_genre.release_id" in genre
+        assert "count(DISTINCT in_genre.genre_name)" in style
+        assert "JOIN graph.in_genre AS in_genre ON in_genre.release_id = in_style.release_id" in style
+        assert "graph.part_of" not in genre + style
+
+    def test_first_year_accepts_any_positive_decimal_year(self) -> None:
+        """Neo4j tests `r.year > 0`; importer normalization owns plausibility bounds."""
+        for relation in ("genre_stats", "style_stats"):
+            statement = _COUNTER_BOOTSTRAP[relation]
+            assert "btrim(release.year) ~ '^[0-9]+$'" in statement
+            assert "btrim(release.year)::numeric > 0" in statement
+            assert "^[0-9]{4}$" not in statement
 
 
 class TestBootstrapFill:

@@ -1855,7 +1855,7 @@ async def postgres_rows_with(query: str, parameters: dict[str, Any]) -> list[tup
 COUNTER_ROW_COUNTS = {
     "genre_stats": "SELECT count(*) FROM graph.genre",
     "style_stats": "SELECT count(*) FROM graph.style",
-    "label_stats": "SELECT count(DISTINCT label_id) FROM graph.on_label",
+    "label_stats": "SELECT count(*) FROM graph.label",
     "artist_degree": """
         SELECT count(*) FROM (
             SELECT artist_id FROM graph.by_artist
@@ -2045,6 +2045,10 @@ async def seed_label_stats_fanout_fixture() -> None:
     connection = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params())
     async with connection, connection.cursor() as cursor:
         await cursor.execute(
+            "INSERT INTO labels (data_id, hash, data) VALUES (%s, %s, %s) ON CONFLICT (data_id) DO NOTHING",
+            (FANOUT_FIXTURE_LABEL_ID, "hash-600", Jsonb({"id": 600, "name": "Fanout Label"})),
+        )
+        await cursor.execute(
             "INSERT INTO releases (data_id, hash, data) VALUES (%s, %s, %s) ON CONFLICT (data_id) DO NOTHING",
             (str(FANOUT_FIXTURE_RELEASE["id"]), "hash-601", Jsonb(FANOUT_FIXTURE_RELEASE)),
         )
@@ -2062,6 +2066,63 @@ async def test_label_stats_release_count_does_not_fan_out_over_artists_and_genre
         "SELECT release_count, artist_count, genre_count FROM graph.label_stats WHERE label_id = %s",
         (FANOUT_FIXTURE_LABEL_ID,),
     ) == [(1, 2, 2)]
+
+
+@pytest.mark.asyncio
+async def test_counter_parity_includes_empty_labels_cooccurrence_and_positive_years() -> None:
+    """The real engine matches graphinator after importer-owned normalization.
+
+    The three-digit year is deliberately below the normalizer's plausibility
+    bound: persisted loader data will not contain it, but the counter contract
+    mirrors Neo4j's `r.year > 0` predicate rather than duplicating that bound.
+    """
+    empty_label_id = "610"
+    release_id = "611"
+    zero_year_release_id = "612"
+    connection = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params())
+    async with connection, connection.cursor() as cursor:
+        await cursor.execute(
+            "INSERT INTO labels (data_id, hash, data) VALUES (%s, %s, %s) ON CONFLICT (data_id) DO NOTHING",
+            (empty_label_id, "hash-610", Jsonb({"id": 610, "name": "No Releases Label"})),
+        )
+        await cursor.execute(
+            "INSERT INTO releases (data_id, hash, data) VALUES (%s, %s, %s) ON CONFLICT (data_id) DO NOTHING",
+            (
+                release_id,
+                "hash-611",
+                Jsonb(
+                    {
+                        "id": 611,
+                        "title": "Counter Parity Release",
+                        "year": "197",
+                        "genres": ["Counter Genre One", "Counter Genre Two"],
+                        "styles": ["Counter Style"],
+                    }
+                ),
+            ),
+        )
+        await cursor.execute(
+            "INSERT INTO releases (data_id, hash, data) VALUES (%s, %s, %s) ON CONFLICT (data_id) DO NOTHING",
+            (
+                zero_year_release_id,
+                "hash-612",
+                Jsonb({"id": 612, "title": "Zero Year Release", "year": "0000", "genres": ["Zero Year Genre"]}),
+            ),
+        )
+        await connection.commit()
+
+    await apply_schema()
+    await bootstrap_the_loader_tables()
+
+    assert await postgres_rows(
+        "SELECT release_count, artist_count, genre_count FROM graph.label_stats WHERE label_id = %s",
+        (empty_label_id,),
+    ) == [(0, 0, 0)]
+    assert await postgres_rows(
+        "SELECT name, style_count, first_year FROM graph.genre_stats WHERE name IN ('Counter Genre One', 'Counter Genre Two') ORDER BY name"
+    ) == [("Counter Genre One", 1, 197), ("Counter Genre Two", 1, 197)]
+    assert await postgres_rows("SELECT genre_count, first_year FROM graph.style_stats WHERE name = 'Counter Style'") == [(2, 197)]
+    assert await postgres_rows("SELECT first_year FROM graph.genre_stats WHERE name = 'Zero Year Genre'") == [(None,)]
 
 
 # ── The shortest path across the traversal surface ───────────────────────────
