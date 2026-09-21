@@ -192,13 +192,15 @@ class TestAppTokensTable:
 class TestExtractionLatchTable:
     """The loader family's durable extraction latch (bead gm-database-schema-fyl).
 
-    The name (`public.loader_extraction_latch`, the first of discogs-sql-loader's
-    `LATCH_CANDIDATES`) and the five required columns' types are pinned to what
+    The name (`public.loader_extraction_latch`, the only relation discogs-sql-loader
+    probes) and the required columns' types are pinned to what
     `tableinator/extraction_latch.py`'s `REQUIRED_COLUMNS` and startup probe
     demand, so a relation this schema declares is never silently declined by
-    the loader. The `loader` discriminator and its `PRIMARY KEY (loader,
-    version)` are what the probe requires for `ON CONFLICT` before it will key
-    and scope statements on the column.
+    the loader. The `loader` discriminator is itself required by
+    `REQUIRED_COLUMNS`, and its `PRIMARY KEY (loader, version)` is what the
+    probe verifies via `pg_constraint` (a PRIMARY KEY or UNIQUE constraint
+    spanning exactly those two columns; a bare unique index is declined)
+    before it scopes every statement to `loader = 'discogs'`.
     """
 
     def _user_tables_dict(self) -> dict[str, str]:

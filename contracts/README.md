@@ -63,12 +63,15 @@ per-`(loader, extraction)` latch for a post-import derived-relation refresh: one
 loader per extraction, recording which of that loader's entity types have signalled
 `extraction_complete` and whether its refresh pass has completed (`refreshed_at`), written
 before the triggering delivery is acked so a restart resumes collection. It mirrors
-`graphinator`'s Neo4j-side latch and is declared here — matching the name (the first of
-`discogs-sql-loader`'s `LATCH_CANDIDATES`), the five required columns' types, the `loader`
-discriminator, and the `loader_extraction_latch_pkey` primary key on `(loader, version)` that
-`tableinator/extraction_latch.py`'s startup probe and `ON CONFLICT` upsert require — rather
-than as a runtime `CREATE TABLE` in the loader, because DDL ownership stays with this
-repository. `discogs-sql-loader` is the writer today (`loader = 'discogs'`); the relation is
+`graphinator`'s Neo4j-side latch and is declared here — matching the single relation
+`discogs-sql-loader` probes (`public.loader_extraction_latch`), the required columns' types,
+the mandatory `loader` discriminator (values `discogs` and `musicbrainz`) that
+`REQUIRED_COLUMNS` demands, and the `loader_extraction_latch_pkey` primary key on `(loader,
+version)` that `tableinator/extraction_latch.py`'s startup probe verifies via `pg_constraint`
+(a PRIMARY KEY or UNIQUE constraint over exactly those two columns; a bare unique index is
+declined by design) before its `ON CONFLICT` upsert — rather than as a runtime `CREATE TABLE`
+in the loader, because DDL ownership stays with this repository. `discogs-sql-loader` is the
+writer today (`loader = 'discogs'`); the relation is
 named for the loader family, not for one loader, so `musicbrainz-sql-loader` can write its own
 rows (`loader = 'musicbrainz'`) into the same relation when it adopts the pattern; see
 `design_decision` in the contract. Storage-only: `loader_extraction_latch` is a plain `public`

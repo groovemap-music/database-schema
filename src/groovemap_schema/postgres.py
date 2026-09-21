@@ -581,15 +581,17 @@ _USER_TABLES: list[tuple[str, str]] = [
     # Declared here rather than by a runtime CREATE TABLE in a loader because
     # this repository is the sole DDL issuer (see docs/architecture.md and
     # contracts/persistence/v1/compatibility.json). discogs-sql-loader probes
-    # `information_schema` at startup for one of `LATCH_CANDIDATES`
-    # (`public.loader_extraction_latch` first) in its
-    # `tableinator/extraction_latch.py`, requires the five non-key columns
-    # below with these exact `information_schema` types, and honours the
-    # `loader` discriminator column, keying and scoping every statement on it
-    # when present — which is why it is declared here rather than omitted.
+    # `information_schema` at startup for `public.loader_extraction_latch` in
+    # its `tableinator/extraction_latch.py`, requires the `loader` column
+    # (its `REQUIRED_COLUMNS`) and the other columns below at their exact
+    # `information_schema` types, and scopes every statement to
+    # `loader = 'discogs'` — which is why the column is declared here rather
+    # than omitted. It also verifies via `pg_constraint` that a PRIMARY KEY
+    # or UNIQUE constraint spans exactly (loader, version); a bare unique
+    # index is declined by design.
     # The relation is named for the loader family, not for one loader, so
-    # musicbrainz-sql-loader can share it under the same `loader` value
-    # convention ('discogs', 'musicbrainz'); see docs/architecture.md.
+    # musicbrainz-sql-loader can write `loader = 'musicbrainz'` rows into the
+    # same relation when it adopts the pattern; see docs/architecture.md.
     (
         "loader_extraction_latch table",
         """
