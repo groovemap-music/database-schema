@@ -3275,12 +3275,16 @@ SELECT genre.name AS name,
           FROM graph.in_genre AS edge
           JOIN graph.on_label AS on_label ON on_label.release_id = edge.release_id
          WHERE edge.genre_name = genre.name) AS label_count,
-       (SELECT count(*) FROM graph.part_of AS part WHERE part.genre_name = genre.name) AS style_count,
-       (SELECT min(NULLIF(btrim(release.year), '')::integer)
+       (SELECT count(DISTINCT in_style.style_name)
+          FROM graph.in_genre AS in_genre
+          JOIN graph.in_style AS in_style ON in_style.release_id = in_genre.release_id
+         WHERE in_genre.genre_name = genre.name) AS style_count,
+       (SELECT min(btrim(release.year)::integer)
           FROM graph.in_genre AS edge
           JOIN graph.release AS release ON release.release_id = edge.release_id
          WHERE edge.genre_name = genre.name
-           AND btrim(release.year) ~ '^[0-9]{4}$') AS first_year
+           AND btrim(release.year) ~ '^[0-9]+$'
+           AND btrim(release.year)::numeric > 0) AS first_year
 FROM graph.genre AS genre
 """,
     "style_stats": """
@@ -3294,23 +3298,32 @@ SELECT style.name AS name,
           FROM graph.in_style AS edge
           JOIN graph.on_label AS on_label ON on_label.release_id = edge.release_id
          WHERE edge.style_name = style.name) AS label_count,
-       (SELECT count(*) FROM graph.part_of AS part WHERE part.style_name = style.name) AS genre_count,
-       (SELECT min(NULLIF(btrim(release.year), '')::integer)
+       (SELECT count(DISTINCT in_genre.genre_name)
+          FROM graph.in_style AS in_style
+          JOIN graph.in_genre AS in_genre ON in_genre.release_id = in_style.release_id
+         WHERE in_style.style_name = style.name) AS genre_count,
+       (SELECT min(btrim(release.year)::integer)
           FROM graph.in_style AS edge
           JOIN graph.release AS release ON release.release_id = edge.release_id
          WHERE edge.style_name = style.name
-           AND btrim(release.year) ~ '^[0-9]{4}$') AS first_year
+           AND btrim(release.year) ~ '^[0-9]+$'
+           AND btrim(release.year)::numeric > 0) AS first_year
 FROM graph.style AS style
 """,
     "label_stats": """
-SELECT on_label.label_id AS label_id,
-       count(DISTINCT on_label.release_id) AS release_count,
-       count(DISTINCT by_artist.artist_id) AS artist_count,
-       count(DISTINCT in_genre.genre_name) AS genre_count
-FROM graph.on_label AS on_label
-LEFT JOIN graph.by_artist AS by_artist ON by_artist.release_id = on_label.release_id
-LEFT JOIN graph.in_genre AS in_genre ON in_genre.release_id = on_label.release_id
-GROUP BY on_label.label_id
+SELECT label.label_id AS label_id,
+       (SELECT count(DISTINCT on_label.release_id)
+          FROM graph.on_label AS on_label
+         WHERE on_label.label_id = label.label_id) AS release_count,
+       (SELECT count(DISTINCT by_artist.artist_id)
+          FROM graph.on_label AS on_label
+          JOIN graph.by_artist AS by_artist ON by_artist.release_id = on_label.release_id
+         WHERE on_label.label_id = label.label_id) AS artist_count,
+       (SELECT count(DISTINCT in_genre.genre_name)
+          FROM graph.on_label AS on_label
+          JOIN graph.in_genre AS in_genre ON in_genre.release_id = on_label.release_id
+         WHERE on_label.label_id = label.label_id) AS genre_count
+FROM graph.label AS label
 """,
     # Every edge a Neo4j `:Artist` node carries, counted undirected exactly as
     # `COUNT { (a)--() }` does.
@@ -3453,7 +3466,7 @@ _COUNTER_COLUMNS: dict[str, tuple[str, ...]] = {
 #
 # - **Vertices before edges.** `part_of` and `in_family` inner-join the vertex
 #   tables, so an edge written before its endpoints exist is silently absent
-#   rather than wrong, and `genre_stats` reads `part_of`.
+#   rather than wrong; `label_stats` also drives from the complete label vertex.
 # - **Edges before counters.** Every counter's count is a sum over the edge
 #   tables — genre_stats and style_stats also join graph.release for
 #   first_year, a document-backed view, but the counts themselves read no

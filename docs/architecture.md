@@ -1636,6 +1636,18 @@ JSONB document directly — `genre_stats` and `style_stats` do join `graph.relea
 `first_year`, a document-backed view, but that lookup is a `min` over an indexed column, not a
 count — which is what keeps the pass affordable.
 
+The Discogs importer owns record cleaning before either backend sees a document. Its optional
+rules can remove rejected genre values and null implausible years before publication, and the
+always-on consumer normalizer applies the authoritative year plausibility bound. The counter
+bodies therefore consume the normalized edge tables rather than duplicating those rules.
+`style_count` and `genre_count` count distinct tags co-occurring on a release, matching
+`graphinator.compute_genre_style_stats`; they deliberately do not count `graph.part_of`, whose
+single-genre guard expresses the narrower claim that a style belongs to one unambiguous genre.
+Likewise, `first_year` accepts any positive decimal year as Neo4j does, while upstream
+normalization determines which years are plausible enough to persist. `label_stats` is driven
+from `graph.label`, so every imported label receives explicit zero counts even when no release
+names it.
+
 **Four of them read back as properties of the label Neo4j carries them on.** That is the
 parity claim and it is the point of the whole arrangement: `MATCH (g IS genre) COLUMNS
 (g.release_count)` reads exactly as the Cypher it replaces, and no query has to learn a second
