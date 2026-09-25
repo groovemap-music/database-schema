@@ -286,6 +286,12 @@ EXPECTED_GRAPH_COLUMNS = {
     ("graph", "label_genre", "label_id", "text"),
     ("graph", "mb_artist", "mbid", "uuid"),
     ("graph", "mb_release", "mbid", "uuid"),
+    # The native id each MusicBrainz vertex shares, by name and type, with the
+    # Discogs vertices (design ADR 0012's amendment, section 3).
+    ("graph", "mb_artist", "gm_item_id", "uuid"),
+    ("graph", "mb_label", "gm_item_id", "uuid"),
+    ("graph", "mb_release", "gm_item_id", "uuid"),
+    ("graph", "mb_release_group", "gm_item_id", "uuid"),
     ("graph", "mb_rel_artist_artist", "source_mbid", "uuid"),
     ("graph", "mb_rel_artist_artist", "target_mbid", "uuid"),
     ("graph", "mb_rel_artist_artist", "relationship_type", "text"),
@@ -3412,3 +3418,64 @@ async def test_supersession_and_dependent_indexes_exist() -> None:
     assert "UNIQUE" in definitions["idx_catalog_item_supersessions_superseded_id"]
     assert definitions["idx_catalog_item_supersessions_superseded_id"].endswith("WHERE (valid_to IS NULL)")
     assert "idx_catalog_item_moves_user_id" in definitions
+
+
+# ── The MusicBrainz vertices' native id (design ADR 0012 amendment, section 3) ─
+
+_MB_VERTEX_TABLES = (
+    ("mb_artist", "artists"),
+    ("mb_label", "labels"),
+    ("mb_release", "releases"),
+    ("mb_release_group", "release_groups"),
+)
+
+
+@pytest.mark.asyncio
+async def test_every_musicbrainz_vertex_publishes_its_gm_item_id() -> None:
+    """Each `mb_*` view reads `gm_item_id` off its table, and on PostgreSQL 19 the label carries it.
+
+    A fresh database is used because the suite's shared one can hold a
+    `graph.catalog` that an earlier test pruned: dropping `graph.mb_label` with
+    CASCADE removes its element, and a re-apply never re-declares an existing
+    graph.
+    """
+    admin_params = initializer._postgres_connection_params()
+    database = f"mb_gm_item_id_{uuid4().hex[:12]}"
+    admin_connection = await psycopg.AsyncConnection.connect(**{**admin_params, "dbname": "postgres"}, autocommit=True)
+    try:
+        await admin_connection.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
+        assert await initializer._apply_postgres_schema({**admin_params, "dbname": database}) is True
+
+        seeded: dict[str, tuple[Any, Any]] = {}
+        connection = await psycopg.AsyncConnection.connect(**{**admin_params, "dbname": database}, autocommit=True)
+        async with connection, connection.cursor() as cursor:
+            for label, table in _MB_VERTEX_TABLES:
+                kind = {"artists": "artist", "labels": "label", "releases": "release", "release_groups": "master"}[table]
+                await cursor.execute("INSERT INTO catalog_items (kind) VALUES (%s) RETURNING id", (kind,))
+                item_id = (await cursor.fetchone() or (None,))[0]
+                mbid = uuid4()
+                await cursor.execute(
+                    sql.SQL("INSERT INTO musicbrainz.{} (mbid, name, gm_item_id) VALUES (%s, %s, %s)").format(sql.Identifier(table)),
+                    (mbid, f"gm-item-id {label}", item_id),
+                )
+                seeded[label] = (mbid, item_id)
+
+        for label, (mbid, item_id) in seeded.items():
+            # `label` is one of the four view names in `_MB_VERTEX_TABLES`.
+            assert await _rows_in(database, f"SELECT gm_item_id FROM graph.{label} WHERE mbid = %s", (mbid,)) == [(item_id,)]  # noqa: S608
+
+        if await server_version_num() < PROPERTY_GRAPH_MINIMUM_SERVER_VERSION:
+            return
+        for label, (mbid, item_id) in seeded.items():
+            # Same constant label; GRAPH_TABLE takes no bind parameter for a label.
+            query = f"""
+                SELECT * FROM GRAPH_TABLE (graph.catalog
+                    MATCH (v IS {label})
+                    WHERE v.mbid = %s
+                    COLUMNS (v.gm_item_id AS gm_item_id)
+                )
+            """  # noqa: S608
+            assert await _rows_in(database, query, (mbid,)) == [(item_id,)], label
+    finally:
+        await admin_connection.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(database)))
+        await admin_connection.close()

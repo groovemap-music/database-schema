@@ -630,10 +630,10 @@ column in this table are unchanged by that; the projection only adds columns. Se
 | `:MediaFamily` | `graph.media_family` | **table** | `name` | — |
 | `:User` | `graph.app_user` | view | `user_id` | `is_active`, `is_admin`, `created_at`, `updated_at` |
 | (native identity) | `graph.catalog_item` | view | `item_id` | `kind`, `created_at` |
-| (MusicBrainz artist) | `graph.mb_artist` | view | `mbid` | `name`, `sort_name`, `type`, `gender`, `begin_date`, `end_date`, `ended`, `area`, `begin_area`, `end_area`, `disambiguation`, `discogs_artist_id`, `updated_at` |
-| (MusicBrainz label) | `graph.mb_label` | view | `mbid` | `name`, `type`, `label_code`, `begin_date`, `end_date`, `ended`, `area`, `disambiguation`, `discogs_label_id`, `updated_at` |
-| (MusicBrainz release) | `graph.mb_release` | view | `mbid` | `name`, `barcode`, `status`, `release_group_mbid`, `discogs_release_id`, `media_families`, `updated_at` |
-| (MusicBrainz release group) | `graph.mb_release_group` | view | `mbid` | `name`, `type`, `secondary_types`, `first_release_date`, `disambiguation`, `discogs_master_id`, `updated_at` |
+| (MusicBrainz artist) | `graph.mb_artist` | view | `mbid` | `name`, `sort_name`, `type`, `gender`, `begin_date`, `end_date`, `ended`, `area`, `begin_area`, `end_area`, `disambiguation`, `discogs_artist_id`, `updated_at`, `gm_item_id` |
+| (MusicBrainz label) | `graph.mb_label` | view | `mbid` | `name`, `type`, `label_code`, `begin_date`, `end_date`, `ended`, `area`, `disambiguation`, `discogs_label_id`, `updated_at`, `gm_item_id` |
+| (MusicBrainz release) | `graph.mb_release` | view | `mbid` | `name`, `barcode`, `status`, `release_group_mbid`, `discogs_release_id`, `media_families`, `updated_at`, `gm_item_id` |
+| (MusicBrainz release group) | `graph.mb_release_group` | view | `mbid` | `name`, `type`, `secondary_types`, `first_release_date`, `disambiguation`, `discogs_master_id`, `updated_at`, `gm_item_id` |
 
 The six name-keyed vertex relations are tables because their views were the most expensive
 relations in the schema and could not carry an index. Each was a `SELECT DISTINCT` over a full
@@ -1392,7 +1392,7 @@ CREATE PROPERTY GRAPH graph.catalog
         graph.mb_artist AS mb_artist KEY (mbid)
             LABEL mb_artist PROPERTIES ALL COLUMNS,
         graph.mb_label AS mb_label KEY (mbid)
-            LABEL mb_label PROPERTIES (mbid, name, type, label_code, begin_date, end_date, ended, area, disambiguation, discogs_label_id::text AS discogs_label_id, updated_at),
+            LABEL mb_label PROPERTIES (mbid, name, type, label_code, begin_date, end_date, ended, area, disambiguation, discogs_label_id::text AS discogs_label_id, updated_at, gm_item_id),
         graph.mb_release AS mb_release KEY (mbid)
             LABEL mb_release PROPERTIES ALL COLUMNS,
         graph.mb_release_group AS mb_release_group KEY (mbid)

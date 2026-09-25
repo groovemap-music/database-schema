@@ -1971,7 +1971,15 @@ _MUSICBRAINZ_GRAPH_ENTITIES: list[tuple[str, str, str]] = [
 
 
 def _musicbrainz_vertex_views() -> list[tuple[str, str]]:
-    """Return the vertex views over the four MusicBrainz catalog tables."""
+    """Return the vertex views over the four MusicBrainz catalog tables.
+
+    Each publishes its table's `gm_item_id` last, under the name and `uuid` type
+    the Discogs vertices already use, so a reader can relate an `mb_release` to
+    the Discogs `release` it describes by native id (design ADR 0012's
+    amendment, section 3). It is appended because `CREATE OR REPLACE VIEW` may
+    only add a column at the end; `discogs_release_id` and its siblings stay as
+    the catalog's own assertion.
+    """
     return [
         _view(
             "mb_artist",
@@ -1989,7 +1997,8 @@ SELECT artists.mbid              AS mbid,
        artists.end_area          AS end_area,
        artists.disambiguation    AS disambiguation,
        artists.discogs_artist_id AS discogs_artist_id,
-       artists.updated_at        AS updated_at
+       artists.updated_at        AS updated_at,
+       artists.gm_item_id        AS gm_item_id
 FROM musicbrainz.artists AS artists
 """,
         ),
@@ -2006,7 +2015,8 @@ SELECT labels.mbid             AS mbid,
        labels.area             AS area,
        labels.disambiguation   AS disambiguation,
        labels.discogs_label_id AS discogs_label_id,
-       labels.updated_at       AS updated_at
+       labels.updated_at       AS updated_at,
+       labels.gm_item_id       AS gm_item_id
 FROM musicbrainz.labels AS labels
 """,
         ),
@@ -2020,7 +2030,8 @@ SELECT releases.mbid               AS mbid,
        releases.release_group_mbid AS release_group_mbid,
        releases.discogs_release_id AS discogs_release_id,
        {_text_array("releases.media -> 'families'")} AS media_families,
-       releases.updated_at         AS updated_at
+       releases.updated_at         AS updated_at,
+       releases.gm_item_id         AS gm_item_id
 FROM musicbrainz.releases AS releases
 """,  # noqa: S608
         ),
@@ -2034,7 +2045,8 @@ SELECT release_groups.mbid               AS mbid,
        release_groups.first_release_date AS first_release_date,
        release_groups.disambiguation     AS disambiguation,
        release_groups.discogs_master_id  AS discogs_master_id,
-       release_groups.updated_at         AS updated_at
+       release_groups.updated_at         AS updated_at,
+       release_groups.gm_item_id         AS gm_item_id
 FROM musicbrainz.release_groups AS release_groups
 """,
         ),
@@ -4731,6 +4743,7 @@ def _property_graph_vertices() -> tuple[_PropertyGraphVertex, ...]:
                 "disambiguation",
                 "discogs_label_id::text AS discogs_label_id",
                 "updated_at",
+                "gm_item_id",
             ),
         ),
         _PropertyGraphVertex("mb_release", ("mbid",)),

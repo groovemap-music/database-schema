@@ -1781,3 +1781,36 @@ class TestPropertyGraphDocumentation:
         assert documented.rstrip().endswith(");")
         for element in (*_property_graph_vertices(), *_property_graph_edges()):
             assert f"graph.{element.element} AS {element.view} " in documented, element.view
+
+
+class TestMusicBrainzVerticesPublishGmItemId:
+    """Each `mb_*` vertex gains `gm_item_id` (design ADR 0012's amendment, section 3)."""
+
+    def test_each_view_appends_its_tables_gm_item_id(self) -> None:
+        for view, table in (
+            ("mb_artist", "artists"),
+            ("mb_label", "labels"),
+            ("mb_release", "releases"),
+            ("mb_release_group", "release_groups"),
+        ):
+            statement = statement_for(view)
+            assert re.search(rf"{table}\.gm_item_id\s+AS gm_item_id\nFROM musicbrainz\.{table} AS {table}", statement), view
+
+    def test_the_discogs_assertions_stay(self) -> None:
+        for view, column in (
+            ("mb_artist", "discogs_artist_id"),
+            ("mb_label", "discogs_label_id"),
+            ("mb_release", "discogs_release_id"),
+            ("mb_release_group", "discogs_master_id"),
+        ):
+            assert f"AS {column}" in statement_for(view), view
+
+    def test_the_explicit_mb_label_property_list_carries_it(self) -> None:
+        vertex = next(vertex for vertex in _property_graph_vertices() if vertex.view == "mb_label")
+        assert vertex.properties is not None
+        assert "gm_item_id" in vertex.properties
+
+    def test_the_other_mb_labels_publish_all_columns(self) -> None:
+        for vertex in _property_graph_vertices():
+            if vertex.view in {"mb_artist", "mb_release", "mb_release_group"}:
+                assert vertex.properties is None, vertex.view
