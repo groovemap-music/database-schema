@@ -6,6 +6,10 @@ All notable changes to the GrooveMap database schema will be documented here.
 
 ### Feat
 
+- **identity**: add `catalog_item_supersessions`, the `catalog_item_moves` ledger, and the
+  `resolve_catalog_item(native_id)` one-hop resolution for ADR 0009's 2026-09-25 native-id
+  merge amendment; `graph.catalog_item` now excludes currently superseded items, and
+  `artifacts.item_id` and `owned_copies.item_id` are indexed for the merge's re-point
 - **loader-latch**: add `loader_extraction_latch` as the loader family's durable
   extraction-complete latch, keyed on `(loader, version)`, for `discogs-sql-loader`'s
   post-import counter refresh and reconciliation pass, matching the exact name, column

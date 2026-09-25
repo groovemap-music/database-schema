@@ -10,6 +10,65 @@
     "tested_commit": "6e84fe9acfd9551bd3bba2f2e78fef0ec1ef38ef",
     "tested_version": "0.1.0"
   },
+  "catalog_item_supersession": {
+    "consumers": [
+      "catalog-api",
+      "analytics-engine"
+    ],
+    "dependent_indexes": [
+      "idx_artifacts_item_id",
+      "idx_owned_copies_item_id"
+    ],
+    "design_decision": "Declared exactly as design ADR 0009's 2026-09-25 amendment ('Superseded catalog items and native-id merge') names it, so catalog-api can code its merge steps 4-7 to the record. The resolution is a function rather than a view because it is defined for any native id, including ids with no catalog_items row (activity.impressions.item_id and the outcome endpoint record ids verbatim); a view keyed on catalog_items would drop those or push the COALESCE into every reader. catalog_item_moves carries from_item_id and to_item_id beside the amendment's columns, so a revert moves a row back only while it still points at to_item_id.",
+    "introduced_in_contract_version": 1,
+    "kind": "additive",
+    "ledger": {
+      "columns": [
+        "supersession_id",
+        "table_name",
+        "row_id",
+        "from_item_id",
+        "to_item_id",
+        "user_id",
+        "moved_at"
+      ],
+      "erasure": "personal data keyed to user_id: the erasure procedure deletes a user's rows and export includes them; deleting the users row cascades",
+      "relation": "public.catalog_item_moves",
+      "tables": [
+        "artifacts",
+        "owned_copies"
+      ],
+      "unique": [
+        "supersession_id",
+        "table_name",
+        "row_id"
+      ]
+    },
+    "note": "A superseded catalog item keeps its catalog_items row; a supersession row records its current survivor, closed by valid_to on revert. Resolution is always one hop: when a survivor is itself superseded, the writer closes the old row and opens one to the new survivor naming the compressing row as via_id. graph.catalog_item excludes currently superseded items. This repository declares the shape only; catalog-api writes every row inside the ADR 0014 transactions and enforces that both items share a kind.",
+    "resolution": {
+      "function": "public.resolve_catalog_item(native_id uuid) RETURNS uuid",
+      "meaning": "the survivor_id of native_id's current supersession row, or native_id itself when there is none; one probe of the current-survivor index",
+      "volatility": "STABLE STRICT PARALLEL SAFE"
+    },
+    "supersessions": {
+      "causes": [
+        "edition_promotion",
+        "catalog_reattachment"
+      ],
+      "columns": [
+        "superseded_id",
+        "survivor_id",
+        "cause",
+        "decision_ref",
+        "valid_from",
+        "valid_to",
+        "via_id"
+      ],
+      "current_survivor_index": "UNIQUE (superseded_id) WHERE valid_to IS NULL",
+      "decision_ref": "the matching decision row for edition_promotion, the admin_audit_log entry for catalog_reattachment; not a foreign key",
+      "relation": "public.catalog_item_supersessions"
+    }
+  },
   "compatibility": {
     "additive_changes": "compatible",
     "consumer_rollout": "expand, migrate consumers, then contract",
