@@ -11,6 +11,7 @@ import pytest
 from common.credit_roles import categorize_role
 from common.media import medium_ids, medium_label
 from neo4j import AsyncGraphDatabase
+from psycopg import sql
 from psycopg.types.json import Jsonb
 
 from groovemap_schema import initializer
@@ -2833,3 +2834,87 @@ async def test_the_artist_embeddings_table_orders_rows_by_exact_cosine_distance(
         (marker, query_vector),
     )
     assert ordered == [(near,), (mid,), (far,)]
+
+
+# ── "available but not superuser" (PG19 tier only) ────────────────────────────
+
+
+async def _rows_in(database: str, query: str, parameters: tuple[Any, ...] = ()) -> list[tuple[Any, ...]]:
+    """Query DATABASE, rather than the suite's default database, once."""
+    params = {**initializer._postgres_connection_params(), "dbname": database}
+    connection = await psycopg.AsyncConnection.connect(**params)
+    async with connection, connection.cursor() as cursor:
+        await cursor.execute(query, parameters)
+        return await cursor.fetchall()
+
+
+@pytest.mark.asyncio
+async def test_available_but_not_superuser_skips_the_extension_with_zero_failures() -> None:
+    """pgvector is available but the connecting role cannot install it (not a
+    superuser, and `vector` carries no `trusted = true`) — the schema still
+    initializes cleanly, with the extension and `artist_embeddings` skipped
+    rather than failed.
+
+    A fresh, owned-by-the-test-role database is used so the extension is
+    genuinely not-yet-installed there, unlike the suite's shared database
+    (already initialized as a superuser by `apply_schema` elsewhere in this
+    file).
+    """
+    if not await vector_extension_present():
+        pytest.skip("pgvector is not installed on this tier; this scenario only exists when it is available")
+
+    admin_params = initializer._postgres_connection_params()
+    role = f"embed_test_nonsuper_{uuid4().hex[:12]}"
+    password = uuid4().hex
+    database = f"embed_test_db_{uuid4().hex[:12]}"
+
+    admin_connection = await psycopg.AsyncConnection.connect(**{**admin_params, "dbname": "postgres"}, autocommit=True)
+    try:
+        async with admin_connection.cursor() as cursor:
+            # NOSUPERUSER, and no CREATEROLE either: this role also exercises
+            # the pipeline role's own guard, which must skip it too, without
+            # that skip counting as a failure either.
+            await cursor.execute(
+                sql.SQL("CREATE ROLE {role} LOGIN PASSWORD {password} NOSUPERUSER NOCREATEROLE").format(
+                    role=sql.Identifier(role), password=sql.Literal(password)
+                )
+            )
+            # PostgreSQL 15+ makes a database's `public` schema owned by
+            # `pg_database_owner`, whose membership tracks the database's own
+            # owner — so making the test role the owner is what gives it
+            # CREATE on `public` (and every schema it creates itself) without
+            # granting it superuser or any catalog-wide privilege.
+            await cursor.execute(
+                sql.SQL("CREATE DATABASE {database} OWNER {role}").format(database=sql.Identifier(database), role=sql.Identifier(role))
+            )
+
+        nonsuper_params = {**admin_params, "dbname": database, "user": role, "password": password}
+        succeeded = await initializer._apply_postgres_schema(nonsuper_params)
+        assert succeeded is True, "a non-superuser connection must still leave the schema healthy (zero failures)"
+
+        assert await _rows_in(database, "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector')") == [(False,)]
+        assert (
+            await _rows_in(
+                database,
+                "SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'artist_embeddings'",
+            )
+            == []
+        )
+        # `pg_roles` is cluster-wide, not per-database, so `embedding_pipeline`
+        # is visible here regardless of this run (the suite's earlier,
+        # superuser passes already created it against the shared database).
+        # What this run's own CREATEROLE guard controls is whether it granted
+        # that role anything in *this* database's `graph` schema — and here it
+        # must not have, since the test role holds no CREATEROLE either.
+        assert (
+            await _rows_in(
+                database,
+                "SELECT 1 FROM information_schema.role_table_grants WHERE grantee = %s AND table_schema = 'graph'",
+                (EMBEDDING_PIPELINE_ROLE,),
+            )
+            == []
+        )
+    finally:
+        await admin_connection.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(database)))
+        await admin_connection.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(role)))
+        await admin_connection.close()

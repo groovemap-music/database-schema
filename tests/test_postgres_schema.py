@@ -12,6 +12,7 @@ from groovemap_schema.postgres import (
     _ENTITY_TABLES,
     _GRAPH_STATEMENTS,
     _INSIGHTS_TABLES,
+    _IS_SUPERUSER_QUERY,
     _MUSICBRAINZ_INDEXES,
     _MUSICBRAINZ_TABLES,
     _PIPELINE_ROLE_STATEMENTS,
@@ -319,9 +320,11 @@ class TestCreatePostgresSchema:
             + len(_MUSICBRAINZ_TABLES)
             + len(_MUSICBRAINZ_INDEXES)
             + len(_GRAPH_STATEMENTS)
-            # `_apply_vector_schema` always probes pg_available_extensions and
-            # pg_roles once each, even when both guards end up closed.
-            + 2
+            # `_apply_vector_schema` always probes pg_extension and pg_roles
+            # (CREATEROLE); with the shared fixture's default (False), the
+            # extension gate also probes pg_available_extensions before
+            # closing, since it is not yet installed.
+            + 3
         )
         assert cursor.execute.await_count == expected_calls
 
@@ -351,9 +354,11 @@ class TestCreatePostgresSchema:
             + len(_MUSICBRAINZ_TABLES)
             + len(_MUSICBRAINZ_INDEXES)
             + len(_GRAPH_STATEMENTS)
-            # `_apply_vector_schema` always probes pg_available_extensions and
-            # pg_roles once each, even when both guards end up closed.
-            + 2
+            # `_apply_vector_schema` always probes pg_extension and pg_roles
+            # (CREATEROLE); with the shared fixture's default (False), the
+            # extension gate also probes pg_available_extensions before
+            # closing, since it is not yet installed.
+            + 3
         )
         assert cursor.execute.await_count == expected_calls
 
@@ -415,9 +420,11 @@ class TestCreatePostgresSchema:
             + len(_MUSICBRAINZ_TABLES)
             + len(_MUSICBRAINZ_INDEXES)
             + len(_GRAPH_STATEMENTS)
-            # `_apply_vector_schema` always probes pg_available_extensions and
-            # pg_roles once each, even when both guards end up closed.
-            + 2
+            # `_apply_vector_schema` always probes pg_extension and pg_roles
+            # (CREATEROLE); with the shared fixture's default (False), the
+            # extension gate also probes pg_available_extensions before
+            # closing, since it is not yet installed.
+            + 3
         )
         assert cursor.execute.await_count == expected_calls
 
@@ -581,28 +588,44 @@ class TestApplyPropertyGraph:
 
 
 class TestVectorSchemaSkipReasons:
-    """The two independent guards, and the one grant that needs both."""
+    """The three-state extension gate, the independent role gate, and the one grant that needs both."""
 
-    def test_pgvector_absent_is_the_extension_reason(self) -> None:
-        reasons = _vector_schema_skip_reasons(vector_available=False, can_create_role=True)
+    def test_already_installed_ignores_availability_and_superuser(self) -> None:
+        """Once installed, nothing else about the extension gate matters."""
+        reasons = _vector_schema_skip_reasons(vector_installed=True, vector_available=False, is_superuser=False, can_create_role=True)
+        assert reasons["extension"] is None
+
+    def test_unavailable_is_the_first_extension_reason(self) -> None:
+        reasons = _vector_schema_skip_reasons(vector_installed=False, vector_available=False, is_superuser=False, can_create_role=True)
         assert reasons["extension"] == f"{VECTOR_EXTENSION} extension is not available on this server"
         assert reasons["role"] is None
         assert reasons["embedding_grant"] == reasons["extension"]
 
+    def test_available_but_not_superuser_is_the_second_extension_reason(self) -> None:
+        """`vector` carries no `trusted = true`, unlike `pg_trgm`."""
+        reasons = _vector_schema_skip_reasons(vector_installed=False, vector_available=True, is_superuser=False, can_create_role=True)
+        assert reasons["extension"] is not None
+        assert "not a superuser" in reasons["extension"]
+        assert reasons["embedding_grant"] == reasons["extension"]
+
+    def test_available_and_superuser_installs_it(self) -> None:
+        reasons = _vector_schema_skip_reasons(vector_installed=False, vector_available=True, is_superuser=True, can_create_role=True)
+        assert reasons["extension"] is None
+
     def test_missing_createrole_is_the_role_reason(self) -> None:
-        reasons = _vector_schema_skip_reasons(vector_available=True, can_create_role=False)
+        reasons = _vector_schema_skip_reasons(vector_installed=True, vector_available=True, is_superuser=True, can_create_role=False)
         assert reasons["extension"] is None
         assert reasons["role"] == "connecting role lacks CREATEROLE"
         assert reasons["embedding_grant"] == reasons["role"]
 
-    def test_both_closed_reports_the_extension_reason_on_the_shared_grant(self) -> None:
-        reasons = _vector_schema_skip_reasons(vector_available=False, can_create_role=False)
+    def test_both_gates_closed_reports_the_extension_reason_on_the_shared_grant(self) -> None:
+        reasons = _vector_schema_skip_reasons(vector_installed=False, vector_available=False, is_superuser=False, can_create_role=False)
         assert reasons["extension"] is not None
         assert reasons["role"] is not None
         assert reasons["embedding_grant"] == reasons["extension"]
 
-    def test_both_open_creates_everything(self) -> None:
-        reasons = _vector_schema_skip_reasons(vector_available=True, can_create_role=True)
+    def test_both_gates_open_creates_everything(self) -> None:
+        reasons = _vector_schema_skip_reasons(vector_installed=True, vector_available=True, is_superuser=True, can_create_role=True)
         assert reasons == {"extension": None, "role": None, "embedding_grant": None}
 
 
@@ -638,7 +661,13 @@ class TestArtistEmbeddingsStatement:
 
 
 class TestApplyVectorSchema:
-    """The gate as the initializer runs it, against the shared cursor fake."""
+    """The gate as the initializer runs it, against the shared cursor fake.
+
+    Probe order and count depend on the branch: `_vector_extension_installed`
+    always runs first; `_vector_extension_available` only when not installed;
+    `_is_superuser` only when not installed but available; `_can_create_role`
+    always runs, independent of the other three.
+    """
 
     @staticmethod
     def _cursor(rows: list[Any]) -> AsyncMock:
@@ -652,18 +681,52 @@ class TestApplyVectorSchema:
         return [str(call.args[0]) for call in cursor.execute.await_args_list]
 
     @pytest.mark.asyncio
-    async def test_pgvector_absent_skips_the_extension_table_and_grant(self) -> None:
-        cursor = self._cursor([(False,), (True,)])  # extension unavailable, CREATEROLE present
+    async def test_already_installed_creates_the_table_regardless_of_superuser(self) -> None:
+        # installed=True (superuser/available never probed), CREATEROLE present
+        cursor = self._cursor([(True,), (True,)])
 
         assert await _apply_vector_schema(cursor) == 0
         statements = self._statements(cursor)
-        assert len(statements) == 2 + len(_PIPELINE_ROLE_STATEMENTS)
+        # 2 probes (installed, role) + the vector schema's 3 statements + the role's 3 + the shared grant
+        assert len(statements) == 2 + len(_VECTOR_SCHEMA_STATEMENTS) + len(_PIPELINE_ROLE_STATEMENTS) + 1
+        assert statements[-1] == _EMBEDDINGS_TABLE_GRANT[1]
+
+    @pytest.mark.asyncio
+    async def test_unavailable_skips_the_extension_table_and_grant(self) -> None:
+        # installed=False, available=False (superuser never probed), CREATEROLE present
+        cursor = self._cursor([(False,), (False,), (True,)])
+
+        assert await _apply_vector_schema(cursor) == 0
+        statements = self._statements(cursor)
+        assert len(statements) == 3 + len(_PIPELINE_ROLE_STATEMENTS)
         assert not any("CREATE EXTENSION" in s.upper() for s in statements)
         assert not any("artist_embeddings" in s for s in statements)
 
     @pytest.mark.asyncio
+    async def test_available_but_not_superuser_skips_the_extension_table_and_grant(self) -> None:
+        # installed=False, available=True, superuser=False, CREATEROLE present
+        cursor = self._cursor([(False,), (True,), (False,), (True,)])
+
+        assert await _apply_vector_schema(cursor) == 0
+        statements = self._statements(cursor)
+        assert len(statements) == 4 + len(_PIPELINE_ROLE_STATEMENTS)
+        assert not any("CREATE EXTENSION" in s.upper() for s in statements)
+        assert not any("artist_embeddings" in s for s in statements)
+
+    @pytest.mark.asyncio
+    async def test_available_and_superuser_installs_and_creates_everything(self) -> None:
+        # installed=False, available=True, superuser=True, CREATEROLE present
+        cursor = self._cursor([(False,), (True,), (True,), (True,)])
+
+        assert await _apply_vector_schema(cursor) == 0
+        statements = self._statements(cursor)
+        assert len(statements) == 4 + len(_VECTOR_SCHEMA_STATEMENTS) + len(_PIPELINE_ROLE_STATEMENTS) + 1
+        assert statements[-1] == _EMBEDDINGS_TABLE_GRANT[1]
+
+    @pytest.mark.asyncio
     async def test_missing_createrole_skips_the_role_and_its_grants(self) -> None:
-        cursor = self._cursor([(True,), (False,)])  # pgvector available, CREATEROLE absent
+        # installed=True, CREATEROLE absent
+        cursor = self._cursor([(True,), (False,)])
 
         assert await _apply_vector_schema(cursor) == 0
         statements = self._statements(cursor)
@@ -671,20 +734,12 @@ class TestApplyVectorSchema:
         assert not any(EMBEDDING_PIPELINE_ROLE in s for s in statements)
 
     @pytest.mark.asyncio
-    async def test_both_guards_open_creates_everything_including_the_shared_grant(self) -> None:
-        cursor = self._cursor([(True,), (True,)])
+    async def test_both_gates_closed_only_probes(self) -> None:
+        # installed=False, available=False, CREATEROLE absent
+        cursor = self._cursor([(False,), (False,), (False,)])
 
         assert await _apply_vector_schema(cursor) == 0
-        statements = self._statements(cursor)
-        assert len(statements) == 2 + len(_VECTOR_SCHEMA_STATEMENTS) + len(_PIPELINE_ROLE_STATEMENTS) + 1
-        assert statements[-1] == _EMBEDDINGS_TABLE_GRANT[1]
-
-    @pytest.mark.asyncio
-    async def test_both_guards_closed_only_probes(self) -> None:
-        cursor = self._cursor([(False,), (False,)])
-
-        assert await _apply_vector_schema(cursor) == 0
-        assert len(self._statements(cursor)) == 2
+        assert len(self._statements(cursor)) == 3
 
     @pytest.mark.asyncio
     async def test_a_failing_statement_is_counted_rather_than_raised(self) -> None:
@@ -705,8 +760,21 @@ class TestApplyVectorSchema:
         assert await _apply_vector_schema(cursor) == 0
 
     @pytest.mark.asyncio
-    async def test_the_full_run_creates_nothing_when_both_guards_are_closed_by_default(self, mock_pool: MagicMock) -> None:
-        """`mock_pool`'s fetchone default (False) closes both guards."""
+    async def test_an_unreadable_superuser_probe_skips_rather_than_raises(self) -> None:
+        """Not installed, available, but the superuser probe itself fails."""
+        cursor = self._cursor([(False,), (True,), (True,)])
+
+        async def fail_on_the_superuser_probe(statement: Any, *_: Any, **__: Any) -> None:
+            if str(statement) == _IS_SUPERUSER_QUERY:
+                raise RuntimeError("Simulated PostgreSQL error")
+
+        cursor.execute = AsyncMock(side_effect=fail_on_the_superuser_probe)
+        assert await _apply_vector_schema(cursor) == 0
+        assert not any("artist_embeddings" in s for s in self._statements(cursor))
+
+    @pytest.mark.asyncio
+    async def test_the_full_run_creates_nothing_when_both_gates_are_closed_by_default(self, mock_pool: MagicMock) -> None:
+        """`mock_pool`'s fetchone default (False) closes both gates."""
         cursor = mock_pool.connection.return_value.__aenter__.return_value.cursor.return_value
         captured: list[str] = []
 

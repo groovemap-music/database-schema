@@ -1808,19 +1808,23 @@ HNSW index over the embedding column is a later bead; this one is exact-search o
 Both halves — the extension-and-table, and the role — are guarded, on two independent
 conditions, so a server missing either one still gets a working schema:
 
-- **pgvector's presence.** `pg_trgm` ships in every official PostgreSQL image, so its
-  `CREATE EXTENSION` statement never actually fails, and only the trigram indexes built on it
-  check `pg_extension` first (see Graph schema above). `vector` is not bundled, and the required
-  PostgreSQL 18 integration tier runs the bare official image, so its absence is the normal case
-  there rather than an edge case: attempting `CREATE EXTENSION` there and letting it fail would
-  count as a failed schema statement and fail the whole initializer (`_schema_succeeded` in
-  `initializer.py`). `_apply_vector_schema` in
-  [`src/groovemap_schema/postgres.py`](../src/groovemap_schema/postgres.py) instead checks
-  `pg_available_extensions` before attempting anything, and logs the skip reason for the
-  extension and `artist_embeddings` together when it is absent.
-- **`CREATEROLE`.** The pipeline role and its grants need it, exactly as the extension needs the
-  privilege to create one; a connecting role without it is a supported, working deployment, not a
-  failure. `_apply_vector_schema` checks `pg_roles` for the connecting role's `rolsuper` or
+- **pgvector's presence and privilege.** `pg_trgm`'s `.control` file carries `trusted = true`
+  and ships in every official PostgreSQL image, so its `CREATE EXTENSION` statement never
+  actually fails, and only the trigram indexes built on it check `pg_extension` first (see Graph
+  schema above). `vector`'s `.control` file carries no such line, so installing it — not merely
+  using it once installed — needs a superuser connection regardless of ordinary schema
+  privileges, and the required PostgreSQL 18 integration tier runs the bare official image, where
+  it is not even available. Attempting `CREATE EXTENSION` unconditionally and letting either case
+  fail would count as a failed schema statement and fail the whole initializer
+  (`_schema_succeeded` in `initializer.py`), so `_apply_vector_schema` in
+  [`src/groovemap_schema/postgres.py`](../src/groovemap_schema/postgres.py) checks this gate in
+  three states, cheapest first: already installed in `pg_extension` (every downstream statement
+  runs regardless of privilege — the ordinary `IF NOT EXISTS` case), not installed but available
+  in `pg_available_extensions` and the connecting role is a superuser (installs it), or anything
+  else (skips the extension and `artist_embeddings` together, with the reason logged).
+- **`CREATEROLE`.** The pipeline role and its grants need it, exactly as the extension needs
+  superuser; a connecting role without it is a supported, working deployment, not a failure.
+  `_apply_vector_schema` checks `pg_roles` for the connecting role's `rolsuper` or
   `rolcreaterole` before attempting `CREATE ROLE`.
 
 The two conditions compose for the one grant that needs both: the pipeline role's access to
@@ -1873,6 +1877,25 @@ The role holds nothing else: no privilege on `public`'s catalog document tables 
 "It holds no other privilege." The login that is a member of this role is provisioned where
 credentials live — `deployment` for development and CI, and the homelab for the shared
 production instance — never in this repository.
+
+The `SELECT` grant is schema-wide (`ALL TABLES IN SCHEMA graph`), which is broader than the ADR
+amendment's own wording — "`SELECT` on the graph edge and vertex relations it reads" — names.
+That is deliberate rather than an over-grant. Every relation the `graph` schema holds today is
+either a vertex or edge relation itself, or one of the small set of counter, degree, and
+aggregate relations (`graph.vertex_degree`, `graph.artist_degree`, `graph.genre_stats`, and
+similar; see `STORAGE_ONLY_RELATIONS` in
+[`tests/integration/test_real_schema_idempotence.py`](../tests/integration/test_real_schema_idempotence.py))
+that exist solely to back the same schema's own traversal functions over that graph — nothing
+unrelated to the catalog graph lives here (see Graph schema above). Naming every relation
+one by one in the grant would restate the schema's own contents rather than narrow it. The grant
+also stays exactly as narrow as the ADR intends in practice: a plain `SELECT` grant on a view is
+checked against the view's *owner* for the `public`/`musicbrainz` base tables underneath it, not
+against the querying role (PostgreSQL's default, non-`security_invoker` view semantics), so
+`embedding_pipeline` reaches nothing outside `graph` through the views it can query — it never
+needs, and is never granted, direct access to `artists`, `labels`, `musicbrainz.artists`, or any
+other base table. And the schema-wide form is what keeps the grant self-maintaining: a graph
+relation `_GRAPH_STATEMENTS` adds later is covered the next time the initializer runs, without
+this grant changing to name it.
 
 
 

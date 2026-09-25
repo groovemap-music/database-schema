@@ -4956,18 +4956,24 @@ async def _apply_property_graph(cursor: Any) -> int:
 # Both halves are guarded, on two independent conditions, so a server missing
 # either one still gets a working schema:
 #
-# - `pg_trgm` ships in every official PostgreSQL image, so its
-#   `CREATE EXTENSION` statement (`_PG_TRGM_STATEMENT`) never actually fails on
-#   one, and only the trigram indexes built on it check `pg_extension` first.
-#   `vector` is not bundled, and the required PostgreSQL 18 integration tier
-#   runs the bare official image, so its absence is the normal case there
-#   rather than an edge case. Attempting `CREATE EXTENSION` anyway and letting
-#   it fail would count as a failed schema statement and fail the whole
-#   initializer (see `_schema_succeeded` in `initializer.py`), so presence is
-#   checked in `pg_available_extensions` before anything that needs it runs.
-# - The pipeline role and its grants need `CREATEROLE`, exactly as an
-#   extension needs the privilege to create one; a connecting role without it
-#   is a supported, working deployment, not a failure.
+# - `pg_trgm` ships in every official PostgreSQL image and its `.control` file
+#   carries `trusted = true`, so its `CREATE EXTENSION` statement
+#   (`_PG_TRGM_STATEMENT`) never actually fails there, and only the trigram
+#   indexes built on it check `pg_extension` first. `vector`'s `.control` file
+#   carries no such line, so installing it (unlike using it once installed)
+#   needs a superuser connection regardless of ordinary schema privileges —
+#   and the required PostgreSQL 18 integration tier runs the bare official
+#   image, where it is not even available. Attempting `CREATE EXTENSION`
+#   unconditionally and letting either case fail would count as a failed
+#   schema statement and fail the whole initializer (see `_schema_succeeded`
+#   in `initializer.py`), so this gate has three states rather than two:
+#   already installed (every downstream statement runs regardless of
+#   privilege, the same as any other `IF NOT EXISTS` object in this module);
+#   installable but not yet installed, which additionally needs the
+#   connecting role to be a superuser; or unavailable outright.
+# - The pipeline role and its grants need `CREATEROLE`, exactly as the
+#   extension needs superuser; a connecting role without it is a supported,
+#   working deployment, not a failure.
 #
 # The two conditions compose for the one grant that needs both: the role's
 # access to `artist_embeddings` needs the role to exist and the table it
@@ -5065,6 +5071,25 @@ _EMBEDDINGS_TABLE_GRANT = (
     f"GRANT SELECT, INSERT, UPDATE, DELETE ON public.artist_embeddings TO {EMBEDDING_PIPELINE_ROLE}",
 )
 
+_VECTOR_EXTENSION_INSTALLED_QUERY = "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = %s)"
+
+
+async def _vector_extension_installed(cursor: Any) -> bool:
+    """Return whether `vector` is already installed on this database.
+
+    Checked first, and separately from availability: once installed, every
+    downstream statement runs regardless of the connecting role's privilege,
+    the same as any other `IF NOT EXISTS` object in this module.
+    """
+    try:
+        await cursor.execute(_VECTOR_EXTENSION_INSTALLED_QUERY, (VECTOR_EXTENSION,))
+        row = await cursor.fetchone()
+    except Exception as error:
+        logger.error("❌ Could not read pg_extension: %s", error)
+        return False
+    return bool(row is not None and row[0])
+
+
 _VECTOR_EXTENSION_AVAILABLE_QUERY = "SELECT EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = %s)"
 
 
@@ -5080,6 +5105,25 @@ async def _vector_extension_available(cursor: Any) -> bool:
         row = await cursor.fetchone()
     except Exception as error:
         logger.error("❌ Could not read pg_available_extensions: %s", error)
+        return False
+    return bool(row is not None and row[0])
+
+
+_IS_SUPERUSER_QUERY = "SELECT rolsuper FROM pg_roles WHERE rolname = current_user"
+
+
+async def _is_superuser(cursor: Any) -> bool:
+    """Return whether the connecting role is a superuser.
+
+    `vector`'s `.control` file carries no `trusted = true` line, unlike
+    `pg_trgm`'s, so installing it — not merely using it once installed — needs
+    a superuser connection no matter what schema privileges the role holds.
+    """
+    try:
+        await cursor.execute(_IS_SUPERUSER_QUERY)
+        row = await cursor.fetchone()
+    except Exception as error:
+        logger.error("❌ Could not read pg_roles: %s", error)
         return False
     return bool(row is not None and row[0])
 
@@ -5103,17 +5147,32 @@ async def _can_create_role(cursor: Any) -> bool:
     return bool(row is not None and row[0])
 
 
-def _vector_schema_skip_reasons(*, vector_available: bool, can_create_role: bool) -> dict[str, str | None]:
+def _vector_schema_skip_reasons(
+    *, vector_installed: bool, vector_available: bool, is_superuser: bool, can_create_role: bool
+) -> dict[str, str | None]:
     """Return why each guarded vector object is skipped, or None to create it.
 
-    Two independent gates, evaluated once each: pgvector's presence for the
-    extension and the embedding table (a `halfvec` column cannot even be
-    declared without it), and `CREATEROLE` for the pipeline role and its
-    graph-schema grant. The role's grant on `artist_embeddings` needs both —
-    the role to hold it and the table it names — so it carries whichever
-    reason applies.
+    The extension gate has three states, evaluated in cost order: already
+    installed (nothing else about it matters — every downstream statement
+    runs), not installed but installable by a superuser connection (`vector`
+    is not a trusted extension, unlike `pg_trgm`, so a role with only CREATE
+    on the target schema cannot install it even though it can use it once
+    installed), or unavailable outright. `CREATEROLE` is a second, independent
+    gate for the pipeline role and its graph-schema grant. The role's grant on
+    `artist_embeddings` needs both — the role to hold it and the table it
+    names — so it carries whichever reason applies.
     """
-    extension_reason = None if vector_available else f"{VECTOR_EXTENSION} extension is not available on this server"
+    if vector_installed:
+        extension_reason = None
+    elif not vector_available:
+        extension_reason = f"{VECTOR_EXTENSION} extension is not available on this server"
+    elif not is_superuser:
+        extension_reason = (
+            f"{VECTOR_EXTENSION} extension is not installed and the connecting role is not a superuser "
+            f"({VECTOR_EXTENSION} is not a trusted extension)"
+        )
+    else:
+        extension_reason = None
     role_reason = None if can_create_role else "connecting role lacks CREATEROLE"
     return {
         "extension": extension_reason,
@@ -5130,8 +5189,13 @@ async def _apply_vector_schema(cursor: Any) -> int:
     Returns the number of failed statements, on the same footing as every
     other schema statement `create_postgres_schema` runs.
     """
+    vector_installed = await _vector_extension_installed(cursor)
+    vector_available = True if vector_installed else await _vector_extension_available(cursor)
+    is_superuser = True if vector_installed else (await _is_superuser(cursor) if vector_available else False)
     reasons = _vector_schema_skip_reasons(
-        vector_available=await _vector_extension_available(cursor),
+        vector_installed=vector_installed,
+        vector_available=vector_available,
+        is_superuser=is_superuser,
         can_create_role=await _can_create_role(cursor),
     )
     failures = 0
