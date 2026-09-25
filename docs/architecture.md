@@ -286,9 +286,11 @@ The executable PostgreSQL inventory is in
   daily per-dimension rollup of `activity` events and impressions, keyed by
   `summary_date`, `dimension`, and `dimension_key`);
 - activity tables in the `activity` schema (see Activity above): `user_subjects`,
-  `consent_grants`, `events`, `impressions`, and `erasures`; and
+  `consent_grants`, `events`, `impressions`, and `erasures`;
 - MusicBrainz tables in the `musicbrainz` schema: `artists`, `labels`, `releases`,
-  `release_groups`, `relationships`, and `external_links`.
+  `release_groups`, `relationships`, and `external_links`; and
+- `public.artist_embeddings` (see Vector embeddings and the embedding pipeline role below),
+  guarded on the `vector` extension being present, alongside the `embedding_pipeline` role.
 
 The statement lists also carry the migrations required for an existing database: additive
 authentication and media columns, rarity-signal columns, Discogs cross-reference widening to
@@ -1794,7 +1796,85 @@ SELECT * FROM GRAPH_TABLE (graph.catalog
 Access is checked against the querying user's permissions on the base relations, not the
 property graph's owner, so the graph grants nothing the views do not already grant.
 
-## Media schema consumer promotion
+## Vector embeddings and the embedding pipeline role
+
+[ADR 0013](https://github.com/groovemap-music/design/blob/main/docs/adr/0013-pgvector-catalog-embeddings.md)
+adopts pgvector for catalog embeddings, starting with artists — labels and masters are in scope
+but get their own tables only when a use for them arrives. Its 2026-09-24 amendment adds the
+embedding pipeline's own least-privilege role, because `analytics-engine`'s FastRP pipeline reads
+the whole catalog graph and writes embeddings directly rather than through `catalog-api`. The
+HNSW index over the embedding column is a later bead; this one is exact-search only.
+
+Both halves — the extension-and-table, and the role — are guarded, on two independent
+conditions, so a server missing either one still gets a working schema:
+
+- **pgvector's presence.** `pg_trgm` ships in every official PostgreSQL image, so its
+  `CREATE EXTENSION` statement never actually fails, and only the trigram indexes built on it
+  check `pg_extension` first (see Graph schema above). `vector` is not bundled, and the required
+  PostgreSQL 18 integration tier runs the bare official image, so its absence is the normal case
+  there rather than an edge case: attempting `CREATE EXTENSION` there and letting it fail would
+  count as a failed schema statement and fail the whole initializer (`_schema_succeeded` in
+  `initializer.py`). `_apply_vector_schema` in
+  [`src/groovemap_schema/postgres.py`](../src/groovemap_schema/postgres.py) instead checks
+  `pg_available_extensions` before attempting anything, and logs the skip reason for the
+  extension and `artist_embeddings` together when it is absent.
+- **`CREATEROLE`.** The pipeline role and its grants need it, exactly as the extension needs the
+  privilege to create one; a connecting role without it is a supported, working deployment, not a
+  failure. `_apply_vector_schema` checks `pg_roles` for the connecting role's `rolsuper` or
+  `rolcreaterole` before attempting `CREATE ROLE`.
+
+The two conditions compose for the one grant that needs both: the pipeline role's access to
+`artist_embeddings` needs the role to exist and the table it names, so it is skipped whenever
+either guard is closed.
+
+### `public.artist_embeddings`
+
+```sql
+CREATE TABLE IF NOT EXISTS public.artist_embeddings (
+    artist_id        TEXT NOT NULL,
+    model_version    TEXT NOT NULL,
+    embedding        halfvec(128) NOT NULL,
+    source_dump_id   TEXT NOT NULL,
+    source_dump_date DATE NOT NULL,
+    computed_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (artist_id, model_version)
+)
+```
+
+`artist_id` matches `graph.artist.artist_id`: the Discogs `data_id`, read as text everywhere the
+graph schema keys on it. `model_version` names the method, its parameters, and its projection
+seed rule (ADR 0013) and is part of the primary key rather than a plain column, so one artist can
+carry one embedding per method without either overwriting the other — a recompute under a new
+`model_version` is an insert, not an update, and a superseded version is deleted once its
+consumers have moved on. `source_dump_id` and `source_dump_date` are the lineage ADR 0013's
+data-rights section requires: embeddings computed from a Discogs or MusicBrainz dump are
+provider-derived data under the same quarantine as the dump itself, and these columns are what
+let a purge of that dump take its embeddings with it. `idx_artist_embeddings_model_version`
+serves the two access patterns keyed on `model_version` alone: a recompute deleting the version it
+replaces, and the churn measurement ADR 0013 requires comparing two versions.
+
+Nothing in this repository computes an embedding or writes provider-derived data into this
+table; `analytics-engine` owns the FastRP pipeline that does, and its own bead covers the model
+version naming scheme in full.
+
+### `embedding_pipeline`
+
+A `NOLOGIN` group role, created and granted by `_PIPELINE_ROLE_STATEMENTS` and
+`_EMBEDDINGS_TABLE_GRANT` in `postgres.py`:
+
+| Grant | Scope |
+| --- | --- |
+| `USAGE` on schema `graph` | Lets the role see the schema at all. |
+| `SELECT` on `ALL TABLES IN SCHEMA graph` | Every vertex and edge relation the FastRP pipeline reads — the schema's shorthand reaches both plain tables and views, so a relation added later is covered the next time the initializer runs without this grant list changing. |
+| `SELECT, INSERT, UPDATE, DELETE` on `public.artist_embeddings` | The one relation the pipeline writes. No `TRUNCATE`, no DDL, no ownership. |
+
+The role holds nothing else: no privilege on `public`'s catalog document tables (`artists`,
+`labels`, `masters`, `releases`), `insights`, `musicbrainz`, or any other schema. ADR 0013:
+"It holds no other privilege." The login that is a member of this role is provisioned where
+credentials live — `deployment` for development and CI, and the homelab for the shared
+production instance — never in this repository.
+
+
 
 Downstream services do not track `database-schema` continuously; each pins
 `contracts/persistence/v1` to a specific, reviewed `database-schema` commit and promotes to a
