@@ -264,8 +264,28 @@ def test_integration_runs_a_required_and_an_advisory_engine_tier() -> None:
     assert f"--build-arg POSTGRES_BASE_IMAGE={PG19_BASE_IMAGE}" in justfile
     assert "--file scripts/postgres19-pgvector.Dockerfile" in justfile
     assert f"--tag {PG19_LOCAL_IMAGE}" in justfile
-    assert f"POSTGRES_INTEGRATION_IMAGE={PG19_LOCAL_IMAGE} bash scripts/test-integration.sh" in justfile
+    assert f"POSTGRES_INTEGRATION_IMAGE={PG19_LOCAL_IMAGE} POSTGRES_INTEGRATION_SHM_SIZE=256m bash scripts/test-integration.sh" in justfile
     assert "docker push" not in justfile
+
+
+def test_postgres19_tier_raises_shared_memory_for_the_hnsw_build() -> None:
+    """A parallel HNSW build needs `/dev/shm` at least as large as `maintenance_work_mem`.
+
+    The PostgreSQL 18 tier never builds an HNSW index and keeps Docker's own
+    64 MB default; only the PostgreSQL 19 tier's recipe overrides it, and only
+    to fit its own modest, test-only `maintenance_work_mem` (see
+    docs/architecture.md, "Building the artist HNSW index") -- never the ~2 GB
+    ADR 0013 documents for production.
+    """
+    justfile = (ROOT / "Justfile").read_text()
+    script = (ROOT / "scripts" / "test-integration.sh").read_text()
+
+    assert "POSTGRES_INTEGRATION_SHM_SIZE" in script
+    assert '--shm-size "${postgres_shm_size}"' in script
+    assert "POSTGRES_INTEGRATION_SHM_SIZE=256m" in justfile
+    assert re.search(r"\ntest-integration:\n    bash scripts/test-integration\.sh\n", justfile), (
+        "the required PostgreSQL 18 tier must keep Docker's shm-size default"
+    )
 
 
 def test_postgres19_pgvector_image_builds_from_the_pinned_tier_base() -> None:

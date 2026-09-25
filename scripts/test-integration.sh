@@ -7,6 +7,13 @@ neo4j_container="${NEO4J_INTEGRATION_CONTAINER:-groovemap-schema-neo4j-${suffix}
 postgres_image="${POSTGRES_INTEGRATION_IMAGE:-postgres:18-alpine@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2}"
 neo4j_image="${NEO4J_INTEGRATION_IMAGE:-neo4j:2026-community@sha256:dbc377fb9cd8fe8dabc19d3041b197d5ca0ef8bae514cea175b8df265e5b7a76}"
 password="${SCHEMA_INTEGRATION_PASSWORD:-integration-test-password}"
+# Docker's own default (64 MB) is fine for the PG18 tier, which never builds an
+# HNSW index. The PG19 tier raises maintenance_work_mem for a small synthetic
+# HNSW build (see docs/architecture.md, "Building the artist HNSW index") and
+# a parallel index build needs /dev/shm at least as large as that setting, so
+# `just test-integration-pg19` overrides this to fit its own, much smaller,
+# test-only maintenance_work_mem rather than Docker's default.
+postgres_shm_size="${POSTGRES_INTEGRATION_SHM_SIZE:-64m}"
 
 cleanup() {
     docker rm --force --volumes "${postgres_container}" "${neo4j_container}" >/dev/null 2>&1 || true
@@ -16,6 +23,7 @@ trap cleanup EXIT
 docker run --detach --rm \
     --name "${postgres_container}" \
     --publish 127.0.0.1::5432 \
+    --shm-size "${postgres_shm_size}" \
     --env POSTGRES_USER=groovemap \
     --env "POSTGRES_PASSWORD=${password}" \
     --env POSTGRES_DB=postgres \

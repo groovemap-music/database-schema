@@ -5071,6 +5071,106 @@ _EMBEDDINGS_TABLE_GRANT = (
     f"GRANT SELECT, INSERT, UPDATE, DELETE ON public.artist_embeddings TO {EMBEDDING_PIPELINE_ROLE}",
 )
 
+# ── The artist embeddings HNSW index, and its build procedure (ADR 0013) ──
+# ADR 0013 selects HNSW over `halfvec_cosine_ops` with pgvector's own defaults
+# (m = 16, ef_construction = 64). The index is guarded on the vector extension
+# exactly like `_ARTIST_EMBEDDINGS_STATEMENT` above -- a server without
+# pgvector still gets a working, index-less (exact-search) schema.
+#
+# Unlike every other statement this module declares, the index's DDL is *not*
+# in `_VECTOR_SCHEMA_STATEMENTS` and `create_postgres_schema` never runs it.
+# The footprint spike (docs/spikes/gm-design-chw.1-pgvector-shared-footprint.md)
+# measured the production default `maintenance_work_mem` (512 MB) overflowing
+# an HNSW build at 657,596 rows: past that point the build does not fail, it
+# degrades to a disk-spilling crawl that can run for hours. An initializer
+# that runs unattended on every deploy must never risk triggering that on an
+# empty-to-full transition -- a table that was empty on the last deploy and is
+# now fully populated by the embedding pipeline. ADR 0013's build-memory
+# precondition is exactly the fix: "Initial builds and rebuilds raise
+# [maintenance_work_mem] to about 2 GB for that session only and revert it. No
+# standing memory setting changes." `build_artist_embeddings_index` below is
+# that procedure -- an explicit, operator-invoked build/rebuild, never
+# something the initializer decides to do on its own. See
+# docs/architecture.md, "Building the artist HNSW index", for how an operator
+# runs it.
+ARTIST_EMBEDDINGS_HNSW_INDEX_NAME = "idx_artist_embeddings_embedding_hnsw"
+
+_ARTIST_EMBEDDINGS_HNSW_INDEX_STATEMENT = (
+    ARTIST_EMBEDDINGS_HNSW_INDEX_NAME,
+    f"""
+    CREATE INDEX IF NOT EXISTS {ARTIST_EMBEDDINGS_HNSW_INDEX_NAME}
+    ON public.artist_embeddings USING hnsw (embedding halfvec_cosine_ops)
+    WITH (m = 16, ef_construction = 64)
+    """,
+)
+
+# The temporary, build-only memory bump ADR 0013's precondition requires,
+# raised for the build and always reverted afterward. `CREATE INDEX` (unlike
+# `CREATE INDEX CONCURRENTLY`) runs inside an ordinary transaction, but the
+# bump is still set and reverted as two separate statements rather than `SET
+# LOCAL`: this function's cursor comes from a pooled or otherwise reused
+# connection, and an explicit `RESET` is what keeps a raised setting from ever
+# being a standing one on a connection that outlives this call, whatever
+# transaction boundary the caller draws around a single `execute`.
+#
+# `about 2 GB` (ADR 0013) is the default and the value every production and
+# operator call uses; `maintenance_work_mem` below exists so a resource-bound
+# test host can exercise this exact function -- the real `SET`/`CREATE
+# INDEX`/`RESET` sequence, not a stand-in -- against a small synthetic fixture
+# without actually requesting a 2 GB ceiling from a shared CI container.
+_HNSW_BUILD_MAINTENANCE_WORK_MEM = "2GB"
+
+_RESET_MAINTENANCE_WORK_MEM = "RESET maintenance_work_mem"
+
+
+def _set_maintenance_work_mem_statement(value: str) -> str:
+    return f"SET maintenance_work_mem = '{value}'"
+
+
+async def build_artist_embeddings_index(cursor: Any, *, maintenance_work_mem: str = _HNSW_BUILD_MAINTENANCE_WORK_MEM) -> int:
+    """Build (or rebuild) the artist embeddings HNSW index -- the ADR 0013 way.
+
+    This is the operator procedure ADR 0013's build-memory precondition
+    requires, not a step `create_postgres_schema` ever takes on its own; see
+    the module comment above `_ARTIST_EMBEDDINGS_HNSW_INDEX_STATEMENT`. Guarded
+    on the vector extension being installed, exactly like the table it
+    indexes -- a fresh `CREATE INDEX CONCURRENTLY` is unnecessary here because
+    an operator invokes this deliberately, during a maintenance window ADR
+    0013 anticipates, rather than concurrently with unrelated writer traffic.
+
+    `maintenance_work_mem` is raised to `maintenance_work_mem` (ADR 0013's
+    documented ~2 GB by default) only for the statement this function runs,
+    and is always reverted before returning, whether or not the build
+    succeeded; no standing server setting changes.
+
+    Returns the number of failed statements (0 means the index was built, was
+    already present, or was correctly skipped because the extension is not
+    installed).
+    """
+    if not await _vector_extension_installed(cursor):
+        logger.info(
+            "⏭️  Skipped %s: %s extension is not installed",
+            ARTIST_EMBEDDINGS_HNSW_INDEX_NAME,
+            VECTOR_EXTENSION,
+        )
+        return 0
+
+    try:
+        await cursor.execute(_set_maintenance_work_mem_statement(maintenance_work_mem))
+    except Exception as error:
+        logger.error("❌ Could not raise maintenance_work_mem for %s: %s", ARTIST_EMBEDDINGS_HNSW_INDEX_NAME, error)
+        return 1
+
+    try:
+        _success, failures = await _execute_schema_statements(cursor, [_ARTIST_EMBEDDINGS_HNSW_INDEX_STATEMENT])
+        return failures
+    finally:
+        try:
+            await cursor.execute(_RESET_MAINTENANCE_WORK_MEM)
+        except Exception as error:
+            logger.error("❌ Could not reset maintenance_work_mem after building %s: %s", ARTIST_EMBEDDINGS_HNSW_INDEX_NAME, error)
+
+
 _VECTOR_EXTENSION_INSTALLED_QUERY = "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = %s)"
 
 
@@ -5235,6 +5335,10 @@ async def create_postgres_schema(pool: Any) -> int:
     `_apply_property_graph`. The vector extension, the artist embedding table,
     and the embedding pipeline role are applied last, each skipped with a
     logged reason when its own guard is closed; see `_apply_vector_schema`.
+    The artist embeddings HNSW index is deliberately *not* applied here --
+    building it needs a temporary `maintenance_work_mem` bump this one-shot,
+    unattended initializer must never decide to make on its own; see
+    `build_artist_embeddings_index`.
 
     Args:
         pool: An AsyncPostgreSQLPool instance (from common.postgres_resilient).

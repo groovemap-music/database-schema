@@ -7,18 +7,23 @@ import pytest
 
 from groovemap_schema.postgres import (
     _ACTIVITY_STATEMENTS,
+    _ARTIST_EMBEDDINGS_HNSW_INDEX_STATEMENT,
     _ARTIST_EMBEDDINGS_STATEMENT,
     _EMBEDDINGS_TABLE_GRANT,
     _ENTITY_TABLES,
     _GRAPH_STATEMENTS,
+    _HNSW_BUILD_MAINTENANCE_WORK_MEM,
     _INSIGHTS_TABLES,
     _IS_SUPERUSER_QUERY,
     _MUSICBRAINZ_INDEXES,
     _MUSICBRAINZ_TABLES,
     _PIPELINE_ROLE_STATEMENTS,
+    _RESET_MAINTENANCE_WORK_MEM,
     _SPECIFIC_INDEXES,
     _USER_TABLES,
+    _VECTOR_EXTENSION_INSTALLED_QUERY,
     _VECTOR_SCHEMA_STATEMENTS,
+    ARTIST_EMBEDDINGS_HNSW_INDEX_NAME,
     EMBEDDING_PIPELINE_ROLE,
     PROPERTY_GRAPH_STATEMENT,
     PROPERTY_GRAPH_SWITCH,
@@ -26,7 +31,9 @@ from groovemap_schema.postgres import (
     _apply_property_graph,
     _apply_vector_schema,
     _property_graph_skip_reason,
+    _set_maintenance_work_mem_statement,
     _vector_schema_skip_reasons,
+    build_artist_embeddings_index,
     create_postgres_schema,
     property_graph_enabled,
 )
@@ -786,3 +793,142 @@ class TestApplyVectorSchema:
 
         assert not any("artist_embeddings" in statement for statement in captured)
         assert not any(EMBEDDING_PIPELINE_ROLE in statement for statement in captured)
+
+
+class TestArtistEmbeddingsHnswIndexStatement:
+    """Static shape checks over the declared HNSW index, independent of any engine."""
+
+    def test_the_index_name_matches_the_declared_constant(self) -> None:
+        assert _ARTIST_EMBEDDINGS_HNSW_INDEX_STATEMENT[0] == ARTIST_EMBEDDINGS_HNSW_INDEX_NAME
+
+    def test_the_statement_is_idempotent(self) -> None:
+        assert f"CREATE INDEX IF NOT EXISTS {ARTIST_EMBEDDINGS_HNSW_INDEX_NAME}" in _ARTIST_EMBEDDINGS_HNSW_INDEX_STATEMENT[1]
+
+    def test_it_targets_the_embedding_column_on_artist_embeddings(self) -> None:
+        assert "ON public.artist_embeddings USING hnsw (embedding halfvec_cosine_ops)" in _ARTIST_EMBEDDINGS_HNSW_INDEX_STATEMENT[1]
+
+    def test_it_uses_the_adr_0013_build_parameters(self) -> None:
+        assert "WITH (m = 16, ef_construction = 64)" in _ARTIST_EMBEDDINGS_HNSW_INDEX_STATEMENT[1]
+
+    def test_the_index_is_not_part_of_the_statements_the_initializer_runs_automatically(self) -> None:
+        """The whole point of this bead: `create_postgres_schema` must never build this on its own."""
+        assert _ARTIST_EMBEDDINGS_HNSW_INDEX_STATEMENT not in _VECTOR_SCHEMA_STATEMENTS
+        names = {name for name, _statement in _VECTOR_SCHEMA_STATEMENTS}
+        assert ARTIST_EMBEDDINGS_HNSW_INDEX_NAME not in names
+
+
+class TestBuildArtistEmbeddingsIndex:
+    """`build_artist_embeddings_index` is the operator procedure, never something
+    `create_postgres_schema` calls on its own -- see `TestApplyVectorSchema` and
+    `TestVectorSchemaFullRun` for the initializer's side of that split.
+    """
+
+    @staticmethod
+    def _cursor(rows: list[Any]) -> AsyncMock:
+        cursor = AsyncMock()
+        cursor.execute = AsyncMock()
+        cursor.fetchone = AsyncMock(side_effect=rows)
+        return cursor
+
+    @staticmethod
+    def _statements(cursor: AsyncMock) -> list[str]:
+        return [str(call.args[0]) for call in cursor.execute.await_args_list]
+
+    @pytest.mark.asyncio
+    async def test_not_installed_skips_without_touching_maintenance_work_mem(self) -> None:
+        cursor = self._cursor([(False,)])
+
+        assert await build_artist_embeddings_index(cursor) == 0
+        statements = self._statements(cursor)
+        assert statements == [_VECTOR_EXTENSION_INSTALLED_QUERY]
+
+    @pytest.mark.asyncio
+    async def test_installed_raises_builds_and_reverts_in_order(self) -> None:
+        cursor = self._cursor([(True,)])
+
+        assert await build_artist_embeddings_index(cursor) == 0
+        statements = self._statements(cursor)
+        assert statements == [
+            _VECTOR_EXTENSION_INSTALLED_QUERY,
+            _set_maintenance_work_mem_statement(_HNSW_BUILD_MAINTENANCE_WORK_MEM),
+            _ARTIST_EMBEDDINGS_HNSW_INDEX_STATEMENT[1],
+            _RESET_MAINTENANCE_WORK_MEM,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_failing_build_still_reverts_maintenance_work_mem(self) -> None:
+        cursor = self._cursor([(True,)])
+
+        async def fail_on_the_index(statement: Any, *_: Any, **__: Any) -> None:
+            if str(statement) == _ARTIST_EMBEDDINGS_HNSW_INDEX_STATEMENT[1]:
+                raise RuntimeError("Simulated PostgreSQL error")
+
+        cursor.execute = AsyncMock(side_effect=fail_on_the_index)
+        assert await build_artist_embeddings_index(cursor) == 1
+        statements = self._statements(cursor)
+        assert statements[-1] == _RESET_MAINTENANCE_WORK_MEM
+
+    @pytest.mark.asyncio
+    async def test_a_failing_reset_does_not_undo_a_successful_build(self) -> None:
+        cursor = self._cursor([(True,)])
+
+        async def fail_on_reset(statement: Any, *_: Any, **__: Any) -> None:
+            if str(statement) == _RESET_MAINTENANCE_WORK_MEM:
+                raise RuntimeError("Simulated PostgreSQL error")
+
+        cursor.execute = AsyncMock(side_effect=fail_on_reset)
+        assert await build_artist_embeddings_index(cursor) == 0
+
+    @pytest.mark.asyncio
+    async def test_a_failing_memory_bump_skips_the_build_entirely(self) -> None:
+        cursor = self._cursor([(True,)])
+
+        async def fail_on_set(statement: Any, *_: Any, **__: Any) -> None:
+            if str(statement) == _set_maintenance_work_mem_statement(_HNSW_BUILD_MAINTENANCE_WORK_MEM):
+                raise RuntimeError("Simulated PostgreSQL error")
+
+        cursor.execute = AsyncMock(side_effect=fail_on_set)
+        assert await build_artist_embeddings_index(cursor) == 1
+        statements = self._statements(cursor)
+        assert _ARTIST_EMBEDDINGS_HNSW_INDEX_STATEMENT[1] not in statements
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_probe_skips_rather_than_raises(self) -> None:
+        cursor = AsyncMock()
+        cursor.execute = AsyncMock(side_effect=Exception("PostgreSQL unavailable"))
+
+        assert await build_artist_embeddings_index(cursor) == 0
+
+    @pytest.mark.asyncio
+    async def test_maintenance_work_mem_is_overridable_for_a_resource_bound_caller(self) -> None:
+        """A test host can exercise the exact same SET/CREATE INDEX/RESET sequence
+        against a small synthetic fixture without requesting the ~2 GB ADR 0013
+        documents for production.
+        """
+        cursor = self._cursor([(True,)])
+
+        assert await build_artist_embeddings_index(cursor, maintenance_work_mem="64MB") == 0
+        statements = self._statements(cursor)
+        assert statements[1] == _set_maintenance_work_mem_statement("64MB")
+
+
+class TestVectorSchemaFullRun:
+    """`create_postgres_schema` never builds the HNSW index, even when every other
+    vector-schema gate is wide open.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_full_run_never_builds_the_hnsw_index(self, mock_pool: MagicMock) -> None:
+        cursor = mock_pool.connection.return_value.__aenter__.return_value.cursor.return_value
+        # Open every gate: vector installed, CREATEROLE present.
+        cursor.fetchone = AsyncMock(return_value=(True,))
+        captured: list[str] = []
+
+        async def capture(stmt: Any, *_: Any, **__: Any) -> None:
+            captured.append(str(stmt))
+
+        cursor.execute = AsyncMock(side_effect=capture)
+        await create_postgres_schema(mock_pool)
+
+        assert not any(ARTIST_EMBEDDINGS_HNSW_INDEX_NAME in statement for statement in captured)
+        assert not any("maintenance_work_mem" in statement for statement in captured)
