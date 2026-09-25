@@ -93,6 +93,16 @@ the recipe directly and carries `continue-on-error: true`. A beta failure is the
 signal, not a merge block. Both tiers share the same Neo4j image; only the PostgreSQL engine
 differs, so a divergence between them is attributable to the engine.
 
+The script also takes the PostgreSQL container's shared memory size from
+`POSTGRES_INTEGRATION_SHM_SIZE`, defaulting to Docker's own 64 MB. The PG18 tier never builds an
+HNSW index and leaves this at the default. The PG19 tier's own integration test builds the
+artist embeddings HNSW index (`build_artist_embeddings_index` in
+[`postgres.py`](../src/groovemap_schema/postgres.py)) over a small synthetic fixture, and a
+parallel HNSW build needs `/dev/shm` at least as large as the `maintenance_work_mem` it runs
+with; `just test-integration-pg19` sets `POSTGRES_INTEGRATION_SHM_SIZE=256m` to cover the
+modest, test-only `maintenance_work_mem` that build passes (never the ~2 GB the "Building the
+artist HNSW index" procedure below documents for production).
+
 ### Promoting the beta tier at general availability
 
 When PostgreSQL 19 reaches general availability, promote the advisory tier in this order:
@@ -286,9 +296,11 @@ The executable PostgreSQL inventory is in
   daily per-dimension rollup of `activity` events and impressions, keyed by
   `summary_date`, `dimension`, and `dimension_key`);
 - activity tables in the `activity` schema (see Activity above): `user_subjects`,
-  `consent_grants`, `events`, `impressions`, and `erasures`; and
+  `consent_grants`, `events`, `impressions`, and `erasures`;
 - MusicBrainz tables in the `musicbrainz` schema: `artists`, `labels`, `releases`,
-  `release_groups`, `relationships`, and `external_links`.
+  `release_groups`, `relationships`, and `external_links`; and
+- `public.artist_embeddings` (see Vector embeddings and the embedding pipeline role below),
+  guarded on the `vector` extension being present, alongside the `embedding_pipeline` role.
 
 The statement lists also carry the migrations required for an existing database: additive
 authentication and media columns, rarity-signal columns, Discogs cross-reference widening to
@@ -1794,7 +1806,240 @@ SELECT * FROM GRAPH_TABLE (graph.catalog
 Access is checked against the querying user's permissions on the base relations, not the
 property graph's owner, so the graph grants nothing the views do not already grant.
 
-## Media schema consumer promotion
+## Vector embeddings and the embedding pipeline role
+
+[ADR 0013](https://github.com/groovemap-music/design/blob/main/docs/adr/0013-pgvector-catalog-embeddings.md)
+adopts pgvector for catalog embeddings, starting with artists — labels and masters are in scope
+but get their own tables only when a use for them arrives. Its 2026-09-24 amendment adds the
+embedding pipeline's own least-privilege role, because `analytics-engine`'s FastRP pipeline reads
+the whole catalog graph and writes embeddings directly rather than through `catalog-api`. The
+HNSW index over the embedding column is a later bead; this one is exact-search only.
+
+Both halves — the extension-and-table, and the role — are guarded, on two independent
+conditions, so a server missing either one still gets a working schema:
+
+- **pgvector's presence and privilege.** `pg_trgm`'s `.control` file carries `trusted = true`
+  and ships in every official PostgreSQL image, so its `CREATE EXTENSION` statement never
+  actually fails, and only the trigram indexes built on it check `pg_extension` first (see Graph
+  schema above). `vector`'s `.control` file carries no such line, so installing it — not merely
+  using it once installed — needs a superuser connection regardless of ordinary schema
+  privileges, and the required PostgreSQL 18 integration tier runs the bare official image, where
+  it is not even available. Attempting `CREATE EXTENSION` unconditionally and letting either case
+  fail would count as a failed schema statement and fail the whole initializer
+  (`_schema_succeeded` in `initializer.py`), so `_apply_vector_schema` in
+  [`src/groovemap_schema/postgres.py`](../src/groovemap_schema/postgres.py) checks this gate in
+  three states, cheapest first: already installed in `pg_extension` (every downstream statement
+  runs regardless of privilege — the ordinary `IF NOT EXISTS` case), not installed but available
+  in `pg_available_extensions` and the connecting role is a superuser (installs it), or anything
+  else (skips the extension and `artist_embeddings` together, with the reason logged).
+- **`CREATEROLE`.** The pipeline role and its grants need it, exactly as the extension needs
+  superuser; a connecting role without it is a supported, working deployment, not a failure.
+  `_apply_vector_schema` checks `pg_roles` for the connecting role's `rolsuper` or
+  `rolcreaterole` before attempting `CREATE ROLE`.
+
+The two conditions compose for the one grant that needs both: the pipeline role's access to
+`artist_embeddings` needs the role to exist and the table it names, so it is skipped whenever
+either guard is closed.
+
+### `public.artist_embeddings`
+
+```sql
+CREATE TABLE IF NOT EXISTS public.artist_embeddings (
+    artist_id        TEXT NOT NULL,
+    model_version    TEXT NOT NULL,
+    embedding        halfvec(128) NOT NULL,
+    source_dump_id   TEXT NOT NULL,
+    source_dump_date DATE NOT NULL,
+    computed_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (artist_id, model_version)
+)
+```
+
+`artist_id` matches `graph.artist.artist_id`: the Discogs `data_id`, read as text everywhere the
+graph schema keys on it. `model_version` names the method, its parameters, and its projection
+seed rule (ADR 0013) and is part of the primary key rather than a plain column, so one artist can
+carry one embedding per method without either overwriting the other — a recompute under a new
+`model_version` is an insert, not an update, and a superseded version is deleted once its
+consumers have moved on. `source_dump_id` and `source_dump_date` are the lineage ADR 0013's
+data-rights section requires: embeddings computed from a Discogs or MusicBrainz dump are
+provider-derived data under the same quarantine as the dump itself, and these columns are what
+let a purge of that dump take its embeddings with it. `idx_artist_embeddings_model_version`
+serves the two access patterns keyed on `model_version` alone: a recompute deleting the version it
+replaces, and the churn measurement ADR 0013 requires comparing two versions.
+
+Nothing in this repository computes an embedding or writes provider-derived data into this
+table; `analytics-engine` owns the FastRP pipeline that does, and its own bead covers the model
+version naming scheme in full.
+
+### `embedding_pipeline`
+
+A `NOLOGIN` group role, created and granted by `_PIPELINE_ROLE_STATEMENTS` and
+`_EMBEDDINGS_TABLE_GRANT` in `postgres.py`:
+
+| Grant | Scope |
+| --- | --- |
+| `USAGE` on schema `graph` | Lets the role see the schema at all. |
+| `SELECT` on `ALL TABLES IN SCHEMA graph` | Every vertex and edge relation the FastRP pipeline reads — the schema's shorthand reaches both plain tables and views, so a relation added later is covered the next time the initializer runs without this grant list changing. |
+| `SELECT, INSERT, UPDATE, DELETE` on `public.artist_embeddings` | The one relation the pipeline writes. No `TRUNCATE`, no DDL, no ownership. |
+
+The role holds nothing else: no privilege on `public`'s catalog document tables (`artists`,
+`labels`, `masters`, `releases`), `insights`, `musicbrainz`, or any other schema. ADR 0013:
+"It holds no other privilege." The login that is a member of this role is provisioned where
+credentials live — `deployment` for development and CI, and the homelab for the shared
+production instance — never in this repository.
+
+The `SELECT` grant is schema-wide (`ALL TABLES IN SCHEMA graph`), which is broader than the ADR
+amendment's own wording — "`SELECT` on the graph edge and vertex relations it reads" — names.
+That is deliberate rather than an over-grant. Every relation the `graph` schema holds today is
+either a vertex or edge relation itself, or one of the small set of counter, degree, and
+aggregate relations (`graph.vertex_degree`, `graph.artist_degree`, `graph.genre_stats`, and
+similar; see `STORAGE_ONLY_RELATIONS` in
+[`tests/integration/test_real_schema_idempotence.py`](../tests/integration/test_real_schema_idempotence.py))
+that exist solely to back the same schema's own traversal functions over that graph — nothing
+unrelated to the catalog graph lives here (see Graph schema above). Naming every relation
+one by one in the grant would restate the schema's own contents rather than narrow it. The grant
+also stays exactly as narrow as the ADR intends in practice: a plain `SELECT` grant on a view is
+checked against the view's *owner* for the `public`/`musicbrainz` base tables underneath it, not
+against the querying role (PostgreSQL's default, non-`security_invoker` view semantics), so
+`embedding_pipeline` reaches nothing outside `graph` through the views it can query — it never
+needs, and is never granted, direct access to `artists`, `labels`, `musicbrainz.artists`, or any
+other base table. And the schema-wide form is what keeps the grant self-maintaining: a graph
+relation `_GRAPH_STATEMENTS` adds later is covered the next time the initializer runs, without
+this grant changing to name it.
+
+### The artist embeddings HNSW index
+
+```sql
+CREATE INDEX IF NOT EXISTS idx_artist_embeddings_embedding_hnsw
+ON public.artist_embeddings USING hnsw (embedding halfvec_cosine_ops)
+WITH (m = 16, ef_construction = 64)
+```
+
+ADR 0013 selects HNSW over `halfvec_cosine_ops`, at pgvector's own defaults (`m = 16`,
+`ef_construction = 64`). The statement is declared as `_ARTIST_EMBEDDINGS_HNSW_INDEX_STATEMENT`
+in `postgres.py`, guarded on the vector extension being installed exactly like
+`public.artist_embeddings` itself — a server without pgvector never sees this index attempted.
+
+Unlike every other statement in this module, `create_postgres_schema` never runs this one. The
+[footprint spike](https://github.com/groovemap-music/design/blob/main/docs/spikes/gm-design-chw.1-pgvector-shared-footprint.md)
+measured the production default `maintenance_work_mem` (512 MB) overflowing an HNSW build at
+657,596 rows; past that point the build does not fail, it degrades to a disk-spilling crawl that
+can run for hours. The unattended, every-deploy initializer must never risk triggering that on an
+empty-to-full transition — a table that was empty the last time it ran and is now fully populated
+by the embedding pipeline's monthly recompute. ADR 0013's build-memory precondition is exactly
+the fix it requires: "Initial builds and rebuilds raise [`maintenance_work_mem`] to about 2 GB
+for that session only and revert it. No standing memory setting changes."
+
+#### Building the artist HNSW index
+
+`build_artist_embeddings_index(cursor, *, maintenance_work_mem="2GB", rebuild=False)` in
+`postgres.py` is that procedure. An operator runs it explicitly — never as part of a deploy —
+after `public.artist_embeddings` exists and the embedding pipeline has populated it:
+
+1. It re-checks the same extension guard as the table (skips, logging why, if `vector` is not
+   installed).
+2. It refuses to run at all, logging why and returning a failure, unless `maintenance_work_mem`
+   is a bare PostgreSQL memory quantity like `2GB` or `64MB` (`_valid_maintenance_work_mem`) —
+   `SET`'s value position takes no bind parameter, so this is the only thing standing between a
+   caller-supplied string and the `SET` statement's interpolated text.
+3. `SET maintenance_work_mem = '2GB'` (ADR 0013's documented value; overridable for a
+   resource-bound caller — see below).
+4. `CREATE INDEX IF NOT EXISTS idx_artist_embeddings_embedding_hnsw ...` by default — safe to
+   re-run, but a no-op once the index exists, so this step alone never rebuilds one. Passing
+   `rebuild=True` runs `REINDEX INDEX public.idx_artist_embeddings_embedding_hnsw` instead, which
+   does. Plain `REINDEX`, not `REINDEX INDEX CONCURRENTLY`: it holds an `ACCESS EXCLUSIVE` lock on
+   the table for its duration, blocking reads and writes through the index, but it is atomic — a
+   failed or cancelled `REINDEX` leaves the existing index exactly as it was, never a half-built or
+   `INVALID` one. `CONCURRENTLY` avoids that lock, but cannot run inside a transaction block, needs
+   two full table scans instead of one, and can abandon an `INVALID` index needing a manual
+   `DROP INDEX` if interrupted — fragility this deliberate, operator-invoked, maintenance-window
+   procedure does not need to accept. `rebuild=True` before the index exists is a caller error:
+   PostgreSQL's own "does not exist" failure surfaces and counts like any other failed statement.
+5. `RESET maintenance_work_mem`, in a `finally`, whether or not the build succeeded — the
+   setting is never left raised on a connection that outlives the call, and no standing server
+   setting is ever touched.
+
+An operator invokes it from a Python shell (or a short script) against a direct, admin
+connection — not the connection pool the initializer and application services share, and not a
+step in the `database-schema` console entry point, which only ever runs the guarded, automatic
+schema pass:
+
+```python
+import asyncio
+import psycopg
+from groovemap_schema.postgres import build_artist_embeddings_index
+
+
+async def main() -> None:
+    async with await psycopg.AsyncConnection.connect(..., autocommit=True) as conn, conn.cursor() as cursor:
+        # Initial build, or after "The bulk-recompute load order" below has
+        # dropped and re-created the index: rebuild=False (the default).
+        # After any other change to already-indexed rows: rebuild=True.
+        failures = await build_artist_embeddings_index(cursor)
+        assert failures == 0
+
+
+asyncio.run(main())
+```
+
+The `maintenance_work_mem` keyword argument exists so a resource-bound test host can exercise
+this exact function — the real `SET` / `CREATE INDEX` (or `REINDEX`) / `RESET` sequence, not a
+stand-in — against a small synthetic fixture without requesting a 2 GB ceiling from a shared CI
+container; the PostgreSQL 19 integration tier does exactly that (see "Integration tiers" above for
+the matching `POSTGRES_INTEGRATION_SHM_SIZE`, since a parallel HNSW build needs `/dev/shm` at least
+as large as whatever `maintenance_work_mem` it runs with). Every production and operator call
+uses the default.
+
+#### The bulk-recompute load order
+
+`analytics-engine`'s monthly FastRP recompute inserts a whole new `model_version` of rows into
+`public.artist_embeddings` — up to the full artist scope in one load. If the HNSW index already
+exists at that point, PostgreSQL maintains it incrementally, once per row, as the bulk load
+runs, at whatever `maintenance_work_mem` that pipeline connection happens to hold — almost
+certainly the server default, since the pipeline is not the operator procedure above and has no
+reason to raise it. That turns one bulk load into millions of individually-memory-constrained
+index insertions instead of one raised-memory build, which is slower and reintroduces exactly the
+memory pressure ADR 0013's precondition exists to bound, just spread across the load instead of
+concentrated in a build. The load order that avoids it:
+
+1. **Drop or defer the index** before the load starts. On the very first load there is nothing to
+   drop yet; on every load after that, an operator drops it
+   (`DROP INDEX IF EXISTS public.idx_artist_embeddings_embedding_hnsw`) first.
+2. **Bulk load.** `analytics-engine` inserts the new `model_version`'s rows with no HNSW index to
+   maintain per row.
+3. **Build or rebuild**, via `build_artist_embeddings_index` above — `rebuild=False` here, since
+   the index was dropped in step 1 and this is a fresh `CREATE INDEX`.
+
+This is deliberately an **operator** step, not something the embedding pipeline's own connection
+ever does. `embedding_pipeline` (see below) holds `SELECT, INSERT, UPDATE, DELETE` on
+`public.artist_embeddings` and nothing else — no DDL privilege, and critically no ownership of the
+table, which is what `DROP INDEX`, `CREATE INDEX`, and `REINDEX` all require regardless of any
+grantable privilege. The maintainer's decision recorded here is that this asymmetry is
+intentional: the pipeline populates the table, and a human- or automation-driven operator step
+with a different, more privileged credential builds or rebuilds the index after each load, never
+the pipeline itself.
+
+#### Querying it: iterative index scans for filtered queries
+
+An approximate HNSW index applies a `WHERE` filter *after* the graph scan, so a query that both
+filters and orders by distance — for example, restricting to one `model_version` — can return
+fewer than `LIMIT k` rows even though enough matching rows exist, if the filter is selective
+enough that the unfiltered scan does not happen to visit them. ADR 0013 calls for pgvector's
+iterative index scans on exactly this shape of query: a caller (`catalog-api`'s similar-artist
+retrieval is the one this repository anticipates) sets
+
+```sql
+SET hnsw.iterative_scan = relaxed_order;
+```
+
+per session, or `SET LOCAL` within the querying transaction, before a filtered
+`ORDER BY embedding <=> $1 LIMIT k` query. `relaxed_order` is the right default here rather than
+`strict_order`: it lets the scan return results slightly out of exact distance order in exchange
+for visiting less of the index, which is the cheaper trade-off for a "similar artists" list where
+approximate ranking is already the premise. This repository does not itself issue any query
+against `artist_embeddings` — `catalog-api` owns retrieval — so there is nothing here to set the
+GUC around; it is recorded here because the index and its query-time behavior are one design
+ADR 0013 makes together.
 
 Downstream services do not track `database-schema` continuously; each pins
 `contracts/persistence/v1` to a specific, reviewed `database-schema` commit and promotes to a

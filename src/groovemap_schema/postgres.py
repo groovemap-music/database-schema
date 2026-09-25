@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 from common.credit_roles import ROLE_CATEGORIES
@@ -4946,6 +4947,449 @@ async def _apply_property_graph(cursor: Any) -> int:
     return failures
 
 
+# ── pgvector, artist embeddings, and the embedding pipeline role (ADR 0013) ──
+# ADR 0013 adopts pgvector for catalog embeddings, starting with artists only;
+# labels and masters are in scope but not created until a use arrives. Its
+# 2026-09-24 amendment adds the embedding pipeline's own least-privilege role,
+# because the pipeline reads the whole catalog graph and writes embeddings
+# directly rather than through `catalog-api`.
+#
+# Both halves are guarded, on two independent conditions, so a server missing
+# either one still gets a working schema:
+#
+# - `pg_trgm` ships in every official PostgreSQL image and its `.control` file
+#   carries `trusted = true`, so its `CREATE EXTENSION` statement
+#   (`_PG_TRGM_STATEMENT`) never actually fails there, and only the trigram
+#   indexes built on it check `pg_extension` first. `vector`'s `.control` file
+#   carries no such line, so installing it (unlike using it once installed)
+#   needs a superuser connection regardless of ordinary schema privileges —
+#   and the required PostgreSQL 18 integration tier runs the bare official
+#   image, where it is not even available. Attempting `CREATE EXTENSION`
+#   unconditionally and letting either case fail would count as a failed
+#   schema statement and fail the whole initializer (see `_schema_succeeded`
+#   in `initializer.py`), so this gate has three states rather than two:
+#   already installed (every downstream statement runs regardless of
+#   privilege, the same as any other `IF NOT EXISTS` object in this module);
+#   installable but not yet installed, which additionally needs the
+#   connecting role to be a superuser; or unavailable outright.
+# - The pipeline role and its grants need `CREATEROLE`, exactly as the
+#   extension needs superuser; a connecting role without it is a supported,
+#   working deployment, not a failure.
+#
+# The two conditions compose for the one grant that needs both: the role's
+# access to `artist_embeddings` needs the role to exist and the table it
+# grants access to.
+
+VECTOR_EXTENSION = "vector"
+EMBEDDING_PIPELINE_ROLE = "embedding_pipeline"
+
+_VECTOR_EXTENSION_STATEMENT = ("vector extension", f"CREATE EXTENSION IF NOT EXISTS {VECTOR_EXTENSION}")
+
+# `artist_id` matches `graph.artist.artist_id`: the Discogs `data_id`, read as
+# text everywhere the graph schema keys on it. `model_version` names the
+# method, its parameters, and its projection seed rule (ADR 0013), so the same
+# artist can carry one embedding per method without either overwriting the
+# other; it is part of the key rather than a plain column for the same reason.
+# `source_dump_id` and `source_dump_date` are the lineage ADR 0013's data-rights
+# section requires: embeddings computed from a Discogs or MusicBrainz dump are
+# provider-derived data under the same quarantine as the dump itself, and these
+# columns are what let a purge of that dump take its embeddings with it. Only
+# `artists` is adopted today; `labels` and `masters` get their own tables of
+# the same shape when a use for them arrives, per ADR 0013.
+_ARTIST_EMBEDDINGS_STATEMENT = (
+    "public.artist_embeddings table",
+    """
+    CREATE TABLE IF NOT EXISTS public.artist_embeddings (
+        artist_id        TEXT NOT NULL,
+        model_version    TEXT NOT NULL,
+        embedding        halfvec(128) NOT NULL,
+        source_dump_id   TEXT NOT NULL,
+        source_dump_date DATE NOT NULL,
+        computed_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (artist_id, model_version)
+    )
+    """,
+)
+
+# A recompute deletes every row of the model_version it is replacing before
+# writing the new one, and the churn measurement ADR 0013 requires compares
+# two model_versions at a time — both scan by `model_version` rather than by
+# the primary key's leading `artist_id`.
+_ARTIST_EMBEDDINGS_MODEL_VERSION_INDEX = (
+    "idx_artist_embeddings_model_version",
+    "CREATE INDEX IF NOT EXISTS idx_artist_embeddings_model_version ON public.artist_embeddings (model_version)",
+)
+
+# The HNSW index over `embedding` is the next bead (ADR 0013 follow-up); this
+# bead's table is exact-search only, which is what `_vector_schema_skip_reasons`
+# and its tests describe as "guarded on the extension being present".
+_VECTOR_SCHEMA_STATEMENTS: list[tuple[str, str]] = [
+    _VECTOR_EXTENSION_STATEMENT,
+    _ARTIST_EMBEDDINGS_STATEMENT,
+    _ARTIST_EMBEDDINGS_MODEL_VERSION_INDEX,
+]
+
+# `CREATE ROLE` has no `IF NOT EXISTS` spelling, unlike every other statement
+# in this module, so idempotence is a manual existence check inside a DO block
+# rather than the usual clause.
+_CREATE_EMBEDDING_PIPELINE_ROLE_STATEMENT = (
+    f"{EMBEDDING_PIPELINE_ROLE} role",
+    f"""
+    DO $create_embedding_pipeline_role$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{EMBEDDING_PIPELINE_ROLE}') THEN
+            CREATE ROLE {EMBEDDING_PIPELINE_ROLE} NOLOGIN;
+        END IF;
+    END
+    $create_embedding_pipeline_role$
+    """,  # noqa: S608 -- EMBEDDING_PIPELINE_ROLE is a module-level constant, not caller input
+)
+
+# The graph schema is the pipeline's whole read surface: every vertex and edge
+# relation the FastRP pipeline walks is a view or table in `graph`, and
+# `ALL TABLES IN SCHEMA` reaches both kinds (PostgreSQL's shorthand covers
+# views and foreign tables, not only base tables). Granting the schema rather
+# than an enumerated relation list also means a graph relation added later is
+# covered the next time the initializer runs, without this list changing.
+# The role gets nothing on `public`, `insights`, `musicbrainz`, or any other
+# schema — ADR 0013: "It holds no other privilege."
+_PIPELINE_ROLE_STATEMENTS: list[tuple[str, str]] = [
+    _CREATE_EMBEDDING_PIPELINE_ROLE_STATEMENT,
+    (
+        f"{EMBEDDING_PIPELINE_ROLE} graph schema usage grant",
+        f"GRANT USAGE ON SCHEMA graph TO {EMBEDDING_PIPELINE_ROLE}",
+    ),
+    (
+        f"{EMBEDDING_PIPELINE_ROLE} graph tables select grant",
+        f"GRANT SELECT ON ALL TABLES IN SCHEMA graph TO {EMBEDDING_PIPELINE_ROLE}",
+    ),
+]
+
+# The one relation the pipeline writes. Read, write, and nothing else: no
+# TRUNCATE, no DDL, no ownership.
+_EMBEDDINGS_TABLE_GRANT = (
+    f"{EMBEDDING_PIPELINE_ROLE} artist_embeddings grant",
+    f"GRANT SELECT, INSERT, UPDATE, DELETE ON public.artist_embeddings TO {EMBEDDING_PIPELINE_ROLE}",
+)
+
+# ── The artist embeddings HNSW index, and its build procedure (ADR 0013) ──
+# ADR 0013 selects HNSW over `halfvec_cosine_ops` with pgvector's own defaults
+# (m = 16, ef_construction = 64). The index is guarded on the vector extension
+# exactly like `_ARTIST_EMBEDDINGS_STATEMENT` above -- a server without
+# pgvector still gets a working, index-less (exact-search) schema.
+#
+# Unlike every other statement this module declares, the index's DDL is *not*
+# in `_VECTOR_SCHEMA_STATEMENTS` and `create_postgres_schema` never runs it.
+# The footprint spike (docs/spikes/gm-design-chw.1-pgvector-shared-footprint.md)
+# measured the production default `maintenance_work_mem` (512 MB) overflowing
+# an HNSW build at 657,596 rows: past that point the build does not fail, it
+# degrades to a disk-spilling crawl that can run for hours. An initializer
+# that runs unattended on every deploy must never risk triggering that on an
+# empty-to-full transition -- a table that was empty on the last deploy and is
+# now fully populated by the embedding pipeline. ADR 0013's build-memory
+# precondition is exactly the fix: "Initial builds and rebuilds raise
+# [maintenance_work_mem] to about 2 GB for that session only and revert it. No
+# standing memory setting changes." `build_artist_embeddings_index` below is
+# that procedure -- an explicit, operator-invoked build/rebuild, never
+# something the initializer decides to do on its own. See
+# docs/architecture.md, "Building the artist HNSW index", for how an operator
+# runs it.
+ARTIST_EMBEDDINGS_HNSW_INDEX_NAME = "idx_artist_embeddings_embedding_hnsw"
+
+_ARTIST_EMBEDDINGS_HNSW_INDEX_STATEMENT = (
+    ARTIST_EMBEDDINGS_HNSW_INDEX_NAME,
+    f"""
+    CREATE INDEX IF NOT EXISTS {ARTIST_EMBEDDINGS_HNSW_INDEX_NAME}
+    ON public.artist_embeddings USING hnsw (embedding halfvec_cosine_ops)
+    WITH (m = 16, ef_construction = 64)
+    """,
+)
+
+# `CREATE INDEX IF NOT EXISTS` above is a no-op once the index exists, so it
+# can build but never rebuild. `build_artist_embeddings_index(..., rebuild=True)`
+# uses this instead. Plain `REINDEX INDEX`, not `REINDEX INDEX CONCURRENTLY`,
+# is the deliberate choice: it takes an ACCESS EXCLUSIVE lock on the table for
+# its duration, blocking reads and writes through the index, but it is atomic
+# -- a failed or cancelled REINDEX leaves the existing index exactly as it
+# was, never a half-built or `INVALID` one. `CONCURRENTLY` avoids that lock,
+# but cannot run inside a transaction block, needs two full table scans
+# instead of one, and can abandon an `INVALID` index needing a manual `DROP
+# INDEX` if it is interrupted -- fragility this operator-invoked,
+# maintenance-window procedure (see the module comment above) does not need
+# to accept. Calling with `rebuild=True` before the index exists is a caller
+# error: PostgreSQL's own "does not exist" failure surfaces and is counted
+# like any other failed statement, the same as every other guarded statement
+# in this module.
+_ARTIST_EMBEDDINGS_HNSW_INDEX_REINDEX_STATEMENT = (
+    f"{ARTIST_EMBEDDINGS_HNSW_INDEX_NAME} (reindex)",
+    f"REINDEX INDEX public.{ARTIST_EMBEDDINGS_HNSW_INDEX_NAME}",
+)
+
+# The temporary, build-only memory bump ADR 0013's precondition requires,
+# raised for the build and always reverted afterward. `CREATE INDEX` (unlike
+# `CREATE INDEX CONCURRENTLY`) runs inside an ordinary transaction, but the
+# bump is still set and reverted as two separate statements rather than `SET
+# LOCAL`: this function's cursor comes from a pooled or otherwise reused
+# connection, and an explicit `RESET` is what keeps a raised setting from ever
+# being a standing one on a connection that outlives this call, whatever
+# transaction boundary the caller draws around a single `execute`.
+#
+# `about 2 GB` (ADR 0013) is the default and the value every production and
+# operator call uses; `maintenance_work_mem` below exists so a resource-bound
+# test host can exercise this exact function -- the real `SET`/`CREATE
+# INDEX`/`RESET` sequence, not a stand-in -- against a small synthetic fixture
+# without actually requesting a 2 GB ceiling from a shared CI container.
+_HNSW_BUILD_MAINTENANCE_WORK_MEM = "2GB"
+
+_RESET_MAINTENANCE_WORK_MEM = "RESET maintenance_work_mem"
+
+# `SET`'s value position does not accept a bind parameter the way an ordinary
+# statement does (there is no `SET maintenance_work_mem = $1` in PostgreSQL's
+# grammar), so this module builds the `SET` statement's text itself rather
+# than parameterizing it -- which makes `maintenance_work_mem` the one piece
+# of this function's own caller-supplied data that ends up interpolated into
+# SQL text rather than bound. `_valid_maintenance_work_mem` is what keeps that
+# safe: it is checked, and rejected on a mismatch, before this ever runs,
+# so nothing but a bare positive integer and one of PostgreSQL's own memory
+# unit suffixes can reach the interpolation.
+_MAINTENANCE_WORK_MEM_PATTERN = re.compile(r"^[1-9][0-9]*(kB|MB|GB|TB)$")
+
+
+def _valid_maintenance_work_mem(value: str) -> bool:
+    """Return whether `value` is a safe, well-formed PostgreSQL memory quantity.
+
+    Deliberately strict rather than merely functional: PostgreSQL itself
+    accepts a bare integer (implicitly kB), decimal quantities, and a `B`
+    suffix, but none of those are the shape ADR 0013's own documented value
+    (`2GB`) or this module's test overrides (`64MB`) take, so this validator
+    only has to admit that one shape -- a positive integer immediately
+    followed by `kB`, `MB`, `GB`, or `TB` -- and can refuse everything else,
+    including anything that could otherwise smuggle a second statement past
+    the single-quoted string this value is interpolated into.
+    """
+    return bool(_MAINTENANCE_WORK_MEM_PATTERN.fullmatch(value))
+
+
+def _set_maintenance_work_mem_statement(value: str) -> str:
+    return f"SET maintenance_work_mem = '{value}'"
+
+
+async def build_artist_embeddings_index(cursor: Any, *, maintenance_work_mem: str = _HNSW_BUILD_MAINTENANCE_WORK_MEM, rebuild: bool = False) -> int:
+    """Build, or rebuild, the artist embeddings HNSW index -- the ADR 0013 way.
+
+    This is the operator procedure ADR 0013's build-memory precondition
+    requires, not a step `create_postgres_schema` ever takes on its own; see
+    the module comment above `_ARTIST_EMBEDDINGS_HNSW_INDEX_STATEMENT`. Guarded
+    on the vector extension being installed, exactly like the table it
+    indexes.
+
+    `maintenance_work_mem` is raised to `maintenance_work_mem` (ADR 0013's
+    documented ~2 GB by default) only for the statement this function runs,
+    and is always reverted before returning, whether or not the build
+    succeeded; no standing server setting changes. Rejected outright, before
+    anything else runs, if it is not a bare PostgreSQL memory quantity like
+    `2GB` -- see `_valid_maintenance_work_mem`.
+
+    `rebuild=False` (the default) is `CREATE INDEX IF NOT EXISTS`: a no-op
+    once the index exists, so it never rebuilds one that is already there.
+    `rebuild=True` runs `REINDEX INDEX` instead, which does -- see the module
+    comment above `_ARTIST_EMBEDDINGS_HNSW_INDEX_REINDEX_STATEMENT` for why
+    plain `REINDEX` and not `CONCURRENTLY`. Use `rebuild=True` after a bulk
+    embedding recompute has changed the indexed rows; see docs/architecture.md,
+    "The bulk-recompute load order", for when that index should exist at all
+    during such a load.
+
+    Returns the number of failed statements (0 means the index was built or
+    rebuilt, was already present in the `rebuild=False` case, or was
+    correctly skipped because the extension is not installed).
+    """
+    if not await _vector_extension_installed(cursor):
+        logger.info(
+            "⏭️  Skipped %s: %s extension is not installed",
+            ARTIST_EMBEDDINGS_HNSW_INDEX_NAME,
+            VECTOR_EXTENSION,
+        )
+        return 0
+
+    if not _valid_maintenance_work_mem(maintenance_work_mem):
+        logger.error(
+            "❌ Refusing to build %s: %r is not a PostgreSQL memory quantity like '2GB'",
+            ARTIST_EMBEDDINGS_HNSW_INDEX_NAME,
+            maintenance_work_mem,
+        )
+        return 1
+
+    try:
+        await cursor.execute(_set_maintenance_work_mem_statement(maintenance_work_mem))
+    except Exception as error:
+        logger.error("❌ Could not raise maintenance_work_mem for %s: %s", ARTIST_EMBEDDINGS_HNSW_INDEX_NAME, error)
+        return 1
+
+    statement = _ARTIST_EMBEDDINGS_HNSW_INDEX_REINDEX_STATEMENT if rebuild else _ARTIST_EMBEDDINGS_HNSW_INDEX_STATEMENT
+    try:
+        _success, failures = await _execute_schema_statements(cursor, [statement])
+        return failures
+    finally:
+        try:
+            await cursor.execute(_RESET_MAINTENANCE_WORK_MEM)
+        except Exception as error:
+            logger.error("❌ Could not reset maintenance_work_mem after building %s: %s", ARTIST_EMBEDDINGS_HNSW_INDEX_NAME, error)
+
+
+_VECTOR_EXTENSION_INSTALLED_QUERY = "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = %s)"
+
+
+async def _vector_extension_installed(cursor: Any) -> bool:
+    """Return whether `vector` is already installed on this database.
+
+    Checked first, and separately from availability: once installed, every
+    downstream statement runs regardless of the connecting role's privilege,
+    the same as any other `IF NOT EXISTS` object in this module.
+    """
+    try:
+        await cursor.execute(_VECTOR_EXTENSION_INSTALLED_QUERY, (VECTOR_EXTENSION,))
+        row = await cursor.fetchone()
+    except Exception as error:
+        logger.error("❌ Could not read pg_extension: %s", error)
+        return False
+    return bool(row is not None and row[0])
+
+
+_VECTOR_EXTENSION_AVAILABLE_QUERY = "SELECT EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = %s)"
+
+
+async def _vector_extension_available(cursor: Any) -> bool:
+    """Return whether `vector` can be installed on this server (not whether it is).
+
+    `pg_available_extensions` lists what the server's control files offer,
+    which answers the question without ever attempting — and possibly
+    failing — the `CREATE EXTENSION` itself.
+    """
+    try:
+        await cursor.execute(_VECTOR_EXTENSION_AVAILABLE_QUERY, (VECTOR_EXTENSION,))
+        row = await cursor.fetchone()
+    except Exception as error:
+        logger.error("❌ Could not read pg_available_extensions: %s", error)
+        return False
+    return bool(row is not None and row[0])
+
+
+_IS_SUPERUSER_QUERY = "SELECT rolsuper FROM pg_roles WHERE rolname = current_user"
+
+
+async def _is_superuser(cursor: Any) -> bool:
+    """Return whether the connecting role is a superuser.
+
+    `vector`'s `.control` file carries no `trusted = true` line, unlike
+    `pg_trgm`'s, so installing it — not merely using it once installed — needs
+    a superuser connection no matter what schema privileges the role holds.
+    """
+    try:
+        await cursor.execute(_IS_SUPERUSER_QUERY)
+        row = await cursor.fetchone()
+    except Exception as error:
+        logger.error("❌ Could not read pg_roles: %s", error)
+        return False
+    return bool(row is not None and row[0])
+
+
+_CAN_CREATE_ROLE_QUERY = "SELECT rolsuper OR rolcreaterole FROM pg_roles WHERE rolname = current_user"
+
+
+async def _can_create_role(cursor: Any) -> bool:
+    """Return whether the connected role can create the pipeline role.
+
+    A superuser bypasses the `CREATEROLE` check entirely, so `rolcreaterole`
+    alone would under-report the common case of a superuser test or
+    development credential whose row does not carry the flag explicitly.
+    """
+    try:
+        await cursor.execute(_CAN_CREATE_ROLE_QUERY)
+        row = await cursor.fetchone()
+    except Exception as error:
+        logger.error("❌ Could not read pg_roles: %s", error)
+        return False
+    return bool(row is not None and row[0])
+
+
+def _vector_schema_skip_reasons(
+    *, vector_installed: bool, vector_available: bool, is_superuser: bool, can_create_role: bool
+) -> dict[str, str | None]:
+    """Return why each guarded vector object is skipped, or None to create it.
+
+    The extension gate has three states, evaluated in cost order: already
+    installed (nothing else about it matters — every downstream statement
+    runs), not installed but installable by a superuser connection (`vector`
+    is not a trusted extension, unlike `pg_trgm`, so a role with only CREATE
+    on the target schema cannot install it even though it can use it once
+    installed), or unavailable outright. `CREATEROLE` is a second, independent
+    gate for the pipeline role and its graph-schema grant. The role's grant on
+    `artist_embeddings` needs both — the role to hold it and the table it
+    names — so it carries whichever reason applies.
+    """
+    if vector_installed:
+        extension_reason = None
+    elif not vector_available:
+        extension_reason = f"{VECTOR_EXTENSION} extension is not available on this server"
+    elif not is_superuser:
+        extension_reason = (
+            f"{VECTOR_EXTENSION} extension is not installed and the connecting role is not a superuser "
+            f"({VECTOR_EXTENSION} is not a trusted extension)"
+        )
+    else:
+        extension_reason = None
+    role_reason = None if can_create_role else "connecting role lacks CREATEROLE"
+    return {
+        "extension": extension_reason,
+        "role": role_reason,
+        "embedding_grant": extension_reason or role_reason,
+    }
+
+
+async def _apply_vector_schema(cursor: Any) -> int:
+    """Create the vector extension, the artist embedding table, and the
+    embedding pipeline role, skipping each with a logged reason when its
+    guard is closed.
+
+    Returns the number of failed statements, on the same footing as every
+    other schema statement `create_postgres_schema` runs.
+    """
+    vector_installed = await _vector_extension_installed(cursor)
+    vector_available = True if vector_installed else await _vector_extension_available(cursor)
+    is_superuser = True if vector_installed else (await _is_superuser(cursor) if vector_available else False)
+    reasons = _vector_schema_skip_reasons(
+        vector_installed=vector_installed,
+        vector_available=vector_available,
+        is_superuser=is_superuser,
+        can_create_role=await _can_create_role(cursor),
+    )
+    failures = 0
+
+    if reasons["extension"] is None:
+        _success, extension_failures = await _execute_schema_statements(cursor, _VECTOR_SCHEMA_STATEMENTS)
+        failures += extension_failures
+    else:
+        logger.info("⏭️  Skipped %s and public.artist_embeddings: %s", VECTOR_EXTENSION, reasons["extension"])
+
+    if reasons["role"] is None:
+        _success, role_failures = await _execute_schema_statements(cursor, _PIPELINE_ROLE_STATEMENTS)
+        failures += role_failures
+    else:
+        logger.info("⏭️  Skipped %s role: %s", EMBEDDING_PIPELINE_ROLE, reasons["role"])
+
+    if reasons["embedding_grant"] is None:
+        _success, grant_failures = await _execute_schema_statements(cursor, [_EMBEDDINGS_TABLE_GRANT])
+        failures += grant_failures
+    else:
+        logger.info(
+            "⏭️  Skipped %s grant on public.artist_embeddings: %s",
+            EMBEDDING_PIPELINE_ROLE,
+            reasons["embedding_grant"],
+        )
+
+    return failures
+
+
 async def create_postgres_schema(pool: Any) -> int:
     """Create all PostgreSQL tables and indexes.
 
@@ -4953,7 +5397,13 @@ async def create_postgres_schema(pool: Any) -> int:
     subsequent calls are no-ops for already-created schema objects. The catalog
     property graph is applied after them, and only when the server is
     PostgreSQL 19 or later and the SCHEMA_PROPERTY_GRAPH switch is enabled; see
-    `_apply_property_graph`.
+    `_apply_property_graph`. The vector extension, the artist embedding table,
+    and the embedding pipeline role are applied last, each skipped with a
+    logged reason when its own guard is closed; see `_apply_vector_schema`.
+    The artist embeddings HNSW index is deliberately *not* applied here --
+    building it needs a temporary `maintenance_work_mem` bump this one-shot,
+    unattended initializer must never decide to make on its own; see
+    `build_artist_embeddings_index`.
 
     Args:
         pool: An AsyncPostgreSQLPool instance (from common.postgres_resilient).
@@ -4972,6 +5422,7 @@ async def create_postgres_schema(pool: Any) -> int:
             success_count, failure_count = await _execute_schema_statements(cursor, statements)
             # Last, and only when the server and the operator both allow it.
             failure_count += await _apply_property_graph(cursor)
+            failure_count += await _apply_vector_schema(cursor)
 
     total = len(statements)
     logger.info(f"✅ PostgreSQL schema creation complete: {success_count} succeeded, {failure_count} failed (total: {total})")
