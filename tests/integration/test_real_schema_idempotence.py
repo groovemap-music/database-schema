@@ -943,6 +943,67 @@ async def test_build_artist_embeddings_index_builds_a_usable_hnsw_index() -> Non
     assert ARTIST_EMBEDDINGS_HNSW_INDEX_NAME in plan, f"planner did not use the HNSW index:\n{plan}"
 
 
+async def index_relfilenode(index_name: str) -> int:
+    """Return the physical file identifier PostgreSQL currently backs `index_name` with.
+
+    `REINDEX` builds a brand-new physical file and swaps it in under the same
+    index name and OID, so a changed `relfilenode` is what actually building
+    something new looks like -- unlike `CREATE INDEX IF NOT EXISTS`, which
+    would leave this untouched.
+    """
+    rows = await postgres_rows(
+        "SELECT relfilenode FROM pg_class WHERE relnamespace = 'public'::regnamespace AND relname = %s",
+        (index_name,),
+    )
+    return rows[0][0]
+
+
+async def index_is_valid(index_name: str) -> bool:
+    rows = await postgres_rows(
+        "SELECT indisvalid FROM pg_index WHERE indexrelid = %s::regclass",
+        (f"public.{index_name}",),
+    )
+    return bool(rows[0][0])
+
+
+@pytest.mark.asyncio
+async def test_build_artist_embeddings_index_rebuild_true_actually_rebuilds() -> None:
+    """`rebuild=True` runs `REINDEX INDEX`, which -- unlike the default
+    `CREATE INDEX IF NOT EXISTS` -- replaces the index's physical file even
+    though its name and OID stay the same; `relfilenode` is what makes that
+    replacement observable. Also proves `maintenance_work_mem` is back to
+    this connection's own inherited value afterward, on the same connection
+    the raise happened on, not merely on a fresh one.
+    """
+    if not await vector_extension_present():
+        pytest.skip("pgvector is not installed on this tier; this scenario only exists when it is available")
+    await apply_schema()
+
+    connection = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params())
+    async with connection, connection.cursor() as cursor:
+        await connection.set_autocommit(True)
+
+        await cursor.execute("SHOW maintenance_work_mem")
+        baseline_maintenance_work_mem = (await cursor.fetchall())[0][0]
+
+        # Ensure a real, already-built index exists first -- `rebuild=True`
+        # rebuilds an existing index, it does not create one from nothing.
+        first_build_failures = await build_artist_embeddings_index(cursor, maintenance_work_mem=_HNSW_FIXTURE_MAINTENANCE_WORK_MEM)
+        assert first_build_failures == 0
+        before_relfilenode = await index_relfilenode(ARTIST_EMBEDDINGS_HNSW_INDEX_NAME)
+
+        rebuild_failures = await build_artist_embeddings_index(cursor, maintenance_work_mem=_HNSW_FIXTURE_MAINTENANCE_WORK_MEM, rebuild=True)
+
+        await cursor.execute("SHOW maintenance_work_mem")
+        after_maintenance_work_mem = (await cursor.fetchall())[0][0]
+
+    assert rebuild_failures == 0
+    after_relfilenode = await index_relfilenode(ARTIST_EMBEDDINGS_HNSW_INDEX_NAME)
+    assert after_relfilenode != before_relfilenode, "REINDEX did not actually replace the index's physical file"
+    assert await index_is_valid(ARTIST_EMBEDDINGS_HNSW_INDEX_NAME) is True
+    assert after_maintenance_work_mem == baseline_maintenance_work_mem, "maintenance_work_mem was not reset after the rebuild"
+
+
 @pytest.mark.asyncio
 async def test_derived_refresh_job_keys_claim_locks_and_repeated_initialization() -> None:
     """Two workers cannot claim one job, and an old generation cannot masquerade as current."""

@@ -7,6 +7,7 @@ import pytest
 
 from groovemap_schema.postgres import (
     _ACTIVITY_STATEMENTS,
+    _ARTIST_EMBEDDINGS_HNSW_INDEX_REINDEX_STATEMENT,
     _ARTIST_EMBEDDINGS_HNSW_INDEX_STATEMENT,
     _ARTIST_EMBEDDINGS_STATEMENT,
     _EMBEDDINGS_TABLE_GRANT,
@@ -32,6 +33,7 @@ from groovemap_schema.postgres import (
     _apply_vector_schema,
     _property_graph_skip_reason,
     _set_maintenance_work_mem_statement,
+    _valid_maintenance_work_mem,
     _vector_schema_skip_reasons,
     build_artist_embeddings_index,
     create_postgres_schema,
@@ -817,6 +819,49 @@ class TestArtistEmbeddingsHnswIndexStatement:
         assert ARTIST_EMBEDDINGS_HNSW_INDEX_NAME not in names
 
 
+class TestArtistEmbeddingsHnswIndexReindexStatement:
+    """Static shape checks over the rebuild statement `rebuild=True` runs instead."""
+
+    def test_it_reindexes_the_same_index_by_name(self) -> None:
+        assert _ARTIST_EMBEDDINGS_HNSW_INDEX_REINDEX_STATEMENT[1] == f"REINDEX INDEX public.{ARTIST_EMBEDDINGS_HNSW_INDEX_NAME}"
+
+    def test_it_is_not_concurrent(self) -> None:
+        """Plain `REINDEX INDEX`, not `CONCURRENTLY` -- see the module comment for why."""
+        assert "CONCURRENTLY" not in _ARTIST_EMBEDDINGS_HNSW_INDEX_REINDEX_STATEMENT[1]
+
+    def test_it_is_not_part_of_the_statements_the_initializer_runs_automatically(self) -> None:
+        assert _ARTIST_EMBEDDINGS_HNSW_INDEX_REINDEX_STATEMENT not in _VECTOR_SCHEMA_STATEMENTS
+
+
+class TestValidMaintenanceWorkMem:
+    """The validator standing between a caller-supplied string and the `SET` statement it is
+    interpolated into -- `SET`'s value position takes no bind parameter.
+    """
+
+    @pytest.mark.parametrize("value", ["2GB", "64MB", "256MB", "1TB", "500kB", "1kB"])
+    def test_accepts_a_bare_positive_integer_with_a_postgres_memory_unit(self, value: str) -> None:
+        assert _valid_maintenance_work_mem(value) is True
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "",
+            "2 GB",  # a space
+            "-1GB",  # negative
+            "0GB",  # zero
+            "2gb",  # lowercase unit
+            "2GiB",  # not a PostgreSQL unit
+            "2",  # no unit at all
+            "GB",  # no quantity
+            "2GB;",  # trailing punctuation
+            "2GB' OR '1'='1",  # a quote-escape attempt
+            "2GB'; DROP TABLE artist_embeddings; --",  # a statement-injection attempt
+        ],
+    )
+    def test_rejects_anything_else(self, value: str) -> None:
+        assert _valid_maintenance_work_mem(value) is False
+
+
 class TestBuildArtistEmbeddingsIndex:
     """`build_artist_embeddings_index` is the operator procedure, never something
     `create_postgres_schema` calls on its own -- see `TestApplyVectorSchema` and
@@ -910,6 +955,45 @@ class TestBuildArtistEmbeddingsIndex:
         assert await build_artist_embeddings_index(cursor, maintenance_work_mem="64MB") == 0
         statements = self._statements(cursor)
         assert statements[1] == _set_maintenance_work_mem_statement("64MB")
+
+    @pytest.mark.asyncio
+    async def test_an_invalid_maintenance_work_mem_is_rejected_before_touching_the_database(self) -> None:
+        """`_valid_maintenance_work_mem` runs before the memory bump, so a rejected value never
+        reaches a `SET` statement, let alone the index build.
+        """
+        cursor = self._cursor([(True,)])
+
+        assert await build_artist_embeddings_index(cursor, maintenance_work_mem="2GB'; DROP TABLE artist_embeddings; --") == 1
+        statements = self._statements(cursor)
+        # Only the extension-installed probe ran; no SET, no index DDL, no RESET.
+        assert statements == [_VECTOR_EXTENSION_INSTALLED_QUERY]
+
+    @pytest.mark.asyncio
+    async def test_rebuild_true_reindexes_instead_of_create_index_if_not_exists(self) -> None:
+        cursor = self._cursor([(True,)])
+
+        assert await build_artist_embeddings_index(cursor, rebuild=True) == 0
+        statements = self._statements(cursor)
+        assert statements == [
+            _VECTOR_EXTENSION_INSTALLED_QUERY,
+            _set_maintenance_work_mem_statement(_HNSW_BUILD_MAINTENANCE_WORK_MEM),
+            _ARTIST_EMBEDDINGS_HNSW_INDEX_REINDEX_STATEMENT[1],
+            _RESET_MAINTENANCE_WORK_MEM,
+        ]
+        assert _ARTIST_EMBEDDINGS_HNSW_INDEX_STATEMENT[1] not in statements
+
+    @pytest.mark.asyncio
+    async def test_a_failing_reindex_still_reverts_maintenance_work_mem(self) -> None:
+        cursor = self._cursor([(True,)])
+
+        async def fail_on_the_reindex(statement: Any, *_: Any, **__: Any) -> None:
+            if str(statement) == _ARTIST_EMBEDDINGS_HNSW_INDEX_REINDEX_STATEMENT[1]:
+                raise RuntimeError("Simulated PostgreSQL error")
+
+        cursor.execute = AsyncMock(side_effect=fail_on_the_reindex)
+        assert await build_artist_embeddings_index(cursor, rebuild=True) == 1
+        statements = self._statements(cursor)
+        assert statements[-1] == _RESET_MAINTENANCE_WORK_MEM
 
 
 class TestVectorSchemaFullRun:

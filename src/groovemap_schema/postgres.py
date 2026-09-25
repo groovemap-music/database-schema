@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 from common.credit_roles import ROLE_CATEGORIES
@@ -5104,6 +5105,26 @@ _ARTIST_EMBEDDINGS_HNSW_INDEX_STATEMENT = (
     """,
 )
 
+# `CREATE INDEX IF NOT EXISTS` above is a no-op once the index exists, so it
+# can build but never rebuild. `build_artist_embeddings_index(..., rebuild=True)`
+# uses this instead. Plain `REINDEX INDEX`, not `REINDEX INDEX CONCURRENTLY`,
+# is the deliberate choice: it takes an ACCESS EXCLUSIVE lock on the table for
+# its duration, blocking reads and writes through the index, but it is atomic
+# -- a failed or cancelled REINDEX leaves the existing index exactly as it
+# was, never a half-built or `INVALID` one. `CONCURRENTLY` avoids that lock,
+# but cannot run inside a transaction block, needs two full table scans
+# instead of one, and can abandon an `INVALID` index needing a manual `DROP
+# INDEX` if it is interrupted -- fragility this operator-invoked,
+# maintenance-window procedure (see the module comment above) does not need
+# to accept. Calling with `rebuild=True` before the index exists is a caller
+# error: PostgreSQL's own "does not exist" failure surfaces and is counted
+# like any other failed statement, the same as every other guarded statement
+# in this module.
+_ARTIST_EMBEDDINGS_HNSW_INDEX_REINDEX_STATEMENT = (
+    f"{ARTIST_EMBEDDINGS_HNSW_INDEX_NAME} (reindex)",
+    f"REINDEX INDEX public.{ARTIST_EMBEDDINGS_HNSW_INDEX_NAME}",
+)
+
 # The temporary, build-only memory bump ADR 0013's precondition requires,
 # raised for the build and always reverted afterward. `CREATE INDEX` (unlike
 # `CREATE INDEX CONCURRENTLY`) runs inside an ordinary transaction, but the
@@ -5122,30 +5143,65 @@ _HNSW_BUILD_MAINTENANCE_WORK_MEM = "2GB"
 
 _RESET_MAINTENANCE_WORK_MEM = "RESET maintenance_work_mem"
 
+# `SET`'s value position does not accept a bind parameter the way an ordinary
+# statement does (there is no `SET maintenance_work_mem = $1` in PostgreSQL's
+# grammar), so this module builds the `SET` statement's text itself rather
+# than parameterizing it -- which makes `maintenance_work_mem` the one piece
+# of this function's own caller-supplied data that ends up interpolated into
+# SQL text rather than bound. `_valid_maintenance_work_mem` is what keeps that
+# safe: it is checked, and rejected on a mismatch, before this ever runs,
+# so nothing but a bare positive integer and one of PostgreSQL's own memory
+# unit suffixes can reach the interpolation.
+_MAINTENANCE_WORK_MEM_PATTERN = re.compile(r"^[1-9][0-9]*(kB|MB|GB|TB)$")
+
+
+def _valid_maintenance_work_mem(value: str) -> bool:
+    """Return whether `value` is a safe, well-formed PostgreSQL memory quantity.
+
+    Deliberately strict rather than merely functional: PostgreSQL itself
+    accepts a bare integer (implicitly kB), decimal quantities, and a `B`
+    suffix, but none of those are the shape ADR 0013's own documented value
+    (`2GB`) or this module's test overrides (`64MB`) take, so this validator
+    only has to admit that one shape -- a positive integer immediately
+    followed by `kB`, `MB`, `GB`, or `TB` -- and can refuse everything else,
+    including anything that could otherwise smuggle a second statement past
+    the single-quoted string this value is interpolated into.
+    """
+    return bool(_MAINTENANCE_WORK_MEM_PATTERN.fullmatch(value))
+
 
 def _set_maintenance_work_mem_statement(value: str) -> str:
     return f"SET maintenance_work_mem = '{value}'"
 
 
-async def build_artist_embeddings_index(cursor: Any, *, maintenance_work_mem: str = _HNSW_BUILD_MAINTENANCE_WORK_MEM) -> int:
-    """Build (or rebuild) the artist embeddings HNSW index -- the ADR 0013 way.
+async def build_artist_embeddings_index(cursor: Any, *, maintenance_work_mem: str = _HNSW_BUILD_MAINTENANCE_WORK_MEM, rebuild: bool = False) -> int:
+    """Build, or rebuild, the artist embeddings HNSW index -- the ADR 0013 way.
 
     This is the operator procedure ADR 0013's build-memory precondition
     requires, not a step `create_postgres_schema` ever takes on its own; see
     the module comment above `_ARTIST_EMBEDDINGS_HNSW_INDEX_STATEMENT`. Guarded
     on the vector extension being installed, exactly like the table it
-    indexes -- a fresh `CREATE INDEX CONCURRENTLY` is unnecessary here because
-    an operator invokes this deliberately, during a maintenance window ADR
-    0013 anticipates, rather than concurrently with unrelated writer traffic.
+    indexes.
 
     `maintenance_work_mem` is raised to `maintenance_work_mem` (ADR 0013's
     documented ~2 GB by default) only for the statement this function runs,
     and is always reverted before returning, whether or not the build
-    succeeded; no standing server setting changes.
+    succeeded; no standing server setting changes. Rejected outright, before
+    anything else runs, if it is not a bare PostgreSQL memory quantity like
+    `2GB` -- see `_valid_maintenance_work_mem`.
 
-    Returns the number of failed statements (0 means the index was built, was
-    already present, or was correctly skipped because the extension is not
-    installed).
+    `rebuild=False` (the default) is `CREATE INDEX IF NOT EXISTS`: a no-op
+    once the index exists, so it never rebuilds one that is already there.
+    `rebuild=True` runs `REINDEX INDEX` instead, which does -- see the module
+    comment above `_ARTIST_EMBEDDINGS_HNSW_INDEX_REINDEX_STATEMENT` for why
+    plain `REINDEX` and not `CONCURRENTLY`. Use `rebuild=True` after a bulk
+    embedding recompute has changed the indexed rows; see docs/architecture.md,
+    "The bulk-recompute load order", for when that index should exist at all
+    during such a load.
+
+    Returns the number of failed statements (0 means the index was built or
+    rebuilt, was already present in the `rebuild=False` case, or was
+    correctly skipped because the extension is not installed).
     """
     if not await _vector_extension_installed(cursor):
         logger.info(
@@ -5155,14 +5211,23 @@ async def build_artist_embeddings_index(cursor: Any, *, maintenance_work_mem: st
         )
         return 0
 
+    if not _valid_maintenance_work_mem(maintenance_work_mem):
+        logger.error(
+            "❌ Refusing to build %s: %r is not a PostgreSQL memory quantity like '2GB'",
+            ARTIST_EMBEDDINGS_HNSW_INDEX_NAME,
+            maintenance_work_mem,
+        )
+        return 1
+
     try:
         await cursor.execute(_set_maintenance_work_mem_statement(maintenance_work_mem))
     except Exception as error:
         logger.error("❌ Could not raise maintenance_work_mem for %s: %s", ARTIST_EMBEDDINGS_HNSW_INDEX_NAME, error)
         return 1
 
+    statement = _ARTIST_EMBEDDINGS_HNSW_INDEX_REINDEX_STATEMENT if rebuild else _ARTIST_EMBEDDINGS_HNSW_INDEX_STATEMENT
     try:
-        _success, failures = await _execute_schema_statements(cursor, [_ARTIST_EMBEDDINGS_HNSW_INDEX_STATEMENT])
+        _success, failures = await _execute_schema_statements(cursor, [statement])
         return failures
     finally:
         try:
