@@ -66,6 +66,8 @@ EXPECTED_POSTGRES_TABLES = {
         "app_tokens",
         "artifacts",
         "artists",
+        "catalog_item_moves",
+        "catalog_item_supersessions",
         "catalog_items",
         "collection_snapshots",
         "extraction_history",
@@ -148,6 +150,22 @@ EXPECTED_COLUMNS = {
     ("public", "loader_derived_refresh_job", "started_at", "timestamp with time zone"),
     ("public", "loader_derived_refresh_job", "completed_at", "timestamp with time zone"),
     ("public", "loader_derived_refresh_job", "superseded_at", "timestamp with time zone"),
+    # catalog-api codes its merge steps to ADR 0009's 2026-09-25 amendment, so
+    # the supersession and ledger columns are pinned at their engine types.
+    ("public", "catalog_item_supersessions", "superseded_id", "uuid"),
+    ("public", "catalog_item_supersessions", "survivor_id", "uuid"),
+    ("public", "catalog_item_supersessions", "cause", "text"),
+    ("public", "catalog_item_supersessions", "decision_ref", "uuid"),
+    ("public", "catalog_item_supersessions", "valid_from", "timestamp with time zone"),
+    ("public", "catalog_item_supersessions", "valid_to", "timestamp with time zone"),
+    ("public", "catalog_item_supersessions", "via_id", "uuid"),
+    ("public", "catalog_item_moves", "supersession_id", "uuid"),
+    ("public", "catalog_item_moves", "table_name", "text"),
+    ("public", "catalog_item_moves", "row_id", "uuid"),
+    ("public", "catalog_item_moves", "from_item_id", "uuid"),
+    ("public", "catalog_item_moves", "to_item_id", "uuid"),
+    ("public", "catalog_item_moves", "user_id", "uuid"),
+    ("public", "catalog_item_moves", "moved_at", "timestamp with time zone"),
 }
 
 # The endpoint-pair indexes every one of the sixteen typed MusicBrainz
@@ -165,6 +183,8 @@ EXPECTED_MUSICBRAINZ_INDEXES = {
 # PostgreSQL 18 tier and the advisory PostgreSQL 19 beta tier must render identically.
 EXPECTED_UUIDV7_DEFAULTS = {
     ("public", "artifacts", "id"),
+    ("public", "catalog_item_moves", "id"),
+    ("public", "catalog_item_supersessions", "id"),
     ("public", "catalog_items", "id"),
     ("public", "collection_snapshots", "id"),
     ("public", "observations", "id"),
@@ -3185,3 +3205,210 @@ async def test_already_installed_creates_artist_embeddings_for_a_non_superuser_t
         await admin_connection.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(database)))
         await admin_connection.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(role)))
         await admin_connection.close()
+
+
+# ── Superseded catalog items (ADR 0009, 2026-09-25 amendment) ────────────────
+# catalog-api writes every supersession and ledger row; these tests play that
+# writer's part by hand to prove the shape admits the amendment's merge,
+# chain compression, and revert, and refuses what it must.
+
+_SUPERSEDE = (
+    "INSERT INTO catalog_item_supersessions (superseded_id, survivor_id, cause, decision_ref, via_id) VALUES (%s, %s, %s, %s, %s) RETURNING id"
+)
+
+
+async def _mint_items(cursor: Any, count: int) -> list[Any]:
+    """Insert COUNT release-kind catalog items and return their ids."""
+    ids = []
+    for _ in range(count):
+        await cursor.execute("INSERT INTO catalog_items (kind) VALUES ('release') RETURNING id")
+        row = await cursor.fetchone()
+        assert row is not None
+        ids.append(row[0])
+    return ids
+
+
+async def _resolve(cursor: Any, native_id: Any) -> Any:
+    await cursor.execute("SELECT public.resolve_catalog_item(%s)", (native_id,))
+    row = await cursor.fetchone()
+    assert row is not None
+    return row[0]
+
+
+async def _live_vertices(cursor: Any, ids: list[Any]) -> set[Any]:
+    await cursor.execute("SELECT item_id FROM graph.catalog_item WHERE item_id = ANY(%s)", (ids,))
+    return {row[0] for row in await cursor.fetchall()}
+
+
+async def _no_current_survivor_is_itself_superseded(cursor: Any) -> bool:
+    await cursor.execute(
+        """
+        SELECT NOT EXISTS (
+            SELECT 1
+            FROM catalog_item_supersessions AS outer_row
+            JOIN catalog_item_supersessions AS inner_row ON inner_row.superseded_id = outer_row.survivor_id
+            WHERE outer_row.valid_to IS NULL AND inner_row.valid_to IS NULL
+        )
+        """
+    )
+    row = await cursor.fetchone()
+    return bool(row is not None and row[0])
+
+
+@pytest.mark.asyncio
+async def test_supersession_resolves_one_hop_through_merge_compression_and_revert() -> None:
+    """A → B, then B → C compressed via `via_id`, then both reverted in reverse order."""
+    await apply_schema()
+    connection = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params(), autocommit=True)
+    async with connection, connection.cursor() as cursor:
+        item_a, item_b, item_c = await _mint_items(cursor, 3)
+        promotion, reattachment = uuid4(), uuid4()
+
+        # Not superseded, and never minted: both resolve to themselves.
+        assert await _resolve(cursor, item_a) == item_a
+        stranger = uuid4()
+        assert await _resolve(cursor, stranger) == stranger
+        assert await _live_vertices(cursor, [item_a, item_b, item_c]) == {item_a, item_b, item_c}
+
+        # Merge A into B.
+        await cursor.execute(_SUPERSEDE, (item_a, item_b, "edition_promotion", promotion, None))
+        a_to_b = (await cursor.fetchone() or (None,))[0]
+        assert await _resolve(cursor, item_a) == item_b
+        assert await _live_vertices(cursor, [item_a, item_b, item_c]) == {item_b, item_c}
+
+        # B is superseded into C in one transaction: close A → B, open B → C,
+        # and open A → C naming B → C as its `via_id`.
+        async with connection.transaction():
+            await cursor.execute(_SUPERSEDE, (item_b, item_c, "catalog_reattachment", reattachment, None))
+            b_to_c = (await cursor.fetchone() or (None,))[0]
+            await cursor.execute("UPDATE catalog_item_supersessions SET valid_to = NOW() WHERE id = %s", (a_to_b,))
+            await cursor.execute(_SUPERSEDE, (item_a, item_c, "edition_promotion", promotion, b_to_c))
+        for item in (item_a, item_b, item_c):
+            assert await _resolve(cursor, item) == item_c
+        assert await _no_current_survivor_is_itself_superseded(cursor)
+        assert await _live_vertices(cursor, [item_a, item_b, item_c]) == {item_c}
+
+        # Revert B → C: close it and every open row compressed through it, and
+        # re-open the predecessor A → B as a new row.
+        async with connection.transaction():
+            await cursor.execute(
+                "UPDATE catalog_item_supersessions SET valid_to = NOW() WHERE (id = %s OR via_id = %s) AND valid_to IS NULL",
+                (b_to_c, b_to_c),
+            )
+            assert cursor.rowcount == 2
+            await cursor.execute(_SUPERSEDE, (item_a, item_b, "edition_promotion", promotion, None))
+        assert await _resolve(cursor, item_a) == item_b
+        assert await _resolve(cursor, item_b) == item_b
+        assert await _no_current_survivor_is_itself_superseded(cursor)
+
+        # Revert A → B: the former id resolves to itself and is live again.
+        await cursor.execute(
+            "UPDATE catalog_item_supersessions SET valid_to = NOW() WHERE superseded_id = %s AND valid_to IS NULL",
+            (item_a,),
+        )
+        assert await _resolve(cursor, item_a) == item_a
+        assert await _live_vertices(cursor, [item_a, item_b, item_c]) == {item_a, item_b, item_c}
+
+        # History is kept by closing rows, never by rewriting them.
+        await cursor.execute(
+            "SELECT count(*) FILTER (WHERE valid_to IS NULL), count(*) FROM catalog_item_supersessions WHERE superseded_id = ANY(%s)",
+            ([item_a, item_b],),
+        )
+        assert await cursor.fetchone() == (0, 4)
+
+
+@pytest.mark.asyncio
+async def test_supersession_refuses_a_second_survivor_an_unknown_cause_and_itself() -> None:
+    await apply_schema()
+    connection = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params(), autocommit=True)
+    async with connection, connection.cursor() as cursor:
+        item_a, item_b, item_c = await _mint_items(cursor, 3)
+        await cursor.execute(_SUPERSEDE, (item_a, item_b, "catalog_reattachment", uuid4(), None))
+
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            await cursor.execute(_SUPERSEDE, (item_a, item_c, "catalog_reattachment", uuid4(), None))
+        with pytest.raises(psycopg.errors.CheckViolation):
+            await cursor.execute(_SUPERSEDE, (item_c, item_b, "upstream_merge", uuid4(), None))
+        with pytest.raises(psycopg.errors.CheckViolation):
+            await cursor.execute(_SUPERSEDE, (item_c, item_c, "edition_promotion", uuid4(), None))
+        with pytest.raises(psycopg.errors.ForeignKeyViolation):
+            await cursor.execute(_SUPERSEDE, (item_c, uuid4(), "edition_promotion", uuid4(), None))
+
+        # A closed row does not count against the one current survivor.
+        await cursor.execute("UPDATE catalog_item_supersessions SET valid_to = NOW() WHERE superseded_id = %s", (item_a,))
+        await cursor.execute(_SUPERSEDE, (item_a, item_c, "catalog_reattachment", uuid4(), None))
+        assert await _resolve(cursor, item_a) == item_c
+
+
+@pytest.mark.asyncio
+async def test_move_ledger_is_keyed_per_merge_and_erased_with_its_user() -> None:
+    await apply_schema()
+    connection = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params(), autocommit=True)
+    async with connection, connection.cursor() as cursor:
+        item_a, item_b = await _mint_items(cursor, 2)
+        await cursor.execute(
+            "INSERT INTO users (email, hashed_password) VALUES (%s, 'x') RETURNING id",
+            (f"{uuid4().hex}@example.invalid",),
+        )
+        user_id = (await cursor.fetchone() or (None,))[0]
+        await cursor.execute("INSERT INTO owned_copies (user_id, item_id) VALUES (%s, %s) RETURNING id", (user_id, item_a))
+        copy_id = (await cursor.fetchone() or (None,))[0]
+
+        # The merge: supersede, re-point, ledger.
+        async with connection.transaction():
+            await cursor.execute(_SUPERSEDE, (item_a, item_b, "catalog_reattachment", uuid4(), None))
+            supersession = (await cursor.fetchone() or (None,))[0]
+            await cursor.execute("UPDATE owned_copies SET item_id = %s WHERE item_id = %s", (item_b, item_a))
+            await cursor.execute(
+                "INSERT INTO catalog_item_moves (supersession_id, table_name, row_id, from_item_id, to_item_id, user_id) "
+                "VALUES (%s, 'owned_copies', %s, %s, %s, %s)",
+                (supersession, copy_id, item_a, item_b, user_id),
+            )
+
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            await cursor.execute(
+                "INSERT INTO catalog_item_moves (supersession_id, table_name, row_id, from_item_id, to_item_id, user_id) "
+                "VALUES (%s, 'owned_copies', %s, %s, %s, %s)",
+                (supersession, copy_id, item_a, item_b, user_id),
+            )
+        with pytest.raises(psycopg.errors.CheckViolation):
+            await cursor.execute(
+                "INSERT INTO catalog_item_moves (supersession_id, table_name, row_id, from_item_id, to_item_id, user_id) "
+                "VALUES (%s, 'observations', %s, %s, %s, %s)",
+                (supersession, uuid4(), item_a, item_b, user_id),
+            )
+
+        # The revert moves back exactly the ledgered rows still on the survivor.
+        await cursor.execute("INSERT INTO owned_copies (user_id, item_id) VALUES (%s, %s) RETURNING id", (user_id, item_b))
+        later_copy = (await cursor.fetchone() or (None,))[0]
+        await cursor.execute(
+            """
+            UPDATE owned_copies AS copy SET item_id = move.from_item_id
+            FROM catalog_item_moves AS move
+            WHERE move.supersession_id = %s AND move.table_name = 'owned_copies'
+              AND copy.id = move.row_id AND copy.item_id = move.to_item_id
+            """,
+            (supersession,),
+        )
+        await cursor.execute("SELECT id, item_id FROM owned_copies WHERE user_id = %s", (user_id,))
+        assert dict(await cursor.fetchall()) == {copy_id: item_a, later_copy: item_b}
+
+        # Erasure: the ledger goes with the user.
+        await cursor.execute("DELETE FROM users WHERE id = %s", (user_id,))
+        await cursor.execute("SELECT count(*) FROM catalog_item_moves WHERE supersession_id = %s", (supersession,))
+        assert await cursor.fetchone() == (0,)
+
+
+@pytest.mark.asyncio
+async def test_supersession_and_dependent_indexes_exist() -> None:
+    await apply_schema()
+    rows = await postgres_rows(
+        "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = 'public' AND tablename IN "
+        "('artifacts', 'owned_copies', 'catalog_item_supersessions', 'catalog_item_moves')"
+    )
+    definitions = dict(rows)
+    assert definitions["idx_artifacts_item_id"].endswith("(item_id)")
+    assert definitions["idx_owned_copies_item_id"].endswith("(item_id)")
+    assert "UNIQUE" in definitions["idx_catalog_item_supersessions_superseded_id"]
+    assert definitions["idx_catalog_item_supersessions_superseded_id"].endswith("WHERE (valid_to IS NULL)")
+    assert "idx_catalog_item_moves_user_id" in definitions

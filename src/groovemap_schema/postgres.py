@@ -358,6 +358,14 @@ _USER_TABLES: list[tuple[str, str]] = [
         )
         """,
     ),
+    # Every artifact on one catalog item.  The native-id merge (ADR 0009's
+    # 2026-09-25 amendment) re-points an artifact on a superseded item to its
+    # survivor, and catalog-api's dependents guard probes for one first, so the
+    # reverse walk from an item must not be a sequential scan.
+    (
+        "idx_artifacts_item_id",
+        "CREATE INDEX IF NOT EXISTS idx_artifacts_item_id ON artifacts (item_id)",
+    ),
     # owned_copies makes the physical copy first class: it exists because a user
     # says it does, not because a provider listed it.  `collection_row_id` is the
     # optional back-link to the provider-keyed collection row, set to NULL rather
@@ -387,6 +395,12 @@ _USER_TABLES: list[tuple[str, str]] = [
     (
         "idx_owned_copies_collection_row_id",
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_owned_copies_collection_row_id ON owned_copies (collection_row_id) WHERE collection_row_id IS NOT NULL",
+    ),
+    # The same reverse walk as idx_artifacts_item_id, for the same guard and the
+    # same merge re-point.
+    (
+        "idx_owned_copies_item_id",
+        "CREATE INDEX IF NOT EXISTS idx_owned_copies_item_id ON owned_copies (item_id)",
     ),
     (
         "collection_snapshots table",
@@ -466,6 +480,136 @@ _USER_TABLES: list[tuple[str, str]] = [
     (
         "idx_provider_aliases_native_id",
         "CREATE INDEX IF NOT EXISTS idx_provider_aliases_native_id ON provider_aliases (native_id)",
+    ),
+    # ------------------------------------------------------------------
+    # Superseded catalog items (ADR 0009, 2026-09-25 amendment)
+    #
+    # When two native catalog items turn out to be one — an edition promotion
+    # or a catalog re-attachment under ADR 0014 — the superseded item keeps its
+    # `catalog_items` row, kind, and id, and a supersession row records that it
+    # now resolves to the survivor.  This repository declares the shape only:
+    # catalog-api writes every row, inside the ADR 0014 transaction that moves
+    # the aliases, and enforces there that both items share a kind.  Declared
+    # after `provider_aliases` because every object here references
+    # `catalog_items` or `users`.
+    # ------------------------------------------------------------------
+    #
+    # `cause` is closed at the two ADR 0014 causes; another joins only by
+    # amendment.  `decision_ref` names what authorized the row — the `matching`
+    # decision row for a promotion, the `admin_audit_log` entry for a
+    # re-attachment run — so it is a bare UUID read against `cause`, not a
+    # foreign key: it points at one of two tables, and `matching` is not built.
+    #
+    # Resolution is always one hop.  When B, which survives A, is superseded
+    # into C, the writer closes A → B and opens A → C with `via_id` naming the
+    # B → C row, so a revert of B → C can find and re-open exactly the rows it
+    # compressed.  The writer also refuses a row whose two ids are equal; the
+    # CHECK below makes that refusal the database's as well, since it needs no
+    # other row to decide.
+    (
+        "catalog_item_supersessions table",
+        """
+        CREATE TABLE IF NOT EXISTS catalog_item_supersessions (
+            id            UUID PRIMARY KEY DEFAULT uuidv7(),
+            superseded_id UUID NOT NULL REFERENCES catalog_items(id),
+            survivor_id   UUID NOT NULL REFERENCES catalog_items(id),
+            cause         TEXT NOT NULL CHECK (cause IN ('edition_promotion', 'catalog_reattachment')),
+            decision_ref  UUID NOT NULL,
+            valid_from    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            valid_to      TIMESTAMPTZ,
+            via_id        UUID REFERENCES catalog_item_supersessions(id),
+            CONSTRAINT catalog_item_supersessions_distinct_items CHECK (superseded_id <> survivor_id)
+        )
+        """,
+    ),
+    # At most one current survivor per item, exactly as provider_aliases admits
+    # at most one current native id per external id: history is kept by closing
+    # rows, never by rewriting them.  It is also the one index probe resolution
+    # costs.
+    (
+        "idx_catalog_item_supersessions_superseded_id",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_catalog_item_supersessions_superseded_id "
+        "ON catalog_item_supersessions (superseded_id) WHERE valid_to IS NULL",
+    ),
+    # Chain compression finds every open row whose survivor is the item now
+    # being superseded, and history reads walk the same column backwards.
+    (
+        "idx_catalog_item_supersessions_survivor_id",
+        "CREATE INDEX IF NOT EXISTS idx_catalog_item_supersessions_survivor_id ON catalog_item_supersessions (survivor_id)",
+    ),
+    # A revert closes every open row whose `via_id` is the reverted row.  Most
+    # rows carry no `via_id`, so the index skips them.
+    (
+        "idx_catalog_item_supersessions_via_id",
+        "CREATE INDEX IF NOT EXISTS idx_catalog_item_supersessions_via_id ON catalog_item_supersessions (via_id) WHERE via_id IS NOT NULL",
+    ),
+    # The move ledger: one row per asserted reference a merge re-pointed, so a
+    # revert moves back exactly the rows the merge moved and never a row created
+    # against the survivor afterwards.  `from_item_id` and `to_item_id` record
+    # what the row pointed at before and after; a revert moves a row back only
+    # while it still points at `to_item_id`.  The alias-table caches are not
+    # ledgered, because the alias table can always reproduce them.
+    #
+    # `user_id` is the owning user (an owned copy's `user_id`, an artifact's
+    # `created_by`), so the ledger is personal data: the erasure procedure
+    # deletes a user's rows by it and export includes them.  It is NULL only for
+    # an artifact no user created, and deleting the user cascades here as it
+    # does for every other user-owned table.  `row_id` names a row in one of two
+    # tables, so it carries no foreign key; the owned copy or artifact itself is
+    # never deleted by a merge.  The unique key admits a row once per merge, and
+    # its leading column is what a revert's lookup by supersession probes.
+    (
+        "catalog_item_moves table",
+        """
+        CREATE TABLE IF NOT EXISTS catalog_item_moves (
+            id              UUID PRIMARY KEY DEFAULT uuidv7(),
+            supersession_id UUID NOT NULL REFERENCES catalog_item_supersessions(id),
+            table_name      TEXT NOT NULL CHECK (table_name IN ('artifacts', 'owned_copies')),
+            row_id          UUID NOT NULL,
+            from_item_id    UUID NOT NULL REFERENCES catalog_items(id),
+            to_item_id      UUID NOT NULL REFERENCES catalog_items(id),
+            user_id         UUID REFERENCES users(id) ON DELETE CASCADE,
+            moved_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT catalog_item_moves_supersession_row_key UNIQUE (supersession_id, table_name, row_id)
+        )
+        """,
+    ),
+    (
+        "idx_catalog_item_moves_user_id",
+        "CREATE INDEX IF NOT EXISTS idx_catalog_item_moves_user_id ON catalog_item_moves (user_id)",
+    ),
+    # The published one-hop resolution: the current survivor of NATIVE_ID, or
+    # NATIVE_ID itself when it is not currently superseded.  A function rather
+    # than a view because resolution is defined for any native id, not only for
+    # ids with a `catalog_items` row: `activity.impressions.item_id` and the
+    # outcome endpoint record ids verbatim, and a view keyed on `catalog_items`
+    # would drop an id it does not know or push the COALESCE back into every
+    # reader, which is the rewrite publishing it once exists to prevent.  It is
+    # one probe of the partial unique index above per call, point-wise for an
+    # endpoint and per row in an analytics join over impressions.  EXECUTE is
+    # granted to PUBLIC by default, and analytics-engine reads `activity` as the
+    # same login that owns these tables, so no grant is declared.
+    (
+        "resolve_catalog_item function",
+        """
+        CREATE OR REPLACE FUNCTION public.resolve_catalog_item(native_id UUID)
+        RETURNS UUID
+        LANGUAGE sql
+        STABLE
+        STRICT
+        PARALLEL SAFE
+        AS $resolve_catalog_item$
+            SELECT COALESCE(
+                (
+                    SELECT supersession.survivor_id
+                    FROM public.catalog_item_supersessions AS supersession
+                    WHERE supersession.superseded_id = native_id
+                      AND supersession.valid_to IS NULL
+                ),
+                native_id
+            )
+        $resolve_catalog_item$
+        """,
     ),
     (
         "sync_history table",
@@ -1969,6 +2113,11 @@ SELECT users.id         AS user_id,
 FROM public.users AS users
 """,
         ),
+        # A currently superseded item is a tombstone, not a live entity (ADR 0009,
+        # 2026-09-25 amendment), so this vertex never exposes one; the merge
+        # re-points `owned_copies` to the survivor, so an `owns` edge never names
+        # one either. A reverted supersession has a `valid_to`, and the item
+        # reappears.
         _view(
             "catalog_item",
             """
@@ -1976,6 +2125,12 @@ SELECT catalog_items.id         AS item_id,
        catalog_items.kind       AS kind,
        catalog_items.created_at AS created_at
 FROM public.catalog_items AS catalog_items
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM public.catalog_item_supersessions AS supersession
+    WHERE supersession.superseded_id = catalog_items.id
+      AND supersession.valid_to IS NULL
+)
 """,
         ),
         _view(
