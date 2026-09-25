@@ -93,6 +93,16 @@ the recipe directly and carries `continue-on-error: true`. A beta failure is the
 signal, not a merge block. Both tiers share the same Neo4j image; only the PostgreSQL engine
 differs, so a divergence between them is attributable to the engine.
 
+The script also takes the PostgreSQL container's shared memory size from
+`POSTGRES_INTEGRATION_SHM_SIZE`, defaulting to Docker's own 64 MB. The PG18 tier never builds an
+HNSW index and leaves this at the default. The PG19 tier's own integration test builds the
+artist embeddings HNSW index (`build_artist_embeddings_index` in
+[`postgres.py`](../src/groovemap_schema/postgres.py)) over a small synthetic fixture, and a
+parallel HNSW build needs `/dev/shm` at least as large as the `maintenance_work_mem` it runs
+with; `just test-integration-pg19` sets `POSTGRES_INTEGRATION_SHM_SIZE=256m` to cover the
+modest, test-only `maintenance_work_mem` that build passes (never the ~2 GB the "Building the
+artist HNSW index" procedure below documents for production).
+
 ### Promoting the beta tier at general availability
 
 When PostgreSQL 19 reaches general availability, promote the advisory tier in this order:
@@ -1897,7 +1907,139 @@ other base table. And the schema-wide form is what keeps the grant self-maintain
 relation `_GRAPH_STATEMENTS` adds later is covered the next time the initializer runs, without
 this grant changing to name it.
 
+### The artist embeddings HNSW index
 
+```sql
+CREATE INDEX IF NOT EXISTS idx_artist_embeddings_embedding_hnsw
+ON public.artist_embeddings USING hnsw (embedding halfvec_cosine_ops)
+WITH (m = 16, ef_construction = 64)
+```
+
+ADR 0013 selects HNSW over `halfvec_cosine_ops`, at pgvector's own defaults (`m = 16`,
+`ef_construction = 64`). The statement is declared as `_ARTIST_EMBEDDINGS_HNSW_INDEX_STATEMENT`
+in `postgres.py`, guarded on the vector extension being installed exactly like
+`public.artist_embeddings` itself — a server without pgvector never sees this index attempted.
+
+Unlike every other statement in this module, `create_postgres_schema` never runs this one. The
+[footprint spike](https://github.com/groovemap-music/design/blob/main/docs/spikes/gm-design-chw.1-pgvector-shared-footprint.md)
+measured the production default `maintenance_work_mem` (512 MB) overflowing an HNSW build at
+657,596 rows; past that point the build does not fail, it degrades to a disk-spilling crawl that
+can run for hours. The unattended, every-deploy initializer must never risk triggering that on an
+empty-to-full transition — a table that was empty the last time it ran and is now fully populated
+by the embedding pipeline's monthly recompute. ADR 0013's build-memory precondition is exactly
+the fix it requires: "Initial builds and rebuilds raise [`maintenance_work_mem`] to about 2 GB
+for that session only and revert it. No standing memory setting changes."
+
+#### Building the artist HNSW index
+
+`build_artist_embeddings_index(cursor, *, maintenance_work_mem="2GB", rebuild=False)` in
+`postgres.py` is that procedure. An operator runs it explicitly — never as part of a deploy —
+after `public.artist_embeddings` exists and the embedding pipeline has populated it:
+
+1. It re-checks the same extension guard as the table (skips, logging why, if `vector` is not
+   installed).
+2. It refuses to run at all, logging why and returning a failure, unless `maintenance_work_mem`
+   is a bare PostgreSQL memory quantity like `2GB` or `64MB` (`_valid_maintenance_work_mem`) —
+   `SET`'s value position takes no bind parameter, so this is the only thing standing between a
+   caller-supplied string and the `SET` statement's interpolated text.
+3. `SET maintenance_work_mem = '2GB'` (ADR 0013's documented value; overridable for a
+   resource-bound caller — see below).
+4. `CREATE INDEX IF NOT EXISTS idx_artist_embeddings_embedding_hnsw ...` by default — safe to
+   re-run, but a no-op once the index exists, so this step alone never rebuilds one. Passing
+   `rebuild=True` runs `REINDEX INDEX public.idx_artist_embeddings_embedding_hnsw` instead, which
+   does. Plain `REINDEX`, not `REINDEX INDEX CONCURRENTLY`: it holds an `ACCESS EXCLUSIVE` lock on
+   the table for its duration, blocking reads and writes through the index, but it is atomic — a
+   failed or cancelled `REINDEX` leaves the existing index exactly as it was, never a half-built or
+   `INVALID` one. `CONCURRENTLY` avoids that lock, but cannot run inside a transaction block, needs
+   two full table scans instead of one, and can abandon an `INVALID` index needing a manual
+   `DROP INDEX` if interrupted — fragility this deliberate, operator-invoked, maintenance-window
+   procedure does not need to accept. `rebuild=True` before the index exists is a caller error:
+   PostgreSQL's own "does not exist" failure surfaces and counts like any other failed statement.
+5. `RESET maintenance_work_mem`, in a `finally`, whether or not the build succeeded — the
+   setting is never left raised on a connection that outlives the call, and no standing server
+   setting is ever touched.
+
+An operator invokes it from a Python shell (or a short script) against a direct, admin
+connection — not the connection pool the initializer and application services share, and not a
+step in the `database-schema` console entry point, which only ever runs the guarded, automatic
+schema pass:
+
+```python
+import asyncio
+import psycopg
+from groovemap_schema.postgres import build_artist_embeddings_index
+
+
+async def main() -> None:
+    async with await psycopg.AsyncConnection.connect(..., autocommit=True) as conn, conn.cursor() as cursor:
+        # Initial build, or after "The bulk-recompute load order" below has
+        # dropped and re-created the index: rebuild=False (the default).
+        # After any other change to already-indexed rows: rebuild=True.
+        failures = await build_artist_embeddings_index(cursor)
+        assert failures == 0
+
+
+asyncio.run(main())
+```
+
+The `maintenance_work_mem` keyword argument exists so a resource-bound test host can exercise
+this exact function — the real `SET` / `CREATE INDEX` (or `REINDEX`) / `RESET` sequence, not a
+stand-in — against a small synthetic fixture without requesting a 2 GB ceiling from a shared CI
+container; the PostgreSQL 19 integration tier does exactly that (see "Integration tiers" above for
+the matching `POSTGRES_INTEGRATION_SHM_SIZE`, since a parallel HNSW build needs `/dev/shm` at least
+as large as whatever `maintenance_work_mem` it runs with). Every production and operator call
+uses the default.
+
+#### The bulk-recompute load order
+
+`analytics-engine`'s monthly FastRP recompute inserts a whole new `model_version` of rows into
+`public.artist_embeddings` — up to the full artist scope in one load. If the HNSW index already
+exists at that point, PostgreSQL maintains it incrementally, once per row, as the bulk load
+runs, at whatever `maintenance_work_mem` that pipeline connection happens to hold — almost
+certainly the server default, since the pipeline is not the operator procedure above and has no
+reason to raise it. That turns one bulk load into millions of individually-memory-constrained
+index insertions instead of one raised-memory build, which is slower and reintroduces exactly the
+memory pressure ADR 0013's precondition exists to bound, just spread across the load instead of
+concentrated in a build. The load order that avoids it:
+
+1. **Drop or defer the index** before the load starts. On the very first load there is nothing to
+   drop yet; on every load after that, an operator drops it
+   (`DROP INDEX IF EXISTS public.idx_artist_embeddings_embedding_hnsw`) first.
+2. **Bulk load.** `analytics-engine` inserts the new `model_version`'s rows with no HNSW index to
+   maintain per row.
+3. **Build or rebuild**, via `build_artist_embeddings_index` above — `rebuild=False` here, since
+   the index was dropped in step 1 and this is a fresh `CREATE INDEX`.
+
+This is deliberately an **operator** step, not something the embedding pipeline's own connection
+ever does. `embedding_pipeline` (see below) holds `SELECT, INSERT, UPDATE, DELETE` on
+`public.artist_embeddings` and nothing else — no DDL privilege, and critically no ownership of the
+table, which is what `DROP INDEX`, `CREATE INDEX`, and `REINDEX` all require regardless of any
+grantable privilege. The maintainer's decision recorded here is that this asymmetry is
+intentional: the pipeline populates the table, and a human- or automation-driven operator step
+with a different, more privileged credential builds or rebuilds the index after each load, never
+the pipeline itself.
+
+#### Querying it: iterative index scans for filtered queries
+
+An approximate HNSW index applies a `WHERE` filter *after* the graph scan, so a query that both
+filters and orders by distance — for example, restricting to one `model_version` — can return
+fewer than `LIMIT k` rows even though enough matching rows exist, if the filter is selective
+enough that the unfiltered scan does not happen to visit them. ADR 0013 calls for pgvector's
+iterative index scans on exactly this shape of query: a caller (`catalog-api`'s similar-artist
+retrieval is the one this repository anticipates) sets
+
+```sql
+SET hnsw.iterative_scan = relaxed_order;
+```
+
+per session, or `SET LOCAL` within the querying transaction, before a filtered
+`ORDER BY embedding <=> $1 LIMIT k` query. `relaxed_order` is the right default here rather than
+`strict_order`: it lets the scan return results slightly out of exact distance order in exchange
+for visiting less of the index, which is the cheaper trade-off for a "similar artists" list where
+approximate ranking is already the premise. This repository does not itself issue any query
+against `artist_embeddings` — `catalog-api` owns retrieval — so there is nothing here to set the
+GUC around; it is recorded here because the index and its query-time behavior are one design
+ADR 0013 makes together.
 
 Downstream services do not track `database-schema` continuously; each pins
 `contracts/persistence/v1` to a specific, reviewed `database-schema` commit and promotes to a

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 from typing import Any
 from uuid import uuid4
 
@@ -22,6 +23,7 @@ from groovemap_schema.postgres import (
     _EDGE_TABLES,
     _GRAPH_STATEMENTS,
     _VERTEX_KIND_NAMES,
+    ARTIST_EMBEDDINGS_HNSW_INDEX_NAME,
     EMBEDDING_PIPELINE_ROLE,
     MUSICBRAINZ_RELATIONSHIP_TYPES,
     PROPERTY_GRAPH_MINIMUM_SERVER_VERSION,
@@ -32,6 +34,7 @@ from groovemap_schema.postgres import (
     _property_graph_edges,
     _property_graph_vertices,
     _widen_to_bigint,
+    build_artist_embeddings_index,
     graph_bootstrap_statements,
     phase0_comparison_statements,
 )
@@ -810,6 +813,195 @@ async def test_both_schema_initializers_are_real_engine_idempotent() -> None:
     assert await neo4j_snapshot() == first_neo4j
     assert await property_graph_snapshot() == first_property_graph
     await assert_sentinels_survive()
+
+
+# ── The artist embeddings HNSW index and its build procedure (ADR 0013) ──────
+# Runs on both tiers, but only the advisory PostgreSQL 19 tier has pgvector
+# (see `just test-integration-pg19`): the required PostgreSQL 18 tier proves
+# the build procedure itself is a correct no-op without the extension,
+# matching how `assert_the_artist_embeddings_table_matches_the_server` treats
+# the table it indexes.
+
+_HNSW_FIXTURE_MODEL_VERSION = "gm-database-schema-lhp2.3-integration-fixture"
+_HNSW_FIXTURE_ROW_COUNT = 5000
+_HNSW_FIXTURE_DIMENSIONS = 128
+# Comfortably below `POSTGRES_INTEGRATION_SHM_SIZE=256m` (see `just
+# test-integration-pg19`) and far below the ~2 GB ADR 0013 documents for
+# production -- this fixture is a few thousand rows, not millions.
+_HNSW_FIXTURE_MAINTENANCE_WORK_MEM = "64MB"
+
+
+def _synthetic_halfvec_literal(rng: random.Random) -> str:
+    """A pgvector text literal for one random 128-dimensional vector."""
+    values = (rng.uniform(-1.0, 1.0) for _dim in range(_HNSW_FIXTURE_DIMENSIONS))
+    return "[" + ",".join(f"{value:.6f}" for value in values) + "]"
+
+
+async def seed_artist_embeddings_hnsw_fixture(cursor: Any) -> None:
+    """Insert a few thousand synthetic 128-dim rows under their own model_version.
+
+    Plenty to build and exercise the index without the multi-GiB scale ADR
+    0013's footprint spike measured on real entity counts -- this fixture only
+    has to prove the DDL and the build procedure work, not reproduce the
+    spike's size or recall numbers.
+    """
+    rng = random.Random(0)  # noqa: S311 -- deterministic synthetic test vectors, not cryptography
+    rows = [
+        (str(artist_id), _HNSW_FIXTURE_MODEL_VERSION, _synthetic_halfvec_literal(rng), "integration-test-fixture", "2026-09-01")
+        for artist_id in range(_HNSW_FIXTURE_ROW_COUNT)
+    ]
+    await cursor.executemany(
+        """
+        INSERT INTO public.artist_embeddings (artist_id, model_version, embedding, source_dump_id, source_dump_date)
+        VALUES (%s, %s, %s::halfvec, %s, %s)
+        ON CONFLICT (artist_id, model_version) DO NOTHING
+        """,
+        rows,
+    )
+    await cursor.execute("ANALYZE public.artist_embeddings")
+
+
+async def hnsw_index_definition() -> str | None:
+    """Return `pg_indexes.indexdef` for the artist embeddings HNSW index, or None."""
+    rows = await postgres_rows(
+        "SELECT indexdef FROM pg_indexes WHERE schemaname = 'public' AND indexname = %s",
+        (ARTIST_EMBEDDINGS_HNSW_INDEX_NAME,),
+    )
+    return rows[0][0] if rows else None
+
+
+@pytest.mark.asyncio
+async def test_build_artist_embeddings_index_is_guarded_on_the_extension() -> None:
+    """`build_artist_embeddings_index` is a correct no-op without pgvector.
+
+    Mirrors `assert_the_artist_embeddings_table_matches_the_server`'s split:
+    the required PostgreSQL 18 tier proves the guard closes; the advisory
+    PostgreSQL 19 tier (which has pgvector) proves the rest below.
+    """
+    await apply_schema()
+    connection = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params())
+    async with connection, connection.cursor() as cursor:
+        await connection.set_autocommit(True)
+        failures = await build_artist_embeddings_index(cursor, maintenance_work_mem=_HNSW_FIXTURE_MAINTENANCE_WORK_MEM)
+
+    if not await vector_extension_present():
+        assert failures == 0
+        assert await hnsw_index_definition() is None
+        return
+
+    assert failures == 0
+    assert await hnsw_index_definition() is not None
+
+
+@pytest.mark.asyncio
+async def test_build_artist_embeddings_index_builds_a_usable_hnsw_index() -> None:
+    """The operator procedure builds an index the planner actually uses.
+
+    Advisory PostgreSQL 19 tier only -- pgvector is not on the required
+    PostgreSQL 18 tier's bare official image. Builds the index over a
+    synthetic fixture with `maintenance_work_mem` raised only for the build
+    (never a standing setting, per ADR 0013), then asserts the planner picks
+    it for a plain `ORDER BY ... LIMIT k` nearest-neighbour query -- the shape
+    the ADR's similar-artist retrieval use runs.
+    """
+    if not await vector_extension_present():
+        pytest.skip("pgvector is not installed on this tier; this scenario only exists when it is available")
+    await apply_schema()
+
+    connection = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params())
+    async with connection, connection.cursor() as cursor:
+        # Independent of test order and of `test_build_artist_embeddings_index_is_guarded_on_the_extension`,
+        # which may have already built this index over an empty table: this
+        # test's whole point is building over an *already-populated* table,
+        # the scenario ADR 0013's build-memory precondition is about, so it
+        # drops any earlier build first rather than relying on incremental
+        # index maintenance over rows inserted after the fact.
+        await connection.set_autocommit(True)
+        await cursor.execute(f"DROP INDEX IF EXISTS public.{ARTIST_EMBEDDINGS_HNSW_INDEX_NAME}")
+        await connection.set_autocommit(False)
+
+        await seed_artist_embeddings_hnsw_fixture(cursor)
+        await connection.commit()
+        await connection.set_autocommit(True)
+        failures = await build_artist_embeddings_index(cursor, maintenance_work_mem=_HNSW_FIXTURE_MAINTENANCE_WORK_MEM)
+    assert failures == 0
+
+    index_definition = await hnsw_index_definition()
+    assert index_definition is not None
+    assert "USING hnsw" in index_definition
+    assert "halfvec_cosine_ops" in index_definition
+    assert "m='16'" in index_definition
+    assert "ef_construction='64'" in index_definition
+
+    probe = random.Random(1)  # noqa: S311 -- deterministic synthetic test vector, not cryptography
+    query_vector = _synthetic_halfvec_literal(probe)
+    plan_rows = await postgres_rows(
+        "EXPLAIN SELECT artist_id FROM public.artist_embeddings ORDER BY embedding <=> %s::halfvec LIMIT 5",
+        (query_vector,),
+    )
+    plan = "\n".join(row[0] for row in plan_rows)
+    assert ARTIST_EMBEDDINGS_HNSW_INDEX_NAME in plan, f"planner did not use the HNSW index:\n{plan}"
+
+
+async def index_relfilenode(index_name: str) -> int:
+    """Return the physical file identifier PostgreSQL currently backs `index_name` with.
+
+    `REINDEX` builds a brand-new physical file and swaps it in under the same
+    index name and OID, so a changed `relfilenode` is what actually building
+    something new looks like -- unlike `CREATE INDEX IF NOT EXISTS`, which
+    would leave this untouched.
+    """
+    rows = await postgres_rows(
+        "SELECT relfilenode FROM pg_class WHERE relnamespace = 'public'::regnamespace AND relname = %s",
+        (index_name,),
+    )
+    return rows[0][0]
+
+
+async def index_is_valid(index_name: str) -> bool:
+    rows = await postgres_rows(
+        "SELECT indisvalid FROM pg_index WHERE indexrelid = %s::regclass",
+        (f"public.{index_name}",),
+    )
+    return bool(rows[0][0])
+
+
+@pytest.mark.asyncio
+async def test_build_artist_embeddings_index_rebuild_true_actually_rebuilds() -> None:
+    """`rebuild=True` runs `REINDEX INDEX`, which -- unlike the default
+    `CREATE INDEX IF NOT EXISTS` -- replaces the index's physical file even
+    though its name and OID stay the same; `relfilenode` is what makes that
+    replacement observable. Also proves `maintenance_work_mem` is back to
+    this connection's own inherited value afterward, on the same connection
+    the raise happened on, not merely on a fresh one.
+    """
+    if not await vector_extension_present():
+        pytest.skip("pgvector is not installed on this tier; this scenario only exists when it is available")
+    await apply_schema()
+
+    connection = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params())
+    async with connection, connection.cursor() as cursor:
+        await connection.set_autocommit(True)
+
+        await cursor.execute("SHOW maintenance_work_mem")
+        baseline_maintenance_work_mem = (await cursor.fetchall())[0][0]
+
+        # Ensure a real, already-built index exists first -- `rebuild=True`
+        # rebuilds an existing index, it does not create one from nothing.
+        first_build_failures = await build_artist_embeddings_index(cursor, maintenance_work_mem=_HNSW_FIXTURE_MAINTENANCE_WORK_MEM)
+        assert first_build_failures == 0
+        before_relfilenode = await index_relfilenode(ARTIST_EMBEDDINGS_HNSW_INDEX_NAME)
+
+        rebuild_failures = await build_artist_embeddings_index(cursor, maintenance_work_mem=_HNSW_FIXTURE_MAINTENANCE_WORK_MEM, rebuild=True)
+
+        await cursor.execute("SHOW maintenance_work_mem")
+        after_maintenance_work_mem = (await cursor.fetchall())[0][0]
+
+    assert rebuild_failures == 0
+    after_relfilenode = await index_relfilenode(ARTIST_EMBEDDINGS_HNSW_INDEX_NAME)
+    assert after_relfilenode != before_relfilenode, "REINDEX did not actually replace the index's physical file"
+    assert await index_is_valid(ARTIST_EMBEDDINGS_HNSW_INDEX_NAME) is True
+    assert after_maintenance_work_mem == baseline_maintenance_work_mem, "maintenance_work_mem was not reset after the rebuild"
 
 
 @pytest.mark.asyncio
@@ -2906,6 +3098,81 @@ async def test_available_but_not_superuser_skips_the_extension_with_zero_failure
         # What this run's own CREATEROLE guard controls is whether it granted
         # that role anything in *this* database's `graph` schema — and here it
         # must not have, since the test role holds no CREATEROLE either.
+        assert (
+            await _rows_in(
+                database,
+                "SELECT 1 FROM information_schema.role_table_grants WHERE grantee = %s AND table_schema = 'graph'",
+                (EMBEDDING_PIPELINE_ROLE,),
+            )
+            == []
+        )
+    finally:
+        await admin_connection.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(database)))
+        await admin_connection.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(role)))
+        await admin_connection.close()
+
+
+# ── "already installed" ignores superuser (PG19 tier only) ───────────────────
+
+
+@pytest.mark.asyncio
+async def test_already_installed_creates_artist_embeddings_for_a_non_superuser_too() -> None:
+    """Once `vector` is installed, a non-superuser connection still gets the
+    full vector schema -- `_vector_schema_skip_reasons` treats "already
+    installed" as unconditional, the same as any other `IF NOT EXISTS` object
+    in this module, regardless of the connecting role's privilege.
+
+    Distinct from `test_available_but_not_superuser_skips_the_extension_with_zero_failures`
+    above: that test covers *not yet installed and not superuser* (skips);
+    this one covers *already installed, connecting role merely lacks
+    superuser* (creates everything the extension gates, in full). lhp2.2
+    covered this branch with unit tests only (`_vector_schema_skip_reasons`);
+    this is the real-engine proof.
+    """
+    if not await vector_extension_present():
+        pytest.skip("pgvector is not installed on this tier; this scenario only exists when it is available")
+
+    admin_params = initializer._postgres_connection_params()
+    role = f"embed_test_installed_{uuid4().hex[:12]}"
+    password = uuid4().hex
+    database = f"embed_test_installed_db_{uuid4().hex[:12]}"
+
+    admin_connection = await psycopg.AsyncConnection.connect(**{**admin_params, "dbname": "postgres"}, autocommit=True)
+    try:
+        async with admin_connection.cursor() as cursor:
+            # NOSUPERUSER, and no CREATEROLE either -- the pipeline role's own
+            # grant stays independently gated on CREATEROLE even once the
+            # extension gate above it is wide open.
+            await cursor.execute(
+                sql.SQL("CREATE ROLE {role} LOGIN PASSWORD {password} NOSUPERUSER NOCREATEROLE").format(
+                    role=sql.Identifier(role), password=sql.Literal(password)
+                )
+            )
+            await cursor.execute(
+                sql.SQL("CREATE DATABASE {database} OWNER {role}").format(database=sql.Identifier(database), role=sql.Identifier(role))
+            )
+            # Installed as the admin (superuser) connection, before the
+            # non-superuser initializer run below -- exactly the state a
+            # server the operator has already provisioned pgvector on is in.
+            admin_in_database = await psycopg.AsyncConnection.connect(**{**admin_params, "dbname": database}, autocommit=True)
+            async with admin_in_database, admin_in_database.cursor() as install_cursor:
+                await install_cursor.execute(f"CREATE EXTENSION IF NOT EXISTS {VECTOR_EXTENSION}")
+
+        nonsuper_params = {**admin_params, "dbname": database, "user": role, "password": password}
+        succeeded = await initializer._apply_postgres_schema(nonsuper_params)
+        assert succeeded is True, "an already-installed extension must not need superuser to finish the schema"
+
+        assert await _rows_in(database, "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector')") == [(True,)]
+        assert await _rows_in(
+            database,
+            "SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'artist_embeddings' AND column_name = 'embedding'",
+        ) == [("embedding",)]
+        assert await _rows_in(
+            database,
+            "SELECT udt_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'artist_embeddings' AND column_name = 'embedding'",
+        ) == [("halfvec",)]
+        # CREATEROLE is independently gated: the extension being installed does
+        # not also grant this role's own guard.
         assert (
             await _rows_in(
                 database,
