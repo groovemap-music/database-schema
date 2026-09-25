@@ -11,6 +11,7 @@ import pytest
 from common.credit_roles import categorize_role
 from common.media import medium_ids, medium_label
 from neo4j import AsyncGraphDatabase
+from psycopg import sql
 from psycopg.types.json import Jsonb
 
 from groovemap_schema import initializer
@@ -21,11 +22,13 @@ from groovemap_schema.postgres import (
     _EDGE_TABLES,
     _GRAPH_STATEMENTS,
     _VERTEX_KIND_NAMES,
+    EMBEDDING_PIPELINE_ROLE,
     MUSICBRAINZ_RELATIONSHIP_TYPES,
     PROPERTY_GRAPH_MINIMUM_SERVER_VERSION,
     PROPERTY_GRAPH_RELATION,
     PROPERTY_GRAPH_SCHEMA,
     PROPERTY_GRAPH_SWITCH,
+    VECTOR_EXTENSION,
     _property_graph_edges,
     _property_graph_vertices,
     _widen_to_bigint,
@@ -338,7 +341,13 @@ async def assert_expected_postgres_schema() -> None:
     actual_tables: dict[str, set[str]] = {schema: set() for schema in EXPECTED_POSTGRES_TABLES}
     for schema, table in table_rows:
         actual_tables[schema].add(table)
-    assert actual_tables == EXPECTED_POSTGRES_TABLES
+    # `public.artist_embeddings` exists only where pgvector does; see
+    # `assert_the_artist_embeddings_table_matches_the_server` for the rest of
+    # its shape.
+    expected_tables = {schema: set(tables) for schema, tables in EXPECTED_POSTGRES_TABLES.items()}
+    if await vector_extension_present():
+        expected_tables["public"].add("artist_embeddings")
+    assert actual_tables == expected_tables
 
     column_rows = await postgres_rows(
         """
@@ -606,6 +615,95 @@ async def assert_the_property_graph_matches_the_server() -> None:
     assert structural == []
 
 
+# ── The vector extension, artist embeddings, and the embedding pipeline role ─
+# (ADR 0013 and its 2026-09-24 amendment)
+
+
+async def vector_extension_present() -> bool:
+    """Return whether `vector` is installed on this engine.
+
+    The required PostgreSQL 18 tier runs the bare official image and never has
+    it; the advisory PostgreSQL 19 tier's local image layers pgvector onto it
+    (see `just test-integration-pg19`) and always does.
+    """
+    rows = await postgres_rows("SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = %s)", (VECTOR_EXTENSION,))
+    return bool(rows[0][0])
+
+
+async def artist_embeddings_primary_key() -> list[str]:
+    """Return `public.artist_embeddings`'s primary-key columns, in key order."""
+    rows = await postgres_rows(
+        """
+        SELECT array_agg(attribute.attname ORDER BY key_column.ordinality)
+        FROM pg_constraint AS constraint_row
+        JOIN pg_class AS table_class ON table_class.oid = constraint_row.conrelid
+        JOIN pg_namespace AS namespace ON namespace.oid = table_class.relnamespace
+        CROSS JOIN LATERAL unnest(constraint_row.conkey) WITH ORDINALITY AS key_column(attnum, ordinality)
+        JOIN pg_attribute AS attribute
+          ON attribute.attrelid = table_class.oid AND attribute.attnum = key_column.attnum
+        WHERE namespace.nspname = 'public'
+          AND table_class.relname = 'artist_embeddings'
+          AND constraint_row.contype = 'p'
+        """
+    )
+    return [] if not rows or rows[0][0] is None else list(rows[0][0])
+
+
+async def assert_the_artist_embeddings_table_matches_the_server() -> None:
+    """Assert `public.artist_embeddings` exists, with its shape, only where pgvector does."""
+    exists = await postgres_rows("SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'artist_embeddings'")
+    if not await vector_extension_present():
+        assert exists == [], "a server without pgvector must carry no public.artist_embeddings table"
+        return
+    assert exists == [(1,)]
+
+    columns = await postgres_rows(
+        """
+        SELECT column_name, is_nullable, udt_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'artist_embeddings'
+        """
+    )
+    assert {(name, nullable) for name, nullable, _udt in columns} == {
+        ("artist_id", "NO"),
+        ("model_version", "NO"),
+        ("embedding", "NO"),
+        ("source_dump_id", "NO"),
+        ("source_dump_date", "NO"),
+        ("computed_at", "NO"),
+    }
+    assert {udt for name, _nullable, udt in columns if name == "embedding"} == {"halfvec"}
+
+    assert await artist_embeddings_primary_key() == ["artist_id", "model_version"]
+
+
+async def assert_the_embedding_pipeline_role_matches_the_server() -> None:
+    """Assert the pipeline role's grants match the ADR 0013 amendment exactly.
+
+    `CREATEROLE` is always available to the integration credential, so the
+    role exists on both tiers; only its grant on `artist_embeddings` (and the
+    table itself) depends on pgvector.
+    """
+    role_rows = await postgres_rows("SELECT rolcanlogin FROM pg_roles WHERE rolname = %s", (EMBEDDING_PIPELINE_ROLE,))
+    assert role_rows == [(False,)], "the pipeline role must be NOLOGIN"
+
+    for privilege in ("INSERT", "UPDATE", "DELETE", "SELECT"):
+        catalog_rows = await postgres_rows("SELECT has_table_privilege(%s, 'public.artists', %s)", (EMBEDDING_PIPELINE_ROLE, privilege))
+        assert catalog_rows == [(False,)], f"the pipeline role must not hold {privilege} on a catalog table"
+
+    graph_read = await postgres_rows("SELECT has_table_privilege(%s, 'graph.artist', 'SELECT')", (EMBEDDING_PIPELINE_ROLE,))
+    assert graph_read == [(True,)]
+    graph_write = await postgres_rows("SELECT has_table_privilege(%s, 'graph.artist', 'INSERT')", (EMBEDDING_PIPELINE_ROLE,))
+    assert graph_write == [(False,)]
+
+    if not await vector_extension_present():
+        return
+
+    for privilege in ("SELECT", "INSERT", "UPDATE", "DELETE"):
+        embedding_rows = await postgres_rows("SELECT has_table_privilege(%s, 'public.artist_embeddings', %s)", (EMBEDDING_PIPELINE_ROLE, privilege))
+        assert embedding_rows == [(True,)], f"the pipeline role must hold {privilege} on artist_embeddings"
+
+
 async def neo4j_rows(query: str) -> list[tuple[Any, ...]]:
     """Query the disposable Neo4j through the production connection settings."""
     driver = AsyncGraphDatabase.driver(
@@ -694,6 +792,8 @@ async def test_both_schema_initializers_are_real_engine_idempotent() -> None:
     await assert_expected_postgres_schema()
     await assert_expected_neo4j_schema()
     await assert_the_property_graph_matches_the_server()
+    await assert_the_artist_embeddings_table_matches_the_server()
+    await assert_the_embedding_pipeline_role_matches_the_server()
     first_postgres = await postgres_snapshot()
     first_neo4j = await neo4j_snapshot()
     first_property_graph = await property_graph_snapshot()
@@ -703,6 +803,8 @@ async def test_both_schema_initializers_are_real_engine_idempotent() -> None:
     await assert_expected_postgres_schema()
     await assert_expected_neo4j_schema()
     await assert_the_property_graph_matches_the_server()
+    await assert_the_artist_embeddings_table_matches_the_server()
+    await assert_the_embedding_pipeline_role_matches_the_server()
 
     assert await postgres_snapshot() == first_postgres
     assert await neo4j_snapshot() == first_neo4j
@@ -2669,3 +2771,150 @@ async def test_two_searches_in_one_transaction_do_not_pollute_each_other() -> No
         # And the deep one still answers deeply afterwards.
         assert (await rows_on(connection, FIND_SHORTEST_PATH, deep))[0][1] == 6
         await connection.commit()
+
+
+# ── The artist embedding table's exact cosine ordering (PG19 tier only) ──────
+
+
+def _halfvec_literal(active: dict[int, float], dims: int = 128) -> str:
+    """Return a `[...]` literal for a 128-dim vector, one at ACTIVE's indices."""
+    values = [0.0] * dims
+    for index, value in active.items():
+        values[index] = value
+    return "[" + ",".join(str(value) for value in values) + "]"
+
+
+@pytest.mark.asyncio
+async def test_the_artist_embeddings_table_orders_rows_by_exact_cosine_distance() -> None:
+    """Insert three 128-dim vectors and confirm ORDER BY <=> ranks them by angle.
+
+    No HNSW index exists yet — that is the next bead — so this is a brute-force
+    exact search, which is exactly what the acceptance criterion asks for.
+    """
+    await apply_schema()
+    if not await vector_extension_present():
+        pytest.skip("pgvector is not installed on this tier; see the absence assertion in the idempotence test")
+
+    marker = f"cosine-order-{uuid4().hex}"
+    near, mid, far = f"{marker}-near", f"{marker}-mid", f"{marker}-far"
+    query_vector = _halfvec_literal({0: 1.0})
+
+    connection = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params())
+    async with connection, connection.cursor() as cursor:
+        await cursor.execute(
+            """
+            INSERT INTO public.artist_embeddings
+                (artist_id, model_version, embedding, source_dump_id, source_dump_date)
+            VALUES
+                (%(near)s, %(v)s, %(near_vec)s::halfvec, 'dump-1', '2026-09-01'),
+                (%(mid)s,  %(v)s, %(mid_vec)s::halfvec,  'dump-1', '2026-09-01'),
+                (%(far)s,  %(v)s, %(far_vec)s::halfvec,  'dump-1', '2026-09-01')
+            """,
+            {
+                "near": near,
+                "mid": mid,
+                "far": far,
+                "v": marker,
+                # near == the query vector (distance 0); mid leans mostly toward
+                # it (small angle); far is orthogonal (distance 1, the maximum).
+                "near_vec": _halfvec_literal({0: 1.0}),
+                "mid_vec": _halfvec_literal({0: 0.9, 1: 0.1}),
+                "far_vec": _halfvec_literal({1: 1.0}),
+            },
+        )
+        await connection.commit()
+
+    ordered = await postgres_rows(
+        """
+        SELECT artist_id
+        FROM public.artist_embeddings
+        WHERE model_version = %s
+        ORDER BY embedding <=> %s::halfvec
+        """,
+        (marker, query_vector),
+    )
+    assert ordered == [(near,), (mid,), (far,)]
+
+
+# ── "available but not superuser" (PG19 tier only) ────────────────────────────
+
+
+async def _rows_in(database: str, query: str, parameters: tuple[Any, ...] = ()) -> list[tuple[Any, ...]]:
+    """Query DATABASE, rather than the suite's default database, once."""
+    params = {**initializer._postgres_connection_params(), "dbname": database}
+    connection = await psycopg.AsyncConnection.connect(**params)
+    async with connection, connection.cursor() as cursor:
+        await cursor.execute(query, parameters)
+        return await cursor.fetchall()
+
+
+@pytest.mark.asyncio
+async def test_available_but_not_superuser_skips_the_extension_with_zero_failures() -> None:
+    """pgvector is available but the connecting role cannot install it (not a
+    superuser, and `vector` carries no `trusted = true`) — the schema still
+    initializes cleanly, with the extension and `artist_embeddings` skipped
+    rather than failed.
+
+    A fresh, owned-by-the-test-role database is used so the extension is
+    genuinely not-yet-installed there, unlike the suite's shared database
+    (already initialized as a superuser by `apply_schema` elsewhere in this
+    file).
+    """
+    if not await vector_extension_present():
+        pytest.skip("pgvector is not installed on this tier; this scenario only exists when it is available")
+
+    admin_params = initializer._postgres_connection_params()
+    role = f"embed_test_nonsuper_{uuid4().hex[:12]}"
+    password = uuid4().hex
+    database = f"embed_test_db_{uuid4().hex[:12]}"
+
+    admin_connection = await psycopg.AsyncConnection.connect(**{**admin_params, "dbname": "postgres"}, autocommit=True)
+    try:
+        async with admin_connection.cursor() as cursor:
+            # NOSUPERUSER, and no CREATEROLE either: this role also exercises
+            # the pipeline role's own guard, which must skip it too, without
+            # that skip counting as a failure either.
+            await cursor.execute(
+                sql.SQL("CREATE ROLE {role} LOGIN PASSWORD {password} NOSUPERUSER NOCREATEROLE").format(
+                    role=sql.Identifier(role), password=sql.Literal(password)
+                )
+            )
+            # PostgreSQL 15+ makes a database's `public` schema owned by
+            # `pg_database_owner`, whose membership tracks the database's own
+            # owner — so making the test role the owner is what gives it
+            # CREATE on `public` (and every schema it creates itself) without
+            # granting it superuser or any catalog-wide privilege.
+            await cursor.execute(
+                sql.SQL("CREATE DATABASE {database} OWNER {role}").format(database=sql.Identifier(database), role=sql.Identifier(role))
+            )
+
+        nonsuper_params = {**admin_params, "dbname": database, "user": role, "password": password}
+        succeeded = await initializer._apply_postgres_schema(nonsuper_params)
+        assert succeeded is True, "a non-superuser connection must still leave the schema healthy (zero failures)"
+
+        assert await _rows_in(database, "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector')") == [(False,)]
+        assert (
+            await _rows_in(
+                database,
+                "SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'artist_embeddings'",
+            )
+            == []
+        )
+        # `pg_roles` is cluster-wide, not per-database, so `embedding_pipeline`
+        # is visible here regardless of this run (the suite's earlier,
+        # superuser passes already created it against the shared database).
+        # What this run's own CREATEROLE guard controls is whether it granted
+        # that role anything in *this* database's `graph` schema — and here it
+        # must not have, since the test role holds no CREATEROLE either.
+        assert (
+            await _rows_in(
+                database,
+                "SELECT 1 FROM information_schema.role_table_grants WHERE grantee = %s AND table_schema = 'graph'",
+                (EMBEDDING_PIPELINE_ROLE,),
+            )
+            == []
+        )
+    finally:
+        await admin_connection.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(database)))
+        await admin_connection.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(role)))
+        await admin_connection.close()
