@@ -67,6 +67,32 @@ for column in jobs["job"]["columns"]:
 assert "WHERE state IN ('pending', 'retry')" in user_statements["idx_loader_derived_refresh_job_due"]
 assert "WHERE state = 'leased'" in user_statements["idx_loader_derived_refresh_job_lease_expiry"]
 
+# Catalog-item supersession (ADR 0009's 2026-09-25 amendment) is consumed by
+# catalog-api's merge steps, so every column, cause, key, and index the contract
+# names must be in the statement that declares it.
+supersession = contract["catalog_item_supersession"]
+assert supersession["kind"] == "additive"
+assert supersession["introduced_in_contract_version"] == contract["version"]
+supersessions_statement = user_statements["catalog_item_supersessions table"]
+assert supersession["supersessions"]["relation"] == "public.catalog_item_supersessions"
+for column in supersession["supersessions"]["columns"]:
+    assert f"\n            {column} " in supersessions_statement, column
+causes = ", ".join(f"'{cause}'" for cause in supersession["supersessions"]["causes"])
+assert f"CHECK (cause IN ({causes}))" in supersessions_statement
+current_survivor = user_statements["idx_catalog_item_supersessions_superseded_id"]
+assert current_survivor.startswith("CREATE UNIQUE INDEX IF NOT EXISTS")
+assert current_survivor.endswith("ON catalog_item_supersessions (superseded_id) WHERE valid_to IS NULL")
+ledger_statement = user_statements["catalog_item_moves table"]
+assert supersession["ledger"]["relation"] == "public.catalog_item_moves"
+for column in supersession["ledger"]["columns"]:
+    assert f"\n            {column} " in ledger_statement, column
+tables = ", ".join(f"'{table}'" for table in supersession["ledger"]["tables"])
+assert f"CHECK (table_name IN ({tables}))" in ledger_statement
+assert f"UNIQUE ({', '.join(supersession['ledger']['unique'])})" in ledger_statement
+assert "CREATE OR REPLACE FUNCTION public.resolve_catalog_item(native_id UUID)" in user_statements["resolve_catalog_item function"]
+for index in supersession["dependent_indexes"]:
+    assert index in user_statements, index
+
 # The graph schema is recorded as an additive object of contract v1. Every count
 # and every relation below is read back from the statement list rather than
 # restated, so a relation added, removed, or reshaped in postgres.py fails this

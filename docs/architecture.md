@@ -219,6 +219,41 @@ that will eventually identify the physical copy. Both `release_id`/`instance_id`
 Discogs/MusicBrainz primary keys stay authoritative until a future contraction decision
 retires them.
 
+### Superseded catalog items
+
+ADR 0009's
+[2026-09-25 amendment](https://github.com/groovemap-music/design/blob/main/docs/adr/0009-native-identity-and-provider-aliases.md#2026-09-25-superseded-catalog-items-and-native-id-merge)
+decides what happens when two native catalog items turn out to be one, through an ADR 0014
+edition promotion or catalog re-attachment. The superseded item keeps its `catalog_items`
+row; this repository declares the shape and `catalog-api` writes every row, inside the ADR
+0014 transaction that moves the aliases:
+
+- `catalog_item_supersessions` — `superseded_id` → `survivor_id` (both foreign keys to
+  `catalog_items`), a `cause` checked against the closed set `edition_promotion` and
+  `catalog_reattachment`, a `decision_ref` naming the matching decision or `admin_audit_log`
+  entry that authorized it (a bare UUID, not a foreign key), a `valid_from`/`valid_to`
+  interval, and `via_id`. A partial unique index on `superseded_id WHERE valid_to IS NULL`
+  admits at most one current survivor per item. Resolution is always one hop: when B, which
+  survives A, is superseded into C, the writer closes A → B and opens A → C with `via_id`
+  naming the B → C row, so reverting B → C can close exactly the rows it compressed and
+  re-open their predecessors.
+- `catalog_item_moves` — the ledger of asserted references a merge re-pointed:
+  `supersession_id`, `table_name` (`artifacts` or `owned_copies`), `row_id`, `from_item_id`,
+  `to_item_id`, the owning `user_id`, and `moved_at`, unique per `(supersession_id,
+  table_name, row_id)`. A revert moves back only the ledgered rows that still point at
+  `to_item_id`. The ledger is personal data: erasure deletes a user's rows by `user_id` (and
+  deleting the `users` row cascades), and export includes them.
+- `public.resolve_catalog_item(native_id uuid)` — the published resolution: the current
+  survivor, or the id itself when it is not superseded. It is a function rather than a view
+  because it must answer for any native id, including ids with no `catalog_items` row, such as
+  an `activity.impressions.item_id` or an outcome recorded verbatim.
+- `graph.catalog_item` excludes currently superseded items, so the vertex never exposes a
+  tombstone.
+
+`artifacts.item_id` and `owned_copies.item_id` are indexed (`idx_artifacts_item_id`,
+`idx_owned_copies_item_id`), because the merge re-point and `catalog-api`'s dependents guard
+both walk from an item to its dependents.
+
 Every table and column above is additive within persistence contract v1 — see
 [the persistence compatibility contract](../contracts/persistence/).
 
@@ -289,7 +324,8 @@ The executable PostgreSQL inventory is in
   `user_collections`, `user_wantlists`, `sync_history`, `extraction_history`, `queue_metrics`,
   `service_health_metrics`, `admin_audit_log`, and `loader_extraction_latch`;
 - native identity tables (see Identity above): `catalog_items`, `artifacts`, `owned_copies`,
-  `collection_snapshots`, `observations`, and `provider_aliases`;
+  `collection_snapshots`, `observations`, `provider_aliases`, `catalog_item_supersessions`,
+  and `catalog_item_moves`;
 - insight tables in the `insights` schema: `artist_centrality`, `genre_trends`,
   `label_longevity`, `monthly_anniversaries`, `data_completeness`, `release_rarity`,
   `community_counts`, `computation_log`, and `activity_summary` (analytics-engine's
@@ -594,10 +630,10 @@ column in this table are unchanged by that; the projection only adds columns. Se
 | `:MediaFamily` | `graph.media_family` | **table** | `name` | — |
 | `:User` | `graph.app_user` | view | `user_id` | `is_active`, `is_admin`, `created_at`, `updated_at` |
 | (native identity) | `graph.catalog_item` | view | `item_id` | `kind`, `created_at` |
-| (MusicBrainz artist) | `graph.mb_artist` | view | `mbid` | `name`, `sort_name`, `type`, `gender`, `begin_date`, `end_date`, `ended`, `area`, `begin_area`, `end_area`, `disambiguation`, `discogs_artist_id`, `updated_at` |
-| (MusicBrainz label) | `graph.mb_label` | view | `mbid` | `name`, `type`, `label_code`, `begin_date`, `end_date`, `ended`, `area`, `disambiguation`, `discogs_label_id`, `updated_at` |
-| (MusicBrainz release) | `graph.mb_release` | view | `mbid` | `name`, `barcode`, `status`, `release_group_mbid`, `discogs_release_id`, `media_families`, `updated_at` |
-| (MusicBrainz release group) | `graph.mb_release_group` | view | `mbid` | `name`, `type`, `secondary_types`, `first_release_date`, `disambiguation`, `discogs_master_id`, `updated_at` |
+| (MusicBrainz artist) | `graph.mb_artist` | view | `mbid` | `name`, `sort_name`, `type`, `gender`, `begin_date`, `end_date`, `ended`, `area`, `begin_area`, `end_area`, `disambiguation`, `discogs_artist_id`, `updated_at`, `gm_item_id` |
+| (MusicBrainz label) | `graph.mb_label` | view | `mbid` | `name`, `type`, `label_code`, `begin_date`, `end_date`, `ended`, `area`, `disambiguation`, `discogs_label_id`, `updated_at`, `gm_item_id` |
+| (MusicBrainz release) | `graph.mb_release` | view | `mbid` | `name`, `barcode`, `status`, `release_group_mbid`, `discogs_release_id`, `media_families`, `updated_at`, `gm_item_id` |
+| (MusicBrainz release group) | `graph.mb_release_group` | view | `mbid` | `name`, `type`, `secondary_types`, `first_release_date`, `disambiguation`, `discogs_master_id`, `updated_at`, `gm_item_id` |
 
 The six name-keyed vertex relations are tables because their views were the most expensive
 relations in the schema and could not carry an index. Each was a `SELECT DISTINCT` over a full
@@ -1356,7 +1392,7 @@ CREATE PROPERTY GRAPH graph.catalog
         graph.mb_artist AS mb_artist KEY (mbid)
             LABEL mb_artist PROPERTIES ALL COLUMNS,
         graph.mb_label AS mb_label KEY (mbid)
-            LABEL mb_label PROPERTIES (mbid, name, type, label_code, begin_date, end_date, ended, area, disambiguation, discogs_label_id::text AS discogs_label_id, updated_at),
+            LABEL mb_label PROPERTIES (mbid, name, type, label_code, begin_date, end_date, ended, area, disambiguation, discogs_label_id::text AS discogs_label_id, updated_at, gm_item_id),
         graph.mb_release AS mb_release KEY (mbid)
             LABEL mb_release PROPERTIES ALL COLUMNS,
         graph.mb_release_group AS mb_release_group KEY (mbid)

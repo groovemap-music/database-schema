@@ -2,17 +2,49 @@
 
 All notable changes to the GrooveMap database schema will be documented here.
 
-## Unreleased
+## v0.4.0 (2026-09-25)
 
 ### Feat
 
-- **loader-latch**: add `loader_extraction_latch` as the loader family's durable
-  extraction-complete latch, keyed on `(loader, version)`, for `discogs-sql-loader`'s
-  post-import counter refresh and reconciliation pass, matching the exact name, column
-  types, and primary key its startup probe requires so DDL ownership moves here and
-  `musicbrainz-sql-loader` can share the same relation
-- **musicbrainz**: add `updated_at` to `musicbrainz.relationships` and
-  `musicbrainz.external_links` as `musicbrainz-sql-loader`'s delete-reconciliation key
+- **graph**: publish gm_item_id on the four MusicBrainz vertices
+- **identity**: add catalog item supersessions, move ledger, and resolution
+- **postgres**: add the artist HNSW index and its build procedure
+- **postgres**: add pgvector extension, artist embeddings, and pipeline role
+- **pg19**: build pgvector onto the digest-pinned PG19 beta test image
+- **loader**: declare durable derived-refresh job state
+- **graph**: add bounded explore traversal
+- **loader-latch**: add discogs_loader_extraction_latch table
+- **graph**: add graph.find_shortest_path as a vertex-at-a-time search
+- **graph**: add the per-vertex degree that orders frontier expansion
+- **musicbrainz**: add updated_at to relationships and external_links
+- **graph**: materialize the MEMBER_OF union across both provenances
+- **spike**: provision the cloud mode on IBM Cloud with Terraform
+- **spike**: add the measurement harness, local and cloud
+- **spike**: expand one vertex at a time and stop at first touch
+- **graph**: ship a bootstrap fill of every loader-owned relation
+- **graph**: replace the phase 0 graph views with loader-written tables
+- **postgres**: declare the catalog property graph behind a PostgreSQL 19 gate
+- **ci**: add an advisory PostgreSQL 19 beta integration tier
+- **postgres**: add person, company, and media graph relations
+- **postgres**: add the graph schema of vertex and edge views
+- **neo4j**: add Company constraint and Release.country index
+- **postgres**: add GIN indexes on identifiers and companies blocks
+
+### Fix
+
+- **postgres**: add a rebuild mode and validate maintenance_work_mem
+- **postgres**: gate vector extension creation on superuser, not just availability
+- **graph**: align counters with normalized imports
+- **tests**: remove integration container volumes
+- **loader-latch**: rename to loader_extraction_latch, add loader discriminator
+- **spike**: generate every table instead of merging reports by hand
+- **spike**: name the borrowed harness by branch, not by repository
+- **graph**: stop label_stats.release_count fanning out over its joins
+- **graph**: carry the counters as properties of the labels Neo4j carries them on
+- **spike**: stop the Neo4j harness overwriting the PostgreSQL timings
+- **postgres**: skip the id widening when a view already reads the column
+- **postgres**: rename user_account view to app_user
+- **postgres**: gate the MusicBrainz id widening on the column type
 
 ### Docs
 
@@ -34,11 +66,6 @@ All notable changes to the GrooveMap database schema will be documented here.
   `pg_constraint` a PRIMARY KEY or UNIQUE constraint over exactly `(loader, version)` (a
   bare unique index is declined by design); `musicbrainz-sql-loader` will write
   `loader = 'musicbrainz'` rows into the same relation when it adopts it.
-
-### Fix
-
-- **graph**: stop `graph.label_stats.release_count` fanning out over a label's `by_artist` and
-  `in_genre` joins, so a release with several artists or genres counts once per label.
 
 ## v0.3.0 (2026-09-14)
 
