@@ -157,14 +157,34 @@ require(
 )
 
 justfile = (ROOT / "Justfile").read_text()
+PG19_BASE_IMAGE = "postgres:19beta3-alpine@sha256:b1692e50613a21e61c424859f943b9e193ae73e5a8c68abd5382dfb235bf15fc"
+PG19_LOCAL_IMAGE = "database-schema-postgres19-pgvector:local"
 require(
-    "POSTGRES_INTEGRATION_IMAGE=postgres:19beta3-alpine@sha256:" in justfile,
+    f"POSTGRES_BASE_IMAGE={PG19_BASE_IMAGE}" in justfile,
     "the PostgreSQL 19 beta tier must pin its engine image by digest",
+)
+require(
+    "--file scripts/postgres19-pgvector.Dockerfile" in justfile,
+    "the PostgreSQL 19 beta tier must build its pgvector-enabled image from the test-tooling Dockerfile",
+)
+require(
+    f"POSTGRES_INTEGRATION_IMAGE={PG19_LOCAL_IMAGE}" in justfile,
+    "the PostgreSQL 19 beta tier must run against the locally built pgvector image, never a registry reference",
 )
 require(
     "NEO4J_INTEGRATION_IMAGE" not in justfile,
     "the PostgreSQL 19 beta tier must reuse the shared Neo4j image",
 )
+
+pgvector_dockerfile = (ROOT / "scripts/postgres19-pgvector.Dockerfile").read_text()
+for fragment in (
+    f"ARG POSTGRES_BASE_IMAGE={PG19_BASE_IMAGE}",
+    "FROM ${POSTGRES_BASE_IMAGE}",
+    '--branch "${PGVECTOR_VERSION}"',
+    "https://github.com/pgvector/pgvector.git",
+    "apk del .build-deps",
+):
+    require(fragment in pgvector_dockerfile, f"pgvector test image is missing {fragment}")
 
 require(re.search(r'on:\s*\n  push:\s*\n    tags: \["v\*"\]', release) is not None, "release must be restricted to pushed version tags")
 for fragment in (

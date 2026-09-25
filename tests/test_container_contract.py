@@ -13,6 +13,8 @@ import pytest
 ROOT = Path(__file__).parent.parent
 AUTOMATION_REVISION = "833cb464507678c38ab78bd4718ce697399463e9"
 PYTHON_LIBRARIES_REVISION = "6e84fe9acfd9551bd3bba2f2e78fef0ec1ef38ef"
+PG19_BASE_IMAGE = "postgres:19beta3-alpine@sha256:b1692e50613a21e61c424859f943b9e193ae73e5a8c68abd5382dfb235bf15fc"
+PG19_LOCAL_IMAGE = "database-schema-postgres19-pgvector:local"
 
 
 def _required_executable(name: str) -> str:
@@ -254,13 +256,33 @@ def test_integration_runs_a_required_and_an_advisory_engine_tier() -> None:
     script = (ROOT / "scripts" / "test-integration.sh").read_text()
     assert "POSTGRES_INTEGRATION_IMAGE" in script
     assert "NEO4J_INTEGRATION_IMAGE" in script
-    assert re.search(
-        r"test-integration-pg19:\n    POSTGRES_INTEGRATION_IMAGE="
-        r"postgres:19beta3-alpine@sha256:[0-9a-f]{64} bash scripts/test-integration\.sh\n",
-        justfile,
-    )
     assert re.search(r"\ntest-integration:\n    bash scripts/test-integration\.sh\n", justfile)
     assert "NEO4J_INTEGRATION_IMAGE" not in justfile
+
+    # The PostgreSQL 19 beta tier builds pgvector onto the tier's digest-pinned
+    # official image and runs the required script against that local image only.
+    assert f"--build-arg POSTGRES_BASE_IMAGE={PG19_BASE_IMAGE}" in justfile
+    assert "--file scripts/postgres19-pgvector.Dockerfile" in justfile
+    assert f"--tag {PG19_LOCAL_IMAGE}" in justfile
+    assert f"POSTGRES_INTEGRATION_IMAGE={PG19_LOCAL_IMAGE} bash scripts/test-integration.sh" in justfile
+    assert "docker push" not in justfile
+
+
+def test_postgres19_pgvector_image_builds_from_the_pinned_tier_base() -> None:
+    dockerfile = (ROOT / "scripts" / "postgres19-pgvector.Dockerfile").read_text()
+
+    assert f"ARG POSTGRES_BASE_IMAGE={PG19_BASE_IMAGE}" in dockerfile
+    assert "FROM ${POSTGRES_BASE_IMAGE}" in dockerfile
+    assert "ARG PGVECTOR_VERSION=v0.8.6" in dockerfile
+    assert '--branch "${PGVECTOR_VERSION}"' in dockerfile
+    assert "https://github.com/pgvector/pgvector.git" in dockerfile
+
+    # Build tools are installed and removed within the same RUN layer.
+    build_step = next(line for line in dockerfile.splitlines() if line.strip().startswith("RUN apk add"))
+    run_layer_start = dockerfile.index(build_step)
+    run_layer = dockerfile[run_layer_start:]
+    assert "apk del .build-deps" in run_layer
+    assert "HEALTHCHECK" not in dockerfile and "EXPOSE" not in dockerfile
 
 
 def test_integration_cleanup_removes_test_container_anonymous_volumes() -> None:
