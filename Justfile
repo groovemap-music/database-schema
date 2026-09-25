@@ -28,9 +28,16 @@ test:
 test-integration:
     bash scripts/test-integration.sh
 
-# Advisory tier. Same script and Neo4j image against the PostgreSQL 19 beta engine.
+# Advisory tier. Builds pgvector 0.8.6 onto the tier's digest-pinned official
+# PostgreSQL 19 beta Alpine image, then runs the same script and Neo4j image
+# against that local, never-published image.
 test-integration-pg19:
-    POSTGRES_INTEGRATION_IMAGE=postgres:19beta3-alpine@sha256:b1692e50613a21e61c424859f943b9e193ae73e5a8c68abd5382dfb235bf15fc bash scripts/test-integration.sh
+    docker build \
+        --build-arg POSTGRES_BASE_IMAGE=postgres:19beta3-alpine@sha256:b1692e50613a21e61c424859f943b9e193ae73e5a8c68abd5382dfb235bf15fc \
+        --file scripts/postgres19-pgvector.Dockerfile \
+        --tag database-schema-postgres19-pgvector:local \
+        .
+    POSTGRES_INTEGRATION_IMAGE=database-schema-postgres19-pgvector:local bash scripts/test-integration.sh
 
 coverage: test
 
