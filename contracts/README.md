@@ -86,6 +86,16 @@ rows (`loader = 'musicbrainz'`) into the same relation when it adopts the patter
 `design_decision` in the contract. Storage-only: `loader_extraction_latch` is a plain `public`
 table, not a `graph` schema relation, and is not a property-graph element.
 
+`catalog_item_supersession` records the shape design ADR 0009's 2026-09-25 amendment decides
+for a native-id merge: `public.catalog_item_supersessions` (one current survivor per item,
+the closed `cause` set, `via_id` chain compression), the `public.catalog_item_moves` ledger of
+re-pointed `artifacts` and `owned_copies` rows, the `public.resolve_catalog_item(native_id)`
+one-hop resolution, and the `artifacts.item_id` and `owned_copies.item_id` indexes the merge
+walks. `catalog-api` is the only writer and codes its merge steps to the amendment, so the
+contract check pins every column, cause, and key it names to the declaring statement;
+`analytics-engine` reads activity history through the resolution. `graph.catalog_item`
+excludes currently superseded items.
+
 Catalog event shapes are not owned here. Discogs events belong to
 [`discogs-ingestion`](https://github.com/groovemap-music/discogs-ingestion), and MusicBrainz
 events belong to

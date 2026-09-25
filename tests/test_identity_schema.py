@@ -224,6 +224,15 @@ _ADDED_STATEMENT_NAMES = frozenset(
         "loader_derived_refresh_job table",
         "idx_loader_derived_refresh_job_due",
         "idx_loader_derived_refresh_job_lease_expiry",
+        "idx_artifacts_item_id",
+        "idx_owned_copies_item_id",
+        "catalog_item_supersessions table",
+        "idx_catalog_item_supersessions_superseded_id",
+        "idx_catalog_item_supersessions_survivor_id",
+        "idx_catalog_item_supersessions_via_id",
+        "catalog_item_moves table",
+        "idx_catalog_item_moves_user_id",
+        "resolve_catalog_item function",
     }
 )
 
@@ -608,6 +617,156 @@ class TestProviderAliases:
             "idx_provider_aliases_native_id",
         ):
             assert names.index("provider_aliases table") < names.index(index)
+
+
+class TestDependentItemIndexes:
+    """artifacts.item_id and owned_copies.item_id are indexed for the merge's reverse walk."""
+
+    def test_artifacts_item_id_index(self) -> None:
+        stmt = _user_tables()["idx_artifacts_item_id"]
+        assert stmt == "CREATE INDEX IF NOT EXISTS idx_artifacts_item_id ON artifacts (item_id)"
+
+    def test_owned_copies_item_id_index(self) -> None:
+        stmt = _user_tables()["idx_owned_copies_item_id"]
+        assert stmt == "CREATE INDEX IF NOT EXISTS idx_owned_copies_item_id ON owned_copies (item_id)"
+
+    def test_indexes_follow_their_tables(self) -> None:
+        names = _user_table_names()
+        assert names.index("artifacts table") < names.index("idx_artifacts_item_id")
+        assert names.index("owned_copies table") < names.index("idx_owned_copies_item_id")
+
+
+class TestCatalogItemSupersessions:
+    """catalog_item_supersessions — ADR 0009's 2026-09-25 amendment, section 1."""
+
+    def _stmt(self) -> str:
+        return _user_tables()["catalog_item_supersessions table"]
+
+    def test_is_idempotent(self) -> None:
+        assert "CREATE TABLE IF NOT EXISTS catalog_item_supersessions" in self._stmt()
+
+    def test_columns_are_the_amendments(self) -> None:
+        stmt = self._stmt()
+        for fragment in (
+            "id            UUID PRIMARY KEY DEFAULT uuidv7()",
+            "superseded_id UUID NOT NULL REFERENCES catalog_items(id)",
+            "survivor_id   UUID NOT NULL REFERENCES catalog_items(id)",
+            "decision_ref  UUID NOT NULL",
+            "valid_from    TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+            "valid_to      TIMESTAMPTZ,",
+            "via_id        UUID REFERENCES catalog_item_supersessions(id)",
+        ):
+            assert fragment in stmt, f"Missing column '{fragment}'"
+
+    def test_cause_is_the_closed_adr_0014_set(self) -> None:
+        assert "cause         TEXT NOT NULL CHECK (cause IN ('edition_promotion', 'catalog_reattachment'))" in self._stmt()
+
+    def test_decision_ref_is_not_a_foreign_key(self) -> None:
+        """It names a matching decision or an audit entry, chosen by cause."""
+        assert "decision_ref  UUID NOT NULL," in self._stmt()
+
+    def test_an_item_cannot_supersede_itself(self) -> None:
+        assert "CHECK (superseded_id <> survivor_id)" in self._stmt()
+
+    def test_one_current_survivor_per_item(self) -> None:
+        stmt = _user_tables()["idx_catalog_item_supersessions_superseded_id"]
+        assert "CREATE UNIQUE INDEX IF NOT EXISTS" in stmt
+        assert "ON catalog_item_supersessions (superseded_id) WHERE valid_to IS NULL" in stmt
+
+    def test_survivor_and_via_indexes(self) -> None:
+        tables = _user_tables()
+        assert "ON catalog_item_supersessions (survivor_id)" in tables["idx_catalog_item_supersessions_survivor_id"]
+        assert "ON catalog_item_supersessions (via_id) WHERE via_id IS NOT NULL" in tables["idx_catalog_item_supersessions_via_id"]
+
+    def test_declared_after_catalog_items_and_before_its_indexes(self) -> None:
+        names = _user_table_names()
+        table = names.index("catalog_item_supersessions table")
+        assert names.index("catalog_items table") < table
+        for index in (
+            "idx_catalog_item_supersessions_superseded_id",
+            "idx_catalog_item_supersessions_survivor_id",
+            "idx_catalog_item_supersessions_via_id",
+        ):
+            assert table < names.index(index)
+
+
+class TestCatalogItemMoves:
+    """catalog_item_moves — the ledger of re-pointed asserted references (section 2)."""
+
+    def _stmt(self) -> str:
+        return _user_tables()["catalog_item_moves table"]
+
+    def test_is_idempotent(self) -> None:
+        assert "CREATE TABLE IF NOT EXISTS catalog_item_moves" in self._stmt()
+
+    def test_columns(self) -> None:
+        stmt = self._stmt()
+        for fragment in (
+            "id              UUID PRIMARY KEY DEFAULT uuidv7()",
+            "supersession_id UUID NOT NULL REFERENCES catalog_item_supersessions(id)",
+            "row_id          UUID NOT NULL",
+            "from_item_id    UUID NOT NULL REFERENCES catalog_items(id)",
+            "to_item_id      UUID NOT NULL REFERENCES catalog_items(id)",
+            "moved_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+        ):
+            assert fragment in stmt, f"Missing column '{fragment}'"
+
+    def test_table_is_closed_at_the_two_asserted_references(self) -> None:
+        assert "table_name      TEXT NOT NULL CHECK (table_name IN ('artifacts', 'owned_copies'))" in self._stmt()
+
+    def test_user_id_is_nullable_and_erased_with_the_user(self) -> None:
+        """An artifact no user created has no owner; every other row is personal data."""
+        stmt = self._stmt()
+        assert "user_id         UUID REFERENCES users(id) ON DELETE CASCADE" in stmt
+        assert "ON catalog_item_moves (user_id)" in _user_tables()["idx_catalog_item_moves_user_id"]
+
+    def test_a_row_is_ledgered_once_per_merge(self) -> None:
+        assert "UNIQUE (supersession_id, table_name, row_id)" in self._stmt()
+
+    def test_declared_after_supersessions(self) -> None:
+        names = _user_table_names()
+        assert names.index("catalog_item_supersessions table") < names.index("catalog_item_moves table")
+        assert names.index("catalog_item_moves table") < names.index("idx_catalog_item_moves_user_id")
+
+
+class TestResolveCatalogItem:
+    """The one-hop resolution published once, as a function."""
+
+    def _stmt(self) -> str:
+        return _user_tables()["resolve_catalog_item function"]
+
+    def test_is_replaceable(self) -> None:
+        assert "CREATE OR REPLACE FUNCTION public.resolve_catalog_item(native_id UUID)" in self._stmt()
+
+    def test_is_a_stable_strict_sql_function(self) -> None:
+        stmt = self._stmt()
+        for fragment in ("RETURNS UUID", "LANGUAGE sql", "STABLE", "STRICT", "PARALLEL SAFE"):
+            assert fragment in stmt
+
+    def test_reads_only_the_current_row_and_falls_back_to_the_id(self) -> None:
+        stmt = self._stmt()
+        assert "FROM public.catalog_item_supersessions AS supersession" in stmt
+        assert "supersession.valid_to IS NULL" in stmt
+        assert "native_id\n            )" in stmt
+
+    def test_declared_after_the_table_it_reads(self) -> None:
+        names = _user_table_names()
+        assert names.index("catalog_item_supersessions table") < names.index("resolve_catalog_item function")
+
+
+class TestCatalogItemVertexExcludesSuperseded:
+    """graph.catalog_item never exposes a currently superseded item."""
+
+    def test_filters_on_the_current_supersession(self) -> None:
+        stmt = dict(_GRAPH_STATEMENTS)["graph.catalog_item view"]
+        assert "WHERE NOT EXISTS (" in stmt
+        assert "FROM public.catalog_item_supersessions AS supersession" in stmt
+        assert "supersession.superseded_id = catalog_items.id" in stmt
+        assert "supersession.valid_to IS NULL" in stmt
+
+    def test_graph_views_run_after_the_table_exists(self) -> None:
+        names = [name for name, _stmt in _schema_statements()]
+        assert names.index("catalog_item_supersessions table") < names.index("graph.catalog_item view")
 
 
 class TestIdentityTableOrdering:
