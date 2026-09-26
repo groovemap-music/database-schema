@@ -700,8 +700,8 @@ that second index; the primary key is the key column set in the column before it
 | `(:Label)-[:SUBLABEL_OF]->(:Label)` | `graph.sublabel_of` | view | `sublabel_id`, `parent_label_id` | — | `sublabel_id` → `parent_label_id` | `labels.data->'parentLabel'` and `->'sublabels'` |
 | `(:Person)-[:CREDITED_ON]->(:Release)` | `graph.credited_on` | **table** | `person_name`, `release_id`, `role` | `(release_id, person_name)` | `person_name` → `release_id` | `releases.data->'extraartists'` |
 | `(:Person)-[:SAME_AS]->(:Artist)` | `graph.same_as` | **table** | `person_name`, `artist_id` | `(artist_id)` | `person_name` → `artist_id` | `releases.data->'extraartists'` and `->'tracklist'[].extraartists` (and their `sub_tracks`) |
-| (track credit — no Neo4j equivalent) | `graph.track_credited_on` | **table** | `person_name`, `release_id`, `track_position`, `role` | `(release_id, track_position, person_name)` | `person_name` → `release_id` | `releases.data->'tracklist'[].extraartists` (and their `sub_tracks`) |
-| (track performer — no Neo4j equivalent) | `graph.track_by_artist` | **table** | `release_id`, `track_position`, `artist_id` | `(artist_id, release_id, track_position)` | `release_id` → `artist_id` | `releases.data->'tracklist'[].artists` (and their `sub_tracks`) |
+| (track credit — no Neo4j equivalent) | `graph.track_credited_on` | **table** | `person_name`, `release_id`, `track_ordinal`, `sub_track_ordinal`, `role` | `(release_id, track_ordinal, sub_track_ordinal, person_name)` | `person_name` → `release_id` | `releases.data->'tracklist'` (xmltodict-wrapped; and its `sub_tracks`) |
+| (track performer — no Neo4j equivalent) | `graph.track_by_artist` | **table** | `release_id`, `track_ordinal`, `sub_track_ordinal`, `artist_id` | `(artist_id, release_id, track_ordinal, sub_track_ordinal)` | `release_id` → `artist_id` | `releases.data->'tracklist'` (xmltodict-wrapped; and its `sub_tracks`) |
 | `(:Release)-[:CREDITED_TO]->(:Company)` | `graph.credited_to` | **table** | `release_id`, `company_id`, `role`, `source` | `(company_id, release_id)` | `release_id` → `company_id` | `releases.data->'companies'` |
 | `(:Release)-[:ISSUED_ON]->(:Medium)` | `graph.issued_on` | **table** | `release_id`, `medium_id`, `source` | `(medium_id, release_id)` | `release_id` → `medium_id` | `releases.media` and `musicbrainz.releases.media` |
 | `(:Medium)-[:IN_FAMILY]->(:MediaFamily)` | `graph.in_family` | view | `medium_id`, `family_name` | — | `medium_id` → `family_name` | `graph.medium` |
@@ -880,23 +880,44 @@ same way, reading both credit sources, so a person credited only on a track is s
 than the release's own credit on a various-artists compilation — so it stores `artist_id`
 directly, exactly as `by_artist` does, with no name-based resolution step.
 
-**Track identity is `(release_id, track_position)`, and `track_position` mints nothing new.**
-It is the dump's own position string (`"A1"`, `"2-3"`, a sub-track's own position) carried
-verbatim, so identifying a track costs one extra key column rather than a synthetic id this
-repository would have to mint, version, and keep stable across dump releases. A credit or
-performer named on a track and, under some other value, on a sub-track of that same track is
-not a collision: a sub-track's own position is a distinct string from its parent's, so the two
-nesting depths union into one key space rather than needing one of their own each.
+**`tracklist` keeps the raw xmltodict wrapper, unlike every field this schema reads at release
+level.** `discogs-ingestion`'s `normalize_release` (`src/discogs/normalize.rs`) unwraps
+`extraartists`, `artists`, `companies`, `genres`, `styles`, and every other release-level array
+this schema reads into a plain JSON array before the document is stored — one child collapses to
+a bare object under a singular key otherwise (`{"artist": {...}}`), several children are a real
+array under it (`{"artist": [...]}`), which is the ordinary xmltodict shape a straight XML-to-JSON
+conversion produces. `normalize_release` never recurses into `tracklist`, so it, each track's
+`sub_tracks`, and a track's or sub-track's own `extraartists`/`artists` are still exactly that raw
+shape in the stored document: `releases.data->'tracklist'` is `{"track": {...}}` for one track,
+`{"track": [...]}` for several, never a bare JSON array. Reading that with the plain "is it an
+array" guard `graph.by_artist` and `graph.credited_on`'s sources use sees an object, not an array,
+and unnests nothing: a synthetic fixture built as a plain array would look correctly populated
+while the same relation stayed silently empty against a real dump. `_xmltodict_array` is the guard
+built for this shape: see its docstring in `src/groovemap_schema/postgres.py` for the four cases
+it handles, matching
+`discogs-ingestion`'s own `unwrap_container` case for case.
+
+**Track identity is `(release_id, track_ordinal, sub_track_ordinal)`, not the dump's own
+`position` string.** A heading entry's `position` is empty, and two entries can legitimately
+share one, so a key built from it would silently drop the first case (filtered out as empty) and
+collapse the second (two credits merged under one key). `track_ordinal` is `tracklist`'s own
+1-based position after `_xmltodict_array` unwraps it, read with `WITH ORDINALITY` the same way
+`graph.credited_to`'s `entry_position` already is; `sub_track_ordinal` is the sub-track's own
+1-based ordinal within its parent's `sub_tracks`, or `0` for a credit on the track itself, because
+a primary key column cannot be `NULL`. Both are stable for one dump's document, which is all a key
+inside one row's projection needs. `track_position` is still carried, as a plain nullable column
+rather than a key column, so a consumer that wants the dump's own string for display still can —
+it is simply never filtered on and never assumed unique.
 
 **Indexes are sized for the embedding pipeline's block reads.** Both tables carry the same
 "indexed in both directions" shape every edge table in this schema does — the natural key as
-primary key, plus a reverse index — but the reverse index leads with `release_id` (then
-`track_position`) rather than with the natural key's own leading column, because the pipeline's
-dominant access pattern is a block read walking release by release, not the person- or
-artist-led lookup `credited_on`/`by_artist` serve. `graph.track_credited_on` also carries the
-`(role_category, release_id, track_position)` fan-out index `credited_on` carries on
-`(role_category, person_name)`, for the categorized block reads spike gm-analytics-engine-ieu.2
-calls for — `role_category` is the same generated column, over the same
+primary key, plus a reverse index — but the reverse index leads with `release_id` (then the two
+ordinals) rather than with the natural key's own leading column, because the pipeline's dominant
+access pattern is a block read walking release by release, not the person- or artist-led lookup
+`credited_on`/`by_artist` serve. `graph.track_credited_on` also carries the
+`(role_category, release_id, track_ordinal, sub_track_ordinal)` fan-out index `credited_on`
+carries on `(role_category, person_name)`, for the categorized block reads spike
+gm-analytics-engine-ieu.2 calls for — `role_category` is the same generated column, over the same
 `graph.credit_role_category(role)`, so a track credit's category is computed by the identical
 rule a release-level one is. `graph.track_by_artist` needs no equivalent, mirroring
 `graph.by_artist`.
@@ -1530,11 +1551,11 @@ CREATE PROPERTY GRAPH graph.catalog
             SOURCE KEY (person_name) REFERENCES person (name)
             DESTINATION KEY (artist_id) REFERENCES artist (artist_id)
             LABEL same_as PROPERTIES ALL COLUMNS,
-        graph.track_credited_on AS track_credited_on KEY (person_name, release_id, track_position, role)
+        graph.track_credited_on AS track_credited_on KEY (person_name, release_id, track_ordinal, sub_track_ordinal, role)
             SOURCE KEY (person_name) REFERENCES person (name)
             DESTINATION KEY (release_id) REFERENCES release (release_id)
             LABEL track_credited_on PROPERTIES ALL COLUMNS,
-        graph.track_by_artist AS track_by_artist KEY (release_id, track_position, artist_id)
+        graph.track_by_artist AS track_by_artist KEY (release_id, track_ordinal, sub_track_ordinal, artist_id)
             SOURCE KEY (release_id) REFERENCES release (release_id)
             DESTINATION KEY (artist_id) REFERENCES artist (artist_id)
             LABEL track_by_artist PROPERTIES ALL COLUMNS,

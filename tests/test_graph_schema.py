@@ -163,8 +163,12 @@ EDGE_KEYS = {
     "owns": (("owned_copy_id",), "user_id", "item_id"),
     "credited_on": (("person_name", "release_id", "role"), "person_name", "release_id"),
     "same_as": (("person_name", "artist_id"), "person_name", "artist_id"),
-    "track_credited_on": (("person_name", "release_id", "track_position", "role"), "person_name", "release_id"),
-    "track_by_artist": (("release_id", "track_position", "artist_id"), "release_id", "artist_id"),
+    "track_credited_on": (
+        ("person_name", "release_id", "track_ordinal", "sub_track_ordinal", "role"),
+        "person_name",
+        "release_id",
+    ),
+    "track_by_artist": (("release_id", "track_ordinal", "sub_track_ordinal", "artist_id"), "release_id", "artist_id"),
     "credited_to": (("release_id", "company_id", "role", "source"), "release_id", "company_id"),
     "issued_on": (("release_id", "medium_id", "source"), "release_id", "medium_id"),
     "in_family": (("medium_id", "family_name"), "medium_id", "family_name"),
@@ -585,13 +589,20 @@ class TestEdgeViews:
             assert f"CREATE INDEX IF NOT EXISTS {relation}_reverse ON graph.{relation} ({reverse})" in index_statements_for(relation), relation
 
     def test_every_edge_key_column_is_text(self) -> None:
+        """Every declared column is `text` or `bigint`, whether `NOT NULL` or not.
+
+        `track_credited_on`/`track_by_artist`'s `track_position` is the one
+        nullable column across every edge table here -- descriptive, not part
+        of the key -- so the check is on the type token itself rather than on
+        the `NOT NULL` phrase every other column happens to carry too.
+        """
         for relation, columns, _reverse, _extras in _EDGE_TABLES:
             for line in columns.strip().splitlines():
                 stripped = line.strip()
                 if stripped.startswith("PRIMARY KEY") or not stripped:
                     continue
-                assert " text " in stripped or " bigint " in stripped, f"{relation}: {stripped}"
-                assert "varchar" not in stripped and "character varying" not in stripped, f"{relation}: {stripped}"
+                column_type = stripped.split()[1].rstrip(",")
+                assert column_type in ("text", "bigint"), f"{relation}: {stripped}"
 
     def test_no_edge_table_declares_a_foreign_key(self) -> None:
         """A loader writes an edge before it has necessarily ingested the endpoint."""
@@ -651,8 +662,8 @@ class TestTrackCredits:
     Neither relation has a Neo4j counterpart -- `graphinator` has never
     projected a track -- so these tests check the design against its own
     stated rules (mirrors `credited_on`/`by_artist`, resolves through
-    `same_as`, keys on the dump's own position) rather than against a Cypher
-    parity claim.
+    `same_as`, keys on ordinal position, unwraps the raw xmltodict shape)
+    rather than against a Cypher parity claim.
     """
 
     def test_track_credited_on_never_stores_an_artist_id(self) -> None:
@@ -664,28 +675,42 @@ class TestTrackCredits:
     def test_track_by_artist_stores_the_artist_id_directly(self) -> None:
         """The `<artists>` shape is formal and id-bearing, like release-level `by_artist`."""
         statement = ddl_for("track_by_artist")
-        assert "artist_id     text NOT NULL" in statement or "artist_id      text NOT NULL" in statement
+        assert "artist_id         text NOT NULL" in statement
 
-    def test_track_position_identifies_the_track_in_both_relations(self) -> None:
+    def test_tracks_are_keyed_on_ordinal_not_on_the_dumps_position_string(self) -> None:
+        """A heading's empty `position`, or two entries sharing one, must not collide."""
         for relation in ("track_credited_on", "track_by_artist"):
             statement = ddl_for(relation)
-            assert "track_position text NOT NULL" in statement
-            assert "track_position" in statement.split("PRIMARY KEY")[1]
+            assert "track_ordinal     bigint NOT NULL" in statement
+            assert "sub_track_ordinal bigint NOT NULL" in statement
+            key = statement.split("PRIMARY KEY")[1]
+            assert "track_ordinal" in key and "sub_track_ordinal" in key
+            assert "track_position" not in key
+
+    def test_track_position_is_a_plain_nullable_column(self) -> None:
+        """Kept for display, not filtered on and not part of the key."""
+        for relation in ("track_credited_on", "track_by_artist"):
+            statement = ddl_for(relation)
+            assert "track_position    text," in statement
+            assert "track_position    text NOT NULL" not in statement
 
     def test_track_credited_on_generates_its_category_the_same_way_credited_on_does(self) -> None:
         statement = ddl_for("track_credited_on")
-        assert "role_category  text GENERATED ALWAYS AS (graph.credit_role_category(role)) STORED" in statement
-        assert any(candidate.endswith("(role_category, release_id, track_position)") for candidate in index_statements_for("track_credited_on"))
+        assert "role_category     text GENERATED ALWAYS AS (graph.credit_role_category(role)) STORED" in statement
+        assert any(
+            candidate.endswith("(role_category, release_id, track_ordinal, sub_track_ordinal)")
+            for candidate in index_statements_for("track_credited_on")
+        )
 
     def test_reverse_indexes_lead_with_release_id_for_block_reads(self) -> None:
         """The pipeline walks release by release, unlike `credited_on`/`by_artist`'s own reverse."""
         assert (
-            "CREATE INDEX IF NOT EXISTS track_credited_on_reverse ON graph.track_credited_on (release_id, track_position, person_name)"
-            in index_statements_for("track_credited_on")
+            "CREATE INDEX IF NOT EXISTS track_credited_on_reverse "
+            "ON graph.track_credited_on (release_id, track_ordinal, sub_track_ordinal, person_name)" in index_statements_for("track_credited_on")
         )
         assert (
-            "CREATE INDEX IF NOT EXISTS track_by_artist_reverse ON graph.track_by_artist (artist_id, release_id, track_position)"
-            in index_statements_for("track_by_artist")
+            "CREATE INDEX IF NOT EXISTS track_by_artist_reverse "
+            "ON graph.track_by_artist (artist_id, release_id, track_ordinal, sub_track_ordinal)" in index_statements_for("track_by_artist")
         )
 
     def test_track_sources_read_both_the_track_and_its_sub_tracks(self) -> None:
@@ -696,13 +721,21 @@ class TestTrackCredits:
             assert "'sub_tracks'" in statement
             assert "UNION ALL" in statement
 
+    def test_track_sources_unwrap_the_raw_xmltodict_shape(self) -> None:
+        """`tracklist` is never normalized, so a plain array guard would see nothing."""
+        for relation in ("track_credited_on", "track_by_artist"):
+            statement = statement_for(relation)
+            assert "jsonb_typeof" in statement
+            assert "jsonb_build_array" in statement
+            assert "WITH ORDINALITY" in statement
+
     def test_same_as_is_extended_with_track_level_ids_not_replaced(self) -> None:
         """One key, `(person_name, artist_id)`: a track-level id converges on the same row.
 
         The top-level combination of the release-level and track-level sources is a
         `UNION` (deduplicating), while the track source's own internal combination of
         a track's row with its sub-tracks' rows is legitimately `UNION ALL` -- the two
-        nesting depths never share a `track_position`, so nothing to deduplicate there.
+        nesting depths are independent ordinal spaces, so nothing to deduplicate there.
         """
         statement = statement_for("same_as")
         assert "'extraartists'" in statement

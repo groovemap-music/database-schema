@@ -1318,34 +1318,50 @@ GRAPH_FIXTURE_RELEASE = {
     },
     # Track-level credits and performers (gm-database-schema-ug3v). "Carol" is
     # credited only here, never at release level, which is what proves
-    # `graph.person` and `graph.same_as` have to read this source too. The
-    # medley's sub-track exercises the nested `sub_tracks[].extraartists` /
-    # `->'artists'` shape, and its second sub-track carries neither, which must
-    # contribute nothing rather than raise.
-    "tracklist": [
-        {
-            "position": "A1",
-            "title": "Track One",
-            "extraartists": [
-                {"name": "Carol", "role": "Vocals", "id": 21},
-                {"name": "No id artist", "role": "Guitar"},
-            ],
-            "artists": [{"id": 22, "name": "Dana"}, {"id": 0, "name": "Various"}],
-        },
-        {
-            "position": "A2",
-            "title": "Medley",
-            "sub_tracks": [
-                {
-                    "position": "A2a",
-                    "title": "Medley Part One",
-                    "extraartists": [{"name": "Eve", "role": "Mixed By", "id": 23}],
-                    "artists": [{"id": 24, "name": "Frank"}],
+    # `graph.person` and `graph.same_as` have to read this source too.
+    #
+    # `tracklist`, and everything nested inside a track, is stored exactly as
+    # `discogs-ingestion` converts it from XML: `normalize_release` never
+    # recurses into it, so several children are the real xmltodict array
+    # (`{"track": [...]}`) and one child collapses to a bare object under the
+    # same key (`{"artist": {...}}`) rather than a one-element array -- both
+    # shapes are deliberately exercised below, once each, rather than only the
+    # plain-array shape a synthetic fixture might otherwise default to. Two
+    # top-level tracks make `tracklist` the array form; track A2's medley makes
+    # `sub_tracks` the array form (two sub-tracks); sub-track A2a's own
+    # `extraartists`/`artists` make the single-object form (one credit, one
+    # performer each); and sub-track A2b carries neither key at all, which
+    # must contribute nothing rather than raise.
+    "tracklist": {
+        "track": [
+            {
+                "position": "A1",
+                "title": "Track One",
+                "extraartists": {
+                    "artist": [
+                        {"name": "Carol", "role": "Vocals", "id": 21},
+                        {"name": "No id artist", "role": "Guitar"},
+                    ]
                 },
-                {"position": "A2b", "title": "Medley Part Two"},
-            ],
-        },
-    ],
+                "artists": {"artist": [{"id": 22, "name": "Dana"}, {"id": 0, "name": "Various"}]},
+            },
+            {
+                "position": "A2",
+                "title": "Medley",
+                "sub_tracks": {
+                    "track": [
+                        {
+                            "position": "A2a",
+                            "title": "Medley Part One",
+                            "extraartists": {"artist": {"name": "Eve", "role": "Mixed By", "id": 23}},
+                            "artists": {"artist": {"id": 24, "name": "Frank"}},
+                        },
+                        {"position": "A2b", "title": "Medley Part Two"},
+                    ]
+                },
+            },
+        ]
+    },
 }
 
 GRAPH_FIXTURE_MEDIA = {
@@ -1359,12 +1375,26 @@ GRAPH_FIXTURE_MEDIA = {
 
 # A pre-cutover record: `companies` is still the raw Discogs list and `artists` has
 # been flattened to strings. Neither may raise; both must contribute nothing.
+#
+# `tracklist` is unrelated to those malformed fields -- each is guarded
+# independently -- and carries exactly one track, which is the xmltodict
+# single-object form at the container's own top level (`{"track": {...}}`
+# rather than `{"track": [...]}`), the one variant release 111's tracklist
+# does not exercise.
 GRAPH_FIXTURE_MALFORMED = {
     "id": 222,
     "title": "Malformed",
     "artists": "not-an-array",
     "companies": [{"name": "Raw"}],
     "genres": None,
+    "tracklist": {
+        "track": {
+            "position": "1",
+            "title": "Solo",
+            "extraartists": {"artist": {"name": "Grace", "role": "Producer", "id": 25}},
+            "artists": {"artist": {"name": "Henry", "id": 26}},
+        }
+    },
 }
 
 GRAPH_FIXTURE_ARTIST = {
@@ -1536,6 +1566,7 @@ async def assert_graph_relations_project_the_enricher_rules() -> None:
         ("Bob",),
         ("Carol",),
         ("Eve",),
+        ("Grace",),
         ("No id artist",),
     ]
     assert await postgres_rows("SELECT person_name, release_id, role, role_category FROM graph.credited_on ORDER BY 1") == [
@@ -1543,25 +1574,37 @@ async def assert_graph_relations_project_the_enricher_rules() -> None:
         ("Bob", "111", "Recorded By, Mastering Engineer", categorize_role("Recorded By, Mastering Engineer")),
     ]
     # Track-level credits and performers (gm-database-schema-ug3v) resolve through
-    # the same `graph.same_as`, so "Carol" and "Eve" -- credited only on a track,
-    # never on the release -- appear here too.
+    # the same `graph.same_as`, so "Carol" (release 111, array-shaped extraartists),
+    # "Eve" (release 111, single-object-shaped extraartists on a sub-track), and
+    # "Grace" (release 222, single-object-shaped tracklist) -- none credited at
+    # release level -- all appear here too.
     assert await postgres_rows("SELECT person_name, artist_id FROM graph.same_as ORDER BY 1") == [
         ("Alice", "7"),
         ("Carol", "21"),
         ("Eve", "23"),
+        ("Grace", "25"),
     ]
 
-    # The track and its sub-track both contribute, "Carol" (track-only) is a
-    # `:Person` row, and the empty second sub-track contributes nothing.
-    assert await postgres_rows("SELECT name FROM graph.person WHERE name = 'Carol'") == [("Carol",)]
-    assert await postgres_rows("SELECT person_name, release_id, track_position, role, role_category FROM graph.track_credited_on ORDER BY 1, 3") == [
-        ("Carol", "111", "A1", "Vocals", categorize_role("Vocals")),
-        ("Eve", "111", "A2a", "Mixed By", categorize_role("Mixed By")),
-        ("No id artist", "111", "A1", "Guitar", categorize_role("Guitar")),
+    # The track and its sub-track both contribute, "Carol"/"Eve"/"Grace" (track-only)
+    # are `:Person` rows, and the empty second sub-track contributes nothing.
+    # `track_ordinal`/`sub_track_ordinal` identify the track, not `position`:
+    # `0` is "on the track itself", the sub-track's own ordinal otherwise.
+    assert await postgres_rows("SELECT name FROM graph.person WHERE name IN ('Carol', 'Grace')") == [("Carol",), ("Grace",)]
+    assert await postgres_rows(
+        "SELECT person_name, release_id, track_ordinal, sub_track_ordinal, track_position, role, role_category "
+        "FROM graph.track_credited_on ORDER BY 2, 3, 4, 1"
+    ) == [
+        ("Carol", "111", 1, 0, "A1", "Vocals", categorize_role("Vocals")),
+        ("No id artist", "111", 1, 0, "A1", "Guitar", categorize_role("Guitar")),
+        ("Eve", "111", 2, 1, "A2a", "Mixed By", categorize_role("Mixed By")),
+        ("Grace", "222", 1, 0, "1", "Producer", categorize_role("Producer")),
     ]
-    assert await postgres_rows("SELECT release_id, track_position, artist_id FROM graph.track_by_artist ORDER BY 2") == [
-        ("111", "A1", "22"),
-        ("111", "A2a", "24"),
+    assert await postgres_rows(
+        "SELECT release_id, track_ordinal, sub_track_ordinal, track_position, artist_id FROM graph.track_by_artist ORDER BY 1, 2, 3"
+    ) == [
+        ("111", 1, 0, "A1", "22"),
+        ("111", 2, 1, "A2a", "24"),
+        ("222", 1, 0, "1", "26"),
     ]
 
     assert await postgres_rows("SELECT company_id, name, discogs_label_id FROM graph.company ORDER BY 1") == [
@@ -1848,11 +1891,13 @@ async def test_the_vertex_degree_agrees_with_artist_degree_on_every_artist() -> 
     await bootstrap_the_loader_tables()
 
     # Neither comparison below is empty agreeing with empty. `graph.artist_degree`
-    # is six, not four: artists 21 and 23 (gm-database-schema-ug3v) are new
-    # `graph.same_as` targets of a track-only credit. `vertex_degree` stays four
-    # -- `same_as` is not one of the ten path relations it sums (it is subtracted
+    # is seven, not four: artists 21, 23, and 25 (gm-database-schema-ug3v) are new
+    # `graph.same_as` targets of a track-only credit. `graph.track_by_artist`'s own
+    # performers (22, 24, 26) are not among them -- that relation is not one of
+    # the sources `artist_degree` sums either. `vertex_degree` stays four --
+    # `same_as` is not one of the ten path relations it sums (it is subtracted
     # in the formula below), so a `same_as`-only artist never gets a row there.
-    assert await postgres_rows("SELECT count(*) FROM graph.artist_degree") == [(6,)]
+    assert await postgres_rows("SELECT count(*) FROM graph.artist_degree") == [(7,)]
     assert await postgres_rows("SELECT count(*) FROM graph.vertex_degree WHERE kind = 'a'") == [(4,)]
 
     assert await postgres_rows(DEGREE_AGREES_WITH_ARTIST_DEGREE) == []
