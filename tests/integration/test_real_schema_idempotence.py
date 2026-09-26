@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import random
-from typing import Any
+from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 import psycopg
@@ -26,11 +27,14 @@ from groovemap_schema.postgres import (
     ARTIST_EMBEDDINGS_HNSW_INDEX_NAME,
     EMBEDDING_PIPELINE_ROLE,
     MUSICBRAINZ_RELATIONSHIP_TYPES,
+    PROPERTY_GRAPH_FINGERPRINT_PREFIX,
     PROPERTY_GRAPH_MINIMUM_SERVER_VERSION,
     PROPERTY_GRAPH_RELATION,
     PROPERTY_GRAPH_SCHEMA,
+    PROPERTY_GRAPH_STATEMENT,
     PROPERTY_GRAPH_SWITCH,
     VECTOR_EXTENSION,
+    _apply_property_graph,
     _property_graph_edges,
     _property_graph_vertices,
     _widen_to_bigint,
@@ -38,6 +42,10 @@ from groovemap_schema.postgres import (
     graph_bootstrap_statements,
     phase0_comparison_statements,
 )
+
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 
 
 pytestmark = pytest.mark.integration
@@ -551,8 +559,8 @@ async def property_graph_snapshot() -> tuple[tuple[Any, ...], ...]:
 
     Empty on PostgreSQL 18, where the `pg_propgraph_*` catalogs do not exist and
     the gate has closed on the server version anyway. On 19 this is what proves a
-    second apply changed nothing: the property graph has no `IF NOT EXISTS`, so
-    the initializer skips it on the catalog check rather than re-running it.
+    second apply changed nothing: the graph's fingerprint and elements already
+    match its definition, so the initializer leaves it rather than re-declaring it.
     """
     if await server_version_num() < PROPERTY_GRAPH_MINIMUM_SERVER_VERSION:
         return ()
@@ -1781,6 +1789,9 @@ async def test_the_widening_skips_a_narrow_column_a_view_already_reads() -> None
     assert await dependent_views_on(WIDENED_TABLE, WIDENED_COLUMN) == [WIDENED_VIEW]
     view_rows = await postgres_rows("SELECT viewname FROM pg_views WHERE schemaname = 'graph'")
     assert {row[0] for row in view_rows} == EXPECTED_GRAPH_VIEWS
+    # On PostgreSQL 19 the CASCADE also pruned the view's element out of
+    # `graph.catalog`; the same run re-declares it.
+    await assert_the_property_graph_matches_the_server()
 
 
 # ── GRAPH_TABLE smoke queries ────────────────────────────────────────────────
@@ -3434,10 +3445,7 @@ _MB_VERTEX_TABLES = (
 async def test_every_musicbrainz_vertex_publishes_its_gm_item_id() -> None:
     """Each `mb_*` view reads `gm_item_id` off its table, and on PostgreSQL 19 the label carries it.
 
-    A fresh database is used because the suite's shared one can hold a
-    `graph.catalog` that an earlier test pruned: dropping `graph.mb_label` with
-    CASCADE removes its element, and a re-apply never re-declares an existing
-    graph.
+    A fresh database keeps the seeded rows out of the suite's shared one.
     """
     admin_params = initializer._postgres_connection_params()
     database = f"mb_gm_item_id_{uuid4().hex[:12]}"
@@ -3479,3 +3487,206 @@ async def test_every_musicbrainz_vertex_publishes_its_gm_item_id() -> None:
     finally:
         await admin_connection.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(database)))
         await admin_connection.close()
+
+
+# ── Re-declaring an existing graph.catalog ───────────────────────────────────
+# Each test runs in a database of its own, because each one leaves
+# `graph.catalog` in a state the shared database's other tests must not see.
+
+
+@asynccontextmanager
+async def _scratch_database(prefix: str) -> AsyncIterator[str]:
+    """Create an empty database named after PREFIX, and drop it afterwards."""
+    admin_params = initializer._postgres_connection_params()
+    database = f"{prefix}_{uuid4().hex[:12]}"
+    admin_connection = await psycopg.AsyncConnection.connect(**{**admin_params, "dbname": "postgres"}, autocommit=True)
+    try:
+        await admin_connection.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
+        yield database
+    finally:
+        await admin_connection.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(database)))
+        await admin_connection.close()
+
+
+async def _apply_schema_to(database: str) -> bool:
+    """Run the initializer's PostgreSQL half against DATABASE."""
+    return await initializer._apply_postgres_schema({**initializer._postgres_connection_params(), "dbname": database})
+
+
+async def _execute_in(database: str, *statements: str) -> None:
+    """Run each statement against DATABASE in autocommit, as the initializer does."""
+    params = {**initializer._postgres_connection_params(), "dbname": database}
+    connection = await psycopg.AsyncConnection.connect(**params, autocommit=True)
+    async with connection, connection.cursor() as cursor:
+        for statement in statements:
+            await cursor.execute(statement)
+
+
+async def _apply_property_graph_in(database: str) -> int:
+    """Run only `_apply_property_graph` against DATABASE and return its failure count."""
+    params = {**initializer._postgres_connection_params(), "dbname": database}
+    connection = await psycopg.AsyncConnection.connect(**params, autocommit=True)
+    async with connection, connection.cursor() as cursor:
+        return await _apply_property_graph(cursor)
+
+
+async def _graph_identity(database: str) -> tuple[Any, Any]:
+    """Return `graph.catalog`'s oid and comment; a changed oid means it was re-declared."""
+    rows = await _rows_in(database, "SELECT oid, obj_description(oid, 'pg_class') FROM pg_class WHERE oid = 'graph.catalog'::regclass")
+    return rows[0]
+
+
+async def _graph_aliases(database: str) -> set[str]:
+    rows = await _rows_in(database, "SELECT pgealias FROM pg_propgraph_element WHERE pgepgid = 'graph.catalog'::regclass")
+    return {row[0] for row in rows}
+
+
+async def _musicbrainz_labels_publishing_gm_item_id(database: str) -> set[str]:
+    rows = await _rows_in(
+        database,
+        """
+        SELECT label.pgllabel
+        FROM pg_propgraph_label AS label
+        JOIN pg_propgraph_element_label AS element_label ON element_label.pgellabelid = label.oid
+        JOIN pg_propgraph_label_property AS label_property ON label_property.plpellabelid = element_label.oid
+        JOIN pg_propgraph_property AS property ON property.oid = label_property.plppropid
+        WHERE label.pglpgid = 'graph.catalog'::regclass AND property.pgpname = 'gm_item_id'
+        """,
+    )
+    return {row[0] for row in rows} & {label for label, _table in _MB_VERTEX_TABLES}
+
+
+async def _declare_the_pre_gm_item_id_graph(database: str) -> None:
+    """Replace `graph.catalog` with the shape a pre-0.4.0 initializer left.
+
+    Before 0.4.0 none of the four `mb_*` labels published `gm_item_id`:
+    `mb_label`'s explicit list did not name it, and the other three expanded
+    `ALL COLUMNS` before the column existed. Spelling those three as explicit
+    lists without it reproduces what their `ALL COLUMNS` captured then. Like
+    every graph a version before this one declared, it carries no comment.
+    """
+    columns = await _rows_in(
+        database,
+        "SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'graph' ORDER BY ordinal_position",
+    )
+    statement = PROPERTY_GRAPH_STATEMENT[1].replace(", gm_item_id)", ")")
+    for label in ("mb_artist", "mb_release", "mb_release_group"):
+        kept = ", ".join(column for table, column in columns if table == label and column != "gm_item_id")
+        statement = statement.replace(f"LABEL {label} PROPERTIES ALL COLUMNS", f"LABEL {label} PROPERTIES ({kept})")
+    await _execute_in(database, "DROP PROPERTY GRAPH graph.catalog", statement)
+    assert await _musicbrainz_labels_publishing_gm_item_id(database) == set()
+
+
+async def _assert_every_musicbrainz_vertex_reads_its_gm_item_id(database: str) -> None:
+    """Seed one row per `mb_*` table and read its `gm_item_id` back through GRAPH_TABLE."""
+    for label, table in _MB_VERTEX_TABLES:
+        kind = {"artists": "artist", "labels": "label", "releases": "release", "release_groups": "master"}[table]
+        item_id, mbid = uuid4(), uuid4()
+        await _execute_in(
+            database,
+            f"INSERT INTO catalog_items (id, kind) VALUES ('{item_id}', '{kind}')",  # noqa: S608
+            f"INSERT INTO musicbrainz.{table} (mbid, name, gm_item_id) VALUES ('{mbid}', 'upgrade {label}', '{item_id}')",  # noqa: S608
+        )
+        query = f"SELECT * FROM GRAPH_TABLE (graph.catalog MATCH (v IS {label}) WHERE v.mbid = %s COLUMNS (v.gm_item_id AS gm_item_id))"  # noqa: S608
+        assert await _rows_in(database, query, (mbid,)) == [(item_id,)], label
+
+
+async def _skip_below_postgresql_19() -> None:
+    if await server_version_num() < PROPERTY_GRAPH_MINIMUM_SERVER_VERSION:
+        pytest.skip("CREATE PROPERTY GRAPH needs PostgreSQL 19")
+
+
+@pytest.mark.asyncio
+async def test_a_graph_declared_from_an_older_definition_is_brought_up_to_date() -> None:
+    """A pre-0.4.0 graph is re-declared once, and a re-apply after that changes nothing."""
+    await _skip_below_postgresql_19()
+    async with _scratch_database("graph_upgrade") as database:
+        assert await _apply_schema_to(database) is True
+        await _declare_the_pre_gm_item_id_graph(database)
+        old_oid, old_comment = await _graph_identity(database)
+        assert old_comment is None
+
+        assert await _apply_schema_to(database) is True
+        upgraded_oid, fingerprint = await _graph_identity(database)
+        assert upgraded_oid != old_oid
+        assert fingerprint.startswith(PROPERTY_GRAPH_FINGERPRINT_PREFIX)
+        assert await _musicbrainz_labels_publishing_gm_item_id(database) == {label for label, _table in _MB_VERTEX_TABLES}
+        await _assert_every_musicbrainz_vertex_reads_its_gm_item_id(database)
+
+        # Same definition: no DROP and no CREATE, so the graph keeps its oid.
+        assert await _apply_schema_to(database) is True
+        assert await _graph_identity(database) == (upgraded_oid, fingerprint)
+
+
+@pytest.mark.asyncio
+async def test_a_graph_pruned_by_a_cascade_is_restored() -> None:
+    """`DROP VIEW ... CASCADE` removes an element but not the graph; a re-apply puts it back."""
+    await _skip_below_postgresql_19()
+    async with _scratch_database("graph_prune") as database:
+        assert await _apply_schema_to(database) is True
+        declared = await _graph_aliases(database)
+        _oid, fingerprint = await _graph_identity(database)
+
+        await _execute_in(database, "DROP VIEW graph.mb_label CASCADE")
+        pruned = await _graph_aliases(database)
+        assert "mb_label" not in pruned
+        assert declared - pruned == {"mb_label"} | {edge.view for edge in _property_graph_edges() if "mb_label" in (edge.source, edge.destination)}
+        # The prune leaves the fingerprint where it was, so it alone cannot catch this.
+        assert (await _graph_identity(database))[1] == fingerprint
+
+        assert await _apply_schema_to(database) is True
+        assert await _graph_aliases(database) == declared
+        await _assert_every_musicbrainz_vertex_reads_its_gm_item_id(database)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_upgrade_leaves_the_previous_graph_in_place() -> None:
+    """The DROP and the CREATE are one transaction; an error in either keeps the old graph."""
+    await _skip_below_postgresql_19()
+    async with _scratch_database("graph_rollback") as database:
+        assert await _apply_schema_to(database) is True
+        await _declare_the_pre_gm_item_id_graph(database)
+        old_identity = await _graph_identity(database)
+        old_aliases = await _graph_aliases(database)
+
+        # The CREATE fails after the DROP has already run: the element relation
+        # it names is not there under that name. The old graph still reads it by oid.
+        await _execute_in(database, "ALTER VIEW graph.mb_release RENAME TO mb_release_aside")
+        assert await _apply_property_graph_in(database) == 1
+        assert await _graph_identity(database) == old_identity
+        assert await _graph_aliases(database) == old_aliases
+        assert await _musicbrainz_labels_publishing_gm_item_id(database) == set()
+        await _execute_in(database, "ALTER VIEW graph.mb_release_aside RENAME TO mb_release")
+
+        # The DROP fails: a consumer's view depends on the graph, and this schema
+        # never cascades into an object it did not create.
+        await _execute_in(
+            database,
+            "CREATE VIEW public.consumer_view AS SELECT * FROM GRAPH_TABLE (graph.catalog MATCH (v IS mb_label) COLUMNS (v.mbid AS mbid))",
+        )
+        assert await _apply_property_graph_in(database) == 1
+        assert await _graph_identity(database) == old_identity
+        assert await _rows_in(database, "SELECT count(*) FROM public.consumer_view") == [(0,)]
+
+        await _execute_in(database, "DROP VIEW public.consumer_view")
+        assert await _apply_property_graph_in(database) == 0
+        assert (await _graph_identity(database))[0] != old_identity[0]
+        await _assert_every_musicbrainz_vertex_reads_its_gm_item_id(database)
+
+
+@pytest.mark.asyncio
+async def test_a_relation_squatting_the_graph_name_is_left_alone() -> None:
+    """A table named `graph.catalog` is not this schema's graph, so it is neither dropped nor replaced."""
+    await _skip_below_postgresql_19()
+    async with _scratch_database("graph_squatter") as database:
+        await _execute_in(
+            database,
+            "CREATE SCHEMA graph",
+            "CREATE TABLE graph.catalog (sentinel text)",
+            "INSERT INTO graph.catalog VALUES ('survives')",
+        )
+        # A skip is not a failure.
+        assert await _apply_schema_to(database) is True
+        assert await _apply_schema_to(database) is True
+        assert await _rows_in(database, "SELECT relkind FROM pg_class WHERE oid = 'graph.catalog'::regclass") == [("r",)]
+        assert await _rows_in(database, "SELECT sentinel FROM graph.catalog") == [("survives",)]

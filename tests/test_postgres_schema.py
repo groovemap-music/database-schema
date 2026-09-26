@@ -26,11 +26,20 @@ from groovemap_schema.postgres import (
     _VECTOR_SCHEMA_STATEMENTS,
     ARTIST_EMBEDDINGS_HNSW_INDEX_NAME,
     EMBEDDING_PIPELINE_ROLE,
+    MUSICBRAINZ_RELATIONSHIP_LABEL,
+    PROPERTY_GRAPH_FINGERPRINT_PREFIX,
+    PROPERTY_GRAPH_RELKIND,
     PROPERTY_GRAPH_STATEMENT,
     PROPERTY_GRAPH_SWITCH,
     VECTOR_EXTENSION,
     _apply_property_graph,
     _apply_vector_schema,
+    _declared_property_graph_labels,
+    _ExistingPropertyGraph,
+    _property_graph_action,
+    _property_graph_create_statement,
+    _property_graph_fingerprint,
+    _property_graph_replace_statement,
     _property_graph_skip_reason,
     _set_maintenance_work_mem_statement,
     _valid_maintenance_work_mem,
@@ -484,42 +493,148 @@ class TestPropertyGraphSwitch:
 
 
 class TestPropertyGraphSkipReason:
-    """The three gates, in the order they are evaluated."""
+    """The two gates that settle whether anything is asked about the graph at all."""
 
     def test_a_disabled_switch_is_the_first_reason(self) -> None:
-        reason = _property_graph_skip_reason(enabled=False, server_version_num=190000, already_exists=False)
+        reason = _property_graph_skip_reason(enabled=False, server_version_num=190000)
         assert reason == "SCHEMA_PROPERTY_GRAPH is not enabled"
 
     def test_an_older_server_is_the_second_reason(self) -> None:
-        reason = _property_graph_skip_reason(enabled=True, server_version_num=180004, already_exists=False)
+        reason = _property_graph_skip_reason(enabled=True, server_version_num=180004)
         assert reason == "server_version_num 180004 is below 190000"
 
     def test_an_unreadable_server_version_skips_rather_than_guesses(self) -> None:
-        reason = _property_graph_skip_reason(enabled=True, server_version_num=None, already_exists=False)
+        reason = _property_graph_skip_reason(enabled=True, server_version_num=None)
         assert reason == "server_version_num None is below 190000"
 
-    def test_an_existing_relation_is_the_third_reason(self) -> None:
-        """There is no IF NOT EXISTS, and nothing here ever drops a relation."""
-        reason = _property_graph_skip_reason(enabled=True, server_version_num=190000, already_exists=True)
-        assert reason == "graph.catalog already exists"
+    def test_an_enabled_switch_on_postgresql_19_goes_on(self) -> None:
+        assert _property_graph_skip_reason(enabled=True, server_version_num=190000) is None
 
-    def test_an_enabled_switch_on_a_fresh_postgresql_19_creates_the_graph(self) -> None:
-        assert _property_graph_skip_reason(enabled=True, server_version_num=190000, already_exists=False) is None
+
+# (relation, column, type) rows standing in for the catalog's element columns.
+_ELEMENT_COLUMNS = [("mb_artist", "mbid", "uuid"), ("mb_artist", "gm_item_id", "uuid"), ("artist", "artist_id", "text")]
+_FINGERPRINT = _property_graph_fingerprint(_ELEMENT_COLUMNS)
+_DECLARED_LABELS = _declared_property_graph_labels()
+
+
+class TestPropertyGraphFingerprint:
+    """The comment that identifies the definition a graph was declared from."""
+
+    def test_it_is_prefixed_so_the_schema_can_recognize_its_own(self) -> None:
+        assert _FINGERPRINT.startswith(PROPERTY_GRAPH_FINGERPRINT_PREFIX)
+        assert len(_FINGERPRINT) == len(PROPERTY_GRAPH_FINGERPRINT_PREFIX) + 64
+
+    def test_column_order_does_not_move_it(self) -> None:
+        assert _property_graph_fingerprint(reversed(_ELEMENT_COLUMNS)) == _FINGERPRINT
+
+    def test_an_added_column_moves_it(self) -> None:
+        """What `PROPERTIES ALL COLUMNS` publishes is part of the definition."""
+        assert _property_graph_fingerprint([*_ELEMENT_COLUMNS, ("mb_label", "gm_item_id", "uuid")]) != _FINGERPRINT
+
+    def test_a_retyped_column_moves_it(self) -> None:
+        retyped = [("artist", "artist_id", "character varying") if row[0] == "artist" else row for row in _ELEMENT_COLUMNS]
+        assert _property_graph_fingerprint(retyped) != _FINGERPRINT
+
+    def test_it_is_a_valid_string_literal(self) -> None:
+        """It is written into the statement verbatim, so it must need no quoting."""
+        assert "'" not in _FINGERPRINT
+        assert "$" not in _FINGERPRINT
+
+    def test_the_declared_labels_include_the_shared_musicbrainz_label(self) -> None:
+        assert ("mb_label", "mb_label") in _DECLARED_LABELS
+        assert ("mb_rel_artist_artist", MUSICBRAINZ_RELATIONSHIP_LABEL) in _DECLARED_LABELS
+
+
+class TestPropertyGraphAction:
+    """What an existing relation named `graph.catalog` gets, and why."""
+
+    def test_nothing_there_is_created(self) -> None:
+        assert _property_graph_action(None, fingerprint=_FINGERPRINT, labels=frozenset()) == ("create", "graph.catalog does not exist")
+
+    @pytest.mark.parametrize("relkind", ["r", "v", "m", "p", "f"])
+    def test_a_relation_that_is_not_a_graph_is_left_alone(self, relkind: str) -> None:
+        action, reason = _property_graph_action(_ExistingPropertyGraph(relkind, None), fingerprint=_FINGERPRINT, labels=_DECLARED_LABELS)
+        assert action == "skip"
+        assert f"relkind {relkind!r}" in reason
+
+    def test_a_graph_with_somebody_elses_comment_is_left_alone(self) -> None:
+        existing = _ExistingPropertyGraph(PROPERTY_GRAPH_RELKIND, "hand-edited by ops, do not touch")
+        action, reason = _property_graph_action(existing, fingerprint=_FINGERPRINT, labels=_DECLARED_LABELS)
+        assert action == "skip"
+        assert "did not write" in reason
+
+    def test_a_graph_without_a_fingerprint_is_replaced(self) -> None:
+        """Every version before this one declared the graph without a comment."""
+        existing = _ExistingPropertyGraph(PROPERTY_GRAPH_RELKIND, None)
+        assert _property_graph_action(existing, fingerprint=_FINGERPRINT, labels=_DECLARED_LABELS)[0] == "replace"
+
+    def test_a_graph_from_another_definition_is_replaced(self) -> None:
+        existing = _ExistingPropertyGraph(PROPERTY_GRAPH_RELKIND, PROPERTY_GRAPH_FINGERPRINT_PREFIX + "0" * 64)
+        action, reason = _property_graph_action(existing, fingerprint=_FINGERPRINT, labels=_DECLARED_LABELS)
+        assert action == "replace"
+        assert "different definition" in reason
+
+    def test_a_graph_missing_an_element_is_replaced(self) -> None:
+        """A cascade prune leaves the comment in place, so the labels are what catch it."""
+        existing = _ExistingPropertyGraph(PROPERTY_GRAPH_RELKIND, _FINGERPRINT)
+        pruned = frozenset(pair for pair in _DECLARED_LABELS if pair[0] != "mb_label")
+        action, reason = _property_graph_action(existing, fingerprint=_FINGERPRINT, labels=pruned)
+        assert action == "replace"
+        assert "missing elements or labels" in reason
+
+    def test_a_current_graph_is_left_alone(self) -> None:
+        existing = _ExistingPropertyGraph(PROPERTY_GRAPH_RELKIND, _FINGERPRINT)
+        assert _property_graph_action(existing, fingerprint=_FINGERPRINT, labels=_DECLARED_LABELS) == (
+            "skip",
+            "graph.catalog already matches its definition",
+        )
+
+
+class TestPropertyGraphStatements:
+    """The two DO blocks: each is one statement, so one transaction on an autocommit connection."""
+
+    def test_the_create_fingerprints_the_graph_it_creates(self) -> None:
+        name, statement = _property_graph_create_statement(_FINGERPRINT)
+        assert name == PROPERTY_GRAPH_STATEMENT[0]
+        assert statement.startswith("DO $property_graph$")
+        assert PROPERTY_GRAPH_STATEMENT[1] in statement
+        assert statement.index("CREATE PROPERTY GRAPH") < statement.index(f"COMMENT ON PROPERTY GRAPH graph.catalog IS '{_FINGERPRINT}'")
+        assert "DROP" not in statement.upper()
+
+    def test_the_replace_drops_creates_and_fingerprints_in_that_order(self) -> None:
+        _name, statement = _property_graph_replace_statement(_FINGERPRINT)
+        assert statement.startswith("DO $property_graph$")
+        drop = statement.index("DROP PROPERTY GRAPH graph.catalog;")
+        create = statement.index(PROPERTY_GRAPH_STATEMENT[1])
+        comment = statement.index(f"COMMENT ON PROPERTY GRAPH graph.catalog IS '{_FINGERPRINT}'")
+        assert drop < create < comment
+
+    def test_the_replace_never_cascades(self) -> None:
+        """A consumer's object over the graph makes the swap fail rather than disappear."""
+        assert "CASCADE" not in _property_graph_replace_statement(_FINGERPRINT)[1].upper()
+
+    def test_the_dollar_quote_tag_does_not_occur_in_the_body(self) -> None:
+        assert "$property_graph$" not in PROPERTY_GRAPH_STATEMENT[1]
 
 
 class TestApplyPropertyGraph:
     """The gate as the initializer runs it, against the shared cursor fake."""
 
     @staticmethod
-    def _cursor(rows: list[Any]) -> AsyncMock:
+    def _cursor(rows: list[Any], fetched: list[Any] | None = None) -> AsyncMock:
         cursor = AsyncMock()
         cursor.execute = AsyncMock()
         cursor.fetchone = AsyncMock(side_effect=rows)
+        cursor.fetchall = AsyncMock(side_effect=fetched or [])
         return cursor
 
     @staticmethod
     def _statements(cursor: AsyncMock) -> list[str]:
         return [str(call.args[0]) for call in cursor.execute.await_args_list]
+
+    @staticmethod
+    def _ddl(cursor: AsyncMock) -> list[str]:
+        return [statement for statement in TestApplyPropertyGraph._statements(cursor) if "PROPERTY GRAPH" in statement]
 
     @pytest.mark.asyncio
     async def test_a_disabled_switch_asks_the_server_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -542,27 +657,51 @@ class TestApplyPropertyGraph:
     @pytest.mark.asyncio
     async def test_postgresql_19_with_the_switch_on_creates_the_graph(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(PROPERTY_GRAPH_SWITCH, "enabled")
-        cursor = self._cursor([(190000,), (False,)])
+        cursor = self._cursor([(190000,), None], [_ELEMENT_COLUMNS])
 
         assert await _apply_property_graph(cursor) == 0
-        statements = self._statements(cursor)
-        assert len(statements) == 3
-        assert statements[-1] == PROPERTY_GRAPH_STATEMENT[1]
+        assert self._ddl(cursor) == [_property_graph_create_statement(_FINGERPRINT)[1]]
 
     @pytest.mark.asyncio
-    async def test_a_second_apply_is_a_no_op_without_dropping_anything(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_a_second_apply_of_the_same_definition_issues_no_ddl(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(PROPERTY_GRAPH_SWITCH, "enabled")
-        cursor = self._cursor([(190000,), (True,)])
+        cursor = self._cursor([(190000,), (PROPERTY_GRAPH_RELKIND, _FINGERPRINT)], [list(_DECLARED_LABELS), _ELEMENT_COLUMNS])
 
         assert await _apply_property_graph(cursor) == 0
-        statements = self._statements(cursor)
-        assert len(statements) == 2
-        assert not any("CREATE PROPERTY GRAPH" in statement for statement in statements)
+        assert self._ddl(cursor) == []
+        assert not any("DROP PROPERTY GRAPH" in statement or "CREATE PROPERTY GRAPH" in statement for statement in self._statements(cursor))
+
+    @pytest.mark.asyncio
+    async def test_a_changed_definition_replaces_the_graph(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(PROPERTY_GRAPH_SWITCH, "enabled")
+        stale = PROPERTY_GRAPH_FINGERPRINT_PREFIX + "0" * 64
+        cursor = self._cursor([(190000,), (PROPERTY_GRAPH_RELKIND, stale)], [list(_DECLARED_LABELS), _ELEMENT_COLUMNS])
+
+        assert await _apply_property_graph(cursor) == 0
+        assert self._ddl(cursor) == [_property_graph_replace_statement(_FINGERPRINT)[1]]
+
+    @pytest.mark.asyncio
+    async def test_a_pruned_graph_is_replaced(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(PROPERTY_GRAPH_SWITCH, "enabled")
+        pruned = [pair for pair in _DECLARED_LABELS if pair[0] != "mb_label"]
+        cursor = self._cursor([(190000,), (PROPERTY_GRAPH_RELKIND, _FINGERPRINT)], [pruned, _ELEMENT_COLUMNS])
+
+        assert await _apply_property_graph(cursor) == 0
+        assert self._ddl(cursor) == [_property_graph_replace_statement(_FINGERPRINT)[1]]
+
+    @pytest.mark.asyncio
+    async def test_a_squatting_relation_is_left_alone_without_reading_graph_catalogs(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(PROPERTY_GRAPH_SWITCH, "enabled")
+        cursor = self._cursor([(190000,), ("r", None)], [_ELEMENT_COLUMNS])
+
+        assert await _apply_property_graph(cursor) == 0
+        assert self._ddl(cursor) == []
+        assert not any("pg_propgraph" in statement for statement in self._statements(cursor))
 
     @pytest.mark.asyncio
     async def test_a_failing_statement_is_counted_rather_than_raised(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(PROPERTY_GRAPH_SWITCH, "enabled")
-        cursor = self._cursor([(190000,), (False,)])
+        cursor = self._cursor([(190000,), (PROPERTY_GRAPH_RELKIND, None)], [list(_DECLARED_LABELS), _ELEMENT_COLUMNS])
 
         async def fail_on_the_ddl(statement: Any, *_: Any, **__: Any) -> None:
             if "CREATE PROPERTY GRAPH" in str(statement):

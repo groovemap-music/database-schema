@@ -47,18 +47,22 @@ leaves it off. With it on, the initializer declares `graph.catalog` over the `gr
 views after the rest of the schema has been applied. See
 [the property graph](architecture.md#property-graph) for the statement itself.
 
-Three things must all be true before anything is emitted: the switch is on, the server reports
-`server_version_num` of at least `190000`, and no relation named `catalog` already exists in
-schema `graph`. Any one of them failing logs a single line naming which one and is not an
-error — the switch on a PostgreSQL 18 server is a supported configuration, not a
-misconfiguration, which is what lets one deployment manifest cover both engines during a
-version migration. A statement that fails once all three are satisfied is counted like any
-other failed schema statement and makes the run exit nonzero.
+Two things must both be true before the server is asked anything about the graph: the switch
+is on, and the server reports `server_version_num` of at least `190000`. Either one failing logs
+a single line naming which one and is not an error — the switch on a PostgreSQL 18 server is a
+supported configuration, not a misconfiguration, which is what lets one deployment manifest
+cover both engines during a version migration.
 
-The switch has no effect on an existing `graph.catalog`. There is no `IF NOT EXISTS` for a
-property graph and this initializer never drops a relation, so turning the switch off does not
-remove the graph and changing the declaration does not roll out on its own; both are deliberate
-operator actions.
+With both true, a missing `graph.catalog` is created, and an existing one this schema declared
+is re-declared in one transaction whenever its definition fingerprint or its elements no longer
+match the current declaration, so a new declaration rolls out on the next run. A current graph
+is left alone, and so is a table, a view, or a property graph carrying a comment this schema did
+not write; each logs one line. A statement that fails is counted like any other failed schema
+statement and makes the run exit nonzero, leaving the previous graph in place. See
+[the property graph](architecture.md#when-it-is-applied) for the fingerprint and the locking.
+
+Turning the switch off does not remove an existing graph: this initializer only ever replaces
+its own graph, and only with the switch on.
 
 ## The bootstrap fill
 

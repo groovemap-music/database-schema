@@ -2,6 +2,12 @@
 
 All notable changes to the GrooveMap database schema will be documented here.
 
+## v0.4.1 (2026-09-25)
+
+### Fix
+
+- **graph**: re-declare graph.catalog when its definition changed
+
 ## v0.4.0 (2026-09-25)
 
 ### Feat
