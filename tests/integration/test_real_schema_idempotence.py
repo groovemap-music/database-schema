@@ -1316,6 +1316,36 @@ GRAPH_FIXTURE_RELEASE = {
             {"name": "No role"},
         ]
     },
+    # Track-level credits and performers (gm-database-schema-ug3v). "Carol" is
+    # credited only here, never at release level, which is what proves
+    # `graph.person` and `graph.same_as` have to read this source too. The
+    # medley's sub-track exercises the nested `sub_tracks[].extraartists` /
+    # `->'artists'` shape, and its second sub-track carries neither, which must
+    # contribute nothing rather than raise.
+    "tracklist": [
+        {
+            "position": "A1",
+            "title": "Track One",
+            "extraartists": [
+                {"name": "Carol", "role": "Vocals", "id": 21},
+                {"name": "No id artist", "role": "Guitar"},
+            ],
+            "artists": [{"id": 22, "name": "Dana"}, {"id": 0, "name": "Various"}],
+        },
+        {
+            "position": "A2",
+            "title": "Medley",
+            "sub_tracks": [
+                {
+                    "position": "A2a",
+                    "title": "Medley Part One",
+                    "extraartists": [{"name": "Eve", "role": "Mixed By", "id": 23}],
+                    "artists": [{"id": 24, "name": "Frank"}],
+                },
+                {"position": "A2b", "title": "Medley Part Two"},
+            ],
+        },
+    ],
 }
 
 GRAPH_FIXTURE_MEDIA = {
@@ -1501,12 +1531,38 @@ async def assert_graph_relations_project_the_enricher_rules() -> None:
     # The malformed record neither raises nor contributes.
     assert await postgres_rows("SELECT country, genres, media_families FROM graph.release WHERE release_id = '222'") == [(None, [], [])]
 
-    assert await postgres_rows("SELECT name FROM graph.person ORDER BY 1") == [("Alice",), ("Bob",)]
+    assert await postgres_rows("SELECT name FROM graph.person ORDER BY 1") == [
+        ("Alice",),
+        ("Bob",),
+        ("Carol",),
+        ("Eve",),
+        ("No id artist",),
+    ]
     assert await postgres_rows("SELECT person_name, release_id, role, role_category FROM graph.credited_on ORDER BY 1") == [
         ("Alice", "111", "Producer", categorize_role("Producer")),
         ("Bob", "111", "Recorded By, Mastering Engineer", categorize_role("Recorded By, Mastering Engineer")),
     ]
-    assert await postgres_rows("SELECT person_name, artist_id FROM graph.same_as ORDER BY 1") == [("Alice", "7")]
+    # Track-level credits and performers (gm-database-schema-ug3v) resolve through
+    # the same `graph.same_as`, so "Carol" and "Eve" -- credited only on a track,
+    # never on the release -- appear here too.
+    assert await postgres_rows("SELECT person_name, artist_id FROM graph.same_as ORDER BY 1") == [
+        ("Alice", "7"),
+        ("Carol", "21"),
+        ("Eve", "23"),
+    ]
+
+    # The track and its sub-track both contribute, "Carol" (track-only) is a
+    # `:Person` row, and the empty second sub-track contributes nothing.
+    assert await postgres_rows("SELECT name FROM graph.person WHERE name = 'Carol'") == [("Carol",)]
+    assert await postgres_rows("SELECT person_name, release_id, track_position, role, role_category FROM graph.track_credited_on ORDER BY 1, 3") == [
+        ("Carol", "111", "A1", "Vocals", categorize_role("Vocals")),
+        ("Eve", "111", "A2a", "Mixed By", categorize_role("Mixed By")),
+        ("No id artist", "111", "A1", "Guitar", categorize_role("Guitar")),
+    ]
+    assert await postgres_rows("SELECT release_id, track_position, artist_id FROM graph.track_by_artist ORDER BY 2") == [
+        ("111", "A1", "22"),
+        ("111", "A2a", "24"),
+    ]
 
     assert await postgres_rows("SELECT company_id, name, discogs_label_id FROM graph.company ORDER BY 1") == [
         ("42", "Plant Ltd", "42"),
@@ -1791,8 +1847,12 @@ async def test_the_vertex_degree_agrees_with_artist_degree_on_every_artist() -> 
     await seed_graph_fixtures()
     await bootstrap_the_loader_tables()
 
-    # Neither comparison below is empty agreeing with empty.
-    assert await postgres_rows("SELECT count(*) FROM graph.artist_degree") == [(4,)]
+    # Neither comparison below is empty agreeing with empty. `graph.artist_degree`
+    # is six, not four: artists 21 and 23 (gm-database-schema-ug3v) are new
+    # `graph.same_as` targets of a track-only credit. `vertex_degree` stays four
+    # -- `same_as` is not one of the ten path relations it sums (it is subtracted
+    # in the formula below), so a `same_as`-only artist never gets a row there.
+    assert await postgres_rows("SELECT count(*) FROM graph.artist_degree") == [(6,)]
     assert await postgres_rows("SELECT count(*) FROM graph.vertex_degree WHERE kind = 'a'") == [(4,)]
 
     assert await postgres_rows(DEGREE_AGREES_WITH_ARTIST_DEGREE) == []

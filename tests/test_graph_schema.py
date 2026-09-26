@@ -163,6 +163,8 @@ EDGE_KEYS = {
     "owns": (("owned_copy_id",), "user_id", "item_id"),
     "credited_on": (("person_name", "release_id", "role"), "person_name", "release_id"),
     "same_as": (("person_name", "artist_id"), "person_name", "artist_id"),
+    "track_credited_on": (("person_name", "release_id", "track_position", "role"), "person_name", "release_id"),
+    "track_by_artist": (("release_id", "track_position", "artist_id"), "release_id", "artist_id"),
     "credited_to": (("release_id", "company_id", "role", "source"), "release_id", "company_id"),
     "issued_on": (("release_id", "medium_id", "source"), "release_id", "medium_id"),
     "in_family": (("medium_id", "family_name"), "medium_id", "family_name"),
@@ -641,6 +643,77 @@ class TestEdgeViews:
         statement = statement_for("part_of")
         assert "public.releases" in statement
         assert "public.masters" in statement
+
+
+class TestTrackCredits:
+    """gm-database-schema-ug3v: track-level credits and performers.
+
+    Neither relation has a Neo4j counterpart -- `graphinator` has never
+    projected a track -- so these tests check the design against its own
+    stated rules (mirrors `credited_on`/`by_artist`, resolves through
+    `same_as`, keys on the dump's own position) rather than against a Cypher
+    parity claim.
+    """
+
+    def test_track_credited_on_never_stores_an_artist_id(self) -> None:
+        """Resolution is `person_name` + `graph.same_as`, exactly as `credited_on`."""
+        statement = ddl_for("track_credited_on")
+        assert "artist_id" not in statement
+        assert "person_name" in statement and "role" in statement
+
+    def test_track_by_artist_stores_the_artist_id_directly(self) -> None:
+        """The `<artists>` shape is formal and id-bearing, like release-level `by_artist`."""
+        statement = ddl_for("track_by_artist")
+        assert "artist_id     text NOT NULL" in statement or "artist_id      text NOT NULL" in statement
+
+    def test_track_position_identifies_the_track_in_both_relations(self) -> None:
+        for relation in ("track_credited_on", "track_by_artist"):
+            statement = ddl_for(relation)
+            assert "track_position text NOT NULL" in statement
+            assert "track_position" in statement.split("PRIMARY KEY")[1]
+
+    def test_track_credited_on_generates_its_category_the_same_way_credited_on_does(self) -> None:
+        statement = ddl_for("track_credited_on")
+        assert "role_category  text GENERATED ALWAYS AS (graph.credit_role_category(role)) STORED" in statement
+        assert any(candidate.endswith("(role_category, release_id, track_position)") for candidate in index_statements_for("track_credited_on"))
+
+    def test_reverse_indexes_lead_with_release_id_for_block_reads(self) -> None:
+        """The pipeline walks release by release, unlike `credited_on`/`by_artist`'s own reverse."""
+        assert (
+            "CREATE INDEX IF NOT EXISTS track_credited_on_reverse ON graph.track_credited_on (release_id, track_position, person_name)"
+            in index_statements_for("track_credited_on")
+        )
+        assert (
+            "CREATE INDEX IF NOT EXISTS track_by_artist_reverse ON graph.track_by_artist (artist_id, release_id, track_position)"
+            in index_statements_for("track_by_artist")
+        )
+
+    def test_track_sources_read_both_the_track_and_its_sub_tracks(self) -> None:
+        """Each relation unions its track-level rows with its sub-track-level rows."""
+        for relation in ("track_credited_on", "track_by_artist"):
+            statement = statement_for(relation)
+            assert "'tracklist'" in statement
+            assert "'sub_tracks'" in statement
+            assert "UNION ALL" in statement
+
+    def test_same_as_is_extended_with_track_level_ids_not_replaced(self) -> None:
+        """One key, `(person_name, artist_id)`: a track-level id converges on the same row.
+
+        The top-level combination of the release-level and track-level sources is a
+        `UNION` (deduplicating), while the track source's own internal combination of
+        a track's row with its sub-tracks' rows is legitimately `UNION ALL` -- the two
+        nesting depths never share a `track_position`, so nothing to deduplicate there.
+        """
+        statement = statement_for("same_as")
+        assert "'extraartists'" in statement
+        assert "'tracklist'" in statement
+        assert "\nUNION\n" in statement
+
+    def test_both_relations_are_declared_property_graph_edges(self) -> None:
+        """Analytics-only edges, the same standing `artist_genre`/`label_genre` have."""
+        edge_views = {edge.view for edge in _property_graph_edges()}
+        assert {"track_credited_on", "track_by_artist"} <= edge_views
+        assert not {"track_credited_on", "track_by_artist"} & STORAGE_ONLY
 
 
 class TestJsonbGuards:
