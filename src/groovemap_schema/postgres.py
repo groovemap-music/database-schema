@@ -7,10 +7,11 @@ runs are no-ops for already-created schema objects. Schema is never dropped.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
-from typing import TYPE_CHECKING, Any, NamedTuple, cast
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast
 
 from common.credit_roles import ROLE_CATEGORIES
 from common.media import medium_ids, medium_label
@@ -2570,8 +2571,10 @@ CROSS JOIN LATERAL (
 # drops only a relation it is replacing in the same pass, only when a view of
 # that name is actually still there. A fresh database drops nothing; a second
 # apply finds a table rather than a view and drops nothing either. CASCADE is
-# required because on PostgreSQL 19 `graph.catalog` depends on the view, and
-# `_apply_property_graph` re-declares the graph on the same run.
+# required because on PostgreSQL 19 `graph.catalog` depends on the view. It
+# removes the view's element, and every edge referencing it, from the graph
+# and leaves the graph in place; `_apply_property_graph` finds those elements
+# missing and re-declares the graph on the same run when its switch is on.
 _VIEW_TO_TABLE_MIGRATION = """
 DO ${tag}$
 BEGIN
@@ -4609,7 +4612,8 @@ _GRAPH_STATEMENTS: list[tuple[str, str]] = _build_graph_statements()
 #
 # The statement is applied only on a PostgreSQL 19 server and only when the
 # `SCHEMA_PROPERTY_GRAPH` switch is enabled, so production on 18 is untouched
-# and the cutover is a configuration change. See `_property_graph_skip_reason`.
+# and the cutover is a configuration change. See `_property_graph_skip_reason`,
+# and `_property_graph_action` for how an existing graph is kept current.
 
 PROPERTY_GRAPH_SWITCH = "SCHEMA_PROPERTY_GRAPH"
 PROPERTY_GRAPH_SCHEMA = "graph"
@@ -5039,39 +5043,215 @@ def property_graph_enabled() -> bool:
     return os.environ.get(PROPERTY_GRAPH_SWITCH, "").strip().lower() in _PROPERTY_GRAPH_ENABLED_VALUES
 
 
-def _property_graph_skip_reason(*, enabled: bool, server_version_num: int | None, already_exists: bool) -> str | None:
-    """Return why `graph.catalog` is not being created, or None to create it.
+def _property_graph_skip_reason(*, enabled: bool, server_version_num: int | None) -> str | None:
+    """Return why `graph.catalog` is not being applied at all, or None to go on.
 
-    The three gates are ordered by cost. The switch is read from the environment
+    The two gates are ordered by cost. The switch is read from the environment
     and settles the common case without a round trip; the server version is one
-    query; the catalog check is the last one and is what makes a second apply a
-    no-op. `CREATE PROPERTY GRAPH` has no `IF NOT EXISTS` spelling and nothing in
-    this schema ever drops a relation a consumer may be reading, so an existing
-    relation of that name is left exactly as it is.
+    query. Whether an existing graph is created, left alone, or re-declared is
+    decided after both open; see `_property_graph_action`.
     """
     if not enabled:
         return f"{PROPERTY_GRAPH_SWITCH} is not enabled"
     if server_version_num is None or server_version_num < PROPERTY_GRAPH_MINIMUM_SERVER_VERSION:
         return f"server_version_num {server_version_num} is below {PROPERTY_GRAPH_MINIMUM_SERVER_VERSION}"
-    if already_exists:
-        return f"{PROPERTY_GRAPH_NAME} already exists"
     return None
 
 
-# A property graph is a relation, so an existing one shows up in `pg_class` under
-# its own relkind. Checking `pg_class` rather than a version-specific catalog view
-# also catches a table or view squatting the name, which is the conservative
-# answer: this schema never drops what it did not just create.
-_PROPERTY_GRAPH_EXISTS_QUERY = """
-SELECT EXISTS (
-    SELECT 1
-    FROM pg_class AS relation
-    JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
-    WHERE namespace.nspname = %s AND relation.relname = %s
-)
+# ── Keeping an existing graph.catalog current ────────────────────────────────
+# `CREATE PROPERTY GRAPH` has no `IF NOT EXISTS` and no `OR REPLACE`, and a
+# property graph captures its shape when it is declared: `PROPERTIES ALL
+# COLUMNS` is expanded to the element relation's columns at that moment, not
+# re-read at query time. So a database that already carries the graph never
+# picks up a later change to the declaration, nor a column added to a relation
+# a label publishes whole, unless the initializer re-declares it. It also
+# never notices an element pruned out from under it: on PostgreSQL 19 beta 3,
+# `DROP VIEW graph.<element> CASCADE` removes that element (and every edge
+# that references it) from the graph and leaves the graph itself in place.
+#
+# **Mechanism: DROP PROPERTY GRAPH + CREATE PROPERTY GRAPH in one
+# transaction, not ALTER PROPERTY GRAPH.** Evaluated on the digest-pinned
+# 19beta3 image the advisory tier runs:
+# - ALTER can add or drop element tables, add or drop a label on one, and add
+#   or drop properties on a label. It cannot change an element's KEY or an
+#   edge's SOURCE or DESTINATION, which is exactly the kind of change the
+#   phase 0 key retype made; those need the element dropped (taking every
+#   edge that references it) and re-added.
+# - Driving ALTER needs a diff between the declaration and the graph as it
+#   stands, which means reading every `pg_propgraph_*` catalog and, for the
+#   labels declared `ALL COLUMNS`, the element relations' columns too, then
+#   rendering the minimal sequence of ALTERs in dependency order. That is a
+#   second, stateful renderer of the same declaration, and its failure mode is
+#   a graph that is neither the old one nor the new one.
+# - DROP + CREATE re-uses the one rendered statement every fresh database
+#   already gets, so an upgraded graph is byte-for-byte the declaration, and
+#   PostgreSQL's transactional DDL makes the swap atomic: any error, including
+#   one in the CREATE, rolls back the DROP and the previous graph stays.
+# Both take the same ACCESS EXCLUSIVE lock on `graph.catalog`, so ALTER buys
+# no concurrency.
+#
+# **Fingerprint.** The declaration's identity is recorded on the graph itself
+# with `COMMENT ON PROPERTY GRAPH`, which 19beta3 supports: a SHA-256 over the
+# rendered statement and over the name and type of every column of every
+# element relation, as the catalog reports them on this run. The columns are
+# part of it because `ALL COLUMNS` makes them part of the definition without
+# appearing in its text; 0.4.0's `gm_item_id` on `graph.mb_artist` is such a
+# change. Comparing that digest with the comment tells "same definition" from
+# "changed" without diffing the graph catalogs. A comment survives a cascade
+# prune, though, so the (element, label) pairs are also compared with the
+# declared ones; that is one catalog read and is what catches a missing
+# element. A property dropped from a label by a cascade from a column is not
+# checked for; nothing in this schema drops a column.
+#
+# **Ownership.** Only a relation of relkind `g` in schema `graph` named
+# `catalog` whose comment is this schema's fingerprint, or which has no
+# comment at all (the shape every version before this one left it in), is
+# treated as this schema's graph and re-declared. A table or view squatting
+# the name, or a property graph carrying somebody else's comment, is left
+# untouched and logged, as before. `DROP PROPERTY GRAPH` is issued without
+# CASCADE, so a view or SQL-body function a consumer declared over the graph
+# makes the DROP fail, the transaction roll back, the old graph stay, and the
+# run count one failure: this schema never cascades into objects it did not
+# create.
+#
+# **Locking.** A `GRAPH_TABLE` reader holds ACCESS SHARE on `graph.catalog`
+# (and on the relations it reads). The DROP takes ACCESS EXCLUSIVE on the
+# graph and holds it until commit; the CREATE takes ACCESS SHARE on every
+# element relation, so writers to the loader-owned tables are not blocked.
+# During the swap the upgrade first waits for in-flight readers of the graph
+# to finish, and every reader that arrives after it queues behind it until
+# the transaction commits, then resolves the name again and reads the new
+# graph. The swap itself is catalog-only and takes milliseconds; the exposure
+# is a long-running `GRAPH_TABLE` query already holding the graph, which
+# stalls both the upgrade and the readers queued behind it for its duration.
+# A re-apply whose definition is unchanged takes no lock beyond the catalog
+# reads.
+
+# The fixed prefix of the comment this schema writes on `graph.catalog`. It is
+# what makes a fingerprint recognizably this schema's, as opposed to a comment
+# an operator wrote.
+PROPERTY_GRAPH_FINGERPRINT_PREFIX = "groovemap-schema definition sha256:"
+
+# The relkind PostgreSQL 19 gives a property graph in `pg_class`, beside `r`
+# for a table and `v` for a view.
+PROPERTY_GRAPH_RELKIND = "g"
+
+PropertyGraphAction = Literal["create", "replace", "skip"]
+
+
+class _ExistingPropertyGraph(NamedTuple):
+    """The relation named `graph.catalog`, whatever kind it is, and its comment."""
+
+    relkind: str
+    comment: str | None
+
+
+# Checking `pg_class` rather than a version-specific catalog view also catches a
+# table or view squatting the name, which is the conservative answer.
+_PROPERTY_GRAPH_RELATION_QUERY = """
+SELECT relation.relkind, obj_description(relation.oid, 'pg_class')
+FROM pg_class AS relation
+JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+WHERE namespace.nspname = %s AND relation.relname = %s
+"""
+
+_PROPERTY_GRAPH_LABELS_QUERY = """
+SELECT element.pgealias, label.pgllabel
+FROM pg_propgraph_element AS element
+JOIN pg_propgraph_element_label AS element_label ON element_label.pgelelid = element.oid
+JOIN pg_propgraph_label AS label ON label.oid = element_label.pgellabelid
+WHERE element.pgepgid = %s::regclass
+"""
+
+_PROPERTY_GRAPH_COLUMNS_QUERY = """
+SELECT relation.relname, attribute.attname, format_type(attribute.atttypid, attribute.atttypmod)
+FROM pg_attribute AS attribute
+JOIN pg_class AS relation ON relation.oid = attribute.attrelid
+JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+WHERE namespace.nspname = %s
+  AND relation.relname = ANY(%s)
+  AND attribute.attnum > 0
+  AND NOT attribute.attisdropped
 """
 
 _SERVER_VERSION_QUERY = "SELECT current_setting('server_version_num')::int"
+
+
+def _declared_property_graph_labels() -> frozenset[tuple[str, str]]:
+    """Return every (element alias, label) pair the declaration gives `graph.catalog`."""
+    pairs = {(vertex.view, vertex.view) for vertex in _property_graph_vertices()}
+    for edge in _property_graph_edges():
+        pairs.add((edge.view, edge.view))
+        pairs.update((edge.view, label) for label in edge.extra_labels)
+    return frozenset(pairs)
+
+
+def _property_graph_element_relations() -> list[str]:
+    """Return the name of every graph-schema relation an element table reads."""
+    return sorted({vertex.element for vertex in _property_graph_vertices()} | {edge.element for edge in _property_graph_edges()})
+
+
+def _property_graph_fingerprint(columns: Iterable[tuple[str, str, str]]) -> str:
+    """Return the comment identifying the rendered definition over these element columns.
+
+    COLUMNS is (relation, column, type) for every element relation, in any
+    order: it is sorted here, so a column's position in its relation, which
+    depends on the order columns were added, does not move the fingerprint.
+    """
+    digest = hashlib.sha256(PROPERTY_GRAPH_STATEMENT[1].encode())
+    for relation, column, type_name in sorted(columns):
+        digest.update(f"\n{relation}.{column} {type_name}".encode())
+    return PROPERTY_GRAPH_FINGERPRINT_PREFIX + digest.hexdigest()
+
+
+def _property_graph_action(
+    existing: _ExistingPropertyGraph | None, *, fingerprint: str, labels: frozenset[tuple[str, str]]
+) -> tuple[PropertyGraphAction, str]:
+    """Decide what to do about `graph.catalog`, and say why.
+
+    LABELS is the (element alias, label) pairs the existing graph carries; it
+    is ignored unless EXISTING is a property graph this schema created.
+    """
+    if existing is None:
+        return "create", f"{PROPERTY_GRAPH_NAME} does not exist"
+    if existing.relkind != PROPERTY_GRAPH_RELKIND:
+        return "skip", f"{PROPERTY_GRAPH_NAME} already exists as relkind {existing.relkind!r}, not a property graph this schema created"
+    if existing.comment is not None and not existing.comment.startswith(PROPERTY_GRAPH_FINGERPRINT_PREFIX):
+        return "skip", f"{PROPERTY_GRAPH_NAME} carries a comment this schema did not write, so it is not a property graph this schema created"
+    if existing.comment is None:
+        return "replace", f"{PROPERTY_GRAPH_NAME} carries no definition fingerprint"
+    if existing.comment != fingerprint:
+        return "replace", f"{PROPERTY_GRAPH_NAME} was declared from a different definition"
+    if labels != _declared_property_graph_labels():
+        return "replace", f"{PROPERTY_GRAPH_NAME} is missing elements or labels of its definition"
+    return "skip", f"{PROPERTY_GRAPH_NAME} already matches its definition"
+
+
+def _property_graph_create_statement(fingerprint: str) -> tuple[str, str]:
+    """Return the statement creating `graph.catalog` and fingerprinting it, as one transaction.
+
+    A DO block is one statement, so on the initializer's autocommit connection
+    it is one transaction: a graph never exists without its fingerprint.
+    """
+    return (
+        PROPERTY_GRAPH_STATEMENT_NAME,
+        f"DO $property_graph$\nBEGIN\n{PROPERTY_GRAPH_STATEMENT[1]};\n"
+        f"COMMENT ON PROPERTY GRAPH {PROPERTY_GRAPH_NAME} IS '{fingerprint}';\nEND\n$property_graph$",
+    )
+
+
+def _property_graph_replace_statement(fingerprint: str) -> tuple[str, str]:
+    """Return the statement swapping `graph.catalog` for its current definition, as one transaction.
+
+    The DROP carries no CASCADE, and it refuses anything that is not a property
+    graph, so it can only ever remove the graph this schema declared; any error
+    rolls the whole block back and leaves the previous graph in place.
+    """
+    return (
+        f"{PROPERTY_GRAPH_NAME} property graph re-declaration",
+        f"DO $property_graph$\nBEGIN\nDROP PROPERTY GRAPH {PROPERTY_GRAPH_NAME};\n{PROPERTY_GRAPH_STATEMENT[1]};\n"
+        f"COMMENT ON PROPERTY GRAPH {PROPERTY_GRAPH_NAME} IS '{fingerprint}';\nEND\n$property_graph$",
+    )
 
 
 async def _server_version_num(cursor: Any) -> int | None:
@@ -5085,33 +5265,50 @@ async def _server_version_num(cursor: Any) -> int | None:
     return None if row is None else int(row[0])
 
 
-async def _property_graph_exists(cursor: Any) -> bool:
-    """Return whether a relation named `catalog` already exists in schema `graph`."""
-    await cursor.execute(_PROPERTY_GRAPH_EXISTS_QUERY, (PROPERTY_GRAPH_SCHEMA, PROPERTY_GRAPH_RELATION))
+async def _existing_property_graph(cursor: Any) -> _ExistingPropertyGraph | None:
+    """Return the relation named `catalog` in schema `graph`, or None when there is none."""
+    await cursor.execute(_PROPERTY_GRAPH_RELATION_QUERY, (PROPERTY_GRAPH_SCHEMA, PROPERTY_GRAPH_RELATION))
     row = await cursor.fetchone()
-    return bool(row is not None and row[0])
+    return None if row is None else _ExistingPropertyGraph(str(row[0]), row[1])
+
+
+async def _property_graph_labels(cursor: Any) -> frozenset[tuple[str, str]]:
+    """Return every (element alias, label) pair the existing `graph.catalog` carries."""
+    await cursor.execute(_PROPERTY_GRAPH_LABELS_QUERY, (PROPERTY_GRAPH_NAME,))
+    return frozenset((str(alias), str(label)) for alias, label in await cursor.fetchall())
+
+
+async def _property_graph_element_columns(cursor: Any) -> list[tuple[str, str, str]]:
+    """Return (relation, column, type) for every column of every element relation."""
+    await cursor.execute(_PROPERTY_GRAPH_COLUMNS_QUERY, (PROPERTY_GRAPH_SCHEMA, _property_graph_element_relations()))
+    return [(str(relation), str(column), str(type_name)) for relation, column, type_name in await cursor.fetchall()]
 
 
 async def _apply_property_graph(cursor: Any) -> int:
-    """Create `graph.catalog` when the server and the switch both allow it.
+    """Create `graph.catalog`, or bring this schema's own copy up to date.
 
     Returns the number of failed statements, so the caller adds it to the same
     count every other schema statement contributes to. A skip is not a failure:
-    running on PostgreSQL 18, or with the switch off, is the supported default
-    and logs one line saying which gate closed.
+    running on PostgreSQL 18, or with the switch off, is the supported default,
+    and so is finding the graph already current; each logs one line saying why.
     """
     enabled = property_graph_enabled()
     server_version_num = await _server_version_num(cursor) if enabled else None
-    already_exists = (
-        await _property_graph_exists(cursor)
-        if enabled and server_version_num is not None and server_version_num >= PROPERTY_GRAPH_MINIMUM_SERVER_VERSION
-        else False
-    )
-    reason = _property_graph_skip_reason(enabled=enabled, server_version_num=server_version_num, already_exists=already_exists)
+    reason = _property_graph_skip_reason(enabled=enabled, server_version_num=server_version_num)
     if reason is not None:
         logger.info("⏭️  Skipped %s: %s", PROPERTY_GRAPH_NAME, reason)
         return 0
-    _success, failures = await _execute_schema_statements(cursor, [PROPERTY_GRAPH_STATEMENT])
+
+    existing = await _existing_property_graph(cursor)
+    labels = await _property_graph_labels(cursor) if existing is not None and existing.relkind == PROPERTY_GRAPH_RELKIND else frozenset()
+    fingerprint = _property_graph_fingerprint(await _property_graph_element_columns(cursor))
+    action, reason = _property_graph_action(existing, fingerprint=fingerprint, labels=labels)
+    if action == "skip":
+        logger.info("⏭️  Skipped %s: %s", PROPERTY_GRAPH_NAME, reason)
+        return 0
+    logger.info("🔁 Declaring %s: %s", PROPERTY_GRAPH_NAME, reason)
+    statement = _property_graph_create_statement(fingerprint) if action == "create" else _property_graph_replace_statement(fingerprint)
+    _success, failures = await _execute_schema_statements(cursor, [statement])
     return failures
 
 
