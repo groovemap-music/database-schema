@@ -1745,6 +1745,47 @@ def _non_empty(expression: str) -> str:
     return f"NULLIF({expression}, '') IS NOT NULL"
 
 
+def _xmltodict_array(container: str, key: str) -> str:
+    """Return the JSONB array CONTAINER's xmltodict wrapper unwraps to under KEY.
+
+    Mirrors `discogs-ingestion`'s `unwrap_container` (`src/discogs/normalize.rs`)
+    exactly, because `normalize_release` calls it on every release field this
+    schema reads at release level (`artists`, `labels`, `extraartists`,
+    `companies`, `identifiers`, `formats`, `genres`, `styles`) but never on
+    `tracklist` or on anything nested inside a track — `sub_tracks`, and a
+    track's or sub-track's own `extraartists`/`artists`. Those stay exactly as
+    the raw Discogs XML converts: one child collapses to a bare object under
+    KEY (`{"track": {...}}`) rather than a one-element array, several children
+    are a real array under KEY (`{"track": [...]}`), and a track or sub-track
+    with none of the relevant child has no KEY at all. Reading that shape with
+    `_jsonb_array`'s plain "is it an array" guard sees an object, not an array,
+    and unnests nothing — every track-level relation would be silently empty
+    against a real dump while looking correct against a synthetic fixture that
+    happened to store a plain array.
+
+    - CONTAINER already an array: returned as-is (a future producer that
+      normalizes tracklist the way it normalizes everything else costs this
+      function nothing).
+    - CONTAINER an object carrying KEY: that value, itself unwrapped the same
+      way `ensure_list` unwraps it -- an array kept, a JSON `null` emptied, and
+      anything else (the single-child case) wrapped as one element.
+    - CONTAINER an object without KEY, or null, or absent: empty array.
+    - Anything else (a bare scalar where an object was expected): wrapped as a
+      single-element array, which is `unwrap_container`'s own fallback and
+      only a defensive mirror -- no known Discogs shape reaches it.
+    """
+    inner = f"({container}) -> '{key}'"
+    return (
+        f"CASE WHEN jsonb_typeof({container}) = 'array' THEN {container} "
+        f"WHEN jsonb_typeof({container}) = 'object' AND ({container}) ? '{key}' THEN "
+        f"CASE WHEN jsonb_typeof({inner}) = 'array' THEN {inner} "
+        f"WHEN jsonb_typeof({inner}) = 'null' THEN '[]'::jsonb "
+        f"ELSE jsonb_build_array({inner}) END "
+        f"WHEN {container} IS NULL OR jsonb_typeof({container}) IN ('object', 'null') THEN '[]'::jsonb "
+        f"ELSE jsonb_build_array({container}) END"
+    )
+
+
 def _view(name: str, body: str) -> tuple[str, str]:
     """Return the named CREATE OR REPLACE VIEW statement for one graph relation.
 
@@ -2333,6 +2374,96 @@ _CREDIT_SOURCE = f"""
       AND {_non_empty("credit.value ->> 'role'")}
 """  # noqa: S608
 
+# One row per `extraartists` credit on a track, or on one of its sub-tracks (a
+# medley or suite indexed under a parent track). `tracklist` and `sub_tracks`
+# are Discogs' own field names for this nesting, and both -- like a track's own
+# `extraartists`/`artists` -- keep the raw xmltodict wrapper `_xmltodict_array`
+# unwraps: `discogs-ingestion`'s `normalize_release` flattens `extraartists` at
+# release level but never recurses into `tracklist`, so everything nested
+# inside a track is still `{"track": {...}}` for one, `{"track": [...]}` for
+# several, exactly as `_xmltodict_array`'s docstring has it.
+#
+# The track and the sub-track branches key on ordinal position, not on the
+# dump's own `position` string: a heading entry's `position` is empty, and two
+# entries sharing a `position` are not unheard of, so keying on it would drop
+# the first case and collapse the second. `WITH ORDINALITY` costs one bigint
+# per unnest and is stable for one dump's document, which is the only stretch
+# a key inside one row's projection needs to survive. `sub_track_ordinal` is
+# `0` for a credit on the track itself and the sub-track's own 1-based ordinal
+# otherwise, rather than `NULL`, because a primary key column cannot be
+# `NULL`; `track_position` still carries the dump's own string, kept as a
+# plain column so a consumer that wants it for display still can.
+#
+# Same rule as `_CREDIT_SOURCE`: names are read verbatim, and this is the
+# release-level rule extended one level deeper, not a new one. `artist_id` is
+# carried through exactly as `_CREDIT_SOURCE` carries it — unused by
+# `track_credited_on`, which never stores it, and read instead by `same_as`'s
+# own body below, so a track-level credit resolves to an artist id the same
+# way a release-level one does.
+_TRACK_CREDIT_SOURCE = f"""
+    SELECT releases.data_id                AS release_id,
+           track.ordinality                AS track_ordinal,
+           0::bigint                       AS sub_track_ordinal,
+           track.value ->> 'position'      AS track_position,
+           credit.value ->> 'name'         AS person_name,
+           credit.value ->> 'role'         AS role,
+           btrim(credit.value ->> 'id')    AS artist_id
+    FROM public.releases AS releases
+    CROSS JOIN LATERAL jsonb_array_elements({_xmltodict_array("releases.data -> 'tracklist'", "track")})
+        WITH ORDINALITY AS track(value, ordinality)
+    CROSS JOIN LATERAL jsonb_array_elements({_xmltodict_array("track.value -> 'extraartists'", "artist")}) AS credit(value)
+    WHERE {_non_empty("credit.value ->> 'name'")}
+      AND {_non_empty("credit.value ->> 'role'")}
+    UNION ALL
+    SELECT releases.data_id                    AS release_id,
+           track.ordinality                    AS track_ordinal,
+           sub_track.ordinality                AS sub_track_ordinal,
+           sub_track.value ->> 'position'      AS track_position,
+           credit.value ->> 'name'             AS person_name,
+           credit.value ->> 'role'             AS role,
+           btrim(credit.value ->> 'id')        AS artist_id
+    FROM public.releases AS releases
+    CROSS JOIN LATERAL jsonb_array_elements({_xmltodict_array("releases.data -> 'tracklist'", "track")})
+        WITH ORDINALITY AS track(value, ordinality)
+    CROSS JOIN LATERAL jsonb_array_elements({_xmltodict_array("track.value -> 'sub_tracks'", "track")})
+        WITH ORDINALITY AS sub_track(value, ordinality)
+    CROSS JOIN LATERAL jsonb_array_elements({_xmltodict_array("sub_track.value -> 'extraartists'", "artist")}) AS credit(value)
+    WHERE {_non_empty("credit.value ->> 'name'")}
+      AND {_non_empty("credit.value ->> 'role'")}
+"""  # noqa: S608
+
+# One row per formal `<artists>` performer on a track or sub-track — the same
+# id-bearing shape `by_artist` reads from `releases.data->'artists'` at release
+# level, most often naming a different artist than the release's own credit on
+# a various-artists compilation. `_usable_id` drops the same falsy id and
+# Discogs "no entity" `0` sentinel `by_artist` drops, for the same reason, and
+# the ordinal keying and xmltodict unwrap are `_TRACK_CREDIT_SOURCE`'s own.
+_TRACK_PERFORMER_SOURCE = f"""
+    SELECT releases.data_id                AS release_id,
+           track.ordinality                AS track_ordinal,
+           0::bigint                       AS sub_track_ordinal,
+           track.value ->> 'position'      AS track_position,
+           btrim(artist.value ->> 'id')    AS artist_id
+    FROM public.releases AS releases
+    CROSS JOIN LATERAL jsonb_array_elements({_xmltodict_array("releases.data -> 'tracklist'", "track")})
+        WITH ORDINALITY AS track(value, ordinality)
+    CROSS JOIN LATERAL jsonb_array_elements({_xmltodict_array("track.value -> 'artists'", "artist")}) AS artist(value)
+    WHERE {_usable_id("artist.value ->> 'id'")}
+    UNION ALL
+    SELECT releases.data_id                    AS release_id,
+           track.ordinality                    AS track_ordinal,
+           sub_track.ordinality                AS sub_track_ordinal,
+           sub_track.value ->> 'position'      AS track_position,
+           btrim(artist.value ->> 'id')        AS artist_id
+    FROM public.releases AS releases
+    CROSS JOIN LATERAL jsonb_array_elements({_xmltodict_array("releases.data -> 'tracklist'", "track")})
+        WITH ORDINALITY AS track(value, ordinality)
+    CROSS JOIN LATERAL jsonb_array_elements({_xmltodict_array("track.value -> 'sub_tracks'", "track")})
+        WITH ORDINALITY AS sub_track(value, ordinality)
+    CROSS JOIN LATERAL jsonb_array_elements({_xmltodict_array("sub_track.value -> 'artists'", "artist")}) AS artist(value)
+    WHERE {_usable_id("artist.value ->> 'id'")}
+"""  # noqa: S608
+
 # One row per entry of the canonical companies block (ADR 0011). A pre-cutover
 # record whose `companies` key still holds the RAW Discogs list contributes
 # nothing: subscripting a JSON array by a text key yields NULL, so the guard
@@ -2854,6 +2985,92 @@ _EDGE_TABLES: list[tuple[str, str, str, tuple[tuple[str, str], ...]]] = [
         "artist_id",
         (),
     ),
+    # Follow-up from gm-analytics-engine-ieu (maintainer decision 2026-09-25).
+    # `graphinator` has never projected a track into Neo4j — `credited_on` and
+    # `by_artist` above are release-level only — but the FastRP embedding
+    # pipeline needs the credit and performer edges Discogs states per track and
+    # sub-track, sized on the 2026-08 dump at ~96.5M credit edges against 51.0M
+    # release-level and 24,370,971 track performer edges naming 1,271,244
+    # artists beyond the release's own credit. Companion bead
+    # gm-discogs-sql-loader-b2a writes the rows; this schema only declares the
+    # two relations, their bootstrap projection, and their indexes.
+    #
+    # **Resolution mirrors what each source array already gives, exactly as the
+    # release-level pair above does.** Track credits come from
+    # `tracklist[].extraartists` (and each track's `sub_tracks[].extraartists`),
+    # the same free-text credit shape `_CREDIT_SOURCE` reads at release level: a
+    # name, a role, and an id that is sometimes absent or wrong. `credited_on`
+    # never stores that id — `person_name` is the key that joins to `:Person`,
+    # and `graph.same_as` is the one relation that resolves a person to an
+    # artist id — so `track_credited_on` follows the same rule rather than
+    # inventing a second resolution path: it stores `person_name` and `role`,
+    # never `artist_id`. `graph.same_as` needs no DDL change to serve it: it is
+    # keyed on `(person_name, artist_id)`, not on where the credit was found, so
+    # a loader that also reads track-level ids into it converges on the same
+    # row a release-level credit would produce. Track performers come from
+    # `tracklist[].artists` (and `sub_tracks[].artists`), the same formal,
+    # id-bearing shape `by_artist` reads from `releases.data->'artists'`, so
+    # `track_by_artist` stores `artist_id` directly, exactly as `by_artist`
+    # does, with no name-based resolution step.
+    #
+    # **Track identity is `(release_id, track_ordinal, sub_track_ordinal)`,
+    # nothing minted here.** Neither is keyed on the dump's own `position`
+    # string: a heading entry's `position` is empty and two entries can share
+    # one, so a key built from it would drop the first case and collapse the
+    # second. The ordinals are `WITH ORDINALITY`'s own count of what
+    # `_xmltodict_array` unwraps, stable for one dump's document, which is all
+    # a key needs; `track_position` is kept as a plain column rather than
+    # dropped, so a consumer that wants the dump's own string for display still
+    # can. `sub_track_ordinal` is `0` for a credit on the track itself and the
+    # sub-track's own 1-based ordinal otherwise, rather than `NULL`, because a
+    # primary key column cannot be `NULL`.
+    #
+    # **`tracklist` keeps the raw xmltodict wrapper `_xmltodict_array` unwraps.**
+    # `discogs-ingestion`'s `normalize_release` flattens `extraartists`,
+    # `artists`, and every other release-level array this schema reads, but
+    # never recurses into `tracklist` — so it, `sub_tracks`, and a track's or
+    # sub-track's own `extraartists`/`artists` are still `{"track": {...}}` for
+    # one child or `{"track": [...]}` for several, not a plain JSON array. See
+    # `_xmltodict_array`'s docstring for the exact shape and the four cases it
+    # handles.
+    #
+    # **Indexes for the embedding pipeline's block reads.** The reverse index
+    # leads with `release_id` (then the two ordinals) rather than with the
+    # natural key's leading column, because the pipeline's dominant access
+    # pattern is a block read walking release by release — the same "indexed
+    # in both directions" rule every edge table here follows, applied to the
+    # direction this consumer actually reads. `track_credited_on` carries the
+    # same `role_category` fan-out index `credited_on` does, for the
+    # categorized block reads the chw.2 spike calls for; `track_by_artist`
+    # needs no equivalent, mirroring `by_artist`.
+    (
+        "track_credited_on",
+        """
+    person_name       text NOT NULL,
+    release_id        text NOT NULL,
+    track_ordinal     bigint NOT NULL,
+    sub_track_ordinal bigint NOT NULL,
+    track_position    text,
+    role              text NOT NULL,
+    role_category     text GENERATED ALWAYS AS (graph.credit_role_category(role)) STORED,
+    PRIMARY KEY (person_name, release_id, track_ordinal, sub_track_ordinal, role)
+""",
+        "release_id, track_ordinal, sub_track_ordinal, person_name",
+        (("role_category", "role_category, release_id, track_ordinal, sub_track_ordinal"),),
+    ),
+    (
+        "track_by_artist",
+        """
+    release_id        text NOT NULL,
+    track_ordinal     bigint NOT NULL,
+    sub_track_ordinal bigint NOT NULL,
+    track_position    text,
+    artist_id         text NOT NULL,
+    PRIMARY KEY (release_id, track_ordinal, sub_track_ordinal, artist_id)
+""",
+        "artist_id, release_id, track_ordinal, sub_track_ordinal",
+        (),
+    ),
     # `source` stays in the key, as ADR 0011 and the phase 0 view already have
     # it, and carries its own index because each loader prunes its own rows.
     (
@@ -2890,7 +3107,7 @@ _EDGE_TABLES: list[tuple[str, str, str, tuple[tuple[str, str], ...]]] = [
 
 
 def _edge_table_statements() -> list[tuple[str, str]]:
-    """Return the fourteen Discogs edge tables with both directions indexed."""
+    """Return the sixteen Discogs edge tables with both directions indexed."""
     statements: list[tuple[str, str]] = []
     for relation, columns, reverse, extras in _EDGE_TABLES:
         statements.append(_table(relation, columns))
@@ -3361,9 +3578,16 @@ FROM ({_TAGGED_DOCUMENTS.strip()}) AS source
 CROSS JOIN LATERAL jsonb_array_elements_text({_jsonb_array(styles)}) AS style(value)
 WHERE {_non_empty("style.value")}
 """,  # noqa: S608
+        # Union with the track-level source (gm-database-schema-ug3v): a person
+        # credited only on a track, never on the release itself, still has to be
+        # a `:Person` row, or `graph.track_credited_on` would reference a vertex
+        # this table never publishes.
         "person": f"""
 SELECT DISTINCT credit.person_name AS name
 FROM ({_CREDIT_SOURCE.strip()}) AS credit
+UNION
+SELECT DISTINCT credit.person_name AS name
+FROM ({_TRACK_CREDIT_SOURCE.strip()}) AS credit
 """,  # noqa: S608
         "company": f"""
 SELECT DISTINCT ON (credit.company_id)
@@ -3425,11 +3649,48 @@ SELECT DISTINCT credit.person_name                          AS person_name,
        graph.credit_role_category(credit.role)              AS role_category
 FROM ({_CREDIT_SOURCE.strip()}) AS credit
 """,  # noqa: S608
+        # A person resolves to an artist id the same way whether the credit that
+        # names both was found on the release or on one of its tracks — `graph.
+        # same_as` has one key, `(person_name, artist_id)`, with no release_id or
+        # track_position in it, so the two sources converge on the same row
+        # rather than needing two relations.
         "same_as": f"""
 SELECT DISTINCT credit.person_name AS person_name,
        credit.artist_id            AS artist_id
 FROM ({_CREDIT_SOURCE.strip()}) AS credit
 WHERE {_usable_id("credit.artist_id")}
+UNION
+SELECT DISTINCT credit.person_name AS person_name,
+       credit.artist_id            AS artist_id
+FROM ({_TRACK_CREDIT_SOURCE.strip()}) AS credit
+WHERE {_usable_id("credit.artist_id")}
+""",  # noqa: S608
+        # TRACK_CREDITED_ON is keyed on (person, release, track_ordinal,
+        # sub_track_ordinal, role): the track-level counterpart of
+        # CREDITED_ON, one row per credit named on a track or a sub-track of
+        # it, identified by ordinal position rather than the dump's own
+        # (sometimes empty, sometimes repeated) `position` string.
+        "track_credited_on": f"""
+SELECT DISTINCT credit.person_name         AS person_name,
+       credit.release_id                   AS release_id,
+       credit.track_ordinal                AS track_ordinal,
+       credit.sub_track_ordinal            AS sub_track_ordinal,
+       credit.track_position               AS track_position,
+       credit.role                         AS role,
+       graph.credit_role_category(credit.role) AS role_category
+FROM ({_TRACK_CREDIT_SOURCE.strip()}) AS credit
+""",  # noqa: S608
+        # TRACK_BY_ARTIST is keyed on (release, track_ordinal,
+        # sub_track_ordinal, artist): the track-level counterpart of
+        # BY_ARTIST, one row per formal performer named on a track or a
+        # sub-track of it.
+        "track_by_artist": f"""
+SELECT DISTINCT performer.release_id     AS release_id,
+       performer.track_ordinal          AS track_ordinal,
+       performer.sub_track_ordinal      AS sub_track_ordinal,
+       performer.track_position         AS track_position,
+       performer.artist_id              AS artist_id
+FROM ({_TRACK_PERFORMER_SOURCE.strip()}) AS performer
 """,  # noqa: S608
         # CREDITED_TO is keyed on (release, company, role, source); the same entry
         # repeated in the document is one edge, and the first occurrence wins so
@@ -3507,6 +3768,8 @@ _BOOTSTRAP_COLUMNS: dict[str, tuple[str, ...]] = {
     "alias_of": ("alias_artist_id", "artist_id"),
     "credited_on": ("person_name", "release_id", "role"),
     "same_as": ("person_name", "artist_id"),
+    "track_credited_on": ("person_name", "release_id", "track_ordinal", "sub_track_ordinal", "track_position", "role"),
+    "track_by_artist": ("release_id", "track_ordinal", "sub_track_ordinal", "track_position", "artist_id"),
     "credited_to": ("release_id", "company_id", "role", "role_category", "source"),
     "issued_on": ("release_id", "medium_id", "source", "qty"),
 }
@@ -4852,6 +5115,33 @@ def _property_graph_edges() -> tuple[_PropertyGraphEdge, ...]:
             ("release_id",),
         ),
         _PropertyGraphEdge("same_as", ("person_name", "artist_id"), ("person_name",), "person", ("name",), ("artist_id",), "artist", ("artist_id",)),
+        # Track-level credits and performers (gm-database-schema-ug3v). No Neo4j
+        # relationship type binds these — `graphinator` has never projected a
+        # track — the same standing `artist_genre`/`label_genre` have below: an
+        # analytics-only edge the property graph still carries because both
+        # endpoints already resolve to an existing vertex and `GRAPH_TABLE`
+        # gains a real pattern to match rather than a two-relation join the
+        # caller would otherwise write by hand.
+        _PropertyGraphEdge(
+            "track_credited_on",
+            ("person_name", "release_id", "track_ordinal", "sub_track_ordinal", "role"),
+            ("person_name",),
+            "person",
+            ("name",),
+            ("release_id",),
+            "release",
+            ("release_id",),
+        ),
+        _PropertyGraphEdge(
+            "track_by_artist",
+            ("release_id", "track_ordinal", "sub_track_ordinal", "artist_id"),
+            ("release_id",),
+            "release",
+            ("release_id",),
+            ("artist_id",),
+            "artist",
+            ("artist_id",),
+        ),
         _PropertyGraphEdge(
             "credited_to",
             ("release_id", "company_id", "role", "source"),

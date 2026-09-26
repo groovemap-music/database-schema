@@ -14,7 +14,7 @@ services never require lockstep source checkouts.
 
 The `graph` schema is recorded in
 [`persistence/v1/compatibility.json`](persistence/v1/compatibility.json) under `graph_schema`
-as an additive object of contract version 1: sixty-six relations — twenty-nine loader-written
+as an additive object of contract version 1: sixty-eight relations — thirty-one loader-written
 tables and thirty-seven read-only views over tables the same contract already declares — plus
 eight functions. Four of those views exist so a vertex label can publish the counters
 Neo4j carries on the node of the same name; `graph_schema.counter_properties` records which
@@ -30,6 +30,18 @@ an environment can be populated once before a loader has run; **it is not author
 owner recorded against each relation supersedes it on that owner's first pass.** Nothing calls
 it — applying the schema declares it and writes nothing — so an empty table on a fresh database
 is still the expected state.
+
+Two of those thirty-one tables are `graph.track_credited_on` and `graph.track_by_artist`
+(gm-database-schema-ug3v, follow-up from gm-analytics-engine-ieu), the track- and
+sub-track-level counterparts of `graph.credited_on` and `graph.by_artist` that the
+FastRP embedding pipeline in `analytics-engine` reads and `discogs-sql-loader` (bead
+gm-discogs-sql-loader-b2a) writes. Neither has a Neo4j relationship type behind it —
+`graphinator` has never projected a track — so both are recorded as owned by
+`discogs-sql-loader` with no MusicBrainz counterpart, the same standing `artist_genre` and
+`label_genre` already have. Person resolution reuses `graph.same_as` rather than a second
+relation: a track-level credit's artist id resolves through the same `(person_name,
+artist_id)` key a release-level one does, so the loader's extended population of `same_as`
+needed no contract change of its own.
 
 The remaining four functions are the two loader-owned refreshes and the two procedural read
 functions. `graph_schema.member_of_union` and `graph_schema.vertex_degree` name

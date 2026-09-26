@@ -500,8 +500,8 @@ Every index and constraint above is additive within persistence contract v1 — 
 ## Graph schema
 
 The `graph` schema re-presents the catalog as the vertex and edge relations of the property
-graph the Neo4j enrichers already build. Sixty-six relations, declared in
-[`src/groovemap_schema/postgres.py`](../src/groovemap_schema/postgres.py): twenty-nine
+graph the Neo4j enrichers already build. Sixty-eight relations, declared in
+[`src/groovemap_schema/postgres.py`](../src/groovemap_schema/postgres.py): thirty-one
 loader-written tables and thirty-seven read-only views over tables declared elsewhere in the
 same module. The schema is additive within persistence contract v1:
 [the persistence compatibility contract](../contracts/persistence/) records every relation
@@ -529,9 +529,13 @@ had nowhere to put. The twenty-eighth is `graph.artist_member_of`, the
 [cross-provenance MEMBER_OF union](#the-member_of-union), and the twenty-ninth is
 `graph.vertex_degree`, [the per-vertex degree](#the-per-vertex-degree) that orders frontier
 expansion. Both are derived from the relations above them rather than from a document, and
-both exist for [the shortest-path function](#the-shortest-path) that reads them.
+both exist for [the shortest-path function](#the-shortest-path) that reads them. The thirtieth
+and thirty-first are `graph.track_credited_on` and `graph.track_by_artist`,
+[the track-level credits and performers](#track-credits-and-track-performers) the FastRP
+embedding pipeline reads — never a phase 0 view, and additive rather than a replacement of
+anything above.
 
-Read the section in two halves. The sixty-six relations are unconditional — every supported
+Read the section in two halves. The sixty-eight relations are unconditional — every supported
 engine gets all of them, on PostgreSQL 18 and 19 alike. The `CREATE PROPERTY GRAPH`
 declaration layered over them is not: it needs PostgreSQL 19 and an explicit switch, and
 [when it is applied](#when-it-is-applied) is the one place those gates are stated. A consumer
@@ -695,7 +699,9 @@ that second index; the primary key is the key column set in the column before it
 | `(:Artist)-[:ALIAS_OF]->(:Artist)` | `graph.alias_of` | **table** | `alias_artist_id`, `artist_id` | `(artist_id, alias_artist_id)` | `alias_artist_id` → `artist_id` | `artists.data->'aliases'` |
 | `(:Label)-[:SUBLABEL_OF]->(:Label)` | `graph.sublabel_of` | view | `sublabel_id`, `parent_label_id` | — | `sublabel_id` → `parent_label_id` | `labels.data->'parentLabel'` and `->'sublabels'` |
 | `(:Person)-[:CREDITED_ON]->(:Release)` | `graph.credited_on` | **table** | `person_name`, `release_id`, `role` | `(release_id, person_name)` | `person_name` → `release_id` | `releases.data->'extraartists'` |
-| `(:Person)-[:SAME_AS]->(:Artist)` | `graph.same_as` | **table** | `person_name`, `artist_id` | `(artist_id)` | `person_name` → `artist_id` | `releases.data->'extraartists'` |
+| `(:Person)-[:SAME_AS]->(:Artist)` | `graph.same_as` | **table** | `person_name`, `artist_id` | `(artist_id)` | `person_name` → `artist_id` | `releases.data->'extraartists'` and `->'tracklist'[].extraartists` (and their `sub_tracks`) |
+| (track credit — no Neo4j equivalent) | `graph.track_credited_on` | **table** | `person_name`, `release_id`, `track_ordinal`, `sub_track_ordinal`, `role` | `(release_id, track_ordinal, sub_track_ordinal, person_name)` | `person_name` → `release_id` | `releases.data->'tracklist'` (xmltodict-wrapped; and its `sub_tracks`) |
+| (track performer — no Neo4j equivalent) | `graph.track_by_artist` | **table** | `release_id`, `track_ordinal`, `sub_track_ordinal`, `artist_id` | `(artist_id, release_id, track_ordinal, sub_track_ordinal)` | `release_id` → `artist_id` | `releases.data->'tracklist'` (xmltodict-wrapped; and its `sub_tracks`) |
 | `(:Release)-[:CREDITED_TO]->(:Company)` | `graph.credited_to` | **table** | `release_id`, `company_id`, `role`, `source` | `(company_id, release_id)` | `release_id` → `company_id` | `releases.data->'companies'` |
 | `(:Release)-[:ISSUED_ON]->(:Medium)` | `graph.issued_on` | **table** | `release_id`, `medium_id`, `source` | `(medium_id, release_id)` | `release_id` → `medium_id` | `releases.media` and `musicbrainz.releases.media` |
 | `(:Medium)-[:IN_FAMILY]->(:MediaFamily)` | `graph.in_family` | view | `medium_id`, `family_name` | — | `medium_id` → `family_name` | `graph.medium` |
@@ -837,7 +843,95 @@ across two Discogs entries — are one edge whose `qty` is their sum, and an abs
 non-integer, or non-positive `qty` defaults to one.
 
 `:Person` is keyed on the credit name, verbatim: `Person.name` is the Neo4j key, so folding
-it here would key the vertex differently from the node it mirrors.
+it here would key the vertex differently from the node it mirrors. `graph.person` reads both
+`releases.data->'extraartists'` and `->'tracklist'[].extraartists` (and their `sub_tracks`,
+gm-database-schema-ug3v) so a person credited only on a track, never on the release itself,
+is still a `:Person` row rather than a `graph.track_credited_on` edge referencing a vertex this
+relation never publishes.
+
+### Track credits and track performers
+
+Follow-up from gm-analytics-engine-ieu (maintainer decision 2026-09-25). `graphinator` has
+never projected a track into Neo4j — `graph.credited_on` and `graph.by_artist` above are
+release-level only — but the FastRP embedding pipeline in `analytics-engine` needs the credit
+and performer edges Discogs states per track and sub-track. Spike gm-analytics-engine-ieu.2
+sized the gap on the 2026-08 dump: full credit scope reaches ~96.5M edges against 51.0M
+release-level, and track performers alone are 24,370,971 edges naming 1,271,244 artists beyond
+the release's own credit. Companion bead gm-discogs-sql-loader-b2a writes the rows into the two
+relations this bead declares; `graph.bootstrap_fill()` also fills them, from the same
+`tracklist` and `sub_tracks` shape that loader reads, so an environment can be populated once
+before that loader has run, exactly like every other loader-owned table (see
+[the bootstrap fill](#the-bootstrap-fill)).
+
+**Resolution mirrors what each source array already gives, exactly as the release-level pair
+does.** `graph.track_credited_on` reads `tracklist[].extraartists` (and each track's
+`sub_tracks[].extraartists`) — the same free-text credit shape `graph.credited_on` reads at
+release level: a name, a role, and an id that is sometimes absent or wrong. It therefore never
+stores that id, for the same reason `credited_on` does not: `person_name` is the key that joins
+to `:Person`, and `graph.same_as` is the one relation that resolves a person to an artist id.
+`graph.same_as` needs no new shape to serve the track-level case — it is keyed on
+`(person_name, artist_id)`, not on where the credit was found, so a loader that also reads
+track-level ids into it converges on the same row a release-level credit would produce; this is
+additive to `graph.same_as`'s population, not a change to it. `graph.person` is extended the
+same way, reading both credit sources, so a person credited only on a track is still a
+`:Person` row rather than an edge referencing a vertex `graph.person` never publishes. `graph.track_by_artist` reads
+`tracklist[].artists` (and `sub_tracks[].artists`), the same formal, id-bearing shape
+`graph.by_artist` reads from `releases.data->'artists'`, most often naming a different artist
+than the release's own credit on a various-artists compilation — so it stores `artist_id`
+directly, exactly as `by_artist` does, with no name-based resolution step.
+
+**`tracklist` keeps the raw xmltodict wrapper, unlike every field this schema reads at release
+level.** `discogs-ingestion`'s `normalize_release` (`src/discogs/normalize.rs`) unwraps
+`extraartists`, `artists`, `companies`, `genres`, `styles`, and every other release-level array
+this schema reads into a plain JSON array before the document is stored — one child collapses to
+a bare object under a singular key otherwise (`{"artist": {...}}`), several children are a real
+array under it (`{"artist": [...]}`), which is the ordinary xmltodict shape a straight XML-to-JSON
+conversion produces. `normalize_release` never recurses into `tracklist`, so it, each track's
+`sub_tracks`, and a track's or sub-track's own `extraartists`/`artists` are still exactly that raw
+shape in the stored document: `releases.data->'tracklist'` is `{"track": {...}}` for one track,
+`{"track": [...]}` for several, never a bare JSON array. Reading that with the plain "is it an
+array" guard `graph.by_artist` and `graph.credited_on`'s sources use sees an object, not an array,
+and unnests nothing: a synthetic fixture built as a plain array would look correctly populated
+while the same relation stayed silently empty against a real dump. `_xmltodict_array` is the guard
+built for this shape: see its docstring in `src/groovemap_schema/postgres.py` for the four cases
+it handles, matching
+`discogs-ingestion`'s own `unwrap_container` case for case.
+
+**Track identity is `(release_id, track_ordinal, sub_track_ordinal)`, not the dump's own
+`position` string.** A heading entry's `position` is empty, and two entries can legitimately
+share one, so a key built from it would silently drop the first case (filtered out as empty) and
+collapse the second (two credits merged under one key). `track_ordinal` is `tracklist`'s own
+1-based position after `_xmltodict_array` unwraps it, read with `WITH ORDINALITY` the same way
+`graph.credited_to`'s `entry_position` already is; `sub_track_ordinal` is the sub-track's own
+1-based ordinal within its parent's `sub_tracks`, or `0` for a credit on the track itself, because
+a primary key column cannot be `NULL`. Both are stable for one dump's document, which is all a key
+inside one row's projection needs. `track_position` is still carried, as a plain nullable column
+rather than a key column, so a consumer that wants the dump's own string for display still can —
+it is simply never filtered on and never assumed unique.
+
+**Indexes are sized for the embedding pipeline's block reads.** Both tables carry the same
+"indexed in both directions" shape every edge table in this schema does — the natural key as
+primary key, plus a reverse index — but the reverse index leads with `release_id` (then the two
+ordinals) rather than with the natural key's own leading column, because the pipeline's dominant
+access pattern is a block read walking release by release, not the person- or artist-led lookup
+`credited_on`/`by_artist` serve. `graph.track_credited_on` also carries the
+`(role_category, release_id, track_ordinal, sub_track_ordinal)` fan-out index `credited_on`
+carries on `(role_category, person_name)`, for the categorized block reads spike
+gm-analytics-engine-ieu.2 calls for — `role_category` is the same generated column, over the same
+`graph.credit_role_category(role)`, so a track credit's category is computed by the identical
+rule a release-level one is. `graph.track_by_artist` needs no equivalent, mirroring
+`graph.by_artist`.
+
+Both relations are property-graph edges (see [Property graph](#property-graph)): no Neo4j
+relationship type binds either, the same standing `graph.artist_genre` and `graph.label_genre`
+already have, but both endpoints resolve to an existing vertex (`:Person`/`:Release` and
+`:Release`/`:Artist`) so `GRAPH_TABLE` gains a real pattern to match rather than requiring the
+caller to write the two-relation join by hand.
+
+The `embedding_pipeline` role's `GRANT SELECT ON ALL TABLES IN SCHEMA graph` (see
+[`embedding_pipeline`](#embedding_pipeline)) already covers both relations on the initializer's
+next run — no grant list to update, which is the whole reason that grant is schema-wide rather
+than an enumerated relation list.
 
 ### Fidelity notes
 
@@ -1247,7 +1341,7 @@ one-sided breadth-first walk has no choice of search side to optimise.
 
 ### The bootstrap fill
 
-`graph.bootstrap_fill()` derives every one of the twenty-nine loader-written tables from the
+`graph.bootstrap_fill()` derives every one of the thirty-one loader-written tables from the
 `artists`, `labels`, `masters`, `releases`, and `musicbrainz` documents in one pass — and
 [the MEMBER_OF union](#the-member_of-union) from the relations it has just filled. It exists
 for one situation: an environment that has the documents but has not run a loader, where a
@@ -1294,7 +1388,7 @@ upsert. `ON CONFLICT DO NOTHING` converges upward only: a row the documents no l
 a release whose genre was corrected, a credit that was removed — would survive every re-run, so
 the relation would drift away from its own definition rather than toward it. Emptying it first
 makes the relation exactly the projection of the documents present, which is what idempotent
-has to mean here. The whole fill is one statement, so it either replaces all twenty-nine
+has to mean here. The whole fill is one statement, so it either replaces all thirty-one
 relations or replaces none; a failure half way through cannot leave edges pointing at vertices
 that were truncated and never refilled. The cost is that a row a loader wrote which the
 documents do not justify is discarded too, which is a reason to run the bootstrap before the
@@ -1334,10 +1428,10 @@ membership only MusicBrainz asserts.
 
 PostgreSQL 19 adds SQL/PGQ, and with it `CREATE PROPERTY GRAPH`: a named, read-only graph over
 relations that a `GRAPH_TABLE` query pattern-matches. `graph.catalog` declares one over every
-relation above — 17 vertex element tables and 38 edge element tables — so the same
+relation above — 17 vertex element tables and 40 edge element tables — so the same
 relation serves both a `SELECT` and a graph pattern. The declaration itself materializes
 nothing and copies nothing: each element is read from the table or view underneath it at query
-time, and the twenty-nine tables are written by their loaders whether the graph is declared
+time, and the thirty-one tables are written by their loaders whether the graph is declared
 or not.
 
 Eleven relations bind no element. Four hold the rows and four the counters of a label that
@@ -1350,7 +1444,7 @@ relationship type it corresponds to, and [`graph.vertex_degree`](#the-per-vertex
 because it is an expansion-ordering heuristic rather than a property of any node.
 
 It is the one conditional object in this schema. On PostgreSQL 18, and on 19 with the switch
-off, `graph.catalog` does not exist while all sixty-six relations do, so no consumer may assume it
+off, `graph.catalog` does not exist while all sixty-eight relations do, so no consumer may assume it
 — [the persistence compatibility contract](../contracts/persistence/) records it as additive
 but conditional for exactly that reason. The gates are stated once, in
 [when it is applied](#when-it-is-applied) below.
@@ -1457,6 +1551,14 @@ CREATE PROPERTY GRAPH graph.catalog
             SOURCE KEY (person_name) REFERENCES person (name)
             DESTINATION KEY (artist_id) REFERENCES artist (artist_id)
             LABEL same_as PROPERTIES ALL COLUMNS,
+        graph.track_credited_on AS track_credited_on KEY (person_name, release_id, track_ordinal, sub_track_ordinal, role)
+            SOURCE KEY (person_name) REFERENCES person (name)
+            DESTINATION KEY (release_id) REFERENCES release (release_id)
+            LABEL track_credited_on PROPERTIES ALL COLUMNS,
+        graph.track_by_artist AS track_by_artist KEY (release_id, track_ordinal, sub_track_ordinal, artist_id)
+            SOURCE KEY (release_id) REFERENCES release (release_id)
+            DESTINATION KEY (artist_id) REFERENCES artist (artist_id)
+            LABEL track_by_artist PROPERTIES ALL COLUMNS,
         graph.credited_to AS credited_to KEY (release_id, company_id, role, source)
             SOURCE KEY (release_id) REFERENCES release (release_id)
             DESTINATION KEY (company_id) REFERENCES company (company_id)
