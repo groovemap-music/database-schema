@@ -1558,29 +1558,57 @@ CREATE PROPERTY GRAPH graph.catalog
 
 #### When it is applied
 
-Three gates, evaluated in that order, and every one of them must open:
+Two gates, evaluated in that order, and both must open before the server is asked anything
+about the graph:
 
 1. `SCHEMA_PROPERTY_GRAPH` is enabled. It defaults to off and is read from the environment, so
    the common case settles without a round trip. See
    [the runtime configuration](runtime-configuration.md).
 2. `current_setting('server_version_num')::int` is at least `190000`. On PostgreSQL 18 the
    statement is a syntax error, so the version is asked before it is sent.
-3. No relation named `catalog` already exists in schema `graph`.
 
 A closed gate logs one line naming which gate closed and is not a failure: running on 18, or
-with the switch off, is the supported default. A statement that fails once all three are open
-is counted like any other failed schema statement and makes the initializer exit nonzero.
+with the switch off, is the supported default. With both open, what happens depends on what
+already carries the name `graph.catalog`:
 
-The third gate is what makes a second apply a no-op. `CREATE PROPERTY GRAPH` has no
-`IF NOT EXISTS` spelling, and this schema never drops a relation a consumer may be reading, so
-an existing `graph.catalog` is left exactly as it is — including one an operator edited by
-hand. The check is against `pg_class` rather than a property-graph-specific catalog, so a table
-or a view squatting the name also closes the gate, which is the conservative answer.
+| Found in `pg_class` | Action |
+| --- | --- |
+| Nothing | Create the graph and fingerprint it, in one transaction |
+| A property graph whose fingerprint and elements match the definition | Nothing: no DDL, no lock beyond the catalog reads |
+| A property graph with a stale fingerprint, no fingerprint, or missing elements or labels | Re-declare it: `DROP PROPERTY GRAPH`, `CREATE PROPERTY GRAPH`, and the fingerprint, in one transaction |
+| A property graph whose comment this schema did not write | Nothing, logged |
+| Any other relation (a table, a view) | Nothing, logged |
 
-Changing the declaration therefore does not roll out on its own. A property graph is replaced
-with `CREATE OR REPLACE PROPERTY GRAPH` or dropped and recreated, both of which this
-initializer refuses to do; moving an already-created `graph.catalog` to a new shape is a
-deliberate operator action, the same coordinated migration a view rename would need.
+A skip is not a failure. A statement that fails once it is issued is counted like any other
+failed schema statement and makes the initializer exit nonzero.
+
+**The fingerprint** is the graph's comment (`COMMENT ON PROPERTY GRAPH`): a fixed
+`groovemap-schema definition sha256:` prefix and a SHA-256 over the rendered statement above and
+over the name and type of every column of every element relation, as the catalog reports them
+on that run. The columns are included because `PROPERTIES ALL COLUMNS` is expanded when the
+graph is declared, so a column added to a view later, such as 0.4.0's `gm_item_id` on the
+`mb_*` vertices, changes what the graph should publish without changing the statement's text.
+The comment survives a `DROP VIEW graph.<element> CASCADE`, which on PostgreSQL 19 removes that
+element and every edge referencing it but leaves the graph, so the (element, label) pairs are
+compared with the declared ones as well. A graph with no comment is how every version before
+0.4.1 left it, so it counts as this schema's and is re-declared once.
+
+**Why drop and create rather than `ALTER PROPERTY GRAPH`.** `ALTER` can add and drop element
+tables, labels, and properties, but it cannot change an element's `KEY` or an edge's `SOURCE` or
+`DESTINATION`, and driving it needs a diff of every `pg_propgraph_*` catalog against the
+declaration — a second, stateful renderer whose failure mode is a graph that is neither the old
+shape nor the new one. Dropping and creating re-uses the one statement a fresh database gets,
+and PostgreSQL's transactional DDL makes the swap atomic: an error anywhere, including in the
+`CREATE`, rolls back the `DROP` and the previous graph stays. The `DROP` carries no `CASCADE`, so
+a view or SQL-body function a consumer declared over the graph makes the swap fail and leaves
+the graph as it was, rather than taking the consumer's object with it.
+
+**Locking.** A `GRAPH_TABLE` query holds `ACCESS SHARE` on `graph.catalog`. The swap takes
+`ACCESS EXCLUSIVE` on it until commit, and `ACCESS SHARE` on the element relations, so loader
+writes are not blocked. It waits for in-flight readers of the graph to finish, and readers
+arriving after it queue until it commits, then read the new graph. The swap itself is
+catalog-only and brief; the exposure is a long-running `GRAPH_TABLE` query already holding the
+graph, which delays the swap and every reader queued behind it for as long as it runs.
 
 #### How it appears in the catalog
 
@@ -1804,15 +1832,15 @@ than leaving it to whoever writes it first.
 
 Neither blocks anything here; both are stated so the query-rewrite beads can plan around them.
 
-**An upgrade that runs with the switch off loses the property graph until the next run with it
-on.** The view-to-table migration drops the phase 0 view with `CASCADE`, and on PostgreSQL 19
-`graph.catalog` depends on that view, so the migration takes the graph with it and relies on
-the same run re-declaring it. `_apply_property_graph` only re-declares when
-`SCHEMA_PROPERTY_GRAPH` is enabled, so an operator who upgrades with the switch off on a
-server that already carried the graph ends that run with the tables in place and no
-`graph.catalog`. The next run with the switch on restores it, because the catalog existence
-check finds nothing and creates it. Turn the switch on for the upgrade run, or expect one
-window without the graph.
+**An upgrade that runs with the switch off leaves the property graph pruned until the next run
+with it on.** The view-to-table migration drops the phase 0 view with `CASCADE`, and on
+PostgreSQL 19 that removes the view's element, and every edge referencing it, from
+`graph.catalog`, leaving the rest of the graph in place. `_apply_property_graph` finds the
+missing elements and re-declares the graph on the same run, but only when
+`SCHEMA_PROPERTY_GRAPH` is enabled, so an operator who upgrades with the switch off on a server
+that already carried the graph ends that run with the tables in place and a graph missing
+those labels. The next run with the switch on restores them. Turn the switch on for the
+upgrade run, or expect one window with a partial graph.
 
 **`gm_id` costs one index probe per vertex binding.** The four Discogs vertex views `LEFT
 JOIN` `provider_aliases`, whose uniqueness comes from a *partial* unique index — `WHERE
