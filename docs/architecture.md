@@ -1994,6 +1994,21 @@ by the embedding pipeline's monthly recompute. ADR 0013's build-memory precondit
 the fix it requires: "Initial builds and rebuilds raise [`maintenance_work_mem`] to about 2 GB
 for that session only and revert it. No standing memory setting changes."
 
+**Sizing note (gm-analytics-engine-ieu.3, 2026-09-26):** ADR 0013's own ~2 GB figure undersizes a
+full month's build at today's catalog scale. A live measurement of the full-scale artist HNSW
+build (6.87M rows, `halfvec(128)`, `m = 16`, `ef_construction = 64`) at `maintenance_work_mem =
+2GB` fell into the disk-spilling slow mode this section describes partway through — around 3.4M
+rows, throughput dropping from roughly 50k tuples/minute to roughly 15–18k. Until ieu.3's own
+measured numbers land here (a link will follow once that bead publishes them), an operator
+building or rebuilding over the full current catalog should raise `maintenance_work_mem` to at
+least ~4.5 GB, and size the build host's `/dev/shm` (or Docker's `--shm-size`) to at least that
+much — the same reason the PostgreSQL 19 integration tier's own `POSTGRES_INTEGRATION_SHM_SIZE`
+tracks its own, much smaller, test-only `maintenance_work_mem` below. `build_artist_embeddings_index`
+and `build_artist_embeddings_version_index` (both below) keep `2GB` as their code *default*
+regardless — that default only ever matches ADR 0013's own documented figure, never a
+recommendation for a full-scale build. Passing a larger `maintenance_work_mem` for one is every
+caller's own job, exactly what the keyword argument exists to let a caller do in either direction.
+
 #### Building the artist HNSW index
 
 `build_artist_embeddings_index(cursor, *, maintenance_work_mem="2GB", rebuild=False)` in
@@ -2054,34 +2069,134 @@ the matching `POSTGRES_INTEGRATION_SHM_SIZE`, since a parallel HNSW build needs 
 as large as whatever `maintenance_work_mem` it runs with). Every production and operator call
 uses the default.
 
-#### The bulk-recompute load order
+#### Serving kNN through the monthly refresh: per-version partial indexes
 
-`analytics-engine`'s monthly FastRP recompute inserts a whole new `model_version` of rows into
-`public.artist_embeddings` — up to the full artist scope in one load. If the HNSW index already
-exists at that point, PostgreSQL maintains it incrementally, once per row, as the bulk load
-runs, at whatever `maintenance_work_mem` that pipeline connection happens to hold — almost
-certainly the server default, since the pipeline is not the operator procedure above and has no
-reason to raise it. That turns one bulk load into millions of individually-memory-constrained
-index insertions instead of one raised-memory build, which is slower and reintroduces exactly the
-memory pressure ADR 0013's precondition exists to bound, just spread across the load instead of
-concentrated in a build. The load order that avoids it:
+**Maintainer decision, 2026-09-25 (gm-database-schema-19g5):** the whole-table index and "The
+bulk-recompute load order" below leave `catalog-api`'s kNN retrieval (gm-catalog-api-2zsq, not yet
+started) without a usable index for the entire monthly load — a full sequential scan of 1M+
+`halfvec` rows, or reads blocked behind whichever the drop/rebuild window happens to be. That gap
+is avoidable because `analytics-engine`'s monthly FastRP recompute never overwrites a
+`model_version` in place: `stored_model_version(config, dump_id)` there composes the algorithm
+version, an edge-set version, and the dump id, so every month's load lands on its own
+primary-key values, never the previous month's. Nothing requires the *old* `model_version`'s index
+to disappear before the *new* one exists — one **partial** HNSW index per `model_version`
+(`... WHERE model_version = '<v>'`) lets both live side by side, and `catalog-api` never sees a
+gap. This is the flow the monthly refresh actually runs; "The bulk-recompute load order" below is
+kept only for the whole-table index's own, separate use (see there).
+
+The three steps, in order:
+
+1. **Load.** `analytics-engine` inserts the new `model_version`'s rows. No index exists yet for
+   this brand-new `model_version`, so this has no effect on the index serving whatever
+   `model_version` `catalog-api` is currently reading — unlike the whole-table index, there is
+   nothing here for this load to maintain incrementally.
+2. **Build the new version's index — an operator step**, via
+   `build_artist_embeddings_version_index(cursor, model_version, index_name, *,
+   maintenance_work_mem="2GB")` in `postgres.py`. `2GB` is only the code default, matching ADR
+   0013's own documented figure — see the "Sizing note" above for why a full-scale monthly build
+   needs considerably more. `embedding_pipeline` cannot run this itself —
+   see "Why this is an operator step" below — so `analytics-engine`'s pipeline only *logs* the
+   statement an operator (human- or automation-driven, on a different, more privileged
+   credential) runs after the load's own transaction commits
+   (`insights.embedding_pipeline._log_operator_step`, in that repository). The logged statement
+   and this function agree on the SQL byte-for-byte:
+
+   ```sql
+   CREATE INDEX CONCURRENTLY IF NOT EXISTS <index_name>
+   ON public.artist_embeddings USING hnsw (embedding halfvec_cosine_ops)
+   WITH (m = 16, ef_construction = 64)
+   WHERE model_version = '<model_version>'
+   ```
+
+   `CONCURRENTLY`, unlike the whole-table build's plain `CREATE INDEX`: this index is built
+   against a table other `model_version`s are being actively read from, and an `ACCESS EXCLUSIVE`
+   lock for the whole build is exactly the read-blocking this per-version scheme exists to avoid.
+   That trade means `build_artist_embeddings_version_index` has two failure modes the whole-table
+   build does not:
+   - **It refuses outright, before touching the database, unless the cursor's connection is
+     already `autocommit=True`.** `CREATE INDEX CONCURRENTLY` cannot run inside a transaction
+     block at all; an operator invokes this the same way as `build_artist_embeddings_index` — a
+     direct admin connection opened with `autocommit=True` — but this function checks for it
+     first rather than letting PostgreSQL's own transaction-block error surface after
+     `maintenance_work_mem` has already been raised.
+   - **A build that fails or is interrupted can leave an `INVALID` index behind under the same
+     name.** `CREATE INDEX CONCURRENTLY IF NOT EXISTS` would then treat a retry as "already
+     there" and silently skip it forever. On any failure, this function immediately runs
+     `DROP INDEX CONCURRENTLY IF EXISTS <index_name>` to remove that leftover before returning,
+     so a retry starts clean.
+
+   **Why `index_name` is a parameter, not derived here:** `analytics-engine`'s
+   `insights.embedding_pipeline._index_name(stored_version)` computes the name from a slug of the
+   dump id and a 12-hex BLAKE2b digest of the full stored `model_version`
+   (`idx_artist_embeddings_<dump-id slug>_<digest>_hnsw`, always ≤ 63 bytes — `model_version`
+   itself routinely exceeds PostgreSQL's identifier limit on its own). This repository takes that
+   name as a caller-supplied argument instead of reimplementing the same slug-and-digest scheme a
+   second time: two independently maintained copies of that derivation could drift (a changed
+   digest length or slug budget on one side produces a name the other does not recognize), and
+   `CREATE INDEX CONCURRENTLY IF NOT EXISTS` would then silently build a *second*, differently
+   named index for the same `model_version` rather than reusing the first. Accepting the name
+   verbatim makes agreement structural instead of parallel-implemented — whatever name an operator
+   copies out of `analytics-engine`'s logged statement is the name used here, with nothing on this
+   side to independently derive and drift. `tests/test_postgres_schema.py`'s
+   `TestCrossRepoIndexNameAgreement` fixes two real `(model_version, index_name)` pairs computed
+   from `analytics-engine`'s own algorithm and asserts this repository's statement matches
+   `_log_operator_step`'s logged one byte-for-byte for both.
+3. **Switch, then retire — the old version's turn.** Once the new `model_version`'s partial index
+   exists, `catalog-api` switches the `model_version` its kNN retrieval filters on (its own bead,
+   not covered here). Only *after* that switch does an operator retire the version it replaced,
+   via `retire_artist_embeddings_version(cursor, model_version, index_name)`:
+   1. `DROP INDEX CONCURRENTLY IF EXISTS <index_name>` — the superseded version's partial index.
+   2. `DELETE FROM public.artist_embeddings WHERE model_version = <model_version>` — its rows,
+      with `model_version` bound as an ordinary parameter (a `DELETE`'s `WHERE` value, unlike an
+      index name in DDL position, has a bind-parameter spelling).
+
+   The index is dropped *before* the rows, the reverse of the shorthand "drop the old version's
+   rows and index": with the partial index gone first, the bulk `DELETE` runs with nothing left to
+   maintain row-by-row — the same row-by-row maintenance cost "The bulk-recompute load order"
+   below exists to avoid for a bulk *insert*, applied here to a bulk *delete*. Both orders are
+   equally correct — nothing still queries this `model_version` once `catalog-api` has switched
+   away from it — this is a performance choice, not a correctness one. `retire_artist_embeddings_version`
+   is never called before the switch, and never for the `model_version` `catalog-api` is actively
+   serving.
+
+**Why this is an operator step, both here and for the whole-table build below:** ADR 0013's
+2026-09-24 amendment grants `embedding_pipeline` `SELECT, INSERT, UPDATE, DELETE` on
+`public.artist_embeddings` and nothing else — no DDL privilege, and critically no ownership of the
+table, which is what `CREATE INDEX`, `DROP INDEX`, and `REINDEX` all require regardless of any
+grantable privilege. The maintainer's decision is that this asymmetry is intentional: the pipeline
+populates the table (and, for the per-version flow, only ever *logs* the DDL its own load implies
+— see "Vector embeddings and the embedding pipeline role" above), and a human- or
+automation-driven operator step with a different, more privileged credential does every piece of
+index or row DDL, for both flows, never the pipeline itself.
+
+#### The bulk-recompute load order (whole-table index only)
+
+`build_artist_embeddings_index` and `ARTIST_EMBEDDINGS_HNSW_INDEX_NAME` above are unchanged and
+still supported, for an operator who wants a single index over every `model_version` at once — for
+example, a full `REINDEX` after restoring from a backup, or a deployment that only ever carries one
+live `model_version` at a time. Nothing about the per-version flow above removes this path or
+requires a migration off it: PostgreSQL allows any number of indexes, partial or not, over the same
+column, so the two coexist without conflict. **The monthly refresh itself no longer uses this
+order** — see "Serving kNN through the monthly refresh" above for the flow it actually runs.
+
+If the whole-table index already exists when a bulk load starts, PostgreSQL maintains it
+incrementally, once per row, at whatever `maintenance_work_mem` that connection happens to hold —
+almost certainly the server default, since a bulk loader is not the operator procedure above and
+has no reason to raise it. That turns one bulk load into millions of individually
+memory-constrained index insertions instead of one raised-memory build, which is slower and
+reintroduces exactly the memory pressure ADR 0013's precondition exists to bound, just spread
+across the load instead of concentrated in a build. The load order that avoids it, for this
+whole-table index specifically:
 
 1. **Drop or defer the index** before the load starts. On the very first load there is nothing to
    drop yet; on every load after that, an operator drops it
    (`DROP INDEX IF EXISTS public.idx_artist_embeddings_embedding_hnsw`) first.
-2. **Bulk load.** `analytics-engine` inserts the new `model_version`'s rows with no HNSW index to
-   maintain per row.
+2. **Bulk load** the rows with no HNSW index to maintain per row.
 3. **Build or rebuild**, via `build_artist_embeddings_index` above — `rebuild=False` here, since
    the index was dropped in step 1 and this is a fresh `CREATE INDEX`.
 
-This is deliberately an **operator** step, not something the embedding pipeline's own connection
-ever does. `embedding_pipeline` (see below) holds `SELECT, INSERT, UPDATE, DELETE` on
-`public.artist_embeddings` and nothing else — no DDL privilege, and critically no ownership of the
-table, which is what `DROP INDEX`, `CREATE INDEX`, and `REINDEX` all require regardless of any
-grantable privilege. The maintainer's decision recorded here is that this asymmetry is
-intentional: the pipeline populates the table, and a human- or automation-driven operator step
-with a different, more privileged credential builds or rebuilds the index after each load, never
-the pipeline itself.
+This order is the same operator-step asymmetry described above: `embedding_pipeline` never runs
+this DDL itself.
 
 #### Querying it: iterative index scans for filtered queries
 

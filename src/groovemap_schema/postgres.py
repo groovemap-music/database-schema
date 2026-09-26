@@ -5601,6 +5601,324 @@ async def build_artist_embeddings_index(cursor: Any, *, maintenance_work_mem: st
             logger.error("❌ Could not reset maintenance_work_mem after building %s: %s", ARTIST_EMBEDDINGS_HNSW_INDEX_NAME, error)
 
 
+# ── Per-model_version partial HNSW indexes (ADR 0013 follow-on, gm-database-schema-19g5) ──
+# `build_artist_embeddings_index` above proves out one whole-table index and the
+# "bulk-recompute load order" (docs/architecture.md) it is documented against: drop the
+# index, bulk-load the new model_version, rebuild. That order works, but it leaves
+# `catalog-api`'s kNN retrieval (gm-catalog-api-2zsq) without a usable index for the
+# entire load -- a full sequential scan of 1M+ halfvec rows, or reads blocked behind
+# whichever the operator chose not to do. The monthly refresh this repository actually
+# has (`analytics-engine`'s FastRP pipeline, gm-analytics-engine-ieu) never overwrites a
+# `model_version` in place -- see `stored_model_version` there -- so nothing requires the
+# *old* version's index to ever go away before the *new* one exists: one partial HNSW
+# index per `model_version` (`... WHERE model_version = '<v>'`) lets both live side by
+# side, and `catalog-api` never sees a gap.
+#
+# The functions below are the maintainer's 2026-09-25 decision replacing the whole-table
+# flow as the one the monthly refresh actually runs -- see docs/architecture.md, "Serving
+# kNN through the monthly refresh: per-version partial indexes", for the full operator
+# sequence. `build_artist_embeddings_index`/`ARTIST_EMBEDDINGS_HNSW_INDEX_NAME` are kept,
+# unchanged, as a documented alternative for an operator who wants a single index over
+# every `model_version` at once (for example, a full `REINDEX` after restoring from a
+# backup) -- nothing here removes that path or requires a migration off it, since it was
+# never itself created automatically and coexists with the partial indexes below without
+# conflict (PostgreSQL allows any number of indexes, partial or not, over the same column).
+#
+# **Index naming is a parameter, not something this module derives.** `analytics-engine`'s
+# `insights.embedding_pipeline._index_name(stored_version)` already computes the name this
+# repository's `CREATE INDEX CONCURRENTLY` must reuse -- `idx_artist_embeddings_<dump-id
+# slug>_<12-hex blake2b digest of the full stored model_version>_hnsw`, always <= 63 bytes
+# -- and logs it as part of the exact operator statement to run
+# (`_log_operator_step`). Reimplementing that slug-and-digest scheme a second time here
+# would create two independently-maintained copies of the same algorithm that could silently
+# drift apart (a changed digest length or slug budget on one side would produce a name the
+# other side does not recognize, and `CREATE INDEX CONCURRENTLY IF NOT EXISTS` would then
+# build a *second*, differently-named index for the same `model_version` instead of
+# reusing the first). Taking `index_name` as an explicit argument instead makes agreement
+# structural rather than parallel-implemented: whatever name the operator copies out of
+# `analytics-engine`'s logged statement is the name used here, verbatim, with no
+# independent derivation on this side to drift. `_valid_index_name` is the validator that
+# stands between that caller-supplied name and the DDL it is interpolated into -- an index
+# name has no bind-parameter spelling, unlike an ordinary value, so (like
+# `_valid_maintenance_work_mem` above) this is the only thing protecting the statement text.
+
+_ARTIST_EMBEDDINGS_INDEX_NAME_PATTERN = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
+
+
+def _valid_index_name(value: str) -> bool:
+    """Return whether `value` is safe to interpolate, unquoted, as an index identifier.
+
+    Deliberately generous rather than hard-coded to `analytics-engine`'s own
+    `idx_artist_embeddings_<slug>_<digest>_hnsw` shape: every name that scheme produces
+    matches this pattern (lowercase ASCII letters, digits, and underscores, starting with
+    a letter or underscore, at most 63 characters -- PostgreSQL's `NAMEDATALEN - 1` on
+    every supported build), but so does any other identifier an operator might
+    reasonably hand-write.
+    """
+    return bool(_ARTIST_EMBEDDINGS_INDEX_NAME_PATTERN.fullmatch(value))
+
+
+def _valid_model_version(value: str) -> bool:
+    """Return whether `value` is a usable `model_version` to filter or delete by.
+
+    Unlike `index_name` and `maintenance_work_mem`, `model_version` is never interpolated
+    bare -- it is always escaped as a quoted SQL string literal (`_sql_string_literal`) for
+    the `WHERE` clause, or bound as an ordinary parameter for the retiring `DELETE` -- so
+    this does not need a restrictive grammar. It only has to catch the caller mistake an
+    empty or blank string would be: `model_version` is `NOT NULL` and never blank in
+    practice (see `stored_model_version` in `analytics-engine`), so one reaching here is a
+    sign of a wiring bug upstream, not a version this repository has ever written.
+    """
+    return value.strip() != ""
+
+
+def _sql_string_literal(value: str) -> str:
+    """A single-quoted SQL string literal, with embedded quotes escaped by doubling.
+
+    Mirrors `analytics-engine`'s own `_sql_string_literal` (`insights/embedding_pipeline.py`)
+    byte-for-byte, so the two repositories escape `model_version` into a `WHERE` clause the
+    same way -- the same reason `_artist_embeddings_version_index_create_statement` below
+    otherwise matches `_log_operator_step`'s logged statement verbatim.
+    """
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _artist_embeddings_version_index_create_statement(index_name: str, model_version: str) -> str:
+    """The `CREATE INDEX CONCURRENTLY` statement for one stored `model_version`.
+
+    Composed to match, statement-for-statement, what `analytics-engine`'s
+    `insights.embedding_pipeline._log_operator_step` logs for the same `model_version` and
+    `index_name` -- see the module comment above. `m = 16` and `ef_construction = 64` are
+    ADR 0013's fixed HNSW parameters, stated explicitly here (as there) rather than left to
+    pgvector's own defaults, so neither repository's statement silently changes if a pgvector
+    upgrade ever changes what its defaults are.
+    """
+    return (
+        f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {index_name} "
+        f"ON public.artist_embeddings USING hnsw (embedding halfvec_cosine_ops) "
+        f"WITH (m = 16, ef_construction = 64) "
+        f"WHERE model_version = {_sql_string_literal(model_version)}"
+    )
+
+
+def _artist_embeddings_version_index_drop_statement(index_name: str) -> str:
+    """The `DROP INDEX CONCURRENTLY` statement retiring one `model_version`'s index.
+
+    `CONCURRENTLY` here for the same reason as the create side: this runs against a live,
+    already-serving table (the just-switched-away-from `model_version`, per
+    `catalog-api`'s active-version switch -- see the module comment above), and an
+    `ACCESS EXCLUSIVE` lock (plain `DROP INDEX`) is exactly the kind of read-blocking this
+    whole per-version scheme exists to avoid. `IF EXISTS` makes a repeated retire (for
+    example, after `build_artist_embeddings_version_index`'s own cleanup already dropped an
+    `INVALID` index of this name) a safe no-op rather than a failure.
+    """
+    return f"DROP INDEX CONCURRENTLY IF EXISTS public.{index_name}"
+
+
+_ARTIST_EMBEDDINGS_VERSION_DELETE_SQL = "DELETE FROM public.artist_embeddings WHERE model_version = %s"
+
+
+def _connection_is_autocommit(cursor: Any) -> bool:
+    """Return whether `cursor`'s connection is in autocommit mode.
+
+    `CREATE INDEX CONCURRENTLY` and `DROP INDEX CONCURRENTLY` both refuse outright inside
+    an explicit transaction block ("cannot run inside a transaction block") -- unlike plain
+    `CREATE INDEX`/`REINDEX` above, which run inside an ordinary transaction just fine. This
+    is checked, and refused with a clear log line, before either statement ever reaches the
+    database, on the same "validate before touching the connection" footing as
+    `_valid_maintenance_work_mem`, `_valid_index_name`, and `_valid_model_version` above --
+    the alternative is PostgreSQL's own transaction-block error surfacing several statements
+    into the procedure, after `maintenance_work_mem` has already been raised.
+    """
+    connection = getattr(cursor, "connection", None)
+    return bool(connection is not None and getattr(connection, "autocommit", False))
+
+
+async def build_artist_embeddings_version_index(
+    cursor: Any,
+    model_version: str,
+    index_name: str,
+    *,
+    maintenance_work_mem: str = _HNSW_BUILD_MAINTENANCE_WORK_MEM,
+) -> int:
+    """Build one stored `model_version`'s partial HNSW index -- the per-version follow-on to
+    `build_artist_embeddings_index` above (ADR 0013, gm-database-schema-19g5). See the
+    module comment above for why this exists beside, not instead of, the whole-table build.
+
+    An operator runs this explicitly, on a direct, `autocommit=True` admin connection --
+    never the connection pool the initializer and application services share, and never a
+    step `create_postgres_schema` takes on its own -- after `analytics-engine`'s monthly
+    load has written the new `model_version`'s rows (docs/architecture.md, "Serving kNN
+    through the monthly refresh: per-version partial indexes"):
+
+    1. Re-checks the same `vector` extension guard as the table and the whole-table index.
+    2. Refuses, logging why, unless `index_name` is a safe, unquoted SQL identifier
+       (`_valid_index_name`) -- an index name has no bind-parameter spelling, so this is the
+       only thing standing between a caller-supplied name and the DDL it is interpolated
+       into. Pass the *exact* name `analytics-engine`'s `_log_operator_step` logged for this
+       `model_version`; see the module comment above for why this module does not derive it.
+    3. Refuses, logging why, unless `model_version` is non-blank (`_valid_model_version`).
+    4. Refuses, logging why, unless `maintenance_work_mem` is a bare PostgreSQL memory
+       quantity like `2GB` (`_valid_maintenance_work_mem`), exactly like
+       `build_artist_embeddings_index`.
+    5. Refuses, logging why, unless `cursor`'s connection is already in autocommit mode
+       (`_connection_is_autocommit`) -- `CREATE INDEX CONCURRENTLY` cannot run inside a
+       transaction block.
+    6. `SET maintenance_work_mem = '2GB'` (or the override), for this session only.
+    7. `CREATE INDEX CONCURRENTLY IF NOT EXISTS <index_name> ... WHERE model_version =
+       '<model_version>'`. Unlike plain `CREATE INDEX`, a `CONCURRENTLY` build that fails or
+       is interrupted can leave an `INVALID` index behind under the same name -- one that
+       `IF NOT EXISTS` would then treat as "already there" on every future retry, silently
+       skipping the rebuild forever. On any failure here, this immediately runs
+       `DROP INDEX CONCURRENTLY IF EXISTS <index_name>` to remove that leftover before
+       returning, so a retry starts clean.
+    8. `RESET maintenance_work_mem`, in a `finally`, whether or not the build (or its
+       cleanup) succeeded -- never a standing setting change, exactly like
+       `build_artist_embeddings_index`.
+
+    Returns the number of failed steps (0 means the index was built, or was already present
+    and this call was a no-op; a skip because `vector` is not installed also counts as 0).
+    """
+    if not await _vector_extension_installed(cursor):
+        logger.info(
+            "⏭️  Skipped %s: %s extension is not installed",
+            index_name,
+            VECTOR_EXTENSION,
+        )
+        return 0
+
+    if not _valid_index_name(index_name):
+        logger.error(
+            "❌ Refusing to build a partial artist_embeddings index: %r is not a safe index identifier",
+            index_name,
+        )
+        return 1
+
+    if not _valid_model_version(model_version):
+        logger.error(
+            "❌ Refusing to build %s: %r is not a usable model_version",
+            index_name,
+            model_version,
+        )
+        return 1
+
+    if not _valid_maintenance_work_mem(maintenance_work_mem):
+        logger.error(
+            "❌ Refusing to build %s: %r is not a PostgreSQL memory quantity like '2GB'",
+            index_name,
+            maintenance_work_mem,
+        )
+        return 1
+
+    if not _connection_is_autocommit(cursor):
+        logger.error(
+            "❌ Refusing to build %s: CREATE INDEX CONCURRENTLY cannot run inside a transaction "
+            "block -- connect (or call set_autocommit) with autocommit=True first",
+            index_name,
+        )
+        return 1
+
+    try:
+        await cursor.execute(_set_maintenance_work_mem_statement(maintenance_work_mem))
+    except Exception as error:
+        logger.error("❌ Could not raise maintenance_work_mem for %s: %s", index_name, error)
+        return 1
+
+    failures = 0
+    try:
+        try:
+            await cursor.execute(_artist_embeddings_version_index_create_statement(index_name, model_version))
+            logger.info("✅ Schema: %s", index_name)
+        except Exception as error:
+            logger.error(
+                "❌ Failed to build %s: %s -- dropping any INVALID index left behind so a retry starts clean",
+                index_name,
+                error,
+            )
+            failures = 1
+            try:
+                await cursor.execute(_artist_embeddings_version_index_drop_statement(index_name))
+            except Exception as cleanup_error:
+                logger.error("❌ Could not clean up INVALID index %s after a failed build: %s", index_name, cleanup_error)
+    finally:
+        try:
+            await cursor.execute(_RESET_MAINTENANCE_WORK_MEM)
+        except Exception as error:
+            logger.error("❌ Could not reset maintenance_work_mem after building %s: %s", index_name, error)
+
+    return failures
+
+
+async def retire_artist_embeddings_version(cursor: Any, model_version: str, index_name: str) -> int:
+    """Retire one superseded `model_version`: drop its partial index, then delete its rows.
+
+    An operator runs this on the same direct, `autocommit=True` admin connection as
+    `build_artist_embeddings_version_index`, after `catalog-api` has switched its active
+    `model_version` away from this one (the module comment above and
+    docs/architecture.md, "Serving kNN through the monthly refresh: per-version partial
+    indexes", cover the full sequence) -- never before the switch, and never for the
+    `model_version` currently being served.
+
+    The index is dropped *before* the rows are deleted, deliberately the reverse of the
+    bead's own shorthand ("drop the old version's rows and index"): dropping first means
+    the bulk `DELETE` below runs with no partial index left to maintain row-by-row, which
+    is exactly the row-by-row maintenance cost the per-version scheme (see the module
+    comment above) exists to avoid during a bulk change. Both orders are equally correct --
+    nothing still queries this `model_version` once `catalog-api` has switched away from
+    it -- so this is a performance choice, not a correctness one.
+
+    1. Refuses, logging why, unless `index_name` is a safe, unquoted SQL identifier
+       (`_valid_index_name`), exactly like the build side.
+    2. Refuses, logging why, unless `model_version` is non-blank (`_valid_model_version`).
+    3. Refuses, logging why, unless `cursor`'s connection is already in autocommit mode
+       (`_connection_is_autocommit`) -- `DROP INDEX CONCURRENTLY` cannot run inside a
+       transaction block, exactly like `CREATE INDEX CONCURRENTLY`.
+    4. `DROP INDEX CONCURRENTLY IF EXISTS <index_name>`.
+    5. `DELETE FROM public.artist_embeddings WHERE model_version = <model_version>`, with
+       `model_version` bound as an ordinary parameter -- a `DELETE`'s `WHERE` value, unlike
+       an index name in DDL position, has a bind-parameter spelling, so it is never
+       interpolated into the statement text.
+
+    Returns the number of failed steps (0 means both the index and the rows are gone, or
+    were already gone).
+    """
+    if not _valid_index_name(index_name):
+        logger.error(
+            "❌ Refusing to retire model_version %r: %r is not a safe index identifier",
+            model_version,
+            index_name,
+        )
+        return 1
+
+    if not _valid_model_version(model_version):
+        logger.error("❌ Refusing to retire an artist_embeddings version: %r is not a usable model_version", model_version)
+        return 1
+
+    if not _connection_is_autocommit(cursor):
+        logger.error(
+            "❌ Refusing to retire %s: DROP INDEX CONCURRENTLY cannot run inside a transaction "
+            "block -- connect (or call set_autocommit) with autocommit=True first",
+            index_name,
+        )
+        return 1
+
+    try:
+        await cursor.execute(_artist_embeddings_version_index_drop_statement(index_name))
+        logger.info("✅ Schema: %s (dropped)", index_name)
+    except Exception as error:
+        logger.error("❌ Failed to drop %s while retiring model_version %r: %s", index_name, model_version, error)
+        return 1
+
+    try:
+        await cursor.execute(_ARTIST_EMBEDDINGS_VERSION_DELETE_SQL, (model_version,))
+        logger.info("✅ Schema: retired model_version %r rows from public.artist_embeddings", model_version)
+    except Exception as error:
+        logger.error("❌ Failed to delete retired model_version %r rows: %s", model_version, error)
+        return 1
+
+    return 0
+
+
 _VECTOR_EXTENSION_INSTALLED_QUERY = "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = %s)"
 
 
