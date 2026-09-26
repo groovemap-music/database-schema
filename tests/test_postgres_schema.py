@@ -10,6 +10,7 @@ from groovemap_schema.postgres import (
     _ARTIST_EMBEDDINGS_HNSW_INDEX_REINDEX_STATEMENT,
     _ARTIST_EMBEDDINGS_HNSW_INDEX_STATEMENT,
     _ARTIST_EMBEDDINGS_STATEMENT,
+    _ARTIST_EMBEDDINGS_VERSION_DELETE_SQL,
     _EMBEDDINGS_TABLE_GRANT,
     _ENTITY_TABLES,
     _GRAPH_STATEMENTS,
@@ -34,6 +35,9 @@ from groovemap_schema.postgres import (
     VECTOR_EXTENSION,
     _apply_property_graph,
     _apply_vector_schema,
+    _artist_embeddings_version_index_create_statement,
+    _artist_embeddings_version_index_drop_statement,
+    _connection_is_autocommit,
     _declared_property_graph_labels,
     _ExistingPropertyGraph,
     _property_graph_action,
@@ -42,11 +46,16 @@ from groovemap_schema.postgres import (
     _property_graph_replace_statement,
     _property_graph_skip_reason,
     _set_maintenance_work_mem_statement,
+    _sql_string_literal,
+    _valid_index_name,
     _valid_maintenance_work_mem,
+    _valid_model_version,
     _vector_schema_skip_reasons,
     build_artist_embeddings_index,
+    build_artist_embeddings_version_index,
     create_postgres_schema,
     property_graph_enabled,
+    retire_artist_embeddings_version,
 )
 
 
@@ -1133,6 +1142,352 @@ class TestBuildArtistEmbeddingsIndex:
         assert await build_artist_embeddings_index(cursor, rebuild=True) == 1
         statements = self._statements(cursor)
         assert statements[-1] == _RESET_MAINTENANCE_WORK_MEM
+
+
+class TestValidIndexName:
+    """The validator standing between a caller-supplied index name and the DDL it is
+    interpolated into -- an index name (unlike an ordinary value) has no bind-parameter
+    spelling at all.
+    """
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "idx_artist_embeddings_embedding_hnsw",
+            # analytics-engine's insights.embedding_pipeline._index_name output for two
+            # real stored model_versions -- see TestCrossRepoIndexNameAgreement below for
+            # the full statement these come from.
+            "idx_artist_embeddings_2026_09_01_25f0ccd57c2e_hnsw",
+            "idx_artist_embeddings_discogs_monthly_2026_10_7f38cf02fe7b_hnsw",
+            "_leading_underscore",
+            "a",
+            "a" * 63,
+        ],
+    )
+    def test_accepts_a_safe_lowercase_identifier(self, value: str) -> None:
+        assert _valid_index_name(value) is True
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "",
+            "a" * 64,  # over NAMEDATALEN - 1
+            "Idx_Mixed_Case",
+            "1_leading_digit",
+            "idx with spaces",
+            "idx-with-dashes",
+            'idx"; DROP TABLE artist_embeddings; --',
+            "idx_artist_embeddings_embedding_hnsw;",
+        ],
+    )
+    def test_rejects_anything_else(self, value: str) -> None:
+        assert _valid_index_name(value) is False
+
+
+class TestValidModelVersion:
+    """`model_version` is always escaped or bound, never interpolated bare, so this only
+    has to catch an empty or blank caller mistake.
+    """
+
+    @pytest.mark.parametrize("value", ["fastrp-d128-seed7:edges-v2@2026-09-01", "x", "  padded but not blank  "])
+    def test_accepts_non_blank_text(self, value: str) -> None:
+        assert _valid_model_version(value) is True
+
+    @pytest.mark.parametrize("value", ["", " ", "\t\n"])
+    def test_rejects_blank_text(self, value: str) -> None:
+        assert _valid_model_version(value) is False
+
+
+class TestSqlStringLiteral:
+    def test_wraps_in_single_quotes(self) -> None:
+        assert _sql_string_literal("fastrp-d128-seed7:edges-v2@2026-09-01") == "'fastrp-d128-seed7:edges-v2@2026-09-01'"
+
+    def test_escapes_an_embedded_quote_by_doubling_it(self) -> None:
+        assert _sql_string_literal("o'brien") == "'o''brien'"
+
+    def test_a_statement_injection_attempt_stays_a_single_literal(self) -> None:
+        value = "x'; DROP TABLE artist_embeddings; --"
+        literal = _sql_string_literal(value)
+        assert literal == "'x''; DROP TABLE artist_embeddings; --'"
+        assert literal.count("'") % 2 == 0
+
+
+class TestCrossRepoIndexNameAgreement:
+    """`analytics-engine`'s `insights.embedding_pipeline._log_operator_step` logs the exact
+    `CREATE INDEX CONCURRENTLY` statement an operator runs; these two (model_version,
+    index_name) pairs are real output of its `_index_name`, computed independently of this
+    module. `_artist_embeddings_version_index_create_statement` must reproduce the same
+    statement text byte-for-byte given the same inputs -- proof the two repositories agree
+    in practice, not merely by design, without this module reimplementing the slug-and-digest
+    derivation itself (see the module comment above `_valid_index_name` in postgres.py).
+    """
+
+    @pytest.mark.parametrize(
+        ("model_version", "index_name", "expected_where"),
+        [
+            (
+                "fastrp-d128-seed7:edges-v2@2026-09-01",
+                "idx_artist_embeddings_2026_09_01_25f0ccd57c2e_hnsw",
+                "WHERE model_version = 'fastrp-d128-seed7:edges-v2@2026-09-01'",
+            ),
+            (
+                "fastrp-d128-seed7:edges-v2@discogs-monthly-2026-10-dump",
+                "idx_artist_embeddings_discogs_monthly_2026_10_7f38cf02fe7b_hnsw",
+                "WHERE model_version = 'fastrp-d128-seed7:edges-v2@discogs-monthly-2026-10-dump'",
+            ),
+        ],
+    )
+    def test_matches_analytics_engines_logged_statement(self, model_version: str, index_name: str, expected_where: str) -> None:
+        statement = _artist_embeddings_version_index_create_statement(index_name, model_version)
+        assert statement == (
+            f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {index_name} "
+            f"ON public.artist_embeddings USING hnsw (embedding halfvec_cosine_ops) "
+            f"WITH (m = 16, ef_construction = 64) "
+            f"{expected_where}"
+        )
+        assert _valid_index_name(index_name) is True
+
+
+class TestArtistEmbeddingsVersionIndexDropStatement:
+    def test_drops_concurrently_if_exists_by_name(self) -> None:
+        assert (
+            _artist_embeddings_version_index_drop_statement("idx_artist_embeddings_example_hnsw")
+            == "DROP INDEX CONCURRENTLY IF EXISTS public.idx_artist_embeddings_example_hnsw"
+        )
+
+
+class TestConnectionIsAutocommit:
+    def test_true_when_the_connections_autocommit_flag_is_true(self) -> None:
+        cursor = MagicMock()
+        cursor.connection = MagicMock(autocommit=True)
+        assert _connection_is_autocommit(cursor) is True
+
+    def test_false_when_the_connections_autocommit_flag_is_false(self) -> None:
+        cursor = MagicMock()
+        cursor.connection = MagicMock(autocommit=False)
+        assert _connection_is_autocommit(cursor) is False
+
+    def test_false_when_the_cursor_has_no_connection_attribute(self) -> None:
+        cursor = object()
+        assert _connection_is_autocommit(cursor) is False
+
+
+class TestBuildArtistEmbeddingsVersionIndex:
+    """`build_artist_embeddings_version_index` is the per-`model_version` follow-on to
+    `build_artist_embeddings_index` above (gm-database-schema-19g5) -- CONCURRENTLY, a
+    caller-supplied index name, and INVALID-index cleanup on failure.
+    """
+
+    _MODEL_VERSION = "fastrp-d128-seed7:edges-v2@2026-09-01"
+    _INDEX_NAME = "idx_artist_embeddings_2026_09_01_25f0ccd57c2e_hnsw"
+
+    @classmethod
+    def _cursor(cls, rows: list[Any], *, autocommit: bool = True) -> AsyncMock:
+        cursor = AsyncMock()
+        cursor.execute = AsyncMock()
+        cursor.fetchone = AsyncMock(side_effect=rows)
+        cursor.connection = MagicMock(autocommit=autocommit)
+        return cursor
+
+    @staticmethod
+    def _statements(cursor: AsyncMock) -> list[str]:
+        return [str(call.args[0]) for call in cursor.execute.await_args_list]
+
+    def _create_statement(self) -> str:
+        return _artist_embeddings_version_index_create_statement(self._INDEX_NAME, self._MODEL_VERSION)
+
+    def _drop_statement(self) -> str:
+        return _artist_embeddings_version_index_drop_statement(self._INDEX_NAME)
+
+    @pytest.mark.asyncio
+    async def test_not_installed_skips_without_touching_maintenance_work_mem(self) -> None:
+        cursor = self._cursor([(False,)])
+
+        assert await build_artist_embeddings_version_index(cursor, self._MODEL_VERSION, self._INDEX_NAME) == 0
+        assert self._statements(cursor) == [_VECTOR_EXTENSION_INSTALLED_QUERY]
+
+    @pytest.mark.asyncio
+    async def test_installed_raises_builds_and_reverts_in_order(self) -> None:
+        cursor = self._cursor([(True,)])
+
+        assert await build_artist_embeddings_version_index(cursor, self._MODEL_VERSION, self._INDEX_NAME) == 0
+        assert self._statements(cursor) == [
+            _VECTOR_EXTENSION_INSTALLED_QUERY,
+            _set_maintenance_work_mem_statement(_HNSW_BUILD_MAINTENANCE_WORK_MEM),
+            self._create_statement(),
+            _RESET_MAINTENANCE_WORK_MEM,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_an_invalid_index_name_is_rejected_before_touching_maintenance_work_mem(self) -> None:
+        cursor = self._cursor([(True,)])
+
+        assert await build_artist_embeddings_version_index(cursor, self._MODEL_VERSION, "not an identifier") == 1
+        assert self._statements(cursor) == [_VECTOR_EXTENSION_INSTALLED_QUERY]
+
+    @pytest.mark.asyncio
+    async def test_a_blank_model_version_is_rejected_before_touching_maintenance_work_mem(self) -> None:
+        cursor = self._cursor([(True,)])
+
+        assert await build_artist_embeddings_version_index(cursor, "  ", self._INDEX_NAME) == 1
+        assert self._statements(cursor) == [_VECTOR_EXTENSION_INSTALLED_QUERY]
+
+    @pytest.mark.asyncio
+    async def test_an_invalid_maintenance_work_mem_is_rejected_before_touching_the_database(self) -> None:
+        cursor = self._cursor([(True,)])
+
+        assert (
+            await build_artist_embeddings_version_index(
+                cursor, self._MODEL_VERSION, self._INDEX_NAME, maintenance_work_mem="2GB'; DROP TABLE artist_embeddings; --"
+            )
+            == 1
+        )
+        assert self._statements(cursor) == [_VECTOR_EXTENSION_INSTALLED_QUERY]
+
+    @pytest.mark.asyncio
+    async def test_a_non_autocommit_connection_is_rejected_before_touching_maintenance_work_mem(self) -> None:
+        cursor = self._cursor([(True,)], autocommit=False)
+
+        assert await build_artist_embeddings_version_index(cursor, self._MODEL_VERSION, self._INDEX_NAME) == 1
+        assert self._statements(cursor) == [_VECTOR_EXTENSION_INSTALLED_QUERY]
+
+    @pytest.mark.asyncio
+    async def test_a_failing_memory_bump_skips_the_build_entirely(self) -> None:
+        cursor = self._cursor([(True,)])
+
+        async def fail_on_set(statement: Any, *_: Any, **__: Any) -> None:
+            if str(statement) == _set_maintenance_work_mem_statement(_HNSW_BUILD_MAINTENANCE_WORK_MEM):
+                raise RuntimeError("Simulated PostgreSQL error")
+
+        cursor.execute = AsyncMock(side_effect=fail_on_set)
+        assert await build_artist_embeddings_version_index(cursor, self._MODEL_VERSION, self._INDEX_NAME) == 1
+        statements = self._statements(cursor)
+        assert self._create_statement() not in statements
+        assert _RESET_MAINTENANCE_WORK_MEM not in statements
+
+    @pytest.mark.asyncio
+    async def test_a_failing_build_drops_any_invalid_index_and_still_reverts_maintenance_work_mem(self) -> None:
+        cursor = self._cursor([(True,)])
+        create_statement = self._create_statement()
+
+        async def fail_on_the_index(statement: Any, *_: Any, **__: Any) -> None:
+            if str(statement) == create_statement:
+                raise RuntimeError("Simulated PostgreSQL error")
+
+        cursor.execute = AsyncMock(side_effect=fail_on_the_index)
+        assert await build_artist_embeddings_version_index(cursor, self._MODEL_VERSION, self._INDEX_NAME) == 1
+        assert self._statements(cursor) == [
+            _VECTOR_EXTENSION_INSTALLED_QUERY,
+            _set_maintenance_work_mem_statement(_HNSW_BUILD_MAINTENANCE_WORK_MEM),
+            create_statement,
+            self._drop_statement(),
+            _RESET_MAINTENANCE_WORK_MEM,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_failing_cleanup_drop_still_reverts_maintenance_work_mem_and_reports_failure(self) -> None:
+        cursor = self._cursor([(True,)])
+        create_statement = self._create_statement()
+        drop_statement = self._drop_statement()
+
+        async def fail_on_index_and_cleanup(statement: Any, *_: Any, **__: Any) -> None:
+            if str(statement) in (create_statement, drop_statement):
+                raise RuntimeError("Simulated PostgreSQL error")
+
+        cursor.execute = AsyncMock(side_effect=fail_on_index_and_cleanup)
+        assert await build_artist_embeddings_version_index(cursor, self._MODEL_VERSION, self._INDEX_NAME) == 1
+        assert self._statements(cursor)[-1] == _RESET_MAINTENANCE_WORK_MEM
+
+    @pytest.mark.asyncio
+    async def test_a_failing_reset_does_not_undo_a_successful_build(self) -> None:
+        cursor = self._cursor([(True,)])
+
+        async def fail_on_reset(statement: Any, *_: Any, **__: Any) -> None:
+            if str(statement) == _RESET_MAINTENANCE_WORK_MEM:
+                raise RuntimeError("Simulated PostgreSQL error")
+
+        cursor.execute = AsyncMock(side_effect=fail_on_reset)
+        assert await build_artist_embeddings_version_index(cursor, self._MODEL_VERSION, self._INDEX_NAME) == 0
+
+    @pytest.mark.asyncio
+    async def test_maintenance_work_mem_is_overridable_for_a_resource_bound_caller(self) -> None:
+        cursor = self._cursor([(True,)])
+
+        assert await build_artist_embeddings_version_index(cursor, self._MODEL_VERSION, self._INDEX_NAME, maintenance_work_mem="64MB") == 0
+        assert self._statements(cursor)[1] == _set_maintenance_work_mem_statement("64MB")
+
+
+class TestRetireArtistEmbeddingsVersion:
+    """`retire_artist_embeddings_version` is the cleanup half of the per-`model_version`
+    flow: drop the superseded index, then delete its rows -- see the module comment above
+    `build_artist_embeddings_version_index` in postgres.py for why the index is dropped
+    first.
+    """
+
+    _MODEL_VERSION = "fastrp-d128-seed7:edges-v2@2026-08-01"
+    _INDEX_NAME = "idx_artist_embeddings_2026_08_01_deadbeefcafe_hnsw"
+
+    @classmethod
+    def _cursor(cls, *, autocommit: bool = True) -> AsyncMock:
+        cursor = AsyncMock()
+        cursor.execute = AsyncMock()
+        cursor.connection = MagicMock(autocommit=autocommit)
+        return cursor
+
+    @staticmethod
+    def _statements(cursor: AsyncMock) -> list[tuple[Any, ...]]:
+        return [tuple(call.args) for call in cursor.execute.await_args_list]
+
+    @pytest.mark.asyncio
+    async def test_drops_the_index_then_deletes_the_rows_in_order(self) -> None:
+        cursor = self._cursor()
+
+        assert await retire_artist_embeddings_version(cursor, self._MODEL_VERSION, self._INDEX_NAME) == 0
+        assert self._statements(cursor) == [
+            (_artist_embeddings_version_index_drop_statement(self._INDEX_NAME),),
+            (_ARTIST_EMBEDDINGS_VERSION_DELETE_SQL, (self._MODEL_VERSION,)),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_an_invalid_index_name_is_rejected_before_touching_the_database(self) -> None:
+        cursor = self._cursor()
+
+        assert await retire_artist_embeddings_version(cursor, self._MODEL_VERSION, "not an identifier") == 1
+        assert self._statements(cursor) == []
+
+    @pytest.mark.asyncio
+    async def test_a_blank_model_version_is_rejected_before_touching_the_database(self) -> None:
+        cursor = self._cursor()
+
+        assert await retire_artist_embeddings_version(cursor, "   ", self._INDEX_NAME) == 1
+        assert self._statements(cursor) == []
+
+    @pytest.mark.asyncio
+    async def test_a_non_autocommit_connection_is_rejected_before_touching_the_database(self) -> None:
+        cursor = self._cursor(autocommit=False)
+
+        assert await retire_artist_embeddings_version(cursor, self._MODEL_VERSION, self._INDEX_NAME) == 1
+        assert self._statements(cursor) == []
+
+    @pytest.mark.asyncio
+    async def test_a_failing_drop_never_attempts_the_delete(self) -> None:
+        cursor = self._cursor()
+        cursor.execute = AsyncMock(side_effect=RuntimeError("Simulated PostgreSQL error"))
+
+        assert await retire_artist_embeddings_version(cursor, self._MODEL_VERSION, self._INDEX_NAME) == 1
+        assert len(cursor.execute.await_args_list) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_failing_delete_is_reported_after_a_successful_drop(self) -> None:
+        cursor = self._cursor()
+        drop_statement = _artist_embeddings_version_index_drop_statement(self._INDEX_NAME)
+
+        async def fail_on_delete(statement: Any, *_: Any, **__: Any) -> None:
+            if str(statement) != drop_statement:
+                raise RuntimeError("Simulated PostgreSQL error")
+
+        cursor.execute = AsyncMock(side_effect=fail_on_delete)
+        assert await retire_artist_embeddings_version(cursor, self._MODEL_VERSION, self._INDEX_NAME) == 1
 
 
 class TestVectorSchemaFullRun:

@@ -39,8 +39,10 @@ from groovemap_schema.postgres import (
     _property_graph_vertices,
     _widen_to_bigint,
     build_artist_embeddings_index,
+    build_artist_embeddings_version_index,
     graph_bootstrap_statements,
     phase0_comparison_statements,
+    retire_artist_embeddings_version,
 )
 
 
@@ -1036,6 +1038,166 @@ async def test_build_artist_embeddings_index_rebuild_true_actually_rebuilds() ->
     assert after_relfilenode != before_relfilenode, "REINDEX did not actually replace the index's physical file"
     assert await index_is_valid(ARTIST_EMBEDDINGS_HNSW_INDEX_NAME) is True
     assert after_maintenance_work_mem == baseline_maintenance_work_mem, "maintenance_work_mem was not reset after the rebuild"
+
+
+# ── Per-model_version partial HNSW indexes (ADR 0013 follow-on, gm-database-schema-19g5) ──
+# See docs/architecture.md, "Serving kNN through the monthly refresh: per-version partial
+# indexes". Advisory PostgreSQL 19 tier only, same as every other HNSW scenario above --
+# pgvector is not on the required PostgreSQL 18 tier's bare official image.
+
+_VERSION_INDEX_FIXTURE_ROW_COUNT = 2000
+_VERSION_INDEX_FIXTURE_MAINTENANCE_WORK_MEM = "64MB"
+
+# Real `analytics-engine` shape, not a repository-local placeholder: `stored_model_version`
+# there composes `FastRPConfig.model_version` (`insights/embeddings/fastrp.py` --
+# `f"fastrp-v{ALGORITHM_VERSION}:dim={dim}:weights={weights}:beta={beta:g}:proj=..."`, itself
+# over 100 characters), an edge-set version, and the dump id. Using the real, long,
+# `:`-and-`=`-and-`,`-laden shape here -- rather than a short placeholder string -- exercises
+# the same long-string, multi-separator value `_sql_string_literal`'s quoting has to handle in
+# production, not a simplified stand-in. `_LIVE_INDEX_NAME`/`_NEW_INDEX_NAME` are
+# `insights.embedding_pipeline._index_name`'s real output for these two exact strings
+# (computed independently of this module -- see `TestCrossRepoIndexNameAgreement` in
+# tests/test_postgres_schema.py for the same cross-repo proof at the unit level).
+_VERSION_INDEX_METHOD_VERSION = "fastrp-v1:dim=128:weights=1,1,1:beta=-1:proj=achlioptas-s3:rows=splitmix64(blake2b64(kind,key)):seed=20260924"
+_VERSION_INDEX_LIVE_MODEL_VERSION = f"{_VERSION_INDEX_METHOD_VERSION}:edges-v2@discogs_20260801"
+_VERSION_INDEX_LIVE_INDEX_NAME = "idx_artist_embeddings_discogs_20260801_d0bb00bf9c8a_hnsw"
+_VERSION_INDEX_NEW_MODEL_VERSION = f"{_VERSION_INDEX_METHOD_VERSION}:edges-v2@discogs_20260901"
+_VERSION_INDEX_NEW_INDEX_NAME = "idx_artist_embeddings_discogs_20260901_29a277e88af8_hnsw"
+
+
+async def _seed_artist_embeddings_version_fixture(cursor: Any, model_version: str, *, seed: int) -> None:
+    """Insert `_VERSION_INDEX_FIXTURE_ROW_COUNT` synthetic rows under one `model_version`."""
+    rng = random.Random(seed)  # noqa: S311 -- deterministic synthetic test vectors, not cryptography
+    rows = [
+        (str(artist_id), model_version, _synthetic_halfvec_literal(rng), "integration-test-fixture", "2026-09-01")
+        for artist_id in range(_VERSION_INDEX_FIXTURE_ROW_COUNT)
+    ]
+    await cursor.executemany(
+        """
+        INSERT INTO public.artist_embeddings (artist_id, model_version, embedding, source_dump_id, source_dump_date)
+        VALUES (%s, %s, %s::halfvec, %s, %s)
+        ON CONFLICT (artist_id, model_version) DO NOTHING
+        """,
+        rows,
+    )
+    await cursor.execute("ANALYZE public.artist_embeddings")
+
+
+async def _model_version_row_count(model_version: str) -> int:
+    rows = await postgres_rows("SELECT count(*) FROM public.artist_embeddings WHERE model_version = %s", (model_version,))
+    return int(rows[0][0])
+
+
+async def _index_definition(index_name: str) -> str | None:
+    """Return `pg_indexes.indexdef` for `index_name`, or None -- generalizes `hnsw_index_definition`
+    (which is hardcoded to the whole-table index) to any of this file's per-version fixture indexes.
+    """
+    rows = await postgres_rows(
+        "SELECT indexdef FROM pg_indexes WHERE schemaname = 'public' AND indexname = %s",
+        (index_name,),
+    )
+    return rows[0][0] if rows else None
+
+
+async def _assert_planner_uses_partial_index_for_model_version(index_name: str, model_version: str, query_vector: str) -> None:
+    """Assert the planner picks `index_name` for a `model_version`-filtered kNN query.
+
+    The shape `catalog-api`'s similar-artist retrieval runs (docs/architecture.md,
+    "Querying it: iterative index scans for filtered queries") -- restricting to one
+    `model_version` and ordering by distance. A partial index whose predicate matches the
+    query's `WHERE` clause exactly does not have the filtered-recall problem an unfiltered
+    HNSW scan has, so this does not need `hnsw.iterative_scan` raised to observe the planner
+    choosing it.
+    """
+    plan_rows = await postgres_rows(
+        "EXPLAIN SELECT artist_id FROM public.artist_embeddings WHERE model_version = %s ORDER BY embedding <=> %s::halfvec LIMIT 5",
+        (model_version, query_vector),
+    )
+    plan = "\n".join(row[0] for row in plan_rows)
+    assert index_name in plan, f"planner did not use {index_name} for model_version={model_version!r}:\n{plan}"
+
+
+@pytest.mark.asyncio
+async def test_build_artist_embeddings_version_index_serves_knn_without_an_index_gap() -> None:
+    """The whole point of gm-database-schema-19g5: kNN for the *live* `model_version` keeps
+    using its own partial index, untouched, while a second `model_version` is loaded and
+    indexed alongside it -- no drop, no gap, no blocked reads. Then proves the retire half
+    of the flow: dropping the live version's index and rows leaves the new version's index
+    and rows exactly as they were.
+    """
+    if not await vector_extension_present():
+        pytest.skip("pgvector is not installed on this tier; this scenario only exists when it is available")
+    await apply_schema()
+
+    connection = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params())
+    async with connection, connection.cursor() as cursor:
+        await connection.set_autocommit(True)
+        # A clean slate, independent of test order and of the whole-table index scenarios
+        # above: this test's whole point is two *partial* indexes coexisting, which the
+        # whole-table index (built over every model_version, including these fixtures)
+        # would otherwise also match and make the planner's choice ambiguous.
+        await cursor.execute(f"DROP INDEX IF EXISTS public.{ARTIST_EMBEDDINGS_HNSW_INDEX_NAME}")
+        await cursor.execute(f"DROP INDEX IF EXISTS public.{_VERSION_INDEX_LIVE_INDEX_NAME}")
+        await cursor.execute(f"DROP INDEX IF EXISTS public.{_VERSION_INDEX_NEW_INDEX_NAME}")
+        await cursor.execute(
+            "DELETE FROM public.artist_embeddings WHERE model_version IN (%s, %s)",
+            (_VERSION_INDEX_LIVE_MODEL_VERSION, _VERSION_INDEX_NEW_MODEL_VERSION),
+        )
+
+        # Step 0: the live model_version is already loaded and indexed -- the steady state
+        # before a monthly refresh starts.
+        await _seed_artist_embeddings_version_fixture(cursor, _VERSION_INDEX_LIVE_MODEL_VERSION, seed=10)
+        live_build_failures = await build_artist_embeddings_version_index(
+            cursor,
+            _VERSION_INDEX_LIVE_MODEL_VERSION,
+            _VERSION_INDEX_LIVE_INDEX_NAME,
+            maintenance_work_mem=_VERSION_INDEX_FIXTURE_MAINTENANCE_WORK_MEM,
+        )
+        assert live_build_failures == 0
+
+        live_probe = random.Random(11)  # noqa: S311 -- deterministic synthetic test vector, not cryptography
+        live_query_vector = _synthetic_halfvec_literal(live_probe)
+        await _assert_planner_uses_partial_index_for_model_version(
+            _VERSION_INDEX_LIVE_INDEX_NAME, _VERSION_INDEX_LIVE_MODEL_VERSION, live_query_vector
+        )
+
+        # Step 1 (analytics-engine's load) + step 2 (the operator's build): a second
+        # model_version is loaded and indexed. The live version's rows and index are never
+        # touched by either step.
+        await _seed_artist_embeddings_version_fixture(cursor, _VERSION_INDEX_NEW_MODEL_VERSION, seed=20)
+        new_build_failures = await build_artist_embeddings_version_index(
+            cursor,
+            _VERSION_INDEX_NEW_MODEL_VERSION,
+            _VERSION_INDEX_NEW_INDEX_NAME,
+            maintenance_work_mem=_VERSION_INDEX_FIXTURE_MAINTENANCE_WORK_MEM,
+        )
+        assert new_build_failures == 0
+
+        # The crux of the bead: the live version's kNN still uses its own index -- no gap
+        # opened by the second model_version's load and build.
+        await _assert_planner_uses_partial_index_for_model_version(
+            _VERSION_INDEX_LIVE_INDEX_NAME, _VERSION_INDEX_LIVE_MODEL_VERSION, live_query_vector
+        )
+
+        new_probe = random.Random(21)  # noqa: S311 -- deterministic synthetic test vector, not cryptography
+        new_query_vector = _synthetic_halfvec_literal(new_probe)
+        await _assert_planner_uses_partial_index_for_model_version(_VERSION_INDEX_NEW_INDEX_NAME, _VERSION_INDEX_NEW_MODEL_VERSION, new_query_vector)
+
+        assert await _model_version_row_count(_VERSION_INDEX_LIVE_MODEL_VERSION) == _VERSION_INDEX_FIXTURE_ROW_COUNT
+        assert await _model_version_row_count(_VERSION_INDEX_NEW_MODEL_VERSION) == _VERSION_INDEX_FIXTURE_ROW_COUNT
+
+        # Step 3 (after catalog-api's switch, simulated by this test simply moving on):
+        # retire the superseded live version.
+        retire_failures = await retire_artist_embeddings_version(cursor, _VERSION_INDEX_LIVE_MODEL_VERSION, _VERSION_INDEX_LIVE_INDEX_NAME)
+        assert retire_failures == 0
+
+    assert await _index_definition(_VERSION_INDEX_LIVE_INDEX_NAME) is None, "the retired version's index must be gone"
+    assert await _model_version_row_count(_VERSION_INDEX_LIVE_MODEL_VERSION) == 0, "the retired version's rows must be gone"
+
+    # The new version -- never touched by retiring the old one -- is exactly as it was.
+    assert await _index_definition(_VERSION_INDEX_NEW_INDEX_NAME) is not None
+    assert await _model_version_row_count(_VERSION_INDEX_NEW_MODEL_VERSION) == _VERSION_INDEX_FIXTURE_ROW_COUNT
+    await _assert_planner_uses_partial_index_for_model_version(_VERSION_INDEX_NEW_INDEX_NAME, _VERSION_INDEX_NEW_MODEL_VERSION, new_query_vector)
 
 
 @pytest.mark.asyncio
