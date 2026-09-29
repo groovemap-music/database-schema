@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import random
 from contextlib import asynccontextmanager
+from datetime import date
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -42,7 +43,9 @@ from groovemap_schema.postgres import (
     build_artist_embeddings_version_index,
     graph_bootstrap_statements,
     phase0_comparison_statements,
+    publish_artist_embedding_release,
     retire_artist_embeddings_version,
+    retire_artist_similar_artists_version,
 )
 
 
@@ -76,6 +79,8 @@ EXPECTED_POSTGRES_TABLES = {
         "app_tokens",
         "artifacts",
         "artists",
+        "artist_embedding_releases",
+        "artist_similar_artists",
         "catalog_item_moves",
         "catalog_item_supersessions",
         "catalog_items",
@@ -735,6 +740,14 @@ async def assert_the_embedding_pipeline_role_matches_the_server() -> None:
     graph_write = await postgres_rows("SELECT has_table_privilege(%s, 'graph.artist', 'INSERT')", (EMBEDDING_PIPELINE_ROLE,))
     assert graph_write == [(False,)]
 
+    # `artist_similar_artists` and `artist_embedding_releases` are created unconditionally
+    # (see the module comment above `_ARTIST_SIMILARITY_STATEMENTS` in postgres.py), so this
+    # grant, unlike the one on `artist_embeddings` below, holds on both tiers.
+    for table in ("public.artist_similar_artists", "public.artist_embedding_releases"):
+        for privilege in ("SELECT", "INSERT", "UPDATE", "DELETE"):
+            similarity_rows = await postgres_rows("SELECT has_table_privilege(%s, %s, %s)", (EMBEDDING_PIPELINE_ROLE, table, privilege))
+            assert similarity_rows == [(True,)], f"the pipeline role must hold {privilege} on {table}"
+
     if not await vector_extension_present():
         return
 
@@ -1284,6 +1297,172 @@ async def test_derived_refresh_job_keys_claim_locks_and_repeated_initialization(
             await connection_a.execute("DELETE FROM loader_derived_refresh_job WHERE loader = %s", (loader,))
             await connection_a.execute("DELETE FROM loader_extraction_latch WHERE loader = %s", (loader,))
             await connection_a.execute("DELETE FROM loader_derived_refresh_cursor WHERE loader = %s", (loader,))
+
+
+# ── Precomputed similar-artist lists and the embedding-release pointer (D serving mode) ──
+# `artist_similar_artists` and `artist_embedding_releases` are created unconditionally (see
+# the module comment above `_ARTIST_SIMILARITY_STATEMENTS` in postgres.py), so -- unlike the
+# HNSW sections above -- these tests need no pgvector gate and run identically on both the
+# required PostgreSQL 18 tier and the advisory PostgreSQL 19 tier.
+
+_SIMILARITY_FIXTURE_SOURCE_DUMP_DATE = date(2026, 9, 1)
+
+
+async def _seed_artist_similar_artists_fixture(cursor: Any, model_version: str, *, artist_count: int = 5) -> int:
+    """Insert `artist_count` artists' worth of synthetic rank-1..3 similar-artist rows.
+
+    Returns the row count inserted (`artist_count * 3`), so callers can assert against it
+    without hardcoding the fixture's own shape a second time.
+    """
+    rows = [
+        (str(artist_id), model_version, rank, str(1_000_000 + artist_id * 10 + rank), 1.0 - (rank * 0.1))
+        for artist_id in range(artist_count)
+        for rank in (1, 2, 3)
+    ]
+    await cursor.executemany(
+        """
+        INSERT INTO public.artist_similar_artists (artist_id, model_version, rank, similar_artist_id, score)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (artist_id, model_version, rank) DO NOTHING
+        """,
+        rows,
+    )
+    return len(rows)
+
+
+async def _delete_artist_similarity_fixture(model_version: str) -> None:
+    """Remove every row a similarity test wrote for `model_version`, from both tables."""
+    connection = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params())
+    async with connection, connection.cursor() as cursor:
+        await cursor.execute("DELETE FROM public.artist_similar_artists WHERE model_version = %s", (model_version,))
+        await cursor.execute("DELETE FROM public.artist_embedding_releases WHERE model_version = %s", (model_version,))
+        await connection.commit()
+
+
+@pytest.mark.asyncio
+async def test_at_most_one_current_release_is_enforced_by_the_database() -> None:
+    """`idx_artist_embedding_releases_is_current` refuses a second `is_current` row outright."""
+    await apply_schema()
+    version_a, version_b = f"integration-test-{uuid4().hex}", f"integration-test-{uuid4().hex}"
+    try:
+        connection = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params())
+        async with connection, connection.cursor() as cursor:
+            await cursor.execute(
+                "INSERT INTO public.artist_embedding_releases (model_version, source_dump_id, source_dump_date, k, artists, is_current) "
+                "VALUES (%s, %s, %s, %s, %s, TRUE)",
+                (version_a, "integration-test-fixture", _SIMILARITY_FIXTURE_SOURCE_DUMP_DATE, 10, 5),
+            )
+            await connection.commit()
+
+            with pytest.raises(psycopg.errors.UniqueViolation):
+                await cursor.execute(
+                    "INSERT INTO public.artist_embedding_releases (model_version, source_dump_id, source_dump_date, k, artists, is_current) "
+                    "VALUES (%s, %s, %s, %s, %s, TRUE)",
+                    (version_b, "integration-test-fixture", _SIMILARITY_FIXTURE_SOURCE_DUMP_DATE, 10, 5),
+                )
+            await connection.rollback()
+    finally:
+        await _delete_artist_similarity_fixture(version_a)
+        await _delete_artist_similarity_fixture(version_b)
+
+
+@pytest.mark.asyncio
+async def test_publish_artist_embedding_release_flips_is_current_atomically() -> None:
+    """`publish_artist_embedding_release` clears the old current release and sets the new one, together."""
+    await apply_schema()
+    version_a, version_b = f"integration-test-{uuid4().hex}", f"integration-test-{uuid4().hex}"
+    try:
+        connection = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params(), autocommit=True)
+        async with connection, connection.cursor() as cursor:
+            assert (
+                await publish_artist_embedding_release(
+                    cursor,
+                    version_a,
+                    source_dump_id="integration-test-fixture",
+                    source_dump_date=_SIMILARITY_FIXTURE_SOURCE_DUMP_DATE,
+                    k=10,
+                    artists=5,
+                )
+                == 0
+            )
+            assert await postgres_rows("SELECT is_current FROM public.artist_embedding_releases WHERE model_version = %s", (version_a,)) == [(True,)]
+
+            assert (
+                await publish_artist_embedding_release(
+                    cursor,
+                    version_b,
+                    source_dump_id="integration-test-fixture",
+                    source_dump_date=_SIMILARITY_FIXTURE_SOURCE_DUMP_DATE,
+                    k=12,
+                    artists=6,
+                )
+                == 0
+            )
+            # The old current release is cleared, the new one is current, and the database
+            # never held two -- the invariant this atomic flip exists to protect.
+            assert await postgres_rows("SELECT is_current FROM public.artist_embedding_releases WHERE model_version = %s", (version_a,)) == [(False,)]
+            assert await postgres_rows("SELECT is_current FROM public.artist_embedding_releases WHERE model_version = %s", (version_b,)) == [(True,)]
+            assert await postgres_rows("SELECT COUNT(*) FROM public.artist_embedding_releases WHERE is_current") == [(1,)]
+
+            # Idempotent: republishing the already-current version changes nothing but succeeds.
+            assert (
+                await publish_artist_embedding_release(
+                    cursor,
+                    version_b,
+                    source_dump_id="integration-test-fixture",
+                    source_dump_date=_SIMILARITY_FIXTURE_SOURCE_DUMP_DATE,
+                    k=12,
+                    artists=6,
+                )
+                == 0
+            )
+            assert await postgres_rows("SELECT COUNT(*) FROM public.artist_embedding_releases WHERE is_current") == [(1,)]
+    finally:
+        await _delete_artist_similarity_fixture(version_a)
+        await _delete_artist_similarity_fixture(version_b)
+
+
+@pytest.mark.asyncio
+async def test_retire_artist_similar_artists_version_refuses_the_current_version() -> None:
+    """`retire_artist_similar_artists_version` refuses the live version and deletes a superseded one."""
+    await apply_schema()
+    current_version, retired_version = f"integration-test-{uuid4().hex}", f"integration-test-{uuid4().hex}"
+    try:
+        connection = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params(), autocommit=True)
+        async with connection, connection.cursor() as cursor:
+            await _seed_artist_similar_artists_fixture(cursor, retired_version)
+            current_row_count = await _seed_artist_similar_artists_fixture(cursor, current_version)
+            for model_version in (retired_version, current_version):
+                assert (
+                    await publish_artist_embedding_release(
+                        cursor,
+                        model_version,
+                        source_dump_id="integration-test-fixture",
+                        source_dump_date=_SIMILARITY_FIXTURE_SOURCE_DUMP_DATE,
+                        k=3,
+                        artists=5,
+                    )
+                    == 0
+                )
+
+            # Refuses the current version outright -- nothing about it is deleted.
+            assert await retire_artist_similar_artists_version(cursor, current_version) == 1
+            assert await postgres_rows("SELECT COUNT(*) FROM public.artist_similar_artists WHERE model_version = %s", (current_version,)) == [
+                (current_row_count,)
+            ]
+            assert await postgres_rows("SELECT COUNT(*) FROM public.artist_embedding_releases WHERE model_version = %s", (current_version,)) == [(1,)]
+
+            # A superseded version is fully retired -- rows and release row both -- without
+            # touching the still-current version.
+            assert await retire_artist_similar_artists_version(cursor, retired_version, delete_release=True) == 0
+            assert await postgres_rows("SELECT COUNT(*) FROM public.artist_similar_artists WHERE model_version = %s", (retired_version,)) == [(0,)]
+            assert await postgres_rows("SELECT COUNT(*) FROM public.artist_embedding_releases WHERE model_version = %s", (retired_version,)) == [(0,)]
+            assert await postgres_rows("SELECT COUNT(*) FROM public.artist_similar_artists WHERE model_version = %s", (current_version,)) == [
+                (current_row_count,)
+            ]
+    finally:
+        await _delete_artist_similarity_fixture(retired_version)
+        await _delete_artist_similarity_fixture(current_version)
 
 
 # ── Graph projection fixtures ────────────────────────────────────────────────

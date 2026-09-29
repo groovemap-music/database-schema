@@ -233,6 +233,10 @@ _ADDED_STATEMENT_NAMES = frozenset(
         "catalog_item_moves table",
         "idx_catalog_item_moves_user_id",
         "resolve_catalog_item function",
+        "public.artist_similar_artists table",
+        "idx_artist_similar_artists_model_version_artist_id",
+        "public.artist_embedding_releases table",
+        "idx_artist_embedding_releases_is_current",
     }
 )
 

@@ -20,6 +20,7 @@ from psycopg import sql
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
+    from datetime import date
 
 
 logger = logging.getLogger(__name__)
@@ -5303,6 +5304,7 @@ def _schema_statements() -> Iterator[tuple[str, Any]]:
     yield from _ACTIVITY_STATEMENTS
     yield from _MUSICBRAINZ_TABLES
     yield from _MUSICBRAINZ_INDEXES
+    yield from _ARTIST_SIMILARITY_STATEMENTS
     # Last: every view in the graph schema reads a table declared above.
     yield from _GRAPH_STATEMENTS
 
@@ -5602,6 +5604,91 @@ async def _apply_property_graph(cursor: Any) -> int:
     return failures
 
 
+# ── Precomputed similar-artist lists and the embedding-release pointer (ADR 0013, D serving mode) ──
+# gm-analytics-engine-8ts measured serving similar artists straight off the live HNSW index
+# against the maintainer's three thresholds and it failed all three: ANN churn 0.7243 (needs
+# >= 0.85), a 0.23 gap to exact churn (needs <= 0.05), and strict recall@10 0.8335 at
+# ef_search=1000 -- pgvector's own maximum. Exact top-K lists, by contrast, are stable month to
+# month (0.9519). The maintainer's 2026-09-29 decision ("D") is therefore to serve precomputed
+# monthly exact top-K lists instead of live ANN search; these two tables are that storage.
+#
+# Both tables are declared here, in the unconditional schema, rather than beside
+# `artist_embeddings` in `_VECTOR_SCHEMA_STATEMENTS` below: the batch job that fills them runs
+# exact nearest-neighbor search once a month over `artist_embeddings` and writes the result, but
+# neither table's own shape touches `vector`/`halfvec` at all, so neither one may require the
+# extension -- a server without pgvector still gets a fully working similar-artists feature, it
+# just never gets fresh rows without the extension the batch job itself needs to compute them.
+#
+# `artist_id` and `similar_artist_id` are `TEXT`, matching `artist_embeddings.artist_id`
+# (both key the same Discogs `data_id`), and carry no foreign key for the same reason
+# `artist_embeddings` carries none: `graph.artist` is a view, not a table a `REFERENCES`
+# clause can target, and the loader is the sole source of truth for which ids exist.
+_ARTIST_SIMILAR_ARTISTS_STATEMENT = (
+    "public.artist_similar_artists table",
+    """
+    CREATE TABLE IF NOT EXISTS public.artist_similar_artists (
+        artist_id         TEXT NOT NULL,
+        model_version     TEXT NOT NULL,
+        rank              SMALLINT NOT NULL CHECK (rank >= 1),
+        similar_artist_id TEXT NOT NULL,
+        score             REAL NOT NULL,
+        computed_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (artist_id, model_version, rank)
+    )
+    """,
+)
+
+# The primary key leads with `artist_id`, which serves the per-artist lookup a catalog-api
+# request makes directly. The monthly batch job's own writes, and a retire's delete, instead
+# scan by `model_version` first and `artist_id` second -- one whole `model_version` at a time,
+# exactly the access `idx_artist_embeddings_model_version` above serves for `artist_embeddings`
+# -- so this index leads with `model_version` rather than duplicating the primary key's order.
+_ARTIST_SIMILAR_ARTISTS_MODEL_VERSION_INDEX = (
+    "idx_artist_similar_artists_model_version_artist_id",
+    "CREATE INDEX IF NOT EXISTS idx_artist_similar_artists_model_version_artist_id ON public.artist_similar_artists (model_version, artist_id)",
+)
+
+# One row per published `model_version`: the lineage the batch job wrote it from
+# (`source_dump_id`/`source_dump_date`, the same provenance columns ADR 0013's data-rights
+# section requires of `artist_embeddings`), the `k` and `artists` counts the job computed, and
+# `is_current` -- the one pointer catalog-api reads to know which `model_version` of
+# `artist_similar_artists` is live. `k` and `artists` are recorded, not merely logged, so an
+# operator (or a test) can answer "how many artists does the current release cover, and at what
+# K" from the database alone, without re-deriving it from `artist_similar_artists` itself.
+_ARTIST_EMBEDDING_RELEASES_STATEMENT = (
+    "public.artist_embedding_releases table",
+    """
+    CREATE TABLE IF NOT EXISTS public.artist_embedding_releases (
+        model_version    TEXT PRIMARY KEY,
+        source_dump_id   TEXT NOT NULL,
+        source_dump_date DATE NOT NULL,
+        k                SMALLINT NOT NULL,
+        artists          BIGINT NOT NULL,
+        published_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        is_current       BOOLEAN NOT NULL DEFAULT FALSE
+    )
+    """,
+)
+
+# At most one current release, enforced by the database rather than left to the discipline of
+# whatever calls `publish_artist_embedding_release` -- the same "let a partial unique index
+# hold the invariant" shape `idx_catalog_item_supersessions_superseded_id` above uses for "at
+# most one open supersession". A plain `UNIQUE (is_current)` cannot express this: it would admit
+# any number of `FALSE` rows but only because `NULL <> NULL`, and `is_current` is `NOT NULL`
+# here, deliberately, so this must be a partial index instead.
+_ARTIST_EMBEDDING_RELEASES_CURRENT_INDEX = (
+    "idx_artist_embedding_releases_is_current",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_artist_embedding_releases_is_current ON public.artist_embedding_releases (is_current) WHERE is_current",
+)
+
+_ARTIST_SIMILARITY_STATEMENTS: list[tuple[str, str]] = [
+    _ARTIST_SIMILAR_ARTISTS_STATEMENT,
+    _ARTIST_SIMILAR_ARTISTS_MODEL_VERSION_INDEX,
+    _ARTIST_EMBEDDING_RELEASES_STATEMENT,
+    _ARTIST_EMBEDDING_RELEASES_CURRENT_INDEX,
+]
+
+
 # ── pgvector, artist embeddings, and the embedding pipeline role (ADR 0013) ──
 # ADR 0013 adopts pgvector for catalog embeddings, starting with artists only;
 # labels and masters are in scope but not created until a use arrives. Its
@@ -5725,6 +5812,22 @@ _PIPELINE_ROLE_STATEMENTS: list[tuple[str, str]] = [
 _EMBEDDINGS_TABLE_GRANT = (
     f"{EMBEDDING_PIPELINE_ROLE} artist_embeddings grant",
     f"GRANT SELECT, INSERT, UPDATE, DELETE ON public.artist_embeddings TO {EMBEDDING_PIPELINE_ROLE}",
+)
+
+# The monthly batch job that fills `artist_similar_artists` and `artist_embedding_releases`
+# (see the "Precomputed similar-artist lists" section above) is the same pipeline this role
+# already exists for, so it gets the same read/write grant on these two tables that it holds on
+# `artist_embeddings`. Unlike `_EMBEDDINGS_TABLE_GRANT`, this grant is gated on the role alone
+# (`reasons["role"]` in `_apply_vector_schema`, not `reasons["embedding_grant"]`): both tables
+# are created unconditionally by `_schema_statements()`, never behind the `vector` extension
+# guard, so granting on them never needs that guard either.
+#
+# `catalog-api` needs no equivalent grant here: it reads these tables, like every other
+# `public` table, as the same login that owns them -- see the `resolve_catalog_item` comment
+# above ("no grant is declared") for the same reasoning applied to `activity`.
+_ARTIST_SIMILARITY_TABLES_GRANT = (
+    f"{EMBEDDING_PIPELINE_ROLE} artist similarity tables grant",
+    f"GRANT SELECT, INSERT, UPDATE, DELETE ON public.artist_similar_artists, public.artist_embedding_releases TO {EMBEDDING_PIPELINE_ROLE}",
 )
 
 # ── The artist embeddings HNSW index, and its build procedure (ADR 0013) ──
@@ -6209,6 +6312,136 @@ async def retire_artist_embeddings_version(cursor: Any, model_version: str, inde
     return 0
 
 
+# ── Publishing and retiring a similar-artists release (ADR 0013, D serving mode) ──
+# The monthly batch job (the exact-search follow-on to `analytics-engine`'s FastRP pipeline)
+# calls these two functions to hand a completed `model_version` of `artist_similar_artists`
+# over to -- and later off of -- `catalog-api`. Neither runs from `create_postgres_schema`,
+# which only ever declares the two tables' shape; see the module comment above
+# `_ARTIST_SIMILARITY_STATEMENTS`.
+
+_ARTIST_EMBEDDING_RELEASES_CLEAR_CURRENT_SQL = "UPDATE public.artist_embedding_releases SET is_current = FALSE WHERE is_current"
+
+_ARTIST_EMBEDDING_RELEASES_UPSERT_SQL = """
+    INSERT INTO public.artist_embedding_releases
+        (model_version, source_dump_id, source_dump_date, k, artists, published_at, is_current)
+    VALUES (%s, %s, %s, %s, %s, NOW(), TRUE)
+    ON CONFLICT (model_version) DO UPDATE SET
+        source_dump_id   = EXCLUDED.source_dump_id,
+        source_dump_date = EXCLUDED.source_dump_date,
+        k                = EXCLUDED.k,
+        artists          = EXCLUDED.artists,
+        published_at     = EXCLUDED.published_at,
+        is_current       = TRUE
+"""
+
+
+async def publish_artist_embedding_release(
+    cursor: Any,
+    model_version: str,
+    *,
+    source_dump_id: str,
+    source_dump_date: date,
+    k: int,
+    artists: int,
+) -> int:
+    """Publish `model_version` as the current `artist_similar_artists` release.
+
+    An operator, or the monthly batch job itself, calls this once the job has finished writing
+    every `artist_similar_artists` row for `model_version` -- never before, since this is what
+    makes `catalog-api` start reading that version.
+
+    Runs in one transaction (`cursor.connection.transaction()`): first clearing `is_current` on
+    whatever release currently holds it, then upserting `model_version`'s own row with
+    `is_current = TRUE`. That order, inside one transaction, is what keeps
+    `idx_artist_embedding_releases_is_current` (at most one current row, enforced by the
+    database) from ever seeing two current rows at once, and a failure at either step rolls
+    both back rather than leaving zero, or two, current releases behind. The upsert (rather
+    than a plain `INSERT`) makes a repeated publish of the same `model_version` -- for example,
+    a retried batch job -- idempotent instead of a duplicate-key failure.
+
+    Refuses, logging why, unless `model_version` is non-blank (`_valid_model_version`), the same
+    guard `retire_artist_embeddings_version` uses.
+
+    Returns the number of failed steps (0 means `model_version` is now the current release).
+    """
+    if not _valid_model_version(model_version):
+        logger.error("❌ Refusing to publish an artist embedding release: %r is not a usable model_version", model_version)
+        return 1
+
+    try:
+        async with cursor.connection.transaction():
+            await cursor.execute(_ARTIST_EMBEDDING_RELEASES_CLEAR_CURRENT_SQL)
+            await cursor.execute(
+                _ARTIST_EMBEDDING_RELEASES_UPSERT_SQL,
+                (model_version, source_dump_id, source_dump_date, k, artists),
+            )
+    except Exception as error:
+        logger.error("❌ Failed to publish artist embedding release %r: %s", model_version, error)
+        return 1
+
+    logger.info("✅ Schema: published artist embedding release %r (k=%d, artists=%d)", model_version, k, artists)
+    return 0
+
+
+_ARTIST_EMBEDDING_RELEASES_IS_CURRENT_QUERY = "SELECT is_current FROM public.artist_embedding_releases WHERE model_version = %s"
+
+_ARTIST_SIMILAR_ARTISTS_VERSION_DELETE_SQL = "DELETE FROM public.artist_similar_artists WHERE model_version = %s"
+
+_ARTIST_EMBEDDING_RELEASES_VERSION_DELETE_SQL = "DELETE FROM public.artist_embedding_releases WHERE model_version = %s"
+
+
+async def retire_artist_similar_artists_version(cursor: Any, model_version: str, *, delete_release: bool = False) -> int:
+    """Retire one superseded `model_version` of `artist_similar_artists`.
+
+    An operator, or the monthly batch job, calls this after `publish_artist_embedding_release`
+    has switched the current release to a newer `model_version` -- never for the `model_version`
+    currently marked `is_current`, which this function refuses outright rather than delete out
+    from under `catalog-api`.
+
+    Runs in one transaction: deletes every `artist_similar_artists` row for `model_version`,
+    and, when `delete_release` is `True`, that `model_version`'s own `artist_embedding_releases`
+    row too (kept by default, so the release's lineage -- what it was computed from, and when --
+    survives its rows being retired, the same reason `catalog_item_supersessions` above keeps a
+    closed row rather than deleting it).
+
+    Refuses, logging why, unless `model_version` is non-blank (`_valid_model_version`).
+    Refuses, logging why, if `model_version` is the release currently marked `is_current`.
+
+    Returns the number of failed steps (0 means the rows -- and the release row, if asked for --
+    are gone, or were already gone).
+    """
+    if not _valid_model_version(model_version):
+        logger.error("❌ Refusing to retire an artist_similar_artists version: %r is not a usable model_version", model_version)
+        return 1
+
+    try:
+        await cursor.execute(_ARTIST_EMBEDDING_RELEASES_IS_CURRENT_QUERY, (model_version,))
+        row = await cursor.fetchone()
+    except Exception as error:
+        logger.error("❌ Could not check whether %r is the current artist embedding release: %s", model_version, error)
+        return 1
+
+    if row is not None and row[0]:
+        logger.error("❌ Refusing to retire %r: it is the current artist embedding release", model_version)
+        return 1
+
+    try:
+        async with cursor.connection.transaction():
+            await cursor.execute(_ARTIST_SIMILAR_ARTISTS_VERSION_DELETE_SQL, (model_version,))
+            if delete_release:
+                await cursor.execute(_ARTIST_EMBEDDING_RELEASES_VERSION_DELETE_SQL, (model_version,))
+    except Exception as error:
+        logger.error("❌ Failed to retire artist_similar_artists version %r: %s", model_version, error)
+        return 1
+
+    logger.info(
+        "✅ Schema: retired artist_similar_artists version %r%s",
+        model_version,
+        " and its release row" if delete_release else "",
+    )
+    return 0
+
+
 _VECTOR_EXTENSION_INSTALLED_QUERY = "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = %s)"
 
 
@@ -6358,6 +6591,20 @@ async def _apply_vector_schema(cursor: Any) -> int:
             "⏭️  Skipped %s grant on public.artist_embeddings: %s",
             EMBEDDING_PIPELINE_ROLE,
             reasons["embedding_grant"],
+        )
+
+    # `artist_similar_artists` and `artist_embedding_releases` are created unconditionally
+    # (see `_ARTIST_SIMILARITY_STATEMENTS`), so this grant needs only the role to exist --
+    # `reasons["role"]`, not the combined `reasons["embedding_grant"]` the vector-gated table
+    # above needs.
+    if reasons["role"] is None:
+        _success, similarity_grant_failures = await _execute_schema_statements(cursor, [_ARTIST_SIMILARITY_TABLES_GRANT])
+        failures += similarity_grant_failures
+    else:
+        logger.info(
+            "⏭️  Skipped %s grant on public.artist_similar_artists and public.artist_embedding_releases: %s",
+            EMBEDDING_PIPELINE_ROLE,
+            reasons["role"],
         )
 
     return failures
