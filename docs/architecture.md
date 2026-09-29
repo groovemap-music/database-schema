@@ -2333,3 +2333,115 @@ them without a migration or a lockstep upgrade across services. See
 [the persistence compatibility contract](../contracts/README.md) for the full
 additive-versus-destructive policy and the expand/migrate/contract ordering a breaking change
 would require.
+
+## Precomputed similar-artist lists (ADR 0013, D serving mode)
+
+**Maintainer decision, 2026-09-29 ("D"):** gm-analytics-engine-8ts measured serving similar
+artists straight off the live HNSW index against the maintainer's three thresholds, and it failed
+all three — ANN churn 0.7243 (needs ≥ 0.85), a 0.23 gap to exact churn (needs ≤ 0.05), and strict
+recall@10 0.8335 at `ef_search = 1000`, pgvector's own maximum. Exact top-K lists, by contrast, are
+stable month to month (0.9519). The maintainer's decision is therefore to serve precomputed
+monthly exact top-K lists instead of live ANN search over `public.artist_embeddings`.
+`public.artist_similar_artists` and `public.artist_embedding_releases` are that storage.
+
+Both tables are declared unconditionally — `_ARTIST_SIMILARITY_STATEMENTS` in `postgres.py` is
+yielded from `_schema_statements()`, never gated behind the `vector` extension the way
+`public.artist_embeddings` is. The monthly batch job that fills them runs exact nearest-neighbor
+search over `artist_embeddings`, which does need pgvector, but neither table's own shape mentions
+`vector`/`halfvec` at all: a server without pgvector still gets a fully working similar-artists
+feature, it just never gets fresh rows without the extension the batch job itself needs.
+
+### `public.artist_similar_artists`
+
+```sql
+CREATE TABLE IF NOT EXISTS public.artist_similar_artists (
+    artist_id         TEXT NOT NULL,
+    model_version     TEXT NOT NULL,
+    rank              SMALLINT NOT NULL CHECK (rank >= 1),
+    similar_artist_id TEXT NOT NULL,
+    score             REAL NOT NULL,
+    computed_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (artist_id, model_version, rank)
+)
+```
+
+One row per `(artist, model_version, rank)`: `similar_artist_id` and `score` are the rank-th
+nearest neighbor and its distance, exactly as the monthly batch job computed them from
+`artist_embeddings`. `artist_id` and `similar_artist_id` are `TEXT`, matching
+`artist_embeddings.artist_id` — both key the same Discogs `data_id` — and carry no foreign key for
+the same reason `artist_embeddings` carries none: `graph.artist` is a view, not a table a
+`REFERENCES` clause can target, and the loader is the sole source of truth for which ids exist.
+
+The primary key leads with `artist_id`, serving the per-artist lookup `catalog-api` makes
+directly. `idx_artist_similar_artists_model_version_artist_id` leads with `model_version` instead,
+for the monthly batch job's own writes and a retire's delete — one whole `model_version` at a
+time — the same access `idx_artist_embeddings_model_version` serves for `artist_embeddings`.
+
+### `public.artist_embedding_releases`
+
+```sql
+CREATE TABLE IF NOT EXISTS public.artist_embedding_releases (
+    model_version    TEXT PRIMARY KEY,
+    source_dump_id   TEXT NOT NULL,
+    source_dump_date DATE NOT NULL,
+    k                SMALLINT NOT NULL,
+    artists          BIGINT NOT NULL,
+    published_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    is_current       BOOLEAN NOT NULL DEFAULT FALSE
+)
+```
+
+One row per published `model_version`: the lineage it was computed from (`source_dump_id` /
+`source_dump_date`, the same provenance columns ADR 0013's data-rights section requires of
+`artist_embeddings`), the `k` and `artists` counts the batch job computed, and `is_current` — the
+one pointer `catalog-api` reads to know which `model_version` of `artist_similar_artists` is live.
+
+At most one current release is enforced by the database, not by caller discipline:
+`idx_artist_embedding_releases_is_current` is a `UNIQUE` index on `is_current` partial on
+`WHERE is_current` — the same "let a partial unique index hold the invariant" shape
+`idx_catalog_item_supersessions_superseded_id` uses above for "at most one open supersession". A
+plain `UNIQUE (is_current)` cannot express this, since `is_current` is `NOT NULL` here and two
+`FALSE` rows would otherwise collide.
+
+### Grants
+
+`embedding_pipeline` (see "Vector embeddings and the embedding pipeline role" above) holds
+`SELECT, INSERT, UPDATE, DELETE` on both tables — `_ARTIST_SIMILARITY_TABLES_GRANT` in
+`postgres.py`. Unlike the grant on `artist_embeddings`, this one is gated on the role alone
+(`CREATEROLE`), not on the `vector` extension: both tables exist regardless of pgvector, so
+granting on them never needs that guard either.
+
+`catalog-api` needs no equivalent grant: it reads these tables, like every other `public` table,
+as the same login that owns them — see `resolve_catalog_item`'s comment above ("no grant is
+declared") for the same reasoning applied to `activity`.
+
+### Publishing and retiring a release
+
+Two functions in `postgres.py` hand a completed `model_version` off to, and later off of,
+`catalog-api`. Neither runs from `create_postgres_schema`, which only ever declares the two
+tables' shape.
+
+`publish_artist_embedding_release(cursor, model_version, *, source_dump_id, source_dump_date, k,
+artists)` — called once the monthly batch job has finished writing every
+`artist_similar_artists` row for `model_version`, never before, since this is what makes
+`catalog-api` start reading that version. It runs in one transaction
+(`cursor.connection.transaction()`): first clearing `is_current` on whatever release currently
+holds it, then upserting `model_version`'s own row with `is_current = TRUE`. That order, inside one
+transaction, is what keeps the partial unique index above from ever seeing two current rows at
+once, and a failure at either step rolls both back rather than leaving zero, or two, current
+releases behind. The upsert (`ON CONFLICT (model_version) DO UPDATE`, not a plain `INSERT`) makes a
+repeated publish of the same `model_version` — a retried batch job — idempotent instead of a
+duplicate-key failure.
+
+`retire_artist_similar_artists_version(cursor, model_version, *, delete_release=False)` — called
+after `publish_artist_embedding_release` has switched the current release to a newer
+`model_version`, never for the `model_version` currently marked `is_current`, which this function
+refuses outright rather than delete out from under `catalog-api`. It deletes every
+`artist_similar_artists` row for `model_version` and, when `delete_release=True`, that
+`model_version`'s own `artist_embedding_releases` row too — kept by default, so the release's
+lineage survives its rows being retired, the same reason `catalog_item_supersessions` above keeps
+a closed row rather than deleting it.
+
+Both functions return a failure count (0 means success), on the same footing as every other
+schema statement and operator procedure in `postgres.py`, and both refuse a blank `model_version`
+before touching the connection.
