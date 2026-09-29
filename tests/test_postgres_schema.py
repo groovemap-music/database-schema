@@ -1,5 +1,6 @@
 """Tests for the PostgreSQL schema definitions."""
 
+from datetime import date
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -7,10 +8,20 @@ import pytest
 
 from groovemap_schema.postgres import (
     _ACTIVITY_STATEMENTS,
+    _ARTIST_EMBEDDING_RELEASES_CLEAR_CURRENT_SQL,
+    _ARTIST_EMBEDDING_RELEASES_CURRENT_INDEX,
+    _ARTIST_EMBEDDING_RELEASES_IS_CURRENT_QUERY,
+    _ARTIST_EMBEDDING_RELEASES_STATEMENT,
+    _ARTIST_EMBEDDING_RELEASES_VERSION_DELETE_SQL,
     _ARTIST_EMBEDDINGS_HNSW_INDEX_REINDEX_STATEMENT,
     _ARTIST_EMBEDDINGS_HNSW_INDEX_STATEMENT,
     _ARTIST_EMBEDDINGS_STATEMENT,
     _ARTIST_EMBEDDINGS_VERSION_DELETE_SQL,
+    _ARTIST_SIMILAR_ARTISTS_MODEL_VERSION_INDEX,
+    _ARTIST_SIMILAR_ARTISTS_STATEMENT,
+    _ARTIST_SIMILAR_ARTISTS_VERSION_DELETE_SQL,
+    _ARTIST_SIMILARITY_STATEMENTS,
+    _ARTIST_SIMILARITY_TABLES_GRANT,
     _EMBEDDINGS_TABLE_GRANT,
     _ENTITY_TABLES,
     _GRAPH_STATEMENTS,
@@ -55,7 +66,9 @@ from groovemap_schema.postgres import (
     build_artist_embeddings_version_index,
     create_postgres_schema,
     property_graph_enabled,
+    publish_artist_embedding_release,
     retire_artist_embeddings_version,
+    retire_artist_similar_artists_version,
 )
 
 
@@ -346,6 +359,7 @@ class TestCreatePostgresSchema:
             + len(_ACTIVITY_STATEMENTS)
             + len(_MUSICBRAINZ_TABLES)
             + len(_MUSICBRAINZ_INDEXES)
+            + len(_ARTIST_SIMILARITY_STATEMENTS)
             + len(_GRAPH_STATEMENTS)
             # `_apply_vector_schema` always probes pg_extension and pg_roles
             # (CREATEROLE); with the shared fixture's default (False), the
@@ -380,6 +394,7 @@ class TestCreatePostgresSchema:
             + len(_ACTIVITY_STATEMENTS)
             + len(_MUSICBRAINZ_TABLES)
             + len(_MUSICBRAINZ_INDEXES)
+            + len(_ARTIST_SIMILARITY_STATEMENTS)
             + len(_GRAPH_STATEMENTS)
             # `_apply_vector_schema` always probes pg_extension and pg_roles
             # (CREATEROLE); with the shared fixture's default (False), the
@@ -446,6 +461,7 @@ class TestCreatePostgresSchema:
             + len(_ACTIVITY_STATEMENTS)
             + len(_MUSICBRAINZ_TABLES)
             + len(_MUSICBRAINZ_INDEXES)
+            + len(_ARTIST_SIMILARITY_STATEMENTS)
             + len(_GRAPH_STATEMENTS)
             # `_apply_vector_schema` always probes pg_extension and pg_roles
             # (CREATEROLE); with the shared fixture's default (False), the
@@ -817,6 +833,169 @@ class TestArtistEmbeddingsStatement:
         assert f"CREATE ROLE {EMBEDDING_PIPELINE_ROLE} NOLOGIN" in _PIPELINE_ROLE_STATEMENTS[0][1]
 
 
+class TestArtistSimilarityStatements:
+    """Static shape checks over the two D-serving-mode tables, independent of any engine."""
+
+    def test_neither_table_mentions_vector_or_halfvec(self) -> None:
+        """Neither table may require the pgvector extension."""
+        for _name, statement in _ARTIST_SIMILARITY_STATEMENTS:
+            assert "vector" not in statement.lower()
+
+    def test_artist_similar_artists_is_keyed_by_artist_model_version_rank(self) -> None:
+        assert "PRIMARY KEY (artist_id, model_version, rank)" in _ARTIST_SIMILAR_ARTISTS_STATEMENT[1]
+
+    def test_artist_similar_artists_carries_no_foreign_key(self) -> None:
+        """Matches `artist_embeddings`: `graph.artist` is a view, not an FK target."""
+        assert "REFERENCES" not in _ARTIST_SIMILAR_ARTISTS_STATEMENT[1]
+        assert "FOREIGN KEY" not in _ARTIST_SIMILAR_ARTISTS_STATEMENT[1]
+
+    def test_artist_similar_artists_rank_is_bounded_below(self) -> None:
+        assert "CHECK (rank >= 1)" in _ARTIST_SIMILAR_ARTISTS_STATEMENT[1]
+
+    def test_artist_similar_artists_statement_is_idempotent(self) -> None:
+        assert "CREATE TABLE IF NOT EXISTS" in _ARTIST_SIMILAR_ARTISTS_STATEMENT[1]
+
+    def test_the_lookup_index_leads_with_model_version(self) -> None:
+        assert "ON public.artist_similar_artists (model_version, artist_id)" in _ARTIST_SIMILAR_ARTISTS_MODEL_VERSION_INDEX[1]
+
+    def test_artist_embedding_releases_is_keyed_by_model_version(self) -> None:
+        assert "model_version    TEXT PRIMARY KEY" in _ARTIST_EMBEDDING_RELEASES_STATEMENT[1]
+
+    def test_artist_embedding_releases_statement_is_idempotent(self) -> None:
+        assert "CREATE TABLE IF NOT EXISTS" in _ARTIST_EMBEDDING_RELEASES_STATEMENT[1]
+
+    def test_at_most_one_current_release_is_a_partial_unique_index(self) -> None:
+        assert "CREATE UNIQUE INDEX IF NOT EXISTS" in _ARTIST_EMBEDDING_RELEASES_CURRENT_INDEX[1]
+        assert "WHERE is_current" in _ARTIST_EMBEDDING_RELEASES_CURRENT_INDEX[1]
+
+    def test_the_pipeline_grant_holds_read_and_write_on_both_tables(self) -> None:
+        assert _ARTIST_SIMILARITY_TABLES_GRANT[1] == (
+            f"GRANT SELECT, INSERT, UPDATE, DELETE ON public.artist_similar_artists, public.artist_embedding_releases TO {EMBEDDING_PIPELINE_ROLE}"
+        )
+
+    def test_the_statements_are_reachable_from_schema_statements(self) -> None:
+        from groovemap_schema.postgres import _schema_statements
+
+        names = [name for name, _statement in _schema_statements()]
+        assert "public.artist_similar_artists table" in names
+        assert "public.artist_embedding_releases table" in names
+
+
+class TestPublishArtistEmbeddingRelease:
+    """`publish_artist_embedding_release` — the atomic is_current flip."""
+
+    @staticmethod
+    def _cursor() -> AsyncMock:
+        cursor = AsyncMock()
+        cursor.execute = AsyncMock()
+        # `conn.transaction()` is a plain (sync) call returning an async context manager.
+        cursor.connection = AsyncMock()
+        cursor.connection.transaction = MagicMock(return_value=AsyncMock())
+        return cursor
+
+    @pytest.mark.asyncio
+    async def test_refuses_a_blank_model_version(self) -> None:
+        cursor = self._cursor()
+        result = await publish_artist_embedding_release(cursor, "  ", source_dump_id="dump-1", source_dump_date=date(2026, 9, 1), k=10, artists=100)
+        assert result == 1
+        cursor.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_clears_the_old_current_before_upserting_the_new_one(self) -> None:
+        cursor = self._cursor()
+        result = await publish_artist_embedding_release(
+            cursor, "fastrp-v3", source_dump_id="dump-1", source_dump_date=date(2026, 9, 1), k=10, artists=100
+        )
+        assert result == 0
+        statements = [str(call.args[0]) for call in cursor.execute.await_args_list]
+        assert len(statements) == 2
+        assert statements[0] == _ARTIST_EMBEDDING_RELEASES_CLEAR_CURRENT_SQL
+        assert "INSERT INTO public.artist_embedding_releases" in statements[1]
+        assert "ON CONFLICT (model_version) DO UPDATE" in statements[1]
+
+    @pytest.mark.asyncio
+    async def test_a_failure_is_counted_rather_than_raised(self) -> None:
+        cursor = self._cursor()
+        cursor.execute = AsyncMock(side_effect=RuntimeError("Simulated PostgreSQL error"))
+        result = await publish_artist_embedding_release(
+            cursor, "fastrp-v3", source_dump_id="dump-1", source_dump_date=date(2026, 9, 1), k=10, artists=100
+        )
+        assert result == 1
+
+
+class TestRetireArtistSimilarArtistsVersion:
+    """`retire_artist_similar_artists_version` — refuses the current version, deletes the rest."""
+
+    @staticmethod
+    def _cursor(*, is_current: bool | None) -> AsyncMock:
+        cursor = AsyncMock()
+        cursor.execute = AsyncMock()
+        cursor.fetchone = AsyncMock(return_value=None if is_current is None else (is_current,))
+        connection = AsyncMock()
+        connection.transaction = MagicMock(return_value=AsyncMock())
+        cursor.connection = connection
+        return cursor
+
+    @pytest.mark.asyncio
+    async def test_refuses_a_blank_model_version(self) -> None:
+        cursor = self._cursor(is_current=False)
+        assert await retire_artist_similar_artists_version(cursor, "   ") == 1
+        cursor.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_refuses_the_current_version(self) -> None:
+        cursor = self._cursor(is_current=True)
+        result = await retire_artist_similar_artists_version(cursor, "fastrp-v3")
+        assert result == 1
+        assert cursor.execute.await_args_list[0].args[0] == _ARTIST_EMBEDDING_RELEASES_IS_CURRENT_QUERY
+        # No delete was attempted once the current-version check refused.
+        assert cursor.execute.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_deletes_rows_for_a_superseded_version(self) -> None:
+        cursor = self._cursor(is_current=False)
+        result = await retire_artist_similar_artists_version(cursor, "fastrp-v2")
+        assert result == 0
+        statements = [str(call.args[0]) for call in cursor.execute.await_args_list]
+        assert _ARTIST_SIMILAR_ARTISTS_VERSION_DELETE_SQL in statements
+        assert _ARTIST_EMBEDDING_RELEASES_VERSION_DELETE_SQL not in statements
+
+    @pytest.mark.asyncio
+    async def test_delete_release_also_deletes_the_release_row(self) -> None:
+        cursor = self._cursor(is_current=False)
+        result = await retire_artist_similar_artists_version(cursor, "fastrp-v2", delete_release=True)
+        assert result == 0
+        statements = [str(call.args[0]) for call in cursor.execute.await_args_list]
+        assert _ARTIST_SIMILAR_ARTISTS_VERSION_DELETE_SQL in statements
+        assert _ARTIST_EMBEDDING_RELEASES_VERSION_DELETE_SQL in statements
+
+    @pytest.mark.asyncio
+    async def test_a_missing_release_row_is_not_current_and_is_not_refused(self) -> None:
+        """A version with no `artist_embedding_releases` row at all can still be retired."""
+        cursor = self._cursor(is_current=None)
+        result = await retire_artist_similar_artists_version(cursor, "fastrp-v1")
+        assert result == 0
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_is_current_check_is_counted_rather_than_raised(self) -> None:
+        cursor = self._cursor(is_current=False)
+        cursor.execute = AsyncMock(side_effect=RuntimeError("Simulated PostgreSQL error"))
+        result = await retire_artist_similar_artists_version(cursor, "fastrp-v2")
+        assert result == 1
+
+    @pytest.mark.asyncio
+    async def test_a_failing_delete_is_counted_rather_than_raised(self) -> None:
+        cursor = self._cursor(is_current=False)
+
+        async def fail_on_the_delete(statement: Any, *_: Any, **__: Any) -> None:
+            if str(statement) == _ARTIST_SIMILAR_ARTISTS_VERSION_DELETE_SQL:
+                raise RuntimeError("Simulated PostgreSQL error")
+
+        cursor.execute = AsyncMock(side_effect=fail_on_the_delete)
+        result = await retire_artist_similar_artists_version(cursor, "fastrp-v2")
+        assert result == 1
+
+
 class TestApplyVectorSchema:
     """The gate as the initializer runs it, against the shared cursor fake.
 
@@ -844,9 +1023,12 @@ class TestApplyVectorSchema:
 
         assert await _apply_vector_schema(cursor) == 0
         statements = self._statements(cursor)
-        # 2 probes (installed, role) + the vector schema's 3 statements + the role's 3 + the shared grant
-        assert len(statements) == 2 + len(_VECTOR_SCHEMA_STATEMENTS) + len(_PIPELINE_ROLE_STATEMENTS) + 1
-        assert statements[-1] == _EMBEDDINGS_TABLE_GRANT[1]
+        # 2 probes (installed, role) + the vector schema's 3 statements + the role's 3
+        # + the artist_embeddings grant + the artist-similarity tables grant (role-gated
+        # only, so it fires here too)
+        assert len(statements) == 2 + len(_VECTOR_SCHEMA_STATEMENTS) + len(_PIPELINE_ROLE_STATEMENTS) + 1 + 1
+        assert statements[-2] == _EMBEDDINGS_TABLE_GRANT[1]
+        assert statements[-1] == _ARTIST_SIMILARITY_TABLES_GRANT[1]
 
     @pytest.mark.asyncio
     async def test_unavailable_skips_the_extension_table_and_grant(self) -> None:
@@ -855,9 +1037,12 @@ class TestApplyVectorSchema:
 
         assert await _apply_vector_schema(cursor) == 0
         statements = self._statements(cursor)
-        assert len(statements) == 3 + len(_PIPELINE_ROLE_STATEMENTS)
+        # The artist-similarity tables grant is gated on CREATEROLE alone, not on the
+        # (here closed) extension gate, so it still fires.
+        assert len(statements) == 3 + len(_PIPELINE_ROLE_STATEMENTS) + 1
         assert not any("CREATE EXTENSION" in s.upper() for s in statements)
         assert not any("artist_embeddings" in s for s in statements)
+        assert statements[-1] == _ARTIST_SIMILARITY_TABLES_GRANT[1]
 
     @pytest.mark.asyncio
     async def test_available_but_not_superuser_skips_the_extension_table_and_grant(self) -> None:
@@ -866,9 +1051,10 @@ class TestApplyVectorSchema:
 
         assert await _apply_vector_schema(cursor) == 0
         statements = self._statements(cursor)
-        assert len(statements) == 4 + len(_PIPELINE_ROLE_STATEMENTS)
+        assert len(statements) == 4 + len(_PIPELINE_ROLE_STATEMENTS) + 1
         assert not any("CREATE EXTENSION" in s.upper() for s in statements)
         assert not any("artist_embeddings" in s for s in statements)
+        assert statements[-1] == _ARTIST_SIMILARITY_TABLES_GRANT[1]
 
     @pytest.mark.asyncio
     async def test_available_and_superuser_installs_and_creates_everything(self) -> None:
@@ -877,8 +1063,9 @@ class TestApplyVectorSchema:
 
         assert await _apply_vector_schema(cursor) == 0
         statements = self._statements(cursor)
-        assert len(statements) == 4 + len(_VECTOR_SCHEMA_STATEMENTS) + len(_PIPELINE_ROLE_STATEMENTS) + 1
-        assert statements[-1] == _EMBEDDINGS_TABLE_GRANT[1]
+        assert len(statements) == 4 + len(_VECTOR_SCHEMA_STATEMENTS) + len(_PIPELINE_ROLE_STATEMENTS) + 1 + 1
+        assert statements[-2] == _EMBEDDINGS_TABLE_GRANT[1]
+        assert statements[-1] == _ARTIST_SIMILARITY_TABLES_GRANT[1]
 
     @pytest.mark.asyncio
     async def test_missing_createrole_skips_the_role_and_its_grants(self) -> None:
