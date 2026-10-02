@@ -6,7 +6,7 @@
   [integration tiers](architecture.md#integration-tiers), and the
   [graph schema](architecture.md#graph-schema) with its non-authoritative
   [bootstrap fill](architecture.md#the-bootstrap-fill) and its conditional
-  [property graph](architecture.md#property-graph).
+  [SQL/PGQ removal and recovery](sql-pgq-removal.md).
 - [Runtime configuration](runtime-configuration.md) — database endpoints, credentials,
   secret files, TLS, logging, image behavior, and the metrics and spans the initializer emits.
 - [Persistence compatibility contract](../contracts/persistence/) — schema evolution policy

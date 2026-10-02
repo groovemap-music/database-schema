@@ -18,7 +18,6 @@ services.
 | `NEO4J_PASSWORD` | `groovemap` | Neo4j password |
 | `NEO4J_TLS_ENABLED` | `false` | Enable encrypted Bolt transport |
 | `NEO4J_TLS_VERIFY` | `true` | Verify the Neo4j server certificate when TLS is enabled |
-| `SCHEMA_PROPERTY_GRAPH` | `disabled` | `enabled` declares the `graph.catalog` property graph. Requires PostgreSQL 19 or later; skipped with a logged reason on an older server |
 | `LOG_LEVEL` | runtime default | Structured-log level |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | OTLP/HTTP collector base URL, for example `http://otel-collector:4318`. Unset disables both metrics and trace export |
 | `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | falls back to `OTEL_EXPORTER_OTLP_ENDPOINT` | Metrics-only endpoint override |
@@ -39,30 +38,6 @@ file path instead of placing the corresponding value directly in the environment
 The image writes its file log to `/logs/database-schema.log`; mount `/logs` when the log
 must persist beyond the one-shot container.
 
-## The property graph switch
-
-`SCHEMA_PROPERTY_GRAPH` is off unless it is set to `enabled` — `true`, `1`, `yes`, `on`, and
-`enable` are accepted as well, and everything else, including `disabled` and an empty value,
-leaves it off. With it on, the initializer declares `graph.catalog` over the `graph` schema's
-views after the rest of the schema has been applied. See
-[the property graph](architecture.md#property-graph) for the statement itself.
-
-Two things must both be true before the server is asked anything about the graph: the switch
-is on, and the server reports `server_version_num` of at least `190000`. Either one failing logs
-a single line naming which one and is not an error — the switch on a PostgreSQL 18 server is a
-supported configuration, not a misconfiguration, which is what lets one deployment manifest
-cover both engines during a version migration.
-
-With both true, a missing `graph.catalog` is created, and an existing one this schema declared
-is re-declared in one transaction whenever its definition fingerprint or its elements no longer
-match the current declaration, so a new declaration rolls out on the next run. A current graph
-is left alone, and so is a table, a view, or a property graph carrying a comment this schema did
-not write; each logs one line. A statement that fails is counted like any other failed schema
-statement and makes the run exit nonzero, leaving the previous graph in place. See
-[the property graph](architecture.md#when-it-is-applied) for the fingerprint and the locking.
-
-Turning the switch off does not remove an existing graph: this initializer only ever replaces
-its own graph, and only with the switch on.
 
 ## The bootstrap fill
 
