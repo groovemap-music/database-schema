@@ -7,11 +7,9 @@ runs are no-ops for already-created schema objects. Schema is never dropped.
 
 from __future__ import annotations
 
-import hashlib
 import logging
-import os
 import re
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from common.credit_roles import ROLE_CATEGORIES
 from common.media import medium_ids, medium_label
@@ -1675,7 +1673,7 @@ _MUSICBRAINZ_INDEXES: list[tuple[str, str]] = [
 
 # ── Graph schema (vertex and edge views) ──────────────────────────────────────
 # The `graph` schema re-presents the catalog tables as the vertex and edge
-# relations of the property graph the Neo4j enrichers already build, without
+# relations that mirror the graph the Neo4j enrichers already build, without
 # copying a byte: every object here is a view over a table defined above.
 #
 # Naming is the contract. A vertex view is named for the Neo4j label it mirrors
@@ -1683,8 +1681,8 @@ _MUSICBRAINZ_INDEXES: list[tuple[str, str]] = [
 # (`graph.by_artist` for `[:BY]`), lowercased and de-reserved — `:User` becomes
 # `graph.app_user`, the label ADR 0012 records for it, because `user` is a
 # reserved word, and `[:BY]`, `[:ON]` and `[:IS]` become `by_artist`,
-# `on_label`, `in_genre` and `in_style` so a later CREATE PROPERTY GRAPH can
-# use the view name as the label verbatim. Where ADR 0012 names a label, its
+# `on_label`, `in_genre` and `in_style` so each relation has an unambiguous SQL
+# name. Where ADR 0012 names a label, its
 # mapping table is the contract and this schema follows it.
 #
 # Every edge view exposes a stable key column set, catalogued in
@@ -2703,10 +2701,9 @@ CROSS JOIN LATERAL (
 # drops only a relation it is replacing in the same pass, only when a view of
 # that name is actually still there. A fresh database drops nothing; a second
 # apply finds a table rather than a view and drops nothing either. CASCADE is
-# required because on PostgreSQL 19 `graph.catalog` depends on the view. It
-# removes the view's element, and every edge referencing it, from the graph
-# and leaves the graph in place; `_apply_property_graph` finds those elements
-# missing and re-declares the graph on the same run when its switch is on.
+# retained for compatibility with databases that applied the former SQL/PGQ
+# declaration; PostgreSQL removes dependent objects before the replacement
+# table is created.
 _VIEW_TO_TABLE_MIGRATION = """
 DO ${tag}$
 BEGIN
@@ -3531,7 +3528,7 @@ _TEXT_KEY_RETYPES: tuple[tuple[str, str], ...] = (
 )
 
 
-def _graph_table_statements() -> list[tuple[str, str]]:
+def _graph_relation_statements() -> list[tuple[str, str]]:
     """Return every loader-owned table, preceded by the migrations that free its name."""
     migrations = [_view_to_table_migration(relation) for relation in (*_MATERIALIZED_VERTICES, *_MATERIALIZED_EDGES)]
     migrations.extend(_key_retype_migration(relation, column) for relation, column in _TEXT_KEY_RETYPES)
@@ -3553,9 +3550,8 @@ def _graph_table_statements() -> list[tuple[str, str]]:
 #
 # It is kept, rather than copied into the test tree, because two things read it
 # and neither is worth having if the two sides can drift. The parity harness
-# creates these definitions in a throwaway schema, fills the tables from them,
-# and then runs the same `GRAPH_TABLE` query over a graph declared on the tables
-# and over the retained views. And `graph.bootstrap_fill()` below — the one
+# creates these definitions in a throwaway schema and compares them with the
+# table-backed projections. And `graph.bootstrap_fill()` below — the one
 # shipped thing in this module that writes a graph row — inlines the same bodies
 # to populate an environment once, so the fill is the phase 0 projection by
 # construction rather than by inspection. A hand-copied body would turn a real
@@ -4823,7 +4819,7 @@ def _build_graph_statements() -> list[tuple[str, str]]:
     with one of them and four views call the others. The tables precede the
     views, because `part_of`, `in_family`, and `release_degree` now read tables
     rather than documents. Every migration that frees a name precedes the
-    relation that takes it, which is what `_graph_table_statements` returns. And
+    relation that takes it, which is what `_graph_relation_statements` returns. And
     the two writing functions come last, after every relation they write or read
     — `graph.refresh_artist_member_of` reads two MusicBrainz views,
     `graph.refresh_vertex_degree` reads the ten path relations including the
@@ -4839,7 +4835,7 @@ def _build_graph_statements() -> list[tuple[str, str]]:
         ("graph.credit_role_category function", _credit_role_category_function()),
         ("graph.medium_label function", _medium_label_function()),
         ("graph.mb_relationship_type function", _mb_relationship_type_function()),
-        *_graph_table_statements(),
+        *_graph_relation_statements(),
         *_discogs_vertex_views(),
         *_discogs_edge_views(),
         *_musicbrainz_vertex_views(),
@@ -4868,386 +4864,8 @@ def _build_graph_statements() -> list[tuple[str, str]]:
 _GRAPH_STATEMENTS: list[tuple[str, str]] = _build_graph_statements()
 
 
-# ── The catalog property graph (SQL/PGQ, PostgreSQL 19) ──────────────────────
-# `CREATE PROPERTY GRAPH` re-presents the graph schema's views as one named
-# graph a `GRAPH_TABLE` query can pattern-match over. It is a declaration, not
-# a materialization: every vertex and edge is read from the view underneath it
-# at query time, so the graph costs nothing to hold and nothing to refresh.
-#
-# The statement is applied only on a PostgreSQL 19 server and only when the
-# `SCHEMA_PROPERTY_GRAPH` switch is enabled, so production on 18 is untouched
-# and the cutover is a configuration change. See `_property_graph_skip_reason`,
-# and `_property_graph_action` for how an existing graph is kept current.
-
-PROPERTY_GRAPH_SWITCH = "SCHEMA_PROPERTY_GRAPH"
-PROPERTY_GRAPH_SCHEMA = "graph"
-PROPERTY_GRAPH_RELATION = "catalog"
-PROPERTY_GRAPH_NAME = f"{PROPERTY_GRAPH_SCHEMA}.{PROPERTY_GRAPH_RELATION}"
-PROPERTY_GRAPH_STATEMENT_NAME = f"{PROPERTY_GRAPH_NAME} property graph"
-
-# SQL/PGQ landed in PostgreSQL 19. 190000 is `server_version_num` for 19beta1
-# onward, which is what the advisory integration tier runs.
-PROPERTY_GRAPH_MINIMUM_SERVER_VERSION = 190000
-
-# The shared label the sixteen `mb_rel_<source>_<target>` edge relations carry in
-# addition to their own. SQL/PGQ allows one label across several element tables
-# only when every one of them exposes the same property names and types, which
-# these sixteen do: each projects the same eight columns of
-# `musicbrainz.relationships`. The shared label is what lets a query ask for any
-# MusicBrainz relationship without spelling out all sixteen endpoint pairs.
-MUSICBRAINZ_RELATIONSHIP_LABEL = "mb_related"
-
-
-class _PropertyGraphVertex(NamedTuple):
-    """One vertex element table: its label, its key, and its properties.
-
-    `view` is the alias and the label. `relation` is the graph-schema relation
-    underneath it, which differs from the label only for the four labels that
-    carry counters: those bind a `<label>_vertex` projection rather than the
-    storage relation of the same name. See `_counter_views`.
-    """
-
-    view: str
-    key: tuple[str, ...]
-    # None means PROPERTIES ALL COLUMNS.
-    properties: tuple[str, ...] | None = None
-    relation: str | None = None
-
-    @property
-    def element(self) -> str:
-        """Return the graph-schema relation this element table reads."""
-        return self.relation or self.view
-
-
-class _PropertyGraphEdge(NamedTuple):
-    """One edge element table, with the vertex aliases its endpoints resolve to."""
-
-    view: str
-    key: tuple[str, ...]
-    source_key: tuple[str, ...]
-    source: str
-    source_columns: tuple[str, ...]
-    destination_key: tuple[str, ...]
-    destination: str
-    destination_columns: tuple[str, ...]
-    properties: tuple[str, ...] | None = None
-    extra_labels: tuple[str, ...] = ()
-
-    @property
-    def element(self) -> str:
-        """Return the graph-schema relation this element table reads.
-
-        No edge label binds a relation of a different name, so this is always
-        the label itself. It exists so a caller can walk vertices and edges
-        together without knowing which kind it is holding.
-        """
-        return self.view
-
-
-def _property_graph_vertices() -> tuple[_PropertyGraphVertex, ...]:
-    """Return every vertex element table of `graph.catalog`.
-
-    Every key is `text`, `uuid`, or `bigint` — never `character varying`.
-    PostgreSQL 19 beta 3 looks the equality operator up against the referenced
-    column's own type and `varchar` registers none of its own, so a `character
-    varying` vertex key makes every edge that points at it unresolvable. The
-    phase 0 declaration worked around that with four appended `<entity>_key`
-    restatements; the relations now publish `text` keys directly and the
-    workaround is retired. Labels and property names are unchanged by that: only
-    the key types moved.
-
-    The explicit property lists that remain are the two casts SQL/PGQ still
-    forces. A property name must have one data type across the whole graph, and
-    `discogs_label_id` is `bigint` on the MusicBrainz side and `text` on the
-    Discogs side, while `release_id` is `text` on every graph relation except
-    `graph.collected` and `graph.wants`, which read `releases.data_id` through a
-    join and publish it as `character varying`. Each is unified on `text`.
-
-    Four labels bind a relation of a different name. `genre`, `style`, `label`,
-    and `artist` read a `<label>_vertex` projection that joins the relation
-    holding their rows to the relation holding their counters, because Neo4j
-    carries those counters as node properties of exactly those four labels and
-    exact parity is the point: `MATCH (g IS genre) COLUMNS (g.release_count)`
-    reads as the Cypher it replaces. Attaching the counter relation to the same
-    label as a second element table is not an option — SQL/PGQ admits one
-    element table per label unless every table exposes an identical property
-    set, and PostgreSQL 19 beta 3 refuses the pair with `mismatching number of
-    properties in definition of label "genre"`. A view is one element table.
-
-    The projection is free when it is not read: the counter relation is unique
-    on the join column, so the planner removes the LEFT JOIN outright for a
-    query that names no counter, and the pilot two-hop plans identically over
-    the projection and over the storage relation alone.
-
-    `release_degree` is the one counter that stays a label of its own; see
-    `_counter_views` for the measurement behind that.
-    """
-    return (
-        _PropertyGraphVertex("artist", ("artist_id",), relation="artist_vertex"),
-        _PropertyGraphVertex("label", ("label_id",), relation="label_vertex"),
-        _PropertyGraphVertex("master", ("master_id",)),
-        _PropertyGraphVertex("release", ("release_id",)),
-        _PropertyGraphVertex("genre", ("name",), relation="genre_vertex"),
-        _PropertyGraphVertex("style", ("name",), relation="style_vertex"),
-        _PropertyGraphVertex("person", ("name",)),
-        _PropertyGraphVertex("company", ("company_id",)),
-        _PropertyGraphVertex("medium", ("medium_id",)),
-        _PropertyGraphVertex("media_family", ("name",)),
-        _PropertyGraphVertex("app_user", ("user_id",)),
-        _PropertyGraphVertex("catalog_item", ("item_id",)),
-        _PropertyGraphVertex("mb_artist", ("mbid",)),
-        _PropertyGraphVertex(
-            "mb_label",
-            ("mbid",),
-            (
-                "mbid",
-                "name",
-                "type",
-                "label_code",
-                "begin_date",
-                "end_date",
-                "ended",
-                "area",
-                "disambiguation",
-                "discogs_label_id::text AS discogs_label_id",
-                "updated_at",
-                "gm_item_id",
-            ),
-        ),
-        _PropertyGraphVertex("mb_release", ("mbid",)),
-        _PropertyGraphVertex("mb_release_group", ("mbid",)),
-        # The one counter that is not a property of the label it describes. Its
-        # live half is a pair of lateral counts no unique key makes removable,
-        # so folding it onto `release` would double the plan of every traversal
-        # that binds a release. The counter relations behind the other four are
-        # loader-owned storage and are deliberately NOT declared as labels of
-        # their own: every property they carry is reachable on the Neo4j label,
-        # so a second label would be surface with no query behind it.
-        _PropertyGraphVertex("release_degree", ("release_id",)),
-    )
-
-
-def _musicbrainz_relationship_edges() -> list[_PropertyGraphEdge]:
-    """Return the sixteen MusicBrainz relationship edge tables.
-
-    Each is keyed on the surrogate `relationship_id` — `musicbrainz.relationships`
-    has one row per relationship and both endpoint joins are to a unique mbid, so
-    the id stays unique through the view.
-    """
-    edges: list[_PropertyGraphEdge] = []
-    for _source_type, _source_table, source_name in _MUSICBRAINZ_GRAPH_ENTITIES:
-        for _target_type, _target_table, target_name in _MUSICBRAINZ_GRAPH_ENTITIES:
-            edges.append(
-                _PropertyGraphEdge(
-                    view=f"mb_rel_{source_name}_{target_name}",
-                    key=("relationship_id",),
-                    source_key=("source_mbid",),
-                    source=f"mb_{source_name}",
-                    source_columns=("mbid",),
-                    destination_key=("target_mbid",),
-                    destination=f"mb_{target_name}",
-                    destination_columns=("mbid",),
-                    extra_labels=(MUSICBRAINZ_RELATIONSHIP_LABEL,),
-                )
-            )
-    return edges
-
-
-def _property_graph_edges() -> tuple[_PropertyGraphEdge, ...]:
-    """Return every edge element table of `graph.catalog`.
-
-    Every key is the column set docs/architecture.md publishes for that
-    relation, and every endpoint now resolves to the published key column of its
-    vertex rather than to an appended restatement of it. `graph.collected` and
-    `graph.wants` carry the one remaining cast: their `release_id` comes through
-    a join on `releases.data_id` and is `character varying`, which is a legal
-    endpoint type but the wrong property type, so it is published as `text`.
-    """
-    return (
-        _PropertyGraphEdge(
-            "by_artist", ("release_id", "artist_id"), ("release_id",), "release", ("release_id",), ("artist_id",), "artist", ("artist_id",)
-        ),
-        _PropertyGraphEdge(
-            "on_label", ("release_id", "label_id"), ("release_id",), "release", ("release_id",), ("label_id",), "label", ("label_id",)
-        ),
-        _PropertyGraphEdge(
-            "derived_from", ("release_id", "master_id"), ("release_id",), "release", ("release_id",), ("master_id",), "master", ("master_id",)
-        ),
-        _PropertyGraphEdge(
-            "in_genre", ("release_id", "genre_name"), ("release_id",), "release", ("release_id",), ("genre_name",), "genre", ("name",)
-        ),
-        _PropertyGraphEdge(
-            "in_style", ("release_id", "style_name"), ("release_id",), "release", ("release_id",), ("style_name",), "style", ("name",)
-        ),
-        _PropertyGraphEdge(
-            "master_by_artist", ("master_id", "artist_id"), ("master_id",), "master", ("master_id",), ("artist_id",), "artist", ("artist_id",)
-        ),
-        _PropertyGraphEdge(
-            "master_in_genre", ("master_id", "genre_name"), ("master_id",), "master", ("master_id",), ("genre_name",), "genre", ("name",)
-        ),
-        _PropertyGraphEdge(
-            "master_in_style", ("master_id", "style_name"), ("master_id",), "master", ("master_id",), ("style_name",), "style", ("name",)
-        ),
-        _PropertyGraphEdge("part_of", ("style_name", "genre_name"), ("style_name",), "style", ("name",), ("genre_name",), "genre", ("name",)),
-        _PropertyGraphEdge(
-            "member_of",
-            ("member_artist_id", "group_artist_id"),
-            ("member_artist_id",),
-            "artist",
-            ("artist_id",),
-            ("group_artist_id",),
-            "artist",
-            ("artist_id",),
-        ),
-        _PropertyGraphEdge(
-            "alias_of", ("alias_artist_id", "artist_id"), ("alias_artist_id",), "artist", ("artist_id",), ("artist_id",), "artist", ("artist_id",)
-        ),
-        _PropertyGraphEdge(
-            "sublabel_of", ("sublabel_id", "parent_label_id"), ("sublabel_id",), "label", ("label_id",), ("parent_label_id",), "label", ("label_id",)
-        ),
-        _PropertyGraphEdge(
-            "credited_on",
-            ("person_name", "release_id", "role"),
-            ("person_name",),
-            "person",
-            ("name",),
-            ("release_id",),
-            "release",
-            ("release_id",),
-        ),
-        _PropertyGraphEdge("same_as", ("person_name", "artist_id"), ("person_name",), "person", ("name",), ("artist_id",), "artist", ("artist_id",)),
-        # Track-level credits and performers (gm-database-schema-ug3v). No Neo4j
-        # relationship type binds these — `graphinator` has never projected a
-        # track — the same standing `artist_genre`/`label_genre` have below: an
-        # analytics-only edge the property graph still carries because both
-        # endpoints already resolve to an existing vertex and `GRAPH_TABLE`
-        # gains a real pattern to match rather than a two-relation join the
-        # caller would otherwise write by hand.
-        _PropertyGraphEdge(
-            "track_credited_on",
-            ("person_name", "release_id", "track_ordinal", "sub_track_ordinal", "role"),
-            ("person_name",),
-            "person",
-            ("name",),
-            ("release_id",),
-            "release",
-            ("release_id",),
-        ),
-        _PropertyGraphEdge(
-            "track_by_artist",
-            ("release_id", "track_ordinal", "sub_track_ordinal", "artist_id"),
-            ("release_id",),
-            "release",
-            ("release_id",),
-            ("artist_id",),
-            "artist",
-            ("artist_id",),
-        ),
-        _PropertyGraphEdge(
-            "credited_to",
-            ("release_id", "company_id", "role", "source"),
-            ("release_id",),
-            "release",
-            ("release_id",),
-            ("company_id",),
-            "company",
-            ("company_id",),
-        ),
-        _PropertyGraphEdge(
-            "issued_on",
-            ("release_id", "medium_id", "source"),
-            ("release_id",),
-            "release",
-            ("release_id",),
-            ("medium_id",),
-            "medium",
-            ("medium_id",),
-        ),
-        _PropertyGraphEdge(
-            "in_family", ("medium_id", "family_name"), ("medium_id",), "medium", ("medium_id",), ("family_name",), "media_family", ("name",)
-        ),
-        # The two genre aggregates the owner asked for. They have no Neo4j
-        # counterpart: `graphinator` never wrote an artist-to-genre edge, and
-        # catalog-api answers the question today by walking `by_artist` into
-        # `in_genre` and counting. A keyed pair with the count on it replaces a
-        # two-hop expansion with one index read.
-        _PropertyGraphEdge(
-            "artist_genre", ("artist_id", "genre_name"), ("artist_id",), "artist", ("artist_id",), ("genre_name",), "genre", ("name",)
-        ),
-        _PropertyGraphEdge("label_genre", ("label_id", "genre_name"), ("label_id",), "label", ("label_id",), ("genre_name",), "genre", ("name",)),
-        _PropertyGraphEdge(
-            "collected",
-            ("collection_id",),
-            ("user_id",),
-            "app_user",
-            ("user_id",),
-            ("release_id",),
-            "release",
-            ("release_id",),
-            ("collection_id", "user_id", "release_id::text AS release_id", "instance_id", "folder_id", "condition", "rating", "date_added"),
-        ),
-        _PropertyGraphEdge(
-            "wants",
-            ("wantlist_id",),
-            ("user_id",),
-            "app_user",
-            ("user_id",),
-            ("release_id",),
-            "release",
-            ("release_id",),
-            ("wantlist_id", "user_id", "release_id::text AS release_id", "rating", "date_added"),
-        ),
-        _PropertyGraphEdge("owns", ("owned_copy_id",), ("user_id",), "app_user", ("user_id",), ("item_id",), "catalog_item", ("item_id",)),
-        *_musicbrainz_relationship_edges(),
-    )
-
-
-def _columns(names: Iterable[str]) -> str:
-    """Return NAMES as a parenthesized SQL column list."""
-    return "(" + ", ".join(names) + ")"
-
-
-def _labels_and_properties(view: str, properties: tuple[str, ...] | None, extra_labels: tuple[str, ...] = ()) -> str:
-    """Return the LABEL and PROPERTIES clauses for one element table.
-
-    The label is the view name verbatim. That is the whole point of the naming
-    rule ADR 0012 records and docs/architecture.md restates: `:User` is projected
-    as `graph.app_user` and the overloaded `[:BY]`, `[:ON]`, and `[:IS]` types as
-    `by_artist`, `on_label`, `in_genre`, and `in_style`, so no label here needs
-    quoting and none collides with a SQL reserved word.
-    """
-    rendered = "PROPERTIES ALL COLUMNS" if properties is None else "PROPERTIES (" + ", ".join(properties) + ")"
-    clauses = [f"LABEL {view} {rendered}"]
-    clauses.extend(f"LABEL {label} {rendered}" for label in extra_labels)
-    return " ".join(clauses)
-
-
-def _property_graph_statement() -> str:
-    """Render CREATE PROPERTY GRAPH graph.catalog over the graph schema views."""
-    vertices = [
-        f"        {PROPERTY_GRAPH_SCHEMA}.{vertex.element} AS {vertex.view} KEY {_columns(vertex.key)}\n"
-        f"            {_labels_and_properties(vertex.view, vertex.properties)}"
-        for vertex in _property_graph_vertices()
-    ]
-    edges = [
-        f"        {PROPERTY_GRAPH_SCHEMA}.{edge.view} AS {edge.view} KEY {_columns(edge.key)}\n"
-        f"            SOURCE KEY {_columns(edge.source_key)} REFERENCES {edge.source} {_columns(edge.source_columns)}\n"
-        f"            DESTINATION KEY {_columns(edge.destination_key)} REFERENCES {edge.destination} {_columns(edge.destination_columns)}\n"
-        f"            {_labels_and_properties(edge.view, edge.properties, edge.extra_labels)}"
-        for edge in _property_graph_edges()
-    ]
-    return (
-        f"CREATE PROPERTY GRAPH {PROPERTY_GRAPH_NAME}\n"
-        "    VERTEX TABLES (\n" + ",\n".join(vertices) + "\n    )\n"
-        "    EDGE TABLES (\n" + ",\n".join(edges) + "\n    )"
-    )
-
-
-# The (name, statement) pair, in the same shape as every entry of
-# `_schema_statements()`. It is deliberately not yielded from there: the
-# statement is conditional on the server and on an operator switch, and
-# `_schema_statements()` is the unconditional schema every supported engine gets.
-PROPERTY_GRAPH_STATEMENT: tuple[str, str] = (PROPERTY_GRAPH_STATEMENT_NAME, _property_graph_statement())
+# SQL/PGQ support was removed after PostgreSQL 19 reverted the feature.
+# The ordinary graph relations above remain the supported relational contract.
 
 
 def _entity_schema_statements() -> Iterator[tuple[str, Any]]:
@@ -5273,14 +4891,8 @@ def _entity_schema_statements() -> Iterator[tuple[str, Any]]:
             index_name = f"idx_{table_name}_{column}"
             yield (
                 index_name,
-                sql.SQL(template).format(
-                    index=sql.Identifier(index_name),
-                    table=sql.Identifier(table_name),
-                ),
+                sql.SQL(template).format(index=sql.Identifier(index_name), table=sql.Identifier(table_name)),
             )
-        # Native identity (ADR 0009): every provider-keyed entity row carries the
-        # native catalog item the loader minted for it, as an additive nullable
-        # column beside the Discogs `data_id` that remains the primary key.
         yield (
             f"{table_name} add gm_item_id column",
             sql.SQL("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS gm_item_id UUID").format(table=sql.Identifier(table_name)),
@@ -5289,8 +4901,7 @@ def _entity_schema_statements() -> Iterator[tuple[str, Any]]:
         yield (
             gm_index_name,
             sql.SQL("CREATE INDEX IF NOT EXISTS {index} ON {table} (gm_item_id)").format(
-                index=sql.Identifier(gm_index_name),
-                table=sql.Identifier(table_name),
+                index=sql.Identifier(gm_index_name), table=sql.Identifier(table_name)
             ),
         )
 
@@ -5305,7 +4916,6 @@ def _schema_statements() -> Iterator[tuple[str, Any]]:
     yield from _MUSICBRAINZ_TABLES
     yield from _MUSICBRAINZ_INDEXES
     yield from _ARTIST_SIMILARITY_STATEMENTS
-    # Last: every view in the graph schema reads a table declared above.
     yield from _GRAPH_STATEMENTS
 
 
@@ -5322,286 +4932,6 @@ async def _execute_schema_statements(cursor: Any, statements: Iterable[tuple[str
             logger.error("❌ Failed to create schema object '%s': %s", name, error)
             failure_count += 1
     return success_count, failure_count
-
-
-# The spellings that turn the switch on. `enabled` is the documented value; the
-# rest are the usual truthy spellings an operator is likely to reach for, so a
-# deployment that writes `true` does not silently get the default.
-_PROPERTY_GRAPH_ENABLED_VALUES = frozenset({"1", "enable", "enabled", "on", "true", "yes"})
-
-
-def property_graph_enabled() -> bool:
-    """Return whether the SCHEMA_PROPERTY_GRAPH switch is on. Defaults to off."""
-    return os.environ.get(PROPERTY_GRAPH_SWITCH, "").strip().lower() in _PROPERTY_GRAPH_ENABLED_VALUES
-
-
-def _property_graph_skip_reason(*, enabled: bool, server_version_num: int | None) -> str | None:
-    """Return why `graph.catalog` is not being applied at all, or None to go on.
-
-    The two gates are ordered by cost. The switch is read from the environment
-    and settles the common case without a round trip; the server version is one
-    query. Whether an existing graph is created, left alone, or re-declared is
-    decided after both open; see `_property_graph_action`.
-    """
-    if not enabled:
-        return f"{PROPERTY_GRAPH_SWITCH} is not enabled"
-    if server_version_num is None or server_version_num < PROPERTY_GRAPH_MINIMUM_SERVER_VERSION:
-        return f"server_version_num {server_version_num} is below {PROPERTY_GRAPH_MINIMUM_SERVER_VERSION}"
-    return None
-
-
-# ── Keeping an existing graph.catalog current ────────────────────────────────
-# `CREATE PROPERTY GRAPH` has no `IF NOT EXISTS` and no `OR REPLACE`, and a
-# property graph captures its shape when it is declared: `PROPERTIES ALL
-# COLUMNS` is expanded to the element relation's columns at that moment, not
-# re-read at query time. So a database that already carries the graph never
-# picks up a later change to the declaration, nor a column added to a relation
-# a label publishes whole, unless the initializer re-declares it. It also
-# never notices an element pruned out from under it: on PostgreSQL 19 beta 3,
-# `DROP VIEW graph.<element> CASCADE` removes that element (and every edge
-# that references it) from the graph and leaves the graph itself in place.
-#
-# **Mechanism: DROP PROPERTY GRAPH + CREATE PROPERTY GRAPH in one
-# transaction, not ALTER PROPERTY GRAPH.** Evaluated on the digest-pinned
-# 19beta3 image the advisory tier runs:
-# - ALTER can add or drop element tables, add or drop a label on one, and add
-#   or drop properties on a label. It cannot change an element's KEY or an
-#   edge's SOURCE or DESTINATION, which is exactly the kind of change the
-#   phase 0 key retype made; those need the element dropped (taking every
-#   edge that references it) and re-added.
-# - Driving ALTER needs a diff between the declaration and the graph as it
-#   stands, which means reading every `pg_propgraph_*` catalog and, for the
-#   labels declared `ALL COLUMNS`, the element relations' columns too, then
-#   rendering the minimal sequence of ALTERs in dependency order. That is a
-#   second, stateful renderer of the same declaration, and its failure mode is
-#   a graph that is neither the old one nor the new one.
-# - DROP + CREATE re-uses the one rendered statement every fresh database
-#   already gets, so an upgraded graph is byte-for-byte the declaration, and
-#   PostgreSQL's transactional DDL makes the swap atomic: any error, including
-#   one in the CREATE, rolls back the DROP and the previous graph stays.
-# Both take the same ACCESS EXCLUSIVE lock on `graph.catalog`, so ALTER buys
-# no concurrency.
-#
-# **Fingerprint.** The declaration's identity is recorded on the graph itself
-# with `COMMENT ON PROPERTY GRAPH`, which 19beta3 supports: a SHA-256 over the
-# rendered statement and over the name and type of every column of every
-# element relation, as the catalog reports them on this run. The columns are
-# part of it because `ALL COLUMNS` makes them part of the definition without
-# appearing in its text; 0.4.0's `gm_item_id` on `graph.mb_artist` is such a
-# change. Comparing that digest with the comment tells "same definition" from
-# "changed" without diffing the graph catalogs. A comment survives a cascade
-# prune, though, so the (element, label) pairs are also compared with the
-# declared ones; that is one catalog read and is what catches a missing
-# element. A property dropped from a label by a cascade from a column is not
-# checked for; nothing in this schema drops a column.
-#
-# **Ownership.** Only a relation of relkind `g` in schema `graph` named
-# `catalog` whose comment is this schema's fingerprint, or which has no
-# comment at all (the shape every version before this one left it in), is
-# treated as this schema's graph and re-declared. A table or view squatting
-# the name, or a property graph carrying somebody else's comment, is left
-# untouched and logged, as before. `DROP PROPERTY GRAPH` is issued without
-# CASCADE, so a view or SQL-body function a consumer declared over the graph
-# makes the DROP fail, the transaction roll back, the old graph stay, and the
-# run count one failure: this schema never cascades into objects it did not
-# create.
-#
-# **Locking.** A `GRAPH_TABLE` reader holds ACCESS SHARE on `graph.catalog`
-# (and on the relations it reads). The DROP takes ACCESS EXCLUSIVE on the
-# graph and holds it until commit; the CREATE takes ACCESS SHARE on every
-# element relation, so writers to the loader-owned tables are not blocked.
-# During the swap the upgrade first waits for in-flight readers of the graph
-# to finish, and every reader that arrives after it queues behind it until
-# the transaction commits, then resolves the name again and reads the new
-# graph. The swap itself is catalog-only and takes milliseconds; the exposure
-# is a long-running `GRAPH_TABLE` query already holding the graph, which
-# stalls both the upgrade and the readers queued behind it for its duration.
-# A re-apply whose definition is unchanged takes no lock beyond the catalog
-# reads.
-
-# The fixed prefix of the comment this schema writes on `graph.catalog`. It is
-# what makes a fingerprint recognizably this schema's, as opposed to a comment
-# an operator wrote.
-PROPERTY_GRAPH_FINGERPRINT_PREFIX = "groovemap-schema definition sha256:"
-
-# The relkind PostgreSQL 19 gives a property graph in `pg_class`, beside `r`
-# for a table and `v` for a view.
-PROPERTY_GRAPH_RELKIND = "g"
-
-PropertyGraphAction = Literal["create", "replace", "skip"]
-
-
-class _ExistingPropertyGraph(NamedTuple):
-    """The relation named `graph.catalog`, whatever kind it is, and its comment."""
-
-    relkind: str
-    comment: str | None
-
-
-# Checking `pg_class` rather than a version-specific catalog view also catches a
-# table or view squatting the name, which is the conservative answer.
-_PROPERTY_GRAPH_RELATION_QUERY = """
-SELECT relation.relkind, obj_description(relation.oid, 'pg_class')
-FROM pg_class AS relation
-JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
-WHERE namespace.nspname = %s AND relation.relname = %s
-"""
-
-_PROPERTY_GRAPH_LABELS_QUERY = """
-SELECT element.pgealias, label.pgllabel
-FROM pg_propgraph_element AS element
-JOIN pg_propgraph_element_label AS element_label ON element_label.pgelelid = element.oid
-JOIN pg_propgraph_label AS label ON label.oid = element_label.pgellabelid
-WHERE element.pgepgid = %s::regclass
-"""
-
-_PROPERTY_GRAPH_COLUMNS_QUERY = """
-SELECT relation.relname, attribute.attname, format_type(attribute.atttypid, attribute.atttypmod)
-FROM pg_attribute AS attribute
-JOIN pg_class AS relation ON relation.oid = attribute.attrelid
-JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
-WHERE namespace.nspname = %s
-  AND relation.relname = ANY(%s)
-  AND attribute.attnum > 0
-  AND NOT attribute.attisdropped
-"""
-
-_SERVER_VERSION_QUERY = "SELECT current_setting('server_version_num')::int"
-
-
-def _declared_property_graph_labels() -> frozenset[tuple[str, str]]:
-    """Return every (element alias, label) pair the declaration gives `graph.catalog`."""
-    pairs = {(vertex.view, vertex.view) for vertex in _property_graph_vertices()}
-    for edge in _property_graph_edges():
-        pairs.add((edge.view, edge.view))
-        pairs.update((edge.view, label) for label in edge.extra_labels)
-    return frozenset(pairs)
-
-
-def _property_graph_element_relations() -> list[str]:
-    """Return the name of every graph-schema relation an element table reads."""
-    return sorted({vertex.element for vertex in _property_graph_vertices()} | {edge.element for edge in _property_graph_edges()})
-
-
-def _property_graph_fingerprint(columns: Iterable[tuple[str, str, str]]) -> str:
-    """Return the comment identifying the rendered definition over these element columns.
-
-    COLUMNS is (relation, column, type) for every element relation, in any
-    order: it is sorted here, so a column's position in its relation, which
-    depends on the order columns were added, does not move the fingerprint.
-    """
-    digest = hashlib.sha256(PROPERTY_GRAPH_STATEMENT[1].encode())
-    for relation, column, type_name in sorted(columns):
-        digest.update(f"\n{relation}.{column} {type_name}".encode())
-    return PROPERTY_GRAPH_FINGERPRINT_PREFIX + digest.hexdigest()
-
-
-def _property_graph_action(
-    existing: _ExistingPropertyGraph | None, *, fingerprint: str, labels: frozenset[tuple[str, str]]
-) -> tuple[PropertyGraphAction, str]:
-    """Decide what to do about `graph.catalog`, and say why.
-
-    LABELS is the (element alias, label) pairs the existing graph carries; it
-    is ignored unless EXISTING is a property graph this schema created.
-    """
-    if existing is None:
-        return "create", f"{PROPERTY_GRAPH_NAME} does not exist"
-    if existing.relkind != PROPERTY_GRAPH_RELKIND:
-        return "skip", f"{PROPERTY_GRAPH_NAME} already exists as relkind {existing.relkind!r}, not a property graph this schema created"
-    if existing.comment is not None and not existing.comment.startswith(PROPERTY_GRAPH_FINGERPRINT_PREFIX):
-        return "skip", f"{PROPERTY_GRAPH_NAME} carries a comment this schema did not write, so it is not a property graph this schema created"
-    if existing.comment is None:
-        return "replace", f"{PROPERTY_GRAPH_NAME} carries no definition fingerprint"
-    if existing.comment != fingerprint:
-        return "replace", f"{PROPERTY_GRAPH_NAME} was declared from a different definition"
-    if labels != _declared_property_graph_labels():
-        return "replace", f"{PROPERTY_GRAPH_NAME} is missing elements or labels of its definition"
-    return "skip", f"{PROPERTY_GRAPH_NAME} already matches its definition"
-
-
-def _property_graph_create_statement(fingerprint: str) -> tuple[str, str]:
-    """Return the statement creating `graph.catalog` and fingerprinting it, as one transaction.
-
-    A DO block is one statement, so on the initializer's autocommit connection
-    it is one transaction: a graph never exists without its fingerprint.
-    """
-    return (
-        PROPERTY_GRAPH_STATEMENT_NAME,
-        f"DO $property_graph$\nBEGIN\n{PROPERTY_GRAPH_STATEMENT[1]};\n"
-        f"COMMENT ON PROPERTY GRAPH {PROPERTY_GRAPH_NAME} IS '{fingerprint}';\nEND\n$property_graph$",
-    )
-
-
-def _property_graph_replace_statement(fingerprint: str) -> tuple[str, str]:
-    """Return the statement swapping `graph.catalog` for its current definition, as one transaction.
-
-    The DROP carries no CASCADE, and it refuses anything that is not a property
-    graph, so it can only ever remove the graph this schema declared; any error
-    rolls the whole block back and leaves the previous graph in place.
-    """
-    return (
-        f"{PROPERTY_GRAPH_NAME} property graph re-declaration",
-        f"DO $property_graph$\nBEGIN\nDROP PROPERTY GRAPH {PROPERTY_GRAPH_NAME};\n{PROPERTY_GRAPH_STATEMENT[1]};\n"
-        f"COMMENT ON PROPERTY GRAPH {PROPERTY_GRAPH_NAME} IS '{fingerprint}';\nEND\n$property_graph$",
-    )
-
-
-async def _server_version_num(cursor: Any) -> int | None:
-    """Return the connected server's `server_version_num`, or None if unreadable."""
-    try:
-        await cursor.execute(_SERVER_VERSION_QUERY)
-        row = await cursor.fetchone()
-    except Exception as error:
-        logger.error("❌ Could not read server_version_num: %s", error)
-        return None
-    return None if row is None else int(row[0])
-
-
-async def _existing_property_graph(cursor: Any) -> _ExistingPropertyGraph | None:
-    """Return the relation named `catalog` in schema `graph`, or None when there is none."""
-    await cursor.execute(_PROPERTY_GRAPH_RELATION_QUERY, (PROPERTY_GRAPH_SCHEMA, PROPERTY_GRAPH_RELATION))
-    row = await cursor.fetchone()
-    return None if row is None else _ExistingPropertyGraph(str(row[0]), row[1])
-
-
-async def _property_graph_labels(cursor: Any) -> frozenset[tuple[str, str]]:
-    """Return every (element alias, label) pair the existing `graph.catalog` carries."""
-    await cursor.execute(_PROPERTY_GRAPH_LABELS_QUERY, (PROPERTY_GRAPH_NAME,))
-    return frozenset((str(alias), str(label)) for alias, label in await cursor.fetchall())
-
-
-async def _property_graph_element_columns(cursor: Any) -> list[tuple[str, str, str]]:
-    """Return (relation, column, type) for every column of every element relation."""
-    await cursor.execute(_PROPERTY_GRAPH_COLUMNS_QUERY, (PROPERTY_GRAPH_SCHEMA, _property_graph_element_relations()))
-    return [(str(relation), str(column), str(type_name)) for relation, column, type_name in await cursor.fetchall()]
-
-
-async def _apply_property_graph(cursor: Any) -> int:
-    """Create `graph.catalog`, or bring this schema's own copy up to date.
-
-    Returns the number of failed statements, so the caller adds it to the same
-    count every other schema statement contributes to. A skip is not a failure:
-    running on PostgreSQL 18, or with the switch off, is the supported default,
-    and so is finding the graph already current; each logs one line saying why.
-    """
-    enabled = property_graph_enabled()
-    server_version_num = await _server_version_num(cursor) if enabled else None
-    reason = _property_graph_skip_reason(enabled=enabled, server_version_num=server_version_num)
-    if reason is not None:
-        logger.info("⏭️  Skipped %s: %s", PROPERTY_GRAPH_NAME, reason)
-        return 0
-
-    existing = await _existing_property_graph(cursor)
-    labels = await _property_graph_labels(cursor) if existing is not None and existing.relkind == PROPERTY_GRAPH_RELKIND else frozenset()
-    fingerprint = _property_graph_fingerprint(await _property_graph_element_columns(cursor))
-    action, reason = _property_graph_action(existing, fingerprint=fingerprint, labels=labels)
-    if action == "skip":
-        logger.info("⏭️  Skipped %s: %s", PROPERTY_GRAPH_NAME, reason)
-        return 0
-    logger.info("🔁 Declaring %s: %s", PROPERTY_GRAPH_NAME, reason)
-    statement = _property_graph_create_statement(fingerprint) if action == "create" else _property_graph_replace_statement(fingerprint)
-    _success, failures = await _execute_schema_statements(cursor, [statement])
-    return failures
 
 
 # ── Precomputed similar-artist lists and the embedding-release pointer (ADR 0013, D serving mode) ──
@@ -6614,11 +5944,9 @@ async def create_postgres_schema(pool: Any) -> int:
     """Create all PostgreSQL tables and indexes.
 
     Safe to call on every startup; all statements use IF NOT EXISTS so
-    subsequent calls are no-ops for already-created schema objects. The catalog
-    property graph is applied after them, and only when the server is
-    PostgreSQL 19 or later and the SCHEMA_PROPERTY_GRAPH switch is enabled; see
-    `_apply_property_graph`. The vector extension, the artist embedding table,
-    and the embedding pipeline role are applied last, each skipped with a
+    subsequent calls are no-ops for already-created schema objects. The vector
+    extension, the artist embedding table, and the embedding pipeline role are
+    applied last, each skipped with a
     logged reason when its own guard is closed; see `_apply_vector_schema`.
     The artist embeddings HNSW index is deliberately *not* applied here --
     building it needs a temporary `maintenance_work_mem` bump this one-shot,
@@ -6640,8 +5968,6 @@ async def create_postgres_schema(pool: Any) -> int:
             cursor = cast("Any", cursor_cm)
             statements = list(_schema_statements())
             success_count, failure_count = await _execute_schema_statements(cursor, statements)
-            # Last, and only when the server and the operator both allow it.
-            failure_count += await _apply_property_graph(cursor)
             failure_count += await _apply_vector_schema(cursor)
 
     total = len(statements)

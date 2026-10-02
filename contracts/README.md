@@ -61,14 +61,9 @@ migration that drops the view only when one is still there and creates the table
 pass. Every key column is `text`, which retired the four appended `<entity>_key` columns the
 Discogs vertex views carried; the contract records that under `graph_schema.key_columns`.
 
-The `graph.catalog` property graph is recorded there too, as an additive object that is
-**conditional**: it exists only on a server reporting `server_version_num` of at least
-`190000` and only when the `SCHEMA_PROPERTY_GRAPH` switch is enabled. On PostgreSQL 18, and on
-19 with the switch off, the object is absent while every view it would be declared over is
-still present. A consumer must therefore probe for it rather than assume it, and must be able
-to fall back to the views. See
-[the graph schema](../docs/architecture.md#graph-schema) for the projection and
-[the property graph](../docs/architecture.md#property-graph) for the declaration and its gates.
+SQL/PGQ is no longer part of the persistence contract. The ordinary `graph` relations remain
+unconditional and Neo4j remains the authoritative graph query backend. Recovery details are in
+[the SQL/PGQ removal notes](../docs/sql-pgq-removal.md).
 
 `musicbrainz_delete_reconciliation` records the additive `updated_at` column on
 `musicbrainz.relationships` and `musicbrainz.external_links` — the two MusicBrainz tables that,

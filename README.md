@@ -39,11 +39,8 @@ writes rows into none. `discogs-sql-loader` owns most of them, `musicbrainz-sql-
 MusicBrainz half and co-owns the shared medium vocabulary, `catalog-api` owns the
 personal-collection views, and `graph.release_degree` is split across `discogs-sql-loader` and
 `catalog-api`; the contract names the owner of each relation individually. Every relation is
-applied on every engine. The `graph.catalog` SQL/PGQ property graph declared over them is not —
-`SCHEMA_PROPERTY_GRAPH` is off by default and, even when enabled, the declaration is skipped
-with a logged reason on a server below PostgreSQL 19, so a consumer must probe for it rather
-than assume it. See the [graph schema](docs/architecture.md#graph-schema) and
-[the property graph](docs/architecture.md#property-graph).
+applied on every supported PostgreSQL engine. See the [graph schema](docs/architecture.md#graph-schema)
+and [SQL/PGQ removal notes](docs/sql-pgq-removal.md).
 
 `just check` expands to formatting, lint, type checking, coverage, compatibility and repository
 checks, package/install verification, license checks, secret scanning, and a non-mutating
@@ -81,7 +78,7 @@ explicit migration. Rollouts follow expand, migrate consumers, then contract.
 
 [`contracts/persistence/v1/compatibility.json`](contracts/persistence/v1/compatibility.json)
 records the tested `groovemap-runtime` version and source revision, and records the `graph`
-schema, its views, and the conditional `graph.catalog` property graph as additive objects of
+schema and its relations as additive objects of
 contract version 1. The lockfile is the
 machine-readable dependency authority. A deployment repository owns rollout and rollback.
 

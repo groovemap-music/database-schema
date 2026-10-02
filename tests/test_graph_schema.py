@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import re
-from pathlib import Path
 from typing import ClassVar
 
 from common.credit_roles import ROLE_CATEGORIES, categorize_role
 from common.media import medium_ids, medium_label
 
 from groovemap_schema.postgres import (
-    _COUNTER_BEARING_VERTICES,
     _COUNTER_BOOTSTRAP,
     _DERIVED_EDGE_BOOTSTRAP,
     _EDGE_TABLES,
@@ -24,16 +22,12 @@ from groovemap_schema.postgres import (
     EXPLORE_DEFAULT_ROW_LIMIT,
     EXPLORE_MAX_HOPS,
     EXPLORE_MIN_HOPS,
-    MUSICBRAINZ_RELATIONSHIP_LABEL,
     MUSICBRAINZ_RELATIONSHIP_TYPES,
     PATH_DEFAULT_DEPTH,
     PATH_MAX_DEPTH,
     PATH_MIN_DEPTH,
     PATH_SEEN_RELATION,
-    PROPERTY_GRAPH_STATEMENT,
     _path_neighbour_branches,
-    _property_graph_edges,
-    _property_graph_vertices,
     _role_category_branches,
     _schema_statements,
     graph_bootstrap_statements,
@@ -79,7 +73,7 @@ NEVER_A_VIEW = frozenset((*DERIVED_TABLES, *COUNTER_TABLES))
 PHASE0_STATEMENTS = dict(phase0_comparison_statements("graph_phase0"))
 
 # Every vertex view, with the column that keys it. This is the contract the
-# CREATE PROPERTY GRAPH bead and catalog-api read against, so it is spelled out
+# relational graph contract and catalog-api read against, so it is spelled out
 # here rather than derived from the statements it is meant to police.
 VERTEX_KEYS = {
     "artist": ("artist_id",),
@@ -742,12 +736,6 @@ class TestTrackCredits:
         assert "'tracklist'" in statement
         assert "\nUNION\n" in statement
 
-    def test_both_relations_are_declared_property_graph_edges(self) -> None:
-        """Analytics-only edges, the same standing `artist_genre`/`label_genre` have."""
-        edge_views = {edge.view for edge in _property_graph_edges()}
-        assert {"track_credited_on", "track_by_artist"} <= edge_views
-        assert not {"track_credited_on", "track_by_artist"} & STORAGE_ONLY
-
 
 class TestJsonbGuards:
     """An unnest of an unchecked document never raises on a malformed record."""
@@ -1071,12 +1059,6 @@ class TestMemberOfUnion:
         assert statement.index("TRUNCATE graph.member_of;") < union
         assert union < min(statement.index(f"TRUNCATE graph.{relation};") for relation in COUNTER_TABLES)
 
-    def test_it_binds_no_property_graph_label(self) -> None:
-        """A second artist-to-artist label would double-count every Discogs membership."""
-        elements = {element.element for element in (*_property_graph_vertices(), *_property_graph_edges())}
-        assert "artist_member_of" not in elements
-        assert "member_of" in elements
-
 
 class TestVertexDegree:
     """The per-vertex degree that orders frontier expansion, and its rebuild."""
@@ -1194,11 +1176,6 @@ class TestVertexDegree:
         degree = statement.index("TRUNCATE graph.vertex_degree;")
         for relation in self.PATH_RELATIONS:
             assert statement.index(f"TRUNCATE graph.{relation};") < degree, relation
-
-    def test_it_binds_no_property_graph_label(self) -> None:
-        """It is an ordering heuristic for the path functions, not a node property."""
-        elements = {element.element for element in (*_property_graph_vertices(), *_property_graph_edges())}
-        assert "vertex_degree" not in elements
 
 
 def executable_sql(statement: str) -> str:
@@ -1407,12 +1384,6 @@ class TestShortestPath:
         for earlier in ("graph.refresh_artist_member_of function", "graph.refresh_vertex_degree function"):
             assert names.index(earlier) < names.index("graph.find_shortest_path function"), earlier
         assert names.index("graph.find_shortest_path function") < names.index("graph.bootstrap_fill function")
-
-    def test_it_binds_no_property_graph_label(self) -> None:
-        """A function is not a relation; `graph.catalog` has nothing to bind here."""
-        elements = {element.element for element in (*_property_graph_vertices(), *_property_graph_edges())}
-        assert "find_shortest_path" not in elements
-        assert "find_shortest_path" not in view_names()
 
 
 class TestExploreTraversal:
@@ -1679,216 +1650,6 @@ class TestMediaViews:
             assert "item.value ->> 'family'" in statement
 
 
-class TestPropertyGraph:
-    """`CREATE PROPERTY GRAPH graph.catalog` over the views above (PostgreSQL 19)."""
-
-    def test_the_statement_names_the_catalog_graph(self) -> None:
-        name, statement = PROPERTY_GRAPH_STATEMENT
-        assert name == "graph.catalog property graph"
-        assert statement.startswith("CREATE PROPERTY GRAPH graph.catalog\n")
-
-    def test_the_statement_drops_nothing(self) -> None:
-        """There is no IF NOT EXISTS for a property graph, and no DROP either."""
-        assert "DROP" not in PROPERTY_GRAPH_STATEMENT[1].upper()
-
-    def test_the_statement_is_not_part_of_the_unconditional_schema(self) -> None:
-        """It is gated on the server version and on an operator switch."""
-        assert PROPERTY_GRAPH_STATEMENT[0] not in {name for name, _statement in _schema_statements()}
-        assert PROPERTY_GRAPH_STATEMENT[0] not in {name for name, _statement in _GRAPH_STATEMENTS}
-
-    def test_every_element_table_is_a_declared_graph_relation(self) -> None:
-        elements = {element.element for element in (*_property_graph_vertices(), *_property_graph_edges())}
-        assert elements == view_names() - STORAGE_ONLY
-
-    def test_only_the_counter_bearing_labels_bind_a_relation_of_another_name(self) -> None:
-        renamed = {vertex.view: vertex.element for vertex in _property_graph_vertices() if vertex.element != vertex.view}
-        assert renamed == {label: relation for label, (relation, _columns) in COUNTER_PROPERTIES.items()}
-        for edge in _property_graph_edges():
-            assert edge.element == edge.view, edge.view
-
-    def test_each_counter_bearing_label_publishes_its_counters_as_properties(self) -> None:
-        """The parity claim: `g.release_count` reads off `:Genre`, as it does in Neo4j."""
-        for label, (relation, columns) in COUNTER_PROPERTIES.items():
-            vertex = next(candidate for candidate in _property_graph_vertices() if candidate.view == label)
-            assert vertex.element == relation, label
-            # PROPERTIES ALL COLUMNS, so every column of the projection is a
-            # property and the projection's column list is the property list.
-            assert vertex.properties is None, label
-            statement = GRAPH_STATEMENTS[f"graph.{relation} view"]
-            for column in columns:
-                assert f"AS {column}\n" in statement or f"AS {column}," in statement, f"{relation} is missing {column}"
-
-    def test_each_counter_projection_left_joins_its_uniquely_keyed_counter_relation(self) -> None:
-        """A LEFT JOIN to a uniquely-keyed relation is removed when nothing reads it."""
-        for relation, storage, counters, _carried, _counted in _COUNTER_BEARING_VERTICES:
-            statement = GRAPH_STATEMENTS[f"graph.{relation} view"]
-            assert f"FROM graph.{storage} AS {storage}" in statement, relation
-            assert f"LEFT JOIN graph.{counters} AS {counters} ON" in statement, relation
-            assert "PRIMARY KEY" in ddl_for(counters), counters
-
-    def test_a_count_reads_zero_and_a_first_year_reads_null(self) -> None:
-        """Every caller does arithmetic on a count; none may divide by a null."""
-        for relation, _storage, counters, _carried, counted in _COUNTER_BEARING_VERTICES:
-            statement = GRAPH_STATEMENTS[f"graph.{relation} view"]
-            for column in counted:
-                assert f"COALESCE({counters}.{column}, 0)::bigint AS {column}" in statement, f"{relation}.{column}"
-            if "first_year" in statement:
-                assert f"{counters}.first_year AS first_year" in statement, relation
-                assert "COALESCE(" + counters + ".first_year" not in statement, relation
-
-    def test_release_degree_is_the_one_counter_that_stays_its_own_label(self) -> None:
-        """Its live half is two lateral counts the planner cannot remove."""
-        labels = {vertex.view for vertex in _property_graph_vertices()}
-        assert "release_degree" in labels
-        assert not labels & {"genre_stats", "style_stats", "label_stats", "artist_degree"}
-        statement = statement_for("release_degree")
-        assert "CROSS JOIN LATERAL" in statement
-        assert "release_degree" not in GRAPH_STATEMENTS["graph.release view"]
-
-    def test_every_vertex_and_edge_alias_is_unique(self) -> None:
-        aliases = [vertex.view for vertex in _property_graph_vertices()] + [edge.view for edge in _property_graph_edges()]
-        assert len(aliases) == len(set(aliases))
-
-    def test_every_documented_vertex_is_declared(self) -> None:
-        declared = {vertex.view for vertex in _property_graph_vertices()}
-        assert declared == set(VERTEX_KEYS)
-
-    def test_every_documented_edge_is_declared(self) -> None:
-        declared = {edge.view for edge in _property_graph_edges()}
-        expected = set(EDGE_KEYS) | {f"mb_rel_{source}_{target}" for source, target in MUSICBRAINZ_PAIRS}
-        assert declared == expected
-
-    def test_edge_keys_are_the_documented_key_columns(self) -> None:
-        for edge in _property_graph_edges():
-            if edge.view not in EDGE_KEYS:
-                continue
-            key, _source, _target = EDGE_KEYS[edge.view]
-            assert edge.key == key, edge.view
-
-    def test_musicbrainz_edges_are_keyed_on_the_surrogate_id(self) -> None:
-        for source, target in MUSICBRAINZ_PAIRS:
-            edge = next(candidate for candidate in _property_graph_edges() if candidate.view == f"mb_rel_{source}_{target}")
-            assert edge.key == ("relationship_id",)
-            assert (edge.source, edge.destination) == (f"mb_{source}", f"mb_{target}")
-
-    def test_edge_endpoints_are_the_documented_source_and_target_columns(self) -> None:
-        for edge in _property_graph_edges():
-            if edge.view not in EDGE_KEYS:
-                continue
-            _key, source_column, target_column = EDGE_KEYS[edge.view]
-            assert edge.source_key == (source_column,), edge.view
-            assert edge.destination_key == (target_column,), edge.view
-
-    def test_every_endpoint_resolves_to_a_declared_vertex_alias(self) -> None:
-        vertices = {vertex.view: vertex for vertex in _property_graph_vertices()}
-        for edge in _property_graph_edges():
-            for alias, columns in ((edge.source, edge.source_columns), (edge.destination, edge.destination_columns)):
-                assert alias in vertices, f"{edge.view} references unknown vertex {alias}"
-                assert columns == vertices[alias].key, f"{edge.view} does not reference {alias}'s key"
-
-    def test_every_vertex_is_keyed_on_its_documented_key_column(self) -> None:
-        """Every key is published; none is an appended restatement any more."""
-        for vertex in _property_graph_vertices():
-            assert vertex.key == VERTEX_KEYS[vertex.view], vertex.view
-
-    def test_no_endpoint_resolves_to_a_retired_key_restatement(self) -> None:
-        for edge in _property_graph_edges():
-            for columns in (edge.source_columns, edge.destination_columns):
-                for column in columns:
-                    assert not column.endswith("_key"), edge.view
-
-    def test_the_colliding_property_names_are_cast_to_one_type(self) -> None:
-        """SQL/PGQ requires one data type per property name across the graph."""
-        casts = {
-            ("mb_label", "discogs_label_id::text AS discogs_label_id"),
-            ("collected", "release_id::text AS release_id"),
-            ("wants", "release_id::text AS release_id"),
-        }
-        elements = {element.view: element.properties for element in (*_property_graph_vertices(), *_property_graph_edges())}
-        for view, cast in casts:
-            properties = elements[view]
-            assert properties is not None, view
-            assert cast in properties, view
-
-    def test_only_the_two_personal_edges_still_cast_release_id(self) -> None:
-        """Every other relation publishes it as `text` already."""
-        casting = {
-            element.view
-            for element in (*_property_graph_vertices(), *_property_graph_edges())
-            if any(item.startswith("release_id::") for item in element.properties or ())
-        }
-        assert casting == {"collected", "wants"}
-
-    def test_every_other_element_publishes_all_of_its_columns(self) -> None:
-        forced = {"mb_label", "collected", "wants"}
-        for element in (*_property_graph_vertices(), *_property_graph_edges()):
-            if element.view in forced:
-                assert element.properties is not None, element.view
-            else:
-                assert element.properties is None, element.view
-        elements = len(_property_graph_vertices()) + len(_property_graph_edges())
-        assert PROPERTY_GRAPH_STATEMENT[1].count("PROPERTIES ALL COLUMNS") == elements - len(forced) + len(MUSICBRAINZ_PAIRS)
-
-    def test_the_shared_musicbrainz_label_is_on_exactly_the_sixteen_pair_views(self) -> None:
-        shared = {edge.view for edge in _property_graph_edges() if MUSICBRAINZ_RELATIONSHIP_LABEL in edge.extra_labels}
-        assert shared == {f"mb_rel_{source}_{target}" for source, target in MUSICBRAINZ_PAIRS}
-
-    def test_no_label_is_a_reserved_word(self) -> None:
-        for label in self.labels():
-            assert label not in RESERVED_WORDS, f"label {label} is reserved"
-
-    def test_every_element_carries_its_own_view_name_as_a_label(self) -> None:
-        statement = PROPERTY_GRAPH_STATEMENT[1]
-        for element in (*_property_graph_vertices(), *_property_graph_edges()):
-            assert f"LABEL {element.view} " in statement, element.view
-
-    def test_the_declared_labels_are_the_relations_plus_the_shared_one(self) -> None:
-        """A label is a relation name verbatim, except the four that bind a projection."""
-        projections = {relation for relation, _columns in COUNTER_PROPERTIES.values()}
-        expected = (view_names() - STORAGE_ONLY - projections) | set(COUNTER_PROPERTIES) | {MUSICBRAINZ_RELATIONSHIP_LABEL}
-        assert self.labels() == expected
-
-    def test_every_edge_declares_explicit_keys_and_references(self) -> None:
-        """No endpoint is inferred from a foreign key: views carry none."""
-        statement = PROPERTY_GRAPH_STATEMENT[1]
-        assert statement.count("SOURCE KEY (") == len(_property_graph_edges())
-        assert statement.count("DESTINATION KEY (") == len(_property_graph_edges())
-        assert statement.count(") REFERENCES ") == 2 * len(_property_graph_edges())
-
-    @staticmethod
-    def labels() -> set[str]:
-        """Return every label the statement declares."""
-        return set(re.findall(r"LABEL (\w+) ", PROPERTY_GRAPH_STATEMENT[1]))
-
-
-# docs/architecture.md carries the rendered statement in full so a catalog-api
-# rewrite can cite an exact label, key, or property without running a
-# PostgreSQL 19 server. That only holds while the two agree.
-ARCHITECTURE_DOC = Path(__file__).resolve().parents[1] / "docs" / "architecture.md"
-
-
-def documented_property_graph_ddl() -> str:
-    """Return the fenced SQL block in the architecture doc holding the statement."""
-    blocks = re.findall(r"```sql\n(.*?)```", ARCHITECTURE_DOC.read_text(), re.DOTALL)
-    declarations = [block for block in blocks if block.startswith("CREATE PROPERTY GRAPH")]
-    assert len(declarations) == 1, f"expected one CREATE PROPERTY GRAPH block, found {len(declarations)}"
-    return declarations[0]
-
-
-class TestPropertyGraphDocumentation:
-    """The documented DDL is the generated DDL, not a copy that drifted from it."""
-
-    def test_the_documented_ddl_is_byte_identical_to_the_generator_output(self) -> None:
-        assert documented_property_graph_ddl() == PROPERTY_GRAPH_STATEMENT[1] + ";\n"
-
-    def test_the_documented_ddl_is_the_whole_statement(self) -> None:
-        """A truncated paste would still start with CREATE PROPERTY GRAPH."""
-        documented = documented_property_graph_ddl()
-        assert documented.rstrip().endswith(");")
-        for element in (*_property_graph_vertices(), *_property_graph_edges()):
-            assert f"graph.{element.element} AS {element.view} " in documented, element.view
-
-
 class TestMusicBrainzVerticesPublishGmItemId:
     """Each `mb_*` vertex gains `gm_item_id` (design ADR 0012's amendment, section 3)."""
 
@@ -1910,13 +1671,3 @@ class TestMusicBrainzVerticesPublishGmItemId:
             ("mb_release_group", "discogs_master_id"),
         ):
             assert f"AS {column}" in statement_for(view), view
-
-    def test_the_explicit_mb_label_property_list_carries_it(self) -> None:
-        vertex = next(vertex for vertex in _property_graph_vertices() if vertex.view == "mb_label")
-        assert vertex.properties is not None
-        assert "gm_item_id" in vertex.properties
-
-    def test_the_other_mb_labels_publish_all_columns(self) -> None:
-        for vertex in _property_graph_vertices():
-            if vertex.view in {"mb_artist", "mb_release", "mb_release_group"}:
-                assert vertex.properties is None, vertex.view
