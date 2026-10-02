@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import random
-from contextlib import asynccontextmanager
 from datetime import date
-from typing import TYPE_CHECKING, Any
+from typing import Any
 from uuid import uuid4
 
 import psycopg
@@ -20,24 +19,13 @@ from psycopg.types.json import Jsonb
 from groovemap_schema import initializer
 from groovemap_schema.neo4j import SCHEMA_STATEMENTS
 from groovemap_schema.postgres import (
-    _BOOTSTRAP_FILL_ORDER,
-    _COUNTER_BEARING_VERTICES,
     _EDGE_TABLES,
     _GRAPH_STATEMENTS,
     _VERTEX_KIND_NAMES,
     ARTIST_EMBEDDINGS_HNSW_INDEX_NAME,
     EMBEDDING_PIPELINE_ROLE,
     MUSICBRAINZ_RELATIONSHIP_TYPES,
-    PROPERTY_GRAPH_FINGERPRINT_PREFIX,
-    PROPERTY_GRAPH_MINIMUM_SERVER_VERSION,
-    PROPERTY_GRAPH_RELATION,
-    PROPERTY_GRAPH_SCHEMA,
-    PROPERTY_GRAPH_STATEMENT,
-    PROPERTY_GRAPH_SWITCH,
     VECTOR_EXTENSION,
-    _apply_property_graph,
-    _property_graph_edges,
-    _property_graph_vertices,
     _widen_to_bigint,
     build_artist_embeddings_index,
     build_artist_embeddings_version_index,
@@ -49,28 +37,8 @@ from groovemap_schema.postgres import (
 )
 
 
-if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
-
-
 pytestmark = pytest.mark.integration
 
-
-@pytest.fixture(autouse=True)
-def _enable_the_property_graph(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Run both tiers with the switch on, so only the server version decides.
-
-    The PostgreSQL 18 tier proving the graph absent is then a statement about
-    the version gate rather than about which environment the suite happened to
-    inherit, and the PostgreSQL 19 tier gets the graph without the integration
-    script having to know the difference.
-    """
-    monkeypatch.setenv(PROPERTY_GRAPH_SWITCH, "enabled")
-
-
-# The relkind PostgreSQL 19 beta3 gives a property graph in `pg_class`. It is its
-# own kind, beside `r` for a table and `v` for a view.
-PROPERTY_GRAPH_RELKIND = "g"
 
 EXPECTED_POSTGRES_TABLES = {
     "public": {
@@ -215,13 +183,6 @@ SCHEMAS = ("public", "insights", "musicbrainz", "graph")
 EXPECTED_GRAPH_VIEWS = {name.removeprefix("graph.").removesuffix(" view") for name, _statement in _GRAPH_STATEMENTS if name.endswith(" view")}
 EXPECTED_GRAPH_TABLES = {name.removeprefix("graph.").removesuffix(" table") for name, _statement in _GRAPH_STATEMENTS if name.endswith(" table")}
 EXPECTED_GRAPH_RELATIONS = EXPECTED_GRAPH_VIEWS | EXPECTED_GRAPH_TABLES
-
-# Every element of `graph.catalog`, and the eleven relations that bind none:
-# they hold rows or counters for a label that binds a view joining them, plus
-# the loader-written half of release degree, the MEMBER_OF union, and the
-# per-vertex degree the path functions order their expansion by.
-DECLARED_ELEMENTS = (*_property_graph_vertices(), *_property_graph_edges())
-STORAGE_ONLY_RELATIONS = EXPECTED_GRAPH_RELATIONS - {element.element for element in DECLARED_ELEMENTS}
 
 # The schema holding the retained phase 0 view definitions. It is created by the
 # parity test alone; the initializer never emits it and a deployed database
@@ -538,125 +499,13 @@ async def assert_expected_postgres_schema() -> None:
     assert latch_key == [(["loader", "version"],)]
 
 
-# ── The catalog property graph ───────────────────────────────────────────────
+# ── PostgreSQL server metadata ───────────────────────────────────────────────
 
 
 async def server_version_num() -> int:
     """Return the connected engine's `server_version_num`."""
     rows = await postgres_rows("SELECT current_setting('server_version_num')::int")
     return int(rows[0][0])
-
-
-async def property_graph_relkind() -> str | None:
-    """Return the relkind of `graph.catalog`, or None when nothing carries the name."""
-    rows = await postgres_rows(
-        """
-        SELECT relation.relkind
-        FROM pg_class AS relation
-        JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
-        WHERE namespace.nspname = %s AND relation.relname = %s
-        """,
-        (PROPERTY_GRAPH_SCHEMA, PROPERTY_GRAPH_RELATION),
-    )
-    return None if not rows else str(rows[0][0])
-
-
-async def property_graph_snapshot() -> tuple[tuple[Any, ...], ...]:
-    """Capture every element, label, and property of `graph.catalog`.
-
-    Empty on PostgreSQL 18, where the `pg_propgraph_*` catalogs do not exist and
-    the gate has closed on the server version anyway. On 19 this is what proves a
-    second apply changed nothing: the graph's fingerprint and elements already
-    match its definition, so the initializer leaves it rather than re-declaring it.
-    """
-    if await server_version_num() < PROPERTY_GRAPH_MINIMUM_SERVER_VERSION:
-        return ()
-    rows = await postgres_rows(
-        """
-        SELECT element.pgealias,
-               element.pgerelid::regclass::text,
-               element.pgekind::text,
-               label.pgllabel,
-               property.pgpname,
-               format_type(property.pgptypid, property.pgptypmod)
-        FROM pg_propgraph_element AS element
-        JOIN pg_propgraph_element_label AS element_label ON element_label.pgelelid = element.oid
-        JOIN pg_propgraph_label AS label ON label.oid = element_label.pgellabelid
-        JOIN pg_propgraph_label_property AS label_property ON label_property.plpellabelid = element_label.oid
-        JOIN pg_propgraph_property AS property ON property.oid = label_property.plppropid
-        WHERE element.pgepgid = (%s || '.' || %s)::regclass
-        ORDER BY 1, 4, 5
-        """,
-        (PROPERTY_GRAPH_SCHEMA, PROPERTY_GRAPH_RELATION),
-    )
-    return tuple(rows)
-
-
-async def assert_the_property_graph_matches_the_server() -> None:
-    """Assert `graph.catalog` exists on PostgreSQL 19 and nowhere else."""
-    relkind = await property_graph_relkind()
-    if await server_version_num() < PROPERTY_GRAPH_MINIMUM_SERVER_VERSION:
-        assert relkind is None, "PostgreSQL 18 must carry no graph.catalog relation"
-        assert await property_graph_snapshot() == ()
-        return
-    assert relkind == PROPERTY_GRAPH_RELKIND
-
-    # Every element table is one of the graph schema's own views, and every one
-    # of them is declared: the graph covers the schema rather than a subset of it.
-    elements = await postgres_rows(
-        """
-        SELECT element.pgealias, element.pgerelid::regclass::text, element.pgekind::text
-        FROM pg_propgraph_element AS element
-        WHERE element.pgepgid = (%s || '.' || %s)::regclass
-        """,
-        (PROPERTY_GRAPH_SCHEMA, PROPERTY_GRAPH_RELATION),
-    )
-    # An alias is the label; the relation underneath it differs for the four
-    # labels that bind a counter projection.
-    assert {alias for alias, _relation, _kind in elements} == {element.view for element in DECLARED_ELEMENTS}
-    assert {relation for _alias, relation, _kind in elements} == {f"graph.{element.element}" for element in DECLARED_ELEMENTS}
-    assert {f"graph.{relation}" for relation in STORAGE_ONLY_RELATIONS}.isdisjoint({relation for _alias, relation, _kind in elements})
-    assert {kind for _alias, _relation, kind in elements} == {"e", "v"}
-
-    # SQL/PGQ requires one data type per property name across the whole graph.
-    # `pg_propgraph_property` is the engine's own register of that, so a single
-    # row per name is the rule holding rather than a restatement of it.
-    duplicates = await postgres_rows(
-        """
-        SELECT property.pgpname
-        FROM pg_propgraph_property AS property
-        WHERE property.pgppgid = (%s || '.' || %s)::regclass
-        GROUP BY property.pgpname
-        HAVING count(*) > 1
-        """,
-        (PROPERTY_GRAPH_SCHEMA, PROPERTY_GRAPH_RELATION),
-    )
-    assert duplicates == []
-
-    # The four names the views spell two ways, unified on text.
-    unified = await postgres_rows(
-        """
-        SELECT property.pgpname, format_type(property.pgptypid, property.pgptypmod)
-        FROM pg_propgraph_property AS property
-        WHERE property.pgppgid = (%s || '.' || %s)::regclass
-          AND property.pgpname IN ('artist_id', 'label_id', 'master_id', 'discogs_label_id')
-        ORDER BY 1
-        """,
-        (PROPERTY_GRAPH_SCHEMA, PROPERTY_GRAPH_RELATION),
-    )
-    assert unified == [("artist_id", "text"), ("discogs_label_id", "text"), ("label_id", "text"), ("master_id", "text")]
-
-    # The structural key columns stay out of the published properties.
-    structural = await postgres_rows(
-        """
-        SELECT property.pgpname
-        FROM pg_propgraph_property AS property
-        WHERE property.pgppgid = (%s || '.' || %s)::regclass
-          AND property.pgpname LIKE '%%\\_key'
-        """,
-        (PROPERTY_GRAPH_SCHEMA, PROPERTY_GRAPH_RELATION),
-    )
-    assert structural == []
 
 
 # ── The vector extension, artist embeddings, and the embedding pipeline role ─
@@ -843,24 +692,20 @@ async def test_both_schema_initializers_are_real_engine_idempotent() -> None:
     await apply_schema()
     await assert_expected_postgres_schema()
     await assert_expected_neo4j_schema()
-    await assert_the_property_graph_matches_the_server()
     await assert_the_artist_embeddings_table_matches_the_server()
     await assert_the_embedding_pipeline_role_matches_the_server()
     first_postgres = await postgres_snapshot()
     first_neo4j = await neo4j_snapshot()
-    first_property_graph = await property_graph_snapshot()
     await seed_sentinels()
 
     await apply_schema()
     await assert_expected_postgres_schema()
     await assert_expected_neo4j_schema()
-    await assert_the_property_graph_matches_the_server()
     await assert_the_artist_embeddings_table_matches_the_server()
     await assert_the_embedding_pipeline_role_matches_the_server()
 
     assert await postgres_snapshot() == first_postgres
     assert await neo4j_snapshot() == first_neo4j
-    assert await property_graph_snapshot() == first_property_graph
     await assert_sentinels_survive()
 
 
@@ -2237,779 +2082,9 @@ async def test_the_widening_skips_a_narrow_column_a_view_already_reads() -> None
     assert {row[0] for row in view_rows} == EXPECTED_GRAPH_VIEWS
     # On PostgreSQL 19 the CASCADE also pruned the view's element out of
     # `graph.catalog`; the same run re-declares it.
-    await assert_the_property_graph_matches_the_server()
 
 
-# ── GRAPH_TABLE smoke queries ────────────────────────────────────────────────
-# Pattern matching over the same sentinel rows the view projections are checked
-# against, so a passing query is a statement about the declared graph rather
-# than about a second fixture written to suit it.
-
-# The bead's own two-hop shape. Release 111 carries one usable artist — the
-# document repeats `{"id": 7}` and the enricher's filters drop the `0` sentinel
-# and the element with no id — so `a` and `b` bind to the same artist. The
-# traversal is still two hops through two edge bindings, which is what is being
-# proved; the query below it walks the same two hops between distinct vertices.
-TWO_HOP_RELEASE_ARTIST = """
-SELECT * FROM GRAPH_TABLE (graph.catalog
-    MATCH (a IS artist)<-[IS by_artist]-(r IS release)-[IS by_artist]->(b IS artist)
-    COLUMNS (r.release_id AS release_id, a.artist_id AS left_artist_id, b.artist_id AS right_artist_id, a.name AS artist_name)
-) ORDER BY 1, 2, 3
-"""
-
-# Release to artist through the master, over three vertex labels and two of the
-# restated text keys.
-TWO_HOP_RELEASE_MASTER_ARTIST = """
-SELECT * FROM GRAPH_TABLE (graph.catalog
-    MATCH (r IS release)-[IS derived_from]->(m IS master)-[IS master_by_artist]->(a IS artist)
-    COLUMNS (r.release_id AS release_id, m.master_id AS master_id, a.artist_id AS artist_id, a.name AS artist_name)
-) ORDER BY 1, 2, 3
-"""
-
-MUSICBRAINZ_RELATIONSHIP = """
-SELECT * FROM GRAPH_TABLE (graph.catalog
-    MATCH (s IS mb_artist)-[e IS mb_rel_artist_artist]->(t IS mb_artist)
-    COLUMNS (s.name AS source_name, e.relationship_type AS relationship_type, t.name AS target_name)
-) ORDER BY 1, 2, 3
-"""
-
-# The same edges reached through the label all sixteen endpoint pairs share.
-MUSICBRAINZ_RELATIONSHIP_SHARED_LABEL = """
-SELECT * FROM GRAPH_TABLE (graph.catalog
-    MATCH (s IS mb_artist)-[e IS mb_related]->(t IS mb_artist)
-    COLUMNS (s.name AS source_name, e.relationship_type AS relationship_type, t.name AS target_name)
-) ORDER BY 1, 2, 3
-"""
-
-
-# The same edges, read through the raw string the loader stored. Both properties
-# are published on all sixteen pair relations, which is what lets them go on
-# sharing one `mb_related` label.
-MUSICBRAINZ_RELATIONSHIP_RAW_TYPE = """
-SELECT * FROM GRAPH_TABLE (graph.catalog
-    MATCH (s IS mb_artist)-[e IS mb_related]->(t IS mb_artist)
-    COLUMNS (s.name AS source_name, e.raw_relationship_type AS raw_relationship_type, t.name AS target_name)
-) ORDER BY 1, 2, 3
-"""
-
-
-@pytest.mark.asyncio
-async def test_graph_table_queries_run_over_the_sentinel_rows() -> None:
-    """Pattern matching resolves on the engine, not only in the statement text."""
-    await apply_schema()
-    if await server_version_num() < PROPERTY_GRAPH_MINIMUM_SERVER_VERSION:
-        pytest.skip("CREATE PROPERTY GRAPH needs PostgreSQL 19")
-    await seed_graph_fixtures()
-    await bootstrap_the_loader_tables()
-
-    assert await postgres_rows(TWO_HOP_RELEASE_ARTIST) == [("111", "7", "7", "Alice")]
-    assert await postgres_rows(TWO_HOP_RELEASE_MASTER_ARTIST) == [("111", "55", "7", "Alice")]
-
-    # The dangling relationship — a target mbid the loader never stored — is
-    # absent, because the edge view inner-joins both endpoint tables. The type
-    # reads as the Neo4j name a ported Cypher query asks for, not as the raw
-    # MusicBrainz string the loader stored.
-    assert await postgres_rows(MUSICBRAINZ_RELATIONSHIP) == [
-        ("Alice", "MEMBER_OF", "The Band"),
-        ("Session Player", "MEMBER_OF", "The Band"),
-    ]
-    assert await postgres_rows(MUSICBRAINZ_RELATIONSHIP_SHARED_LABEL) == [
-        ("Alice", "MEMBER_OF", "The Band"),
-        ("Session Player", "MEMBER_OF", "The Band"),
-    ]
-    assert await postgres_rows(MUSICBRAINZ_RELATIONSHIP_RAW_TYPE) == [
-        ("Alice", "member of band", "The Band"),
-        ("Session Player", "member of band", "The Band"),
-    ]
-
-
-# ── Counters as properties of the label Neo4j carries them on ───────────────
-# `graphinator` writes release_count, artist_count, label_count, style_count and
-# first_year onto `:Genre`, and the equivalents onto `:Style`, `:Label` and
-# `:Artist`. Eight catalog-api functions read them as node properties, so the
-# parity claim is that they read as properties of the same label here. These
-# queries are the claim: a bare read, a filter, and a read across an edge.
-
-COUNTERS_ON_THE_GENRE_LABEL = """
-SELECT * FROM GRAPH_TABLE (graph.catalog
-    MATCH (g IS genre)
-    COLUMNS (g.name AS name, g.release_count AS release_count, g.style_count AS style_count, g.first_year AS first_year)
-) ORDER BY 1
-"""
-
-FILTERING_ON_A_COUNTER = """
-SELECT * FROM GRAPH_TABLE (graph.catalog
-    MATCH (g IS genre WHERE g.release_count > 0)
-    COLUMNS (g.name AS name, g.release_count AS release_count)
-) ORDER BY 1
-"""
-
-COUNTERS_READ_ACROSS_AN_EDGE = """
-SELECT * FROM GRAPH_TABLE (graph.catalog
-    MATCH (r IS release)-[IS in_genre]->(g IS genre)
-    COLUMNS (r.release_id AS release_id, g.name AS name, g.release_count AS release_count)
-) ORDER BY 1, 2
-"""
-
-DEGREE_ON_THE_ARTIST_LABEL = """
-SELECT * FROM GRAPH_TABLE (graph.catalog
-    MATCH (a IS artist WHERE a.artist_id = '7')
-    COLUMNS (a.artist_id AS artist_id, a.name AS name, a.degree AS degree)
-)
-"""
-
-# Release degree is the one counter that is NOT a property of its label, and
-# this is the carry-forward spelling a rewrite uses instead.
-RELEASE_DEGREE_AS_ITS_OWN_LABEL = """
-SELECT * FROM GRAPH_TABLE (graph.catalog
-    MATCH (r IS release_degree WHERE r.release_id = '111')
-    COLUMNS (r.release_id AS release_id, r.degree AS degree)
-)
-"""
-
-# The two-hop the pilot family walks, read with no counter named. The planner
-# removes each LEFT JOIN to a uniquely-keyed counter relation outright, so the
-# shape costs nothing on the path catalog-api actually migrates first.
-PILOT_TWO_HOP_PLAN = """
-EXPLAIN (COSTS OFF)
-SELECT * FROM GRAPH_TABLE (graph.catalog
-    MATCH (anchor IS artist WHERE anchor.artist_id = '1')
-          <-[IS by_artist]-(credit IS release)-[IS by_artist]->(peer IS artist)
-    COLUMNS (peer.artist_id AS collaborator_id, peer.name AS collaborator_name, credit.release_id AS release_id)
-)
-"""
-
-
-@pytest.mark.asyncio
-async def test_the_counters_read_as_properties_of_the_label_neo4j_carries_them_on() -> None:
-    """`g.release_count` reads off `:Genre`, exactly as the Cypher it replaces does."""
-    await apply_schema()
-    if await server_version_num() < PROPERTY_GRAPH_MINIMUM_SERVER_VERSION:
-        pytest.skip("GRAPH_TABLE needs PostgreSQL 19")
-    await seed_graph_fixtures()
-    await bootstrap_the_loader_tables()
-
-    # A LEFT JOIN to a uniquely-keyed relation neither drops a vertex nor
-    # doubles one. Proving it on the engine is what says the projection is a
-    # presentation of the storage relation rather than a second population.
-    for relation, storage, _counters, _carried, _counted in _COUNTER_BEARING_VERTICES:
-        # Both names come from the initializer's own statement list.
-        projected = await postgres_rows(f"SELECT count(*) FROM graph.{relation}")  # noqa: S608
-        stored = await postgres_rows(f"SELECT count(*) FROM graph.{storage}")  # noqa: S608
-        assert projected == stored, relation
-        assert stored[0][0] > 0, storage
-
-    assert await postgres_rows(COUNTERS_ON_THE_GENRE_LABEL) == [("Rock", 1, 2, 1969)]
-    assert await postgres_rows(FILTERING_ON_A_COUNTER) == [("Rock", 1)]
-    assert await postgres_rows(COUNTERS_READ_ACROSS_AN_EDGE) == [("111", "Rock", 1)]
-    assert await postgres_rows(DEGREE_ON_THE_ARTIST_LABEL) == [("7", "Alice", 6)]
-
-    # Release degree stays a label of its own; this is the one carry-forward
-    # spelling, and the reason is the live half of the count rather than any
-    # SQL/PGQ limit.
-    base = await postgres_rows("SELECT degree FROM graph.release_degree_base WHERE release_id = '111'")
-    assert await postgres_rows(RELEASE_DEGREE_AS_ITS_OWN_LABEL) == [("111", base[0][0] + 2)]
-
-
-@pytest.mark.asyncio
-async def test_the_counter_join_is_removed_when_no_counter_is_read() -> None:
-    """A LEFT JOIN to a uniquely-keyed relation costs nothing when nothing reads it.
-
-    This is what makes carrying the counters on the label free on the pilot
-    path: the two-hop collaborator walk names no counter, so neither artist
-    binding pays for `graph.artist_degree` at all.
-    """
-    await apply_schema()
-    if await server_version_num() < PROPERTY_GRAPH_MINIMUM_SERVER_VERSION:
-        pytest.skip("GRAPH_TABLE needs PostgreSQL 19")
-    await seed_pilot_fixtures()
-    await bootstrap_the_loader_tables()
-    await execute_all([("analyze", "ANALYZE graph.artist, graph.artist_degree, graph.by_artist")])
-
-    plan = "\n".join(str(row[0]) for row in await postgres_rows(PILOT_TWO_HOP_PLAN))
-    assert "artist_degree" not in plan, plan
-    assert "by_artist" in plan, plan
-
-    # The join is present the moment a counter is named, which is what proves
-    # the absence above is the planner removing it rather than the property
-    # being unreachable.
-    named = "\n".join(
-        str(row[0])
-        for row in await postgres_rows(
-            "EXPLAIN (COSTS OFF) " + DEGREE_ON_THE_ARTIST_LABEL.replace("'7'", "'1'"),
-        )
-    )
-    assert "artist_degree" in named, named
-
-
-@pytest.mark.asyncio
-async def test_the_property_graph_is_absent_below_postgresql_19() -> None:
-    """The required tier must be untouched by a feature it cannot carry."""
-    await apply_schema()
-    if await server_version_num() >= PROPERTY_GRAPH_MINIMUM_SERVER_VERSION:
-        pytest.skip("this engine is PostgreSQL 19 or later")
-    assert await property_graph_relkind() is None
-    assert await postgres_rows(
-        "SELECT count(*) FROM pg_class WHERE relnamespace = 'graph'::regnamespace AND relkind = %s",
-        (PROPERTY_GRAPH_RELKIND,),
-    ) == [(0,)]
-
-
-# ── The pilot family, over tables and over the retained phase 0 views ────────
-# catalog-api's first GRAPH_TABLE migration is the collaborator family in
-# `api/queries/network_pg_queries.py`, written against the template in its
-# `docs/graph-table-migration-template.md`. It touches two vertex labels and one
-# edge label — `artist`, `release`, and `by_artist` — and the whole point of
-# re-declaring `graph.catalog` over tables is that those queries do not move.
-#
-# So they are run here verbatim, character for character as catalog-api holds
-# them, against two property graphs over the same rows: `graph.catalog`, whose
-# `by_artist` is the loader-written table, and a second graph whose `by_artist`
-# is the retained phase 0 view. A difference between them is a difference in
-# what the edge model holds, because nothing else about the two declarations
-# differs.
-
-PILOT_GRAPH = "graph_pilot_phase0.catalog"
-
-# The second declaration. The two vertex element tables are the shipped views —
-# they were never materialized — so the edge relation is the only thing that
-# changes between the two graphs, which is what makes the comparison mean
-# something.
-PILOT_PHASE0_GRAPH = f"""
-CREATE PROPERTY GRAPH {PILOT_GRAPH}
-    VERTEX TABLES (
-        graph.release AS release KEY (release_id)
-            LABEL release PROPERTIES ALL COLUMNS,
-        graph.artist AS artist KEY (artist_id)
-            LABEL artist PROPERTIES ALL COLUMNS
-    )
-    EDGE TABLES (
-        {PHASE0_SCHEMA}.by_artist AS by_artist KEY (release_id, artist_id)
-            SOURCE KEY (release_id) REFERENCES release (release_id)
-            DESTINATION KEY (artist_id) REFERENCES artist (artist_id)
-            LABEL by_artist PROPERTIES ALL COLUMNS
-    )
-"""
-
-# Verbatim from catalog-api `api/queries/network_pg_queries.py:75`.
-ARTIST_IDENTITY_SQL = """
-SELECT anchor_row.artist_id, anchor_row.artist_name
-FROM GRAPH_TABLE (graph.catalog
-    MATCH (anchor IS artist WHERE anchor.artist_id = %(artist_id)s)
-    COLUMNS (anchor.artist_id AS artist_id, anchor.name AS artist_name)
-) AS anchor_row
-LIMIT 1
-"""
-
-# Verbatim from catalog-api `api/queries/network_pg_queries.py:146`, with the
-# f-string fragments expanded exactly as the module composes them.
-MULTI_HOP_COLLABORATORS_SQL = """
-WITH direct AS (
-    SELECT collaborator_id, collaborator_name, release_id
-    FROM GRAPH_TABLE (graph.catalog
-        MATCH (anchor IS artist WHERE anchor.artist_id = %(artist_id)s)
-              <-[IS by_artist]-(credit IS release)-[IS by_artist]->(peer IS artist)
-        WHERE peer.artist_id <> anchor.artist_id
-        COLUMNS (
-            peer.artist_id AS collaborator_id,
-            peer.name AS collaborator_name,
-            credit.release_id AS release_id
-        )
-    ) AS hop
-),
-indirect AS (
-    SELECT collaborator_id, collaborator_name, bridge_id
-    FROM GRAPH_TABLE (graph.catalog
-        MATCH (anchor IS artist WHERE anchor.artist_id = %(artist_id)s)
-              <-[IS by_artist]-(near IS release)-[IS by_artist]->(bridge IS artist)
-              <-[IS by_artist]-(far IS release)-[IS by_artist]->(peer IS artist)
-        WHERE bridge.artist_id <> anchor.artist_id
-          AND peer.artist_id <> anchor.artist_id
-          AND peer.artist_id <> bridge.artist_id
-          AND far.release_id <> near.release_id
-        COLUMNS (
-            peer.artist_id AS collaborator_id,
-            peer.name AS collaborator_name,
-            bridge.artist_id AS bridge_id
-        )
-    ) AS hop
-)
-SELECT collaborator_id AS artist_id,
-       collaborator_name AS artist_name,
-       distance,
-       collaboration_count
-FROM (
-    SELECT collaborator_id,
-           collaborator_name,
-           1 AS distance,
-           count(DISTINCT release_id)::bigint AS collaboration_count
-    FROM direct
-    GROUP BY collaborator_id, collaborator_name
-    UNION ALL
-    SELECT collaborator_id,
-           collaborator_name,
-           2 AS distance,
-           count(DISTINCT bridge_id)::bigint AS collaboration_count
-    FROM indirect
-    WHERE %(depth)s >= 2
-      AND NOT EXISTS (SELECT 1
-        FROM GRAPH_TABLE (graph.catalog
-            MATCH (anchor IS artist WHERE anchor.artist_id = %(artist_id)s)
-                  <-[IS by_artist]-(credit IS release)-[IS by_artist]->(peer IS artist)
-            COLUMNS (peer.artist_id AS collaborator_id)
-        ) AS one_hop
-        WHERE one_hop.collaborator_id = indirect.collaborator_id
-      )
-    GROUP BY collaborator_id, collaborator_name
-) AS reachable
-ORDER BY distance ASC, collaboration_count DESC
-LIMIT %(limit)s
-"""
-
-# Verbatim from catalog-api `api/queries/network_pg_queries.py:181`.
-COUNT_MULTI_HOP_COLLABORATORS_SQL = """
-WITH direct AS (
-    SELECT collaborator_id, collaborator_name, release_id
-    FROM GRAPH_TABLE (graph.catalog
-        MATCH (anchor IS artist WHERE anchor.artist_id = %(artist_id)s)
-              <-[IS by_artist]-(credit IS release)-[IS by_artist]->(peer IS artist)
-        WHERE peer.artist_id <> anchor.artist_id
-        COLUMNS (
-            peer.artist_id AS collaborator_id,
-            peer.name AS collaborator_name,
-            credit.release_id AS release_id
-        )
-    ) AS hop
-),
-indirect AS (
-    SELECT collaborator_id, collaborator_name, bridge_id
-    FROM GRAPH_TABLE (graph.catalog
-        MATCH (anchor IS artist WHERE anchor.artist_id = %(artist_id)s)
-              <-[IS by_artist]-(near IS release)-[IS by_artist]->(bridge IS artist)
-              <-[IS by_artist]-(far IS release)-[IS by_artist]->(peer IS artist)
-        WHERE bridge.artist_id <> anchor.artist_id
-          AND peer.artist_id <> anchor.artist_id
-          AND peer.artist_id <> bridge.artist_id
-          AND far.release_id <> near.release_id
-        COLUMNS (
-            peer.artist_id AS collaborator_id,
-            peer.name AS collaborator_name,
-            bridge.artist_id AS bridge_id
-        )
-    ) AS hop
-)
-SELECT count(*)::bigint AS total
-FROM (
-    SELECT collaborator_id FROM direct
-    UNION
-    SELECT collaborator_id
-    FROM indirect
-    WHERE %(depth)s >= 2
-      AND NOT EXISTS (SELECT 1
-        FROM GRAPH_TABLE (graph.catalog
-            MATCH (anchor IS artist WHERE anchor.artist_id = %(artist_id)s)
-                  <-[IS by_artist]-(credit IS release)-[IS by_artist]->(peer IS artist)
-            COLUMNS (peer.artist_id AS collaborator_id)
-        ) AS one_hop
-        WHERE one_hop.collaborator_id = indirect.collaborator_id
-      )
-) AS reachable
-"""
-
-PILOT_QUERIES = (
-    ("artist identity", ARTIST_IDENTITY_SQL, {"artist_id": "1"}),
-    ("collaborators, depth 1", MULTI_HOP_COLLABORATORS_SQL, {"artist_id": "1", "depth": 1, "limit": 50}),
-    ("collaborators, depth 2", MULTI_HOP_COLLABORATORS_SQL, {"artist_id": "1", "depth": 2, "limit": 50}),
-    ("collaborators, limited", MULTI_HOP_COLLABORATORS_SQL, {"artist_id": "1", "depth": 2, "limit": 4}),
-    ("collaborator count", COUNT_MULTI_HOP_COLLABORATORS_SQL, {"artist_id": "1", "depth": 2}),
-    ("unknown artist", MULTI_HOP_COLLABORATORS_SQL, {"artist_id": "does-not-exist", "depth": 2, "limit": 50}),
-)
-
-# A collaboration neighbourhood two hops deep around artist 1. Artists 2, 3, and
-# 4 are direct collaborators over three, two, and one release; 5, 6, and 7 are
-# reachable only through them.
-PILOT_ARTISTS = {
-    "1": "Anchor",
-    "2": "Near Two",
-    "3": "Near Three",
-    "4": "Near Four",
-    "5": "Far Five",
-    "6": "Far Six",
-    "7": "Far Seven",
-}
-
-PILOT_RELEASES = {
-    "2001": ["1", "2"],
-    "2002": ["1", "2"],
-    "2003": ["1", "2", "3"],
-    "2004": ["1", "3"],
-    "2005": ["1", "4"],
-    "2006": ["2", "5"],
-    "2007": ["3", "5"],
-    "2008": ["3", "6"],
-    "2009": ["4", "7"],
-}
-
-
-async def seed_pilot_fixtures() -> None:
-    """Write the collaboration neighbourhood the pilot family reads."""
-    connection = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params())
-    async with connection, connection.cursor() as cursor:
-        for artist_id, name in PILOT_ARTISTS.items():
-            await cursor.execute(
-                "INSERT INTO artists (data_id, hash, data) VALUES (%s, %s, %s) ON CONFLICT (data_id) DO NOTHING",
-                (artist_id, f"hash-artist-{artist_id}", Jsonb({"id": int(artist_id), "name": name})),
-            )
-        for release_id, artist_ids in PILOT_RELEASES.items():
-            document = {
-                "id": int(release_id),
-                "title": f"Pilot {release_id}",
-                "artists": [{"id": int(artist_id), "name": PILOT_ARTISTS[artist_id]} for artist_id in artist_ids],
-            }
-            await cursor.execute(
-                "INSERT INTO releases (data_id, hash, data) VALUES (%s, %s, %s) ON CONFLICT (data_id) DO NOTHING",
-                (release_id, f"hash-release-{release_id}", Jsonb(document)),
-            )
-        await connection.commit()
-
-
-@pytest.mark.asyncio
-async def test_the_pilot_family_reads_the_tables_exactly_as_it_read_the_views() -> None:
-    """catalog-api's first GRAPH_TABLE migration does not move when the shape does.
-
-    Both graphs are declared over the same two vertex views and differ only in
-    where `by_artist` comes from, so the comparison isolates the one thing this
-    batch changed about that read path.
-    """
-    await apply_schema()
-    if await server_version_num() < PROPERTY_GRAPH_MINIMUM_SERVER_VERSION:
-        pytest.skip("GRAPH_TABLE needs PostgreSQL 19")
-    await seed_pilot_fixtures()
-    await bootstrap_the_loader_tables()
-
-    await execute_all(
-        [
-            ("pilot comparison schema", f"CREATE SCHEMA IF NOT EXISTS {PILOT_GRAPH.split('.')[0]}"),
-            ("pilot comparison graph", f"DROP PROPERTY GRAPH IF EXISTS {PILOT_GRAPH}"),
-            ("pilot comparison graph", PILOT_PHASE0_GRAPH),
-        ]
-    )
-
-    # The fill has to have produced the edges, or every query below returns
-    # nothing from both graphs and the comparison proves nothing.
-    edges = await postgres_rows("SELECT count(*) FROM graph.by_artist")
-    assert edges[0][0] >= sum(len(artists) for artists in PILOT_RELEASES.values())
-    # `PHASE0_SCHEMA` is a module constant, not input from a row or a request.
-    assert await postgres_rows(f"SELECT count(*) FROM {PHASE0_SCHEMA}.by_artist") == edges  # noqa: S608
-
-    matched = 0
-    for label, query, parameters in PILOT_QUERIES:
-        over_tables = await postgres_rows_with(query, parameters)
-        over_views = await postgres_rows_with(query.replace("graph.catalog", PILOT_GRAPH), parameters)
-        # Sorted rather than compared in place: both sides order by
-        # `(distance, collaboration_count)` and neither adds a tiebreaker, so a
-        # tie would make row order legitimately unspecified on both sides and
-        # the comparison would be testing the two planners instead of the two
-        # edge relations.
-        assert sorted(over_tables) == sorted(over_views), label
-        if parameters["artist_id"] == "1":
-            assert over_tables, f"{label} returned nothing from either graph"
-            matched += 1
-    assert matched == len(PILOT_QUERIES) - 1
-
-    # The depth-1 answer is the neighbourhood the fixture states, so the two
-    # graphs agreeing is not two identical empty results.
-    depth_one = await postgres_rows_with(MULTI_HOP_COLLABORATORS_SQL, {"artist_id": "1", "depth": 1, "limit": 50})
-    assert [(row[0], row[3]) for row in depth_one] == [("2", 3), ("3", 2), ("4", 1)]
-
-
-async def postgres_rows_with(query: str, parameters: dict[str, Any]) -> list[tuple[Any, ...]]:
-    """Query the disposable target database with named placeholders."""
-    connection = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params())
-    async with connection, connection.cursor() as cursor:
-        await cursor.execute(query, parameters)
-        return await cursor.fetchall()
-
-
-# What each counter relation's row count has to be, restated independently of
-# how `graph.bootstrap_fill` computes it. The fill reaches these numbers with a
-# `GROUP BY` or a correlated count; each query below is a distinct count of the
-# relation's key instead, so the comparison is a second opinion rather than the
-# fill's own arithmetic read back.
-COUNTER_ROW_COUNTS = {
-    "genre_stats": "SELECT count(*) FROM graph.genre",
-    "style_stats": "SELECT count(*) FROM graph.style",
-    "label_stats": "SELECT count(*) FROM graph.label",
-    "artist_degree": """
-        SELECT count(*) FROM (
-            SELECT artist_id FROM graph.by_artist
-            UNION SELECT artist_id FROM graph.master_by_artist
-            UNION SELECT artist_id FROM graph.same_as
-            UNION SELECT member_artist_id FROM graph.member_of
-            UNION SELECT group_artist_id FROM graph.member_of
-            UNION SELECT alias_artist_id FROM graph.alias_of
-            UNION SELECT artist_id FROM graph.alias_of
-        ) AS endpoint
-    """,
-    "release_degree_base": """
-        SELECT count(*) FROM (
-            SELECT release_id FROM graph.by_artist
-            UNION SELECT release_id FROM graph.on_label
-            UNION SELECT release_id FROM graph.in_genre
-            UNION SELECT release_id FROM graph.in_style
-            UNION SELECT release_id FROM graph.derived_from
-            UNION SELECT release_id FROM graph.credited_on
-            UNION SELECT release_id FROM graph.credited_to
-            UNION SELECT release_id FROM graph.issued_on
-        ) AS endpoint
-    """,
-    # The distinct vertices of the traversal surface, by a UNION of the same
-    # twenty branches rather than by the fill's GROUP BY.
-    "vertex_degree": """
-        SELECT count(*) FROM (
-            SELECT 'r'::"char" AS kind, release_id AS key FROM graph.by_artist
-            UNION SELECT 'a'::"char", artist_id FROM graph.by_artist
-            UNION SELECT 'm'::"char", master_id FROM graph.master_by_artist
-            UNION SELECT 'a'::"char", artist_id FROM graph.master_by_artist
-            UNION SELECT 'r'::"char", release_id FROM graph.on_label
-            UNION SELECT 'l'::"char", label_id FROM graph.on_label
-            UNION SELECT 'r'::"char", release_id FROM graph.in_genre
-            UNION SELECT 'g'::"char", genre_name FROM graph.in_genre
-            UNION SELECT 'r'::"char", release_id FROM graph.in_style
-            UNION SELECT 's'::"char", style_name FROM graph.in_style
-            UNION SELECT 'm'::"char", master_id FROM graph.master_in_genre
-            UNION SELECT 'g'::"char", genre_name FROM graph.master_in_genre
-            UNION SELECT 'm'::"char", master_id FROM graph.master_in_style
-            UNION SELECT 's'::"char", style_name FROM graph.master_in_style
-            UNION SELECT 'r'::"char", release_id FROM graph.derived_from
-            UNION SELECT 'm'::"char", master_id FROM graph.derived_from
-            UNION SELECT 'a'::"char", alias_artist_id FROM graph.alias_of
-            UNION SELECT 'a'::"char", artist_id FROM graph.alias_of
-            UNION SELECT 'a'::"char", member_artist_id FROM graph.artist_member_of
-            UNION SELECT 'a'::"char", group_artist_id FROM graph.artist_member_of
-        ) AS vertex
-    """,
-    "artist_genre": """
-        SELECT count(*) FROM (
-            SELECT DISTINCT by_artist.artist_id, in_genre.genre_name
-            FROM graph.by_artist AS by_artist
-            JOIN graph.in_genre AS in_genre ON in_genre.release_id = by_artist.release_id
-        ) AS pair
-    """,
-    "label_genre": """
-        SELECT count(*) FROM (
-            SELECT DISTINCT on_label.label_id, in_genre.genre_name
-            FROM graph.on_label AS on_label
-            JOIN graph.in_genre AS in_genre ON in_genre.release_id = on_label.release_id
-        ) AS pair
-    """,
-}
-
-# What the one derived relation's row count has to be, restated the same way:
-# the Discogs half is `graph.member_of` entire, and the MusicBrainz half is the
-# distinct Discogs pairs the artist-to-artist MEMBER_OF relationships resolve to.
-DERIVED_ROW_COUNTS = {
-    "artist_member_of": """
-        SELECT (SELECT count(*) FROM graph.member_of)
-             + (SELECT count(*) FROM (
-                   SELECT DISTINCT member.discogs_artist_id, band.discogs_artist_id
-                   FROM graph.mb_rel_artist_artist AS relationship
-                   JOIN graph.mb_artist AS member ON member.mbid = relationship.source_mbid
-                   JOIN graph.mb_artist AS band ON band.mbid = relationship.target_mbid
-                   WHERE relationship.relationship_type = 'MEMBER_OF'
-                     AND member.discogs_artist_id IS NOT NULL
-                     AND band.discogs_artist_id IS NOT NULL
-                     AND member.discogs_artist_id <> band.discogs_artist_id
-               ) AS pair)
-    """,
-}
-
-# Every relation the fill computes rather than projects from a retained view.
-COMPUTED_ROW_COUNTS = {**COUNTER_ROW_COUNTS, **DERIVED_ROW_COUNTS}
-
-# A row no document justifies. The fill has to remove it, which an upsert never
-# would, and which is the whole reason each step empties its relation first.
-STALE_GENRE = "Not In Any Document"
-
-
-async def run_the_bootstrap_fill() -> dict[str, int]:
-    """Run the fill and return the row count it reports for each relation, in order."""
-    rows = await postgres_rows("SELECT relation, row_count FROM graph.bootstrap_fill()")
-    return {str(relation).removeprefix("graph."): int(count) for relation, count in rows}
-
-
-async def filled_relation_counts() -> dict[str, int]:
-    """Return what each filled relation actually holds, by the engine's own count."""
-    counts: dict[str, int] = {}
-    for relation in _BOOTSTRAP_FILL_ORDER:
-        # `_BOOTSTRAP_FILL_ORDER` is a module constant, not input from a row.
-        rows = await postgres_rows(f"SELECT count(*) FROM graph.{relation}")  # noqa: S608
-        counts[relation] = int(rows[0][0])
-    return counts
-
-
-async def filled_relation_rows() -> dict[str, list[str]]:
-    """Return every row of every filled relation, ordered so two runs compare."""
-    snapshot: dict[str, list[str]] = {}
-    for relation in _BOOTSTRAP_FILL_ORDER:
-        rows = await postgres_rows(f"SELECT * FROM graph.{relation}")  # noqa: S608
-        # Sorted by their rendering rather than by value: several relations mix
-        # a null `first_year` in with integers, and tuple ordering across None
-        # and int raises rather than ordering.
-        snapshot[relation] = sorted(repr(row) for row in rows)
-    return snapshot
-
-
-@pytest.mark.asyncio
-async def test_the_bootstrap_fill_reproduces_the_phase_0_projection() -> None:
-    """The fill is the phase 0 projection of the documents, and re-running converges.
-
-    This is the claim the bootstrap makes and the only one it makes: every
-    loader-owned relation ends up holding exactly what the view that preceded it
-    published, computed once from the documents rather than on every read. The
-    loaders supersede all of it on their first pass.
-    """
-    await apply_schema()
-    await seed_graph_fixtures()
-    await execute_all(phase0_comparison_statements(PHASE0_SCHEMA))
-
-    reported = await run_the_bootstrap_fill()
-    assert list(reported) == list(_BOOTSTRAP_FILL_ORDER)
-
-    stored = await filled_relation_counts()
-    assert reported == stored
-    print("bootstrap_fill row counts: " + ", ".join(f"{relation}={count}" for relation, count in reported.items()))
-
-    # Every vertex and edge relation holds exactly what its retained phase 0
-    # view publishes, which is the definition the fill was rendered from.
-    for relation in _BOOTSTRAP_FILL_ORDER:
-        if relation in COMPUTED_ROW_COUNTS:
-            continue
-        # `PHASE0_SCHEMA` and the relation are module constants, not input.
-        expected = await postgres_rows(f"SELECT count(*) FROM {PHASE0_SCHEMA}.{relation}")  # noqa: S608
-        assert stored[relation] == expected[0][0], relation
-
-    for relation, query in COMPUTED_ROW_COUNTS.items():
-        expected = await postgres_rows(query)
-        assert stored[relation] == expected[0][0], relation
-
-    # None of the comparisons above is zero agreeing with zero.
-    assert all(count > 0 for count in stored.values()), stored
-
-    # Re-running changes nothing: same reported counts, same rows.
-    before = await filled_relation_rows()
-    assert await run_the_bootstrap_fill() == reported
-    assert await filled_relation_rows() == before
-
-    # And it converges downward, which is what an upsert would not do.
-    await execute_all([("stale row", f"INSERT INTO graph.genre (name) VALUES ('{STALE_GENRE}')")])  # noqa: S608
-    assert await run_the_bootstrap_fill() == reported
-    assert await postgres_rows("SELECT count(*) FROM graph.genre WHERE name = %s", (STALE_GENRE,)) == [(0,)]
-
-
-# A release credited to several artists and carrying several genres, on a label
-# that owns nothing else. Before the fix, `label_stats.release_count` was a bare
-# `count(*)` over `on_label` LEFT JOINed to both `by_artist` and `in_genre`, so
-# this one release's two artists times its two genres reported a release_count
-# of four instead of one. Appended last, after every prior test in this module
-# has made its own full-relation assertions, so the extra label/release/genre
-# rows this seeds cannot perturb them.
-FANOUT_FIXTURE_LABEL_ID = "600"
-FANOUT_FIXTURE_RELEASE = {
-    "id": 601,
-    "title": "Fanout Release",
-    "artists": [{"id": 602, "name": "Fanout Artist One"}, {"id": 603, "name": "Fanout Artist Two"}],
-    "labels": [{"id": 600, "catno": "FAN1"}],
-    "genres": ["Fanout Genre One", "Fanout Genre Two"],
-}
-
-
-async def seed_label_stats_fanout_fixture() -> None:
-    """Write one release with two artists and two genres under one label."""
-    connection = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params())
-    async with connection, connection.cursor() as cursor:
-        await cursor.execute(
-            "INSERT INTO labels (data_id, hash, data) VALUES (%s, %s, %s) ON CONFLICT (data_id) DO NOTHING",
-            (FANOUT_FIXTURE_LABEL_ID, "hash-600", Jsonb({"id": 600, "name": "Fanout Label"})),
-        )
-        await cursor.execute(
-            "INSERT INTO releases (data_id, hash, data) VALUES (%s, %s, %s) ON CONFLICT (data_id) DO NOTHING",
-            (str(FANOUT_FIXTURE_RELEASE["id"]), "hash-601", Jsonb(FANOUT_FIXTURE_RELEASE)),
-        )
-        await connection.commit()
-
-
-@pytest.mark.asyncio
-async def test_label_stats_release_count_does_not_fan_out_over_artists_and_genres() -> None:
-    """One release with two artists and two genres still counts once for its label."""
-    await apply_schema()
-    await seed_label_stats_fanout_fixture()
-    await bootstrap_the_loader_tables()
-
-    assert await postgres_rows(
-        "SELECT release_count, artist_count, genre_count FROM graph.label_stats WHERE label_id = %s",
-        (FANOUT_FIXTURE_LABEL_ID,),
-    ) == [(1, 2, 2)]
-
-
-@pytest.mark.asyncio
-async def test_counter_parity_includes_empty_labels_cooccurrence_and_positive_years() -> None:
-    """The real engine matches graphinator after importer-owned normalization.
-
-    The three-digit year is deliberately below the normalizer's plausibility
-    bound: persisted loader data will not contain it, but the counter contract
-    mirrors Neo4j's `r.year > 0` predicate rather than duplicating that bound.
-    """
-    empty_label_id = "610"
-    release_id = "611"
-    zero_year_release_id = "612"
-    connection = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params())
-    async with connection, connection.cursor() as cursor:
-        await cursor.execute(
-            "INSERT INTO labels (data_id, hash, data) VALUES (%s, %s, %s) ON CONFLICT (data_id) DO NOTHING",
-            (empty_label_id, "hash-610", Jsonb({"id": 610, "name": "No Releases Label"})),
-        )
-        await cursor.execute(
-            "INSERT INTO releases (data_id, hash, data) VALUES (%s, %s, %s) ON CONFLICT (data_id) DO NOTHING",
-            (
-                release_id,
-                "hash-611",
-                Jsonb(
-                    {
-                        "id": 611,
-                        "title": "Counter Parity Release",
-                        "year": "197",
-                        "genres": ["Counter Genre One", "Counter Genre Two"],
-                        "styles": ["Counter Style"],
-                    }
-                ),
-            ),
-        )
-        await cursor.execute(
-            "INSERT INTO releases (data_id, hash, data) VALUES (%s, %s, %s) ON CONFLICT (data_id) DO NOTHING",
-            (
-                zero_year_release_id,
-                "hash-612",
-                Jsonb({"id": 612, "title": "Zero Year Release", "year": "0000", "genres": ["Zero Year Genre"]}),
-            ),
-        )
-        await connection.commit()
-
-    await apply_schema()
-    await bootstrap_the_loader_tables()
-
-    assert await postgres_rows(
-        "SELECT release_count, artist_count, genre_count FROM graph.label_stats WHERE label_id = %s",
-        (empty_label_id,),
-    ) == [(0, 0, 0)]
-    assert await postgres_rows(
-        "SELECT name, style_count, first_year FROM graph.genre_stats WHERE name IN ('Counter Genre One', 'Counter Genre Two') ORDER BY name"
-    ) == [("Counter Genre One", 1, 197), ("Counter Genre Two", 1, 197)]
-    assert await postgres_rows("SELECT genre_count, first_year FROM graph.style_stats WHERE name = 'Counter Style'") == [(2, 197)]
-    assert await postgres_rows("SELECT first_year FROM graph.genre_stats WHERE name = 'Zero Year Genre'") == [(None,)]
-
-
-# ── The shortest path across the traversal surface ───────────────────────────
+# ── The shortest path# ── The shortest path across the traversal surface ───────────────────────────
 # `graph.find_shortest_path` is the vertex-at-a-time bidirectional search spike
 # gm-database-schema-gkt.1 prototyped. These are its answers, on a real engine,
 # against a hand-computed table.
@@ -3082,6 +2157,51 @@ async def seed_path_fixture() -> None:
         )
         await cursor.execute("SELECT count(*) FROM graph.refresh_artist_member_of()")
         await cursor.execute("SELECT count(*) FROM graph.refresh_vertex_degree()")
+        await connection.commit()
+
+
+PILOT_ARTISTS = {
+    "1": "Anchor",
+    "2": "Near Two",
+    "3": "Near Three",
+    "4": "Near Four",
+    "5": "Far Five",
+    "6": "Far Six",
+    "7": "Far Seven",
+}
+
+PILOT_RELEASES = {
+    "2001": ["1", "2"],
+    "2002": ["1", "2"],
+    "2003": ["1", "2", "3"],
+    "2004": ["1", "3"],
+    "2005": ["1", "4"],
+    "2006": ["2", "5"],
+    "2007": ["3", "5"],
+    "2008": ["3", "6"],
+    "2009": ["4", "7"],
+}
+
+
+async def seed_pilot_fixtures() -> None:
+    """Write the collaboration neighbourhood the relational path tests read."""
+    connection = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params())
+    async with connection, connection.cursor() as cursor:
+        for artist_id, name in PILOT_ARTISTS.items():
+            await cursor.execute(
+                "INSERT INTO artists (data_id, hash, data) VALUES (%s, %s, %s) ON CONFLICT (data_id) DO NOTHING",
+                (artist_id, f"hash-artist-{artist_id}", Jsonb({"id": int(artist_id), "name": name})),
+            )
+        for release_id, artist_ids in PILOT_RELEASES.items():
+            document = {
+                "id": int(release_id),
+                "title": f"Pilot {release_id}",
+                "artists": [{"id": int(artist_id), "name": PILOT_ARTISTS[artist_id]} for artist_id in artist_ids],
+            }
+            await cursor.execute(
+                "INSERT INTO releases (data_id, hash, data) VALUES (%s, %s, %s) ON CONFLICT (data_id) DO NOTHING",
+                (release_id, f"hash-release-{release_id}", Jsonb(document)),
+            )
         await connection.commit()
 
 
@@ -3889,10 +3009,7 @@ _MB_VERTEX_TABLES = (
 
 @pytest.mark.asyncio
 async def test_every_musicbrainz_vertex_publishes_its_gm_item_id() -> None:
-    """Each `mb_*` view reads `gm_item_id` off its table, and on PostgreSQL 19 the label carries it.
-
-    A fresh database keeps the seeded rows out of the suite's shared one.
-    """
+    """Each `mb_*` view reads `gm_item_id` off its table."""
     admin_params = initializer._postgres_connection_params()
     database = f"mb_gm_item_id_{uuid4().hex[:12]}"
     admin_connection = await psycopg.AsyncConnection.connect(**{**admin_params, "dbname": "postgres"}, autocommit=True)
@@ -3918,221 +3035,6 @@ async def test_every_musicbrainz_vertex_publishes_its_gm_item_id() -> None:
             # `label` is one of the four view names in `_MB_VERTEX_TABLES`.
             assert await _rows_in(database, f"SELECT gm_item_id FROM graph.{label} WHERE mbid = %s", (mbid,)) == [(item_id,)]  # noqa: S608
 
-        if await server_version_num() < PROPERTY_GRAPH_MINIMUM_SERVER_VERSION:
-            return
-        for label, (mbid, item_id) in seeded.items():
-            # Same constant label; GRAPH_TABLE takes no bind parameter for a label.
-            query = f"""
-                SELECT * FROM GRAPH_TABLE (graph.catalog
-                    MATCH (v IS {label})
-                    WHERE v.mbid = %s
-                    COLUMNS (v.gm_item_id AS gm_item_id)
-                )
-            """  # noqa: S608
-            assert await _rows_in(database, query, (mbid,)) == [(item_id,)], label
     finally:
         await admin_connection.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(database)))
         await admin_connection.close()
-
-
-# ── Re-declaring an existing graph.catalog ───────────────────────────────────
-# Each test runs in a database of its own, because each one leaves
-# `graph.catalog` in a state the shared database's other tests must not see.
-
-
-@asynccontextmanager
-async def _scratch_database(prefix: str) -> AsyncIterator[str]:
-    """Create an empty database named after PREFIX, and drop it afterwards."""
-    admin_params = initializer._postgres_connection_params()
-    database = f"{prefix}_{uuid4().hex[:12]}"
-    admin_connection = await psycopg.AsyncConnection.connect(**{**admin_params, "dbname": "postgres"}, autocommit=True)
-    try:
-        await admin_connection.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
-        yield database
-    finally:
-        await admin_connection.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(database)))
-        await admin_connection.close()
-
-
-async def _apply_schema_to(database: str) -> bool:
-    """Run the initializer's PostgreSQL half against DATABASE."""
-    return await initializer._apply_postgres_schema({**initializer._postgres_connection_params(), "dbname": database})
-
-
-async def _execute_in(database: str, *statements: str) -> None:
-    """Run each statement against DATABASE in autocommit, as the initializer does."""
-    params = {**initializer._postgres_connection_params(), "dbname": database}
-    connection = await psycopg.AsyncConnection.connect(**params, autocommit=True)
-    async with connection, connection.cursor() as cursor:
-        for statement in statements:
-            await cursor.execute(statement)
-
-
-async def _apply_property_graph_in(database: str) -> int:
-    """Run only `_apply_property_graph` against DATABASE and return its failure count."""
-    params = {**initializer._postgres_connection_params(), "dbname": database}
-    connection = await psycopg.AsyncConnection.connect(**params, autocommit=True)
-    async with connection, connection.cursor() as cursor:
-        return await _apply_property_graph(cursor)
-
-
-async def _graph_identity(database: str) -> tuple[Any, Any]:
-    """Return `graph.catalog`'s oid and comment; a changed oid means it was re-declared."""
-    rows = await _rows_in(database, "SELECT oid, obj_description(oid, 'pg_class') FROM pg_class WHERE oid = 'graph.catalog'::regclass")
-    return rows[0]
-
-
-async def _graph_aliases(database: str) -> set[str]:
-    rows = await _rows_in(database, "SELECT pgealias FROM pg_propgraph_element WHERE pgepgid = 'graph.catalog'::regclass")
-    return {row[0] for row in rows}
-
-
-async def _musicbrainz_labels_publishing_gm_item_id(database: str) -> set[str]:
-    rows = await _rows_in(
-        database,
-        """
-        SELECT label.pgllabel
-        FROM pg_propgraph_label AS label
-        JOIN pg_propgraph_element_label AS element_label ON element_label.pgellabelid = label.oid
-        JOIN pg_propgraph_label_property AS label_property ON label_property.plpellabelid = element_label.oid
-        JOIN pg_propgraph_property AS property ON property.oid = label_property.plppropid
-        WHERE label.pglpgid = 'graph.catalog'::regclass AND property.pgpname = 'gm_item_id'
-        """,
-    )
-    return {row[0] for row in rows} & {label for label, _table in _MB_VERTEX_TABLES}
-
-
-async def _declare_the_pre_gm_item_id_graph(database: str) -> None:
-    """Replace `graph.catalog` with the shape a pre-0.4.0 initializer left.
-
-    Before 0.4.0 none of the four `mb_*` labels published `gm_item_id`:
-    `mb_label`'s explicit list did not name it, and the other three expanded
-    `ALL COLUMNS` before the column existed. Spelling those three as explicit
-    lists without it reproduces what their `ALL COLUMNS` captured then. Like
-    every graph a version before this one declared, it carries no comment.
-    """
-    columns = await _rows_in(
-        database,
-        "SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'graph' ORDER BY ordinal_position",
-    )
-    statement = PROPERTY_GRAPH_STATEMENT[1].replace(", gm_item_id)", ")")
-    for label in ("mb_artist", "mb_release", "mb_release_group"):
-        kept = ", ".join(column for table, column in columns if table == label and column != "gm_item_id")
-        statement = statement.replace(f"LABEL {label} PROPERTIES ALL COLUMNS", f"LABEL {label} PROPERTIES ({kept})")
-    await _execute_in(database, "DROP PROPERTY GRAPH graph.catalog", statement)
-    assert await _musicbrainz_labels_publishing_gm_item_id(database) == set()
-
-
-async def _assert_every_musicbrainz_vertex_reads_its_gm_item_id(database: str) -> None:
-    """Seed one row per `mb_*` table and read its `gm_item_id` back through GRAPH_TABLE."""
-    for label, table in _MB_VERTEX_TABLES:
-        kind = {"artists": "artist", "labels": "label", "releases": "release", "release_groups": "master"}[table]
-        item_id, mbid = uuid4(), uuid4()
-        await _execute_in(
-            database,
-            f"INSERT INTO catalog_items (id, kind) VALUES ('{item_id}', '{kind}')",  # noqa: S608
-            f"INSERT INTO musicbrainz.{table} (mbid, name, gm_item_id) VALUES ('{mbid}', 'upgrade {label}', '{item_id}')",  # noqa: S608
-        )
-        query = f"SELECT * FROM GRAPH_TABLE (graph.catalog MATCH (v IS {label}) WHERE v.mbid = %s COLUMNS (v.gm_item_id AS gm_item_id))"  # noqa: S608
-        assert await _rows_in(database, query, (mbid,)) == [(item_id,)], label
-
-
-async def _skip_below_postgresql_19() -> None:
-    if await server_version_num() < PROPERTY_GRAPH_MINIMUM_SERVER_VERSION:
-        pytest.skip("CREATE PROPERTY GRAPH needs PostgreSQL 19")
-
-
-@pytest.mark.asyncio
-async def test_a_graph_declared_from_an_older_definition_is_brought_up_to_date() -> None:
-    """A pre-0.4.0 graph is re-declared once, and a re-apply after that changes nothing."""
-    await _skip_below_postgresql_19()
-    async with _scratch_database("graph_upgrade") as database:
-        assert await _apply_schema_to(database) is True
-        await _declare_the_pre_gm_item_id_graph(database)
-        old_oid, old_comment = await _graph_identity(database)
-        assert old_comment is None
-
-        assert await _apply_schema_to(database) is True
-        upgraded_oid, fingerprint = await _graph_identity(database)
-        assert upgraded_oid != old_oid
-        assert fingerprint.startswith(PROPERTY_GRAPH_FINGERPRINT_PREFIX)
-        assert await _musicbrainz_labels_publishing_gm_item_id(database) == {label for label, _table in _MB_VERTEX_TABLES}
-        await _assert_every_musicbrainz_vertex_reads_its_gm_item_id(database)
-
-        # Same definition: no DROP and no CREATE, so the graph keeps its oid.
-        assert await _apply_schema_to(database) is True
-        assert await _graph_identity(database) == (upgraded_oid, fingerprint)
-
-
-@pytest.mark.asyncio
-async def test_a_graph_pruned_by_a_cascade_is_restored() -> None:
-    """`DROP VIEW ... CASCADE` removes an element but not the graph; a re-apply puts it back."""
-    await _skip_below_postgresql_19()
-    async with _scratch_database("graph_prune") as database:
-        assert await _apply_schema_to(database) is True
-        declared = await _graph_aliases(database)
-        _oid, fingerprint = await _graph_identity(database)
-
-        await _execute_in(database, "DROP VIEW graph.mb_label CASCADE")
-        pruned = await _graph_aliases(database)
-        assert "mb_label" not in pruned
-        assert declared - pruned == {"mb_label"} | {edge.view for edge in _property_graph_edges() if "mb_label" in (edge.source, edge.destination)}
-        # The prune leaves the fingerprint where it was, so it alone cannot catch this.
-        assert (await _graph_identity(database))[1] == fingerprint
-
-        assert await _apply_schema_to(database) is True
-        assert await _graph_aliases(database) == declared
-        await _assert_every_musicbrainz_vertex_reads_its_gm_item_id(database)
-
-
-@pytest.mark.asyncio
-async def test_a_failed_upgrade_leaves_the_previous_graph_in_place() -> None:
-    """The DROP and the CREATE are one transaction; an error in either keeps the old graph."""
-    await _skip_below_postgresql_19()
-    async with _scratch_database("graph_rollback") as database:
-        assert await _apply_schema_to(database) is True
-        await _declare_the_pre_gm_item_id_graph(database)
-        old_identity = await _graph_identity(database)
-        old_aliases = await _graph_aliases(database)
-
-        # The CREATE fails after the DROP has already run: the element relation
-        # it names is not there under that name. The old graph still reads it by oid.
-        await _execute_in(database, "ALTER VIEW graph.mb_release RENAME TO mb_release_aside")
-        assert await _apply_property_graph_in(database) == 1
-        assert await _graph_identity(database) == old_identity
-        assert await _graph_aliases(database) == old_aliases
-        assert await _musicbrainz_labels_publishing_gm_item_id(database) == set()
-        await _execute_in(database, "ALTER VIEW graph.mb_release_aside RENAME TO mb_release")
-
-        # The DROP fails: a consumer's view depends on the graph, and this schema
-        # never cascades into an object it did not create.
-        await _execute_in(
-            database,
-            "CREATE VIEW public.consumer_view AS SELECT * FROM GRAPH_TABLE (graph.catalog MATCH (v IS mb_label) COLUMNS (v.mbid AS mbid))",
-        )
-        assert await _apply_property_graph_in(database) == 1
-        assert await _graph_identity(database) == old_identity
-        assert await _rows_in(database, "SELECT count(*) FROM public.consumer_view") == [(0,)]
-
-        await _execute_in(database, "DROP VIEW public.consumer_view")
-        assert await _apply_property_graph_in(database) == 0
-        assert (await _graph_identity(database))[0] != old_identity[0]
-        await _assert_every_musicbrainz_vertex_reads_its_gm_item_id(database)
-
-
-@pytest.mark.asyncio
-async def test_a_relation_squatting_the_graph_name_is_left_alone() -> None:
-    """A table named `graph.catalog` is not this schema's graph, so it is neither dropped nor replaced."""
-    await _skip_below_postgresql_19()
-    async with _scratch_database("graph_squatter") as database:
-        await _execute_in(
-            database,
-            "CREATE SCHEMA graph",
-            "CREATE TABLE graph.catalog (sentinel text)",
-            "INSERT INTO graph.catalog VALUES ('survives')",
-        )
-        # A skip is not a failure.
-        assert await _apply_schema_to(database) is True
-        assert await _apply_schema_to(database) is True
-        assert await _rows_in(database, "SELECT relkind FROM pg_class WHERE oid = 'graph.catalog'::regclass") == [("r",)]
-        assert await _rows_in(database, "SELECT sentinel FROM graph.catalog") == [("survives",)]
