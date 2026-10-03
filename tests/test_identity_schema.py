@@ -234,7 +234,9 @@ _ADDED_STATEMENT_NAMES = frozenset(
         "idx_catalog_item_moves_user_id",
         "resolve_catalog_item function",
         "public.artist_similar_artists table",
-        "idx_artist_similar_artists_model_version_artist_id",
+        "artist similarity K guard function",
+        "artist similarity K guard trigger",
+        "artist release K guard trigger",
         "public.artist_embedding_releases table",
         "idx_artist_embedding_releases_is_current",
     }

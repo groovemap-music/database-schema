@@ -4949,73 +4949,86 @@ async def _execute_schema_statements(cursor: Any, statements: Iterable[tuple[str
 # extension -- a server without pgvector still gets a fully working similar-artists feature, it
 # just never gets fresh rows without the extension the batch job itself needs to compute them.
 #
-# `artist_id` and `similar_artist_id` are `TEXT`, matching `artist_embeddings.artist_id`
-# (both key the same Discogs `data_id`), and carry no foreign key for the same reason
-# `artist_embeddings` carries none: `graph.artist` is a view, not a table a `REFERENCES`
-# clause can target, and the loader is the sole source of truth for which ids exist.
-_ARTIST_SIMILAR_ARTISTS_STATEMENT = (
-    "public.artist_similar_artists table",
-    """
-    CREATE TABLE IF NOT EXISTS public.artist_similar_artists (
-        artist_id         TEXT NOT NULL,
-        model_version     TEXT NOT NULL,
-        rank              SMALLINT NOT NULL CHECK (rank >= 1),
-        similar_artist_id TEXT NOT NULL,
-        score             REAL NOT NULL,
-        computed_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        PRIMARY KEY (artist_id, model_version, rank)
-    )
-    """,
-)
-
-# The primary key leads with `artist_id`, which serves the per-artist lookup a catalog-api
-# request makes directly. The monthly batch job's own writes, and a retire's delete, instead
-# scan by `model_version` first and `artist_id` second -- one whole `model_version` at a time,
-# exactly the access `idx_artist_embeddings_model_version` above serves for `artist_embeddings`
-# -- so this index leads with `model_version` rather than duplicating the primary key's order.
-_ARTIST_SIMILAR_ARTISTS_MODEL_VERSION_INDEX = (
-    "idx_artist_similar_artists_model_version_artist_id",
-    "CREATE INDEX IF NOT EXISTS idx_artist_similar_artists_model_version_artist_id ON public.artist_similar_artists (model_version, artist_id)",
-)
-
-# One row per published `model_version`: the lineage the batch job wrote it from
-# (`source_dump_id`/`source_dump_date`, the same provenance columns ADR 0013's data-rights
-# section requires of `artist_embeddings`), the `k` and `artists` counts the job computed, and
-# `is_current` -- the one pointer catalog-api reads to know which `model_version` of
-# `artist_similar_artists` is live. `k` and `artists` are recorded, not merely logged, so an
-# operator (or a test) can answer "how many artists does the current release cover, and at what
-# K" from the database alone, without re-deriving it from `artist_similar_artists` itself.
+# A surrogate release id avoids repeating the long model-version label in every artist row.
+# These replace the unreleased rank-row contract; existing scratch databases must reset the
+# two tables explicitly (see docs/architecture.md), never silently from the initializer.
 _ARTIST_EMBEDDING_RELEASES_STATEMENT = (
     "public.artist_embedding_releases table",
     """
     CREATE TABLE IF NOT EXISTS public.artist_embedding_releases (
-        model_version    TEXT PRIMARY KEY,
+        release_id       INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        model_version    TEXT UNIQUE NOT NULL,
         source_dump_id   TEXT NOT NULL,
         source_dump_date DATE NOT NULL,
-        k                SMALLINT NOT NULL,
-        artists          BIGINT NOT NULL,
+        k                SMALLINT NOT NULL CHECK (k >= 1),
+        artists          BIGINT NOT NULL DEFAULT 0 CHECK (artists >= 0),
         published_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         is_current       BOOLEAN NOT NULL DEFAULT FALSE
     )
     """,
 )
 
-# At most one current release, enforced by the database rather than left to the discipline of
-# whatever calls `publish_artist_embedding_release` -- the same "let a partial unique index
-# hold the invariant" shape `idx_catalog_item_supersessions_superseded_id` above uses for "at
-# most one open supersession". A plain `UNIQUE (is_current)` cannot express this: it would admit
-# any number of `FALSE` rows but only because `NULL <> NULL`, and `is_current` is `NOT NULL`
-# here, deliberately, so this must be a partial index instead.
+_ARTIST_SIMILAR_ARTISTS_STATEMENT = (
+    "public.artist_similar_artists table",
+    """
+    CREATE TABLE IF NOT EXISTS public.artist_similar_artists (
+        release_id         INTEGER NOT NULL REFERENCES public.artist_embedding_releases(release_id) ON DELETE CASCADE,
+        artist_id          TEXT NOT NULL,
+        similar_artist_ids TEXT[] NOT NULL,
+        scores             REAL[] NOT NULL,
+        PRIMARY KEY (release_id, artist_id),
+        CHECK (cardinality(similar_artist_ids) = cardinality(scores))
+    )
+    """,
+)
+
 _ARTIST_EMBEDDING_RELEASES_CURRENT_INDEX = (
     "idx_artist_embedding_releases_is_current",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_artist_embedding_releases_is_current ON public.artist_embedding_releases (is_current) WHERE is_current",
 )
 
+# CHECK cannot reference another table. Guard K with triggers, including a release's K update.
+# FOR SHARE also serializes a concurrent K change with an artist write.
+_ARTIST_SIMILARITY_LIMIT_FUNCTION = (
+    "artist similarity K guard function",
+    """
+    CREATE OR REPLACE FUNCTION public.check_artist_similarity_k() RETURNS trigger
+    LANGUAGE plpgsql AS $$
+    DECLARE release_k INTEGER;
+    BEGIN
+        IF TG_TABLE_NAME = 'artist_similar_artists' THEN
+            SELECT k INTO release_k FROM public.artist_embedding_releases
+                WHERE release_id = NEW.release_id FOR SHARE;
+            IF cardinality(NEW.similar_artist_ids) > release_k THEN
+                RAISE EXCEPTION 'similar artist list exceeds release k' USING ERRCODE = '23514';
+            END IF;
+        ELSIF NEW.k < OLD.k AND EXISTS (
+            SELECT 1 FROM public.artist_similar_artists WHERE release_id = NEW.release_id
+                AND cardinality(similar_artist_ids) > NEW.k
+        ) THEN
+            RAISE EXCEPTION 'release k is smaller than existing lists' USING ERRCODE = '23514';
+        END IF;
+        RETURN NEW;
+    END
+    $$
+    """,
+)
+
 _ARTIST_SIMILARITY_STATEMENTS: list[tuple[str, str]] = [
-    _ARTIST_SIMILAR_ARTISTS_STATEMENT,
-    _ARTIST_SIMILAR_ARTISTS_MODEL_VERSION_INDEX,
     _ARTIST_EMBEDDING_RELEASES_STATEMENT,
+    _ARTIST_SIMILAR_ARTISTS_STATEMENT,
     _ARTIST_EMBEDDING_RELEASES_CURRENT_INDEX,
+    _ARTIST_SIMILARITY_LIMIT_FUNCTION,
+    (
+        "artist similarity K guard trigger",
+        "CREATE OR REPLACE TRIGGER artist_similarity_k BEFORE INSERT OR UPDATE ON public.artist_similar_artists "
+        "FOR EACH ROW EXECUTE FUNCTION public.check_artist_similarity_k()",
+    ),
+    (
+        "artist release K guard trigger",
+        "CREATE OR REPLACE TRIGGER artist_release_k BEFORE UPDATE OF k ON public.artist_embedding_releases "
+        "FOR EACH ROW EXECUTE FUNCTION public.check_artist_similarity_k()",
+    ),
 ]
 
 
@@ -5158,6 +5171,11 @@ _EMBEDDINGS_TABLE_GRANT = (
 _ARTIST_SIMILARITY_TABLES_GRANT = (
     f"{EMBEDDING_PIPELINE_ROLE} artist similarity tables grant",
     f"GRANT SELECT, INSERT, UPDATE, DELETE ON public.artist_similar_artists, public.artist_embedding_releases TO {EMBEDDING_PIPELINE_ROLE}",
+)
+
+_ARTIST_SIMILARITY_SEQUENCE_GRANT = (
+    f"{EMBEDDING_PIPELINE_ROLE} artist release sequence grant",
+    f"GRANT USAGE ON SEQUENCE public.artist_embedding_releases_release_id_seq TO {EMBEDDING_PIPELINE_ROLE}",
 )
 
 # ── The artist embeddings HNSW index, and its build procedure (ADR 0013) ──
@@ -5649,126 +5667,112 @@ async def retire_artist_embeddings_version(cursor: Any, model_version: str, inde
 # which only ever declares the two tables' shape; see the module comment above
 # `_ARTIST_SIMILARITY_STATEMENTS`.
 
+# Serialize publish and retire on the same lock, including when there is no current row yet.
+# Lock order is always table, then release row; caller transaction/savepoint owns both.
+_ARTIST_EMBEDDING_RELEASES_LOCK_SQL = "LOCK TABLE public.artist_embedding_releases IN SHARE ROW EXCLUSIVE MODE"
 _ARTIST_EMBEDDING_RELEASES_CLEAR_CURRENT_SQL = "UPDATE public.artist_embedding_releases SET is_current = FALSE WHERE is_current"
-
-_ARTIST_EMBEDDING_RELEASES_UPSERT_SQL = """
-    INSERT INTO public.artist_embedding_releases
-        (model_version, source_dump_id, source_dump_date, k, artists, published_at, is_current)
-    VALUES (%s, %s, %s, %s, %s, NOW(), TRUE)
-    ON CONFLICT (model_version) DO UPDATE SET
-        source_dump_id   = EXCLUDED.source_dump_id,
-        source_dump_date = EXCLUDED.source_dump_date,
-        k                = EXCLUDED.k,
-        artists          = EXCLUDED.artists,
-        published_at     = EXCLUDED.published_at,
-        is_current       = TRUE
+_ARTIST_EMBEDDING_RELEASES_CREATE_SQL = """
+    INSERT INTO public.artist_embedding_releases (model_version, source_dump_id, source_dump_date, k)
+    VALUES (%s, %s, %s, %s)
+    ON CONFLICT (model_version) DO UPDATE SET model_version = EXCLUDED.model_version
+    RETURNING release_id, source_dump_id, source_dump_date, k
 """
 
 
-async def publish_artist_embedding_release(
-    cursor: Any,
-    model_version: str,
-    *,
-    source_dump_id: str,
-    source_dump_date: date,
-    k: int,
-    artists: int,
-) -> int:
-    """Publish `model_version` as the current `artist_similar_artists` release.
+async def create_artist_embedding_release(cursor: Any, model_version: str, *, source_dump_id: str, source_dump_date: date, k: int) -> int | None:
+    """Create a non-current batch target, returning its generated id (None on failure).
 
-    An operator, or the monthly batch job itself, calls this once the job has finished writing
-    every `artist_similar_artists` row for `model_version` -- never before, since this is what
-    makes `catalog-api` start reading that version.
-
-    Runs in one transaction (`cursor.connection.transaction()`): first clearing `is_current` on
-    whatever release currently holds it, then upserting `model_version`'s own row with
-    `is_current = TRUE`. That order, inside one transaction, is what keeps
-    `idx_artist_embedding_releases_is_current` (at most one current row, enforced by the
-    database) from ever seeing two current rows at once, and a failure at either step rolls
-    both back rather than leaving zero, or two, current releases behind. The upsert (rather
-    than a plain `INSERT`) makes a repeated publish of the same `model_version` -- for example,
-    a retried batch job -- idempotent instead of a duplicate-key failure.
-
-    Refuses, logging why, unless `model_version` is non-blank (`_valid_model_version`), the same
-    guard `retire_artist_embeddings_version` uses.
-
-    Returns the number of failed steps (0 means `model_version` is now the current release).
+    Retries return the original id only when lineage and K match. They never alter a live
+    release or reuse the same model_version for a different batch definition. Publish and
+    retire retain the failure-count convention; creation returns an id, not a failure count.
     """
     if not _valid_model_version(model_version):
-        logger.error("❌ Refusing to publish an artist embedding release: %r is not a usable model_version", model_version)
-        return 1
-
+        logger.error("❌ Refusing to create an artist embedding release: invalid model_version %r", model_version)
+        return None
     try:
         async with cursor.connection.transaction():
+            await cursor.execute(_ARTIST_EMBEDDING_RELEASES_CREATE_SQL, (model_version, source_dump_id, source_dump_date, k))
+            row = await cursor.fetchone()
+            if row is None or tuple(row[1:]) != (source_dump_id, source_dump_date, k):
+                raise ValueError("existing model_version has different lineage or k")
+            release_id = int(row[0])
+    except Exception as error:
+        logger.error("❌ Failed to create artist embedding release %r: %s", model_version, error)
+        return None
+    return release_id
+
+
+def _valid_artist_release_reference(reference: str | int) -> bool:
+    return _valid_model_version(reference) if isinstance(reference, str) else type(reference) is int and reference > 0
+
+
+async def publish_artist_embedding_release(cursor: Any, model_version: str | int, *, artists: int) -> int:
+    """Atomically publish a previously created release by model_version or release_id.
+
+    Returns a failure count. A missing target or failed update rolls the entire flip back.
+    Re-publishing preserves published_at. The batch must finish writing before calling this.
+    """
+    if not _valid_artist_release_reference(model_version):
+        logger.error("❌ Refusing to publish an artist embedding release: invalid reference %r", model_version)
+        return 1
+    lookup_sql = (
+        "SELECT release_id, is_current FROM public.artist_embedding_releases WHERE model_version = %s FOR UPDATE"
+        if isinstance(model_version, str)
+        else "SELECT release_id, is_current FROM public.artist_embedding_releases WHERE release_id = %s FOR UPDATE"
+    )
+    try:
+        async with cursor.connection.transaction():
+            await cursor.execute(_ARTIST_EMBEDDING_RELEASES_LOCK_SQL)
+            await cursor.execute(
+                lookup_sql,
+                (model_version,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise ValueError("release must be created before publication")
+            release_id, was_current = row
             await cursor.execute(_ARTIST_EMBEDDING_RELEASES_CLEAR_CURRENT_SQL)
             await cursor.execute(
-                _ARTIST_EMBEDDING_RELEASES_UPSERT_SQL,
-                (model_version, source_dump_id, source_dump_date, k, artists),
+                "UPDATE public.artist_embedding_releases SET artists = %s, is_current = TRUE, "
+                "published_at = CASE WHEN %s THEN published_at ELSE NOW() END WHERE release_id = %s",
+                (artists, was_current, release_id),
             )
     except Exception as error:
         logger.error("❌ Failed to publish artist embedding release %r: %s", model_version, error)
         return 1
-
-    logger.info("✅ Schema: published artist embedding release %r (k=%d, artists=%d)", model_version, k, artists)
     return 0
 
 
-_ARTIST_EMBEDDING_RELEASES_IS_CURRENT_QUERY = "SELECT is_current FROM public.artist_embedding_releases WHERE model_version = %s"
-
-_ARTIST_SIMILAR_ARTISTS_VERSION_DELETE_SQL = "DELETE FROM public.artist_similar_artists WHERE model_version = %s"
-
+_ARTIST_EMBEDDING_RELEASES_IS_CURRENT_QUERY = "SELECT is_current FROM public.artist_embedding_releases WHERE model_version = %s FOR UPDATE"
+_ARTIST_SIMILAR_ARTISTS_VERSION_DELETE_SQL = (
+    "DELETE FROM public.artist_similar_artists WHERE release_id = (SELECT release_id FROM public.artist_embedding_releases WHERE model_version = %s)"
+)
 _ARTIST_EMBEDDING_RELEASES_VERSION_DELETE_SQL = "DELETE FROM public.artist_embedding_releases WHERE model_version = %s"
 
 
 async def retire_artist_similar_artists_version(cursor: Any, model_version: str, *, delete_release: bool = False) -> int:
-    """Retire one superseded `model_version` of `artist_similar_artists`.
+    """Delete a superseded release's lists, optionally cascading through its release row.
 
-    An operator, or the monthly batch job, calls this after `publish_artist_embedding_release`
-    has switched the current release to a newer `model_version` -- never for the `model_version`
-    currently marked `is_current`, which this function refuses outright rather than delete out
-    from under `catalog-api`.
-
-    Runs in one transaction: deletes every `artist_similar_artists` row for `model_version`,
-    and, when `delete_release` is `True`, that `model_version`'s own `artist_embedding_releases`
-    row too (kept by default, so the release's lineage -- what it was computed from, and when --
-    survives its rows being retired, the same reason `catalog_item_supersessions` above keeps a
-    closed row rather than deleting it).
-
-    Refuses, logging why, unless `model_version` is non-blank (`_valid_model_version`).
-    Refuses, logging why, if `model_version` is the release currently marked `is_current`.
-
-    Returns the number of failed steps (0 means the rows -- and the release row, if asked for --
-    are gone, or were already gone).
+    Returns a failure count; refuses the current release. Check and deletion share the same
+    transaction and lock as publish so a concurrent publish cannot invalidate the guard.
+    Missing releases are successful no-ops. Retained release rows preserve lineage.
     """
     if not _valid_model_version(model_version):
-        logger.error("❌ Refusing to retire an artist_similar_artists version: %r is not a usable model_version", model_version)
+        logger.error("❌ Refusing to retire an artist_similar_artists version: invalid model_version %r", model_version)
         return 1
-
-    try:
-        await cursor.execute(_ARTIST_EMBEDDING_RELEASES_IS_CURRENT_QUERY, (model_version,))
-        row = await cursor.fetchone()
-    except Exception as error:
-        logger.error("❌ Could not check whether %r is the current artist embedding release: %s", model_version, error)
-        return 1
-
-    if row is not None and row[0]:
-        logger.error("❌ Refusing to retire %r: it is the current artist embedding release", model_version)
-        return 1
-
     try:
         async with cursor.connection.transaction():
-            await cursor.execute(_ARTIST_SIMILAR_ARTISTS_VERSION_DELETE_SQL, (model_version,))
-            if delete_release:
-                await cursor.execute(_ARTIST_EMBEDDING_RELEASES_VERSION_DELETE_SQL, (model_version,))
+            await cursor.execute(_ARTIST_EMBEDDING_RELEASES_LOCK_SQL)
+            await cursor.execute(_ARTIST_EMBEDDING_RELEASES_IS_CURRENT_QUERY, (model_version,))
+            row = await cursor.fetchone()
+            if row is not None and row[0]:
+                logger.error("❌ Refusing to retire %r: it is the current artist embedding release", model_version)
+                return 1
+            delete_sql = _ARTIST_EMBEDDING_RELEASES_VERSION_DELETE_SQL if delete_release else _ARTIST_SIMILAR_ARTISTS_VERSION_DELETE_SQL
+            await cursor.execute(delete_sql, (model_version,))
     except Exception as error:
         logger.error("❌ Failed to retire artist_similar_artists version %r: %s", model_version, error)
         return 1
-
-    logger.info(
-        "✅ Schema: retired artist_similar_artists version %r%s",
-        model_version,
-        " and its release row" if delete_release else "",
-    )
     return 0
 
 
@@ -5928,7 +5932,9 @@ async def _apply_vector_schema(cursor: Any) -> int:
     # `reasons["role"]`, not the combined `reasons["embedding_grant"]` the vector-gated table
     # above needs.
     if reasons["role"] is None:
-        _success, similarity_grant_failures = await _execute_schema_statements(cursor, [_ARTIST_SIMILARITY_TABLES_GRANT])
+        _success, similarity_grant_failures = await _execute_schema_statements(
+            cursor, [_ARTIST_SIMILARITY_TABLES_GRANT, _ARTIST_SIMILARITY_SEQUENCE_GRANT]
+        )
         failures += similarity_grant_failures
     else:
         logger.info(
