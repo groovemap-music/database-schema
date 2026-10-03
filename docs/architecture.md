@@ -1791,97 +1791,115 @@ search over `artist_embeddings`, which does need pgvector, but neither table's o
 `vector`/`halfvec` at all: a server without pgvector still gets a fully working similar-artists
 feature, it just never gets fresh rows without the extension the batch job itself needs.
 
-### `public.artist_similar_artists`
+### Compact per-artist lists (gm-database-schema-hqjp)
 
-```sql
-CREATE TABLE IF NOT EXISTS public.artist_similar_artists (
-    artist_id         TEXT NOT NULL,
-    model_version     TEXT NOT NULL,
-    rank              SMALLINT NOT NULL CHECK (rank >= 1),
-    similar_artist_id TEXT NOT NULL,
-    score             REAL NOT NULL,
-    computed_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (artist_id, model_version, rank)
-)
-```
-
-One row per `(artist, model_version, rank)`: `similar_artist_id` and `score` are the rank-th
-nearest neighbor and its distance, exactly as the monthly batch job computed them from
-`artist_embeddings`. `artist_id` and `similar_artist_id` are `TEXT`, matching
-`artist_embeddings.artist_id` — both key the same Discogs `data_id` — and carry no foreign key for
-the same reason `artist_embeddings` carries none: `graph.artist` is a view, not a table a
-`REFERENCES` clause can target, and the loader is the sole source of truth for which ids exist.
-
-The primary key leads with `artist_id`, serving the per-artist lookup `catalog-api` makes
-directly. `idx_artist_similar_artists_model_version_artist_id` leads with `model_version` instead,
-for the monthly batch job's own writes and a retire's delete — one whole `model_version` at a
-time — the same access `idx_artist_embeddings_model_version` serves for `artist_embeddings`.
-
-### `public.artist_embedding_releases`
+The unreleased gm-database-schema-2xe0 rank-row contract repeated a 148-character
+`model_version` in both heap and primary key for every neighbour. Its measured 559 bytes
+per neighbour implied approximately 262 GB per monthly release at K=50. The maintainer's
+2026-09-29 decision replaces it with one row per artist and a generated release id.
+No catalog data is migrated or included in this repository.
 
 ```sql
 CREATE TABLE IF NOT EXISTS public.artist_embedding_releases (
-    model_version    TEXT PRIMARY KEY,
+    release_id       INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    model_version    TEXT UNIQUE NOT NULL,
     source_dump_id   TEXT NOT NULL,
     source_dump_date DATE NOT NULL,
-    k                SMALLINT NOT NULL,
-    artists          BIGINT NOT NULL,
+    k                SMALLINT NOT NULL CHECK (k >= 1),
+    artists          BIGINT NOT NULL DEFAULT 0 CHECK (artists >= 0),
     published_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     is_current       BOOLEAN NOT NULL DEFAULT FALSE
-)
+);
+CREATE TABLE IF NOT EXISTS public.artist_similar_artists (
+    release_id         INTEGER NOT NULL REFERENCES public.artist_embedding_releases(release_id) ON DELETE CASCADE,
+    artist_id          TEXT NOT NULL,
+    similar_artist_ids TEXT[] NOT NULL,
+    scores             REAL[] NOT NULL,
+    PRIMARY KEY (release_id, artist_id),
+    CHECK (cardinality(similar_artist_ids) = cardinality(scores))
+);
 ```
 
-One row per published `model_version`: the lineage it was computed from (`source_dump_id` /
-`source_dump_date`, the same provenance columns ADR 0013's data-rights section requires of
-`artist_embeddings`), the `k` and `artists` counts the batch job computed, and `is_current` — the
-one pointer `catalog-api` reads to know which `model_version` of `artist_similar_artists` is live.
+Array positions preserve rank order; aligned `scores` are the batch's real-valued neighbour
+scores. The primary key serves both per-artist lookups within a release and whole-release
+retirement. The old `(model_version, artist_id)` secondary index is unnecessary and removed
+from the contract. Artist identifiers remain text without a foreign key to `graph.artist`,
+which is a view. The release foreign key cascades deletes to its lists.
 
-At most one current release is enforced by the database, not by caller discipline:
-`idx_artist_embedding_releases_is_current` is a `UNIQUE` index on `is_current` partial on
-`WHERE is_current` — the same "let a partial unique index hold the invariant" shape
-`idx_catalog_item_supersessions_superseded_id` uses above for "at most one open supersession". A
-plain `UNIQUE (is_current)` cannot express this, since `is_current` is `NOT NULL` here and two
-`FALSE` rows would otherwise collide.
+The `check_artist_similarity_k` triggers reject lists longer than their release's K and K
+updates smaller than stored lists. The artist-write trigger reads the release `FOR SHARE`
+to serialize against a concurrent K update. `idx_artist_embedding_releases_is_current`
+remains a partial unique index on `is_current WHERE is_current`, enforcing at most one
+current release regardless of the caller.
 
-### Grants
+### Creating, publishing, and retiring
 
-`embedding_pipeline` (see "Vector embeddings and the embedding pipeline role" above) holds
-`SELECT, INSERT, UPDATE, DELETE` on both tables — `_ARTIST_SIMILARITY_TABLES_GRANT` in
-`postgres.py`. Unlike the grant on `artist_embeddings`, this one is gated on the role alone
-(`CREATEROLE`), not on the `vector` extension: both tables exist regardless of pgvector, so
-granting on them never needs that guard either.
+`create_artist_embedding_release(cursor, model_version, *, source_dump_id,
+source_dump_date, k) -> int | None` creates a non-current release with `artists=0` before
+its batch writes any lists, and returns its generated integer id. A retry with identical
+lineage and K returns the same id; conflicting lineage or K fails rather than rewriting
+a release. Failure logs the cause and returns `None` (creation returns an id rather than
+a failure count). Integer ids permit more releases than a smallint while adding only two
+bytes per artist row.
 
-`catalog-api` needs no equivalent grant: it reads these tables, like every other `public` table,
-as the same login that owns them — see `resolve_catalog_item`'s comment above ("no grant is
-declared") for the same reasoning applied to `activity`.
+After all rows are written, call `publish_artist_embedding_release(cursor,
+model_version_or_release_id, *, artists)`. It resolves the existing target, clears the old
+current pointer, and publishes the new release in one transaction. A missing target or
+failed update rolls back the whole change, preserving the previous current release.
+Repeated publication preserves `published_at`. Publication and retirement take the same
+`SHARE ROW EXCLUSIVE` table lock before reading/updating the target, serializing simultaneous
+operators even when no release is current yet. Readers continue to see the previously
+committed pointer until the transaction commits.
 
-### Publishing and retiring a release
+`retire_artist_similar_artists_version(cursor, model_version, *, delete_release=False)`
+checks the current pointer and deletes within that same transaction and lock. It refuses
+the current release. By default it removes lists and retains lineage; `delete_release=True`
+deletes the release row and uses its foreign-key cascade to remove lists. Missing versions
+are successful no-ops. Publish and retire return a failure count (`0` means success).
+All three helpers retain the `_valid_model_version` guard for textual references.
 
-Two functions in `postgres.py` hand a completed `model_version` off to, and later off of,
-`catalog-api`. Neither runs from `create_postgres_schema`, which only ever declares the two
-tables' shape.
+`embedding_pipeline` retains CRUD on both tables and now has `USAGE` on the generated
+`artist_embedding_releases_release_id_seq`. Grants require the role, independent of pgvector.
+`catalog-api` reads as the table owner, like other public tables.
 
-`publish_artist_embedding_release(cursor, model_version, *, source_dump_id, source_dump_date, k,
-artists)` — called once the monthly batch job has finished writing every
-`artist_similar_artists` row for `model_version`, never before, since this is what makes
-`catalog-api` start reading that version. It runs in one transaction
-(`cursor.connection.transaction()`): first clearing `is_current` on whatever release currently
-holds it, then upserting `model_version`'s own row with `is_current = TRUE`. That order, inside one
-transaction, is what keeps the partial unique index above from ever seeing two current rows at
-once, and a failure at either step rolls both back rather than leaving zero, or two, current
-releases behind. The upsert (`ON CONFLICT (model_version) DO UPDATE`, not a plain `INSERT`) makes a
-repeated publish of the same `model_version` — a retried batch job — idempotent instead of a
-duplicate-key failure.
+### Synthetic PostgreSQL 19 storage measurement
 
-`retire_artist_similar_artists_version(cursor, model_version, *, delete_release=False)` — called
-after `publish_artist_embedding_release` has switched the current release to a newer
-`model_version`, never for the `model_version` currently marked `is_current`, which this function
-refuses outright rather than delete out from under `catalog-api`. It deletes every
-`artist_similar_artists` row for `model_version` and, when `delete_release=True`, that
-`model_version`'s own `artist_embedding_releases` row too — kept by default, so the release's
-lineage survives its rows being retired, the same reason `catalog_item_supersessions` above keeps
-a closed row rather than deleting it.
+On 2026-10-02, `scripts/measure-artist-similarity-storage.py` loaded **1,000,000 synthetic
+artists at K=50** into a fresh disposable PostgreSQL **19beta3**, aarch64 Alpine container
+(the pinned `just test-integration-pg19` image with pgvector 0.8.6). Artist and neighbour ids
+are seven-digit synthetic strings; scores are `real` arrays. The script vacuums/analyzes
+before measuring. No Discogs or MusicBrainz data is read or exported.
 
-Both functions return a failure count (0 means success), on the same footing as every other
-schema statement and operator procedure in `postgres.py`, and both refuse a blank `model_version`
-before touching the connection.
+| Measurement | Bytes | Bytes per artist |
+| --- | ---: | ---: |
+| Average `pg_column_size` | — | 884.00 |
+| Table including auxiliary storage | 910,516,224 | 910.52 |
+| Primary-key index | 31,563,776 | 31.56 |
+| Total relation | **942,080,000** | **942.08** |
+
+This is approximately **0.94 GB per million artists**, or approximately **8.8 GB for
+9.3 million artists**, roughly 30 times smaller than the prior K=50 rank-row projection.
+Sizes include the artist-list table and primary-key index; release metadata is one row per
+release and negligible. The estimate does not include replicas, WAL, spare disk, embeddings,
+or dead tuples. Actual identifiers and score values can change compression and size.
+
+Reproduce only against a fresh disposable test database, with its DSN supplied through
+`SIMILARITY_STORAGE_TEST_DSN` and `PYTHONPATH=src`, then run the script via `uv run python`.
+The script refuses an existing similarity schema and prints only scalar measurements.
+Explicit `just test-integration-pg19` exercises generated ids, cardinality/K checks, cascade
+retirement, one-current enforcement, and failed-publication rollback. `just check` excludes
+integration tests and never applies a schema to a live database.
+
+### Compatibility and rollback
+
+This intentionally breaks the unreleased rank-row contract. There is no production migration:
+replace the old definitions and update batch/Catalog API consumers together. For a disposable
+scratch database that already has the old tables, an operator may explicitly drop
+`public.artist_similar_artists` first and `public.artist_embedding_releases` second, then rerun
+the initializer and the synthetic batch. Dropping the old table also removes its old index.
+The initializer does not drop existing data or silently reinterpret an old schema.
+
+Rollback requires restoring the prior code and consumers, recreating the prior two table
+contracts in a disposable database, and recomputing lists. Do not retain array rows for a
+rank-row consumer or apply this reset to live catalog data. Schema application, release
+publication, and pushing remain separate maintainer actions; package version stays 0.4.x.
