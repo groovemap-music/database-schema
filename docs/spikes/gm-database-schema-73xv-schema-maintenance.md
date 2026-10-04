@@ -124,13 +124,13 @@ maintained operator material describes stopping affected writers as a
 prerequisite, but no reviewed, executable quiescence receipt exists for this
 run.
 
-Update 77 reports about 12.45 GiB of native free space and explicitly says full
-resource admission is unverified. That is not a capacity model for two large
-indexes, temporary index build space, retained old/new index pages, PostgreSQL
-WAL, checkpoint pressure, Neo4j index population, logs, and rollback artifacts.
-The homelab guide expects PostgreSQL WAL to remain below 20 GiB during heavy
-ingest, already larger than the reported free-space observation. No preflight
-establishes a safe floor for this DDL.
+Update 77's approximately 12.45 GiB free-space observation describes the local
+Mac workspace used for native validation, not storage on the managed database
+host. It supplies no production capacity evidence. No managed-host preflight
+establishes safe floors for two large indexes, temporary index build space,
+retained old/new index pages, PostgreSQL WAL and checkpoint pressure, Neo4j
+index population, logs, and rollback artifacts. Actual managed index and WAL
+headroom therefore remain unproven.
 
 ### Interruption and partial-DDL recovery
 
@@ -161,8 +161,10 @@ gates.
 
 ## Recommendation
 
-Do not run the full initializer on the managed stores. Keep the new consumers
-stopped and leave the currently successful additive schema unchanged.
+Do not run the full initializer on the managed stores, and do not start or
+deploy the newly published consumers. Update 78 records that the legacy
+consumers remain healthy on their old images; this recommendation does not call
+for stopping them. Leave the currently successful additive schema unchanged.
 
 Before a new execution authorization, require a reviewed operator runbook and
 fresh receipts that:
@@ -178,8 +180,8 @@ fresh receipts that:
    reconciliation procedure for timeout/interruption;
 4. prove free-space, temporary index, WAL/checkpoint, and Neo4j index-population
    headroom against explicit floors;
-5. bind the exact immutable schema image, explicit
-   explicit managed target database selector, complete before/after object inventory,
+5. bind the exact immutable schema image, managed target database selector,
+   complete before/after object inventory,
    zero-exit first run, and zero-exit second run; and
 6. treat rollback honestly: retain compatible additive schema when consumers
    roll back, or restore both independently verified store recovery points when
