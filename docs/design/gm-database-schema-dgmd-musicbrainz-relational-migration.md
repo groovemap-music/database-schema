@@ -25,9 +25,8 @@ operations retain their existing authorization.
 
 ## Evidence and review record
 
-The successor study used the repository source, its
-[source and inventory receipt](/Users/Robert/workspaces/github/work/beadhive-inventory-2026-10-02/dispatch/schema-successor-research-progress.json), and the
-[live-store compatibility receipt](/Users/Robert/workspaces/github/work/beadhive-inventory-2026-10-02/dispatch/update75-musicbrainz-live-store-compatibility-research.json).
+The successor study used the repository source and the maintained
+[source, inventory, and live-compatibility receipt index](evidence/gm-database-schema-a704-schema-research-receipts.md#successor-source-and-live-inventory).
 It preserves the original incident constraints and history: current `main`
 descends from the SQL/PGQ removal floor `9a50949b1810f3e61adae2f89b86acec2e20c4a3`,
 keeps Neo4j as graph-query authority, and retains the accepted compact
@@ -36,15 +35,15 @@ floor and is not an eligible migration source.
 
 The maintenance study used repository source plus the actual managed homelab
 source and durable operator receipts. Its
-[control and backup evidence receipt](/Users/Robert/workspaces/github/work/beadhive-inventory-2026-10-02/dispatch/schema-maintenance-research-progress.json)
+[control and backup evidence index](evidence/gm-database-schema-a704-schema-research-receipts.md#maintenance-controls-and-live-state)
 records the exact maintained source, backup exclusion, timeout experiment,
 writer-control gap, and disposable validation. Its PostgreSQL 18 and Neo4j
 fixture applied the full schema twice and passed `25` tests with the expected
 `6` pgvector skips. The
-[native capacity receipt](/Users/Robert/workspaces/github/work/beadhive-inventory-2026-10-02/dispatch/update77-native-capacity-recheck.json)
+[capacity receipt identity](evidence/gm-database-schema-a704-schema-research-receipts.md#maintenance-controls-and-live-state)
 records about 12.45 GiB on the local Mac only; it supplies no Lux production
 capacity evidence. The
-[current consumer receipt](/Users/Robert/workspaces/github/work/beadhive-inventory-2026-10-02/dispatch/update78-live-consumer-and-resend-prerequisite-recheck.json)
+[consumer-state receipt identity](evidence/gm-database-schema-a704-schema-research-receipts.md#maintenance-controls-and-live-state)
 shows the legacy `brainztableinator:latest` and `brainzgraphinator:latest`
 containers healthy on their old images. The approved newer immutable consumer
 images were cached and isolated-probed, but have not been deployed or started;
@@ -52,7 +51,7 @@ their schema prerequisite remains unmet.
 
 Both studies received independent pristine-checkout review, correction,
 resubmission, approval, and merge into epic `gm-database-schema-afan`. The
-[independent review record](/Users/Robert/workspaces/github/work/beadhive-inventory-2026-10-02/dispatch/update83-independent-research-review.json)
+[independent review evidence index](evidence/gm-database-schema-a704-schema-research-receipts.md#independent-review-and-merge)
 binds the final successor study to
 `917dfba8b78cf81febe0252b2c9adbd6ebfa9705` and merge
 `dcd62aa6de229c1a89cc25816207fe29949ff907`, and the final maintenance
