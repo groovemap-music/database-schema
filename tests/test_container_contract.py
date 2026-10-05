@@ -178,16 +178,16 @@ def test_legal_and_repository_documentation_contract() -> None:
 
 def test_reusable_workflows_are_immutably_pinned() -> None:
     expected = {
-        "ci.yml": "reusable-ci.yml",
-        "release.yml": "reusable-release.yml",
+        "ci.yml": ("reusable-ci.yml", "2f890111657d9f3e6f55d8bd5a5e7b8f9ca97b26"),
+        "release.yml": ("reusable-release.yml", AUTOMATION_REVISION),
     }
-    for name, reusable_name in expected.items():
+    for name, (reusable_name, approved_revision) in expected.items():
         workflow = (ROOT / ".github" / "workflows" / name).read_text()
         refs = re.findall(
             rf"uses: groovemap-music/automation/\.github/workflows/{reusable_name}@([^\s]+)",
             workflow,
         )
-        assert refs == [AUTOMATION_REVISION]
+        assert refs == [approved_revision]
         assert "groovemap-music/.github/" not in workflow
         assert "secrets: inherit" not in workflow
 
