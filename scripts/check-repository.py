@@ -15,6 +15,7 @@ from repository_source import RepositorySourceError, check_retired_branding
 ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY = "https://github.com/groovemap-music/database-schema"
 AUTOMATION_REVISION = "833cb464507678c38ab78bd4718ce697399463e9"
+CI_AUTOMATION_REVISION = "2f890111657d9f3e6f55d8bd5a5e7b8f9ca97b26"
 PYTHON_LIBRARIES_REVISION = "9bac0220df80fdb550fde78d4db8228ca4273625"
 
 
@@ -97,12 +98,12 @@ for fragment in (
 ci = (ROOT / ".github/workflows/ci.yml").read_text()
 release = (ROOT / ".github/workflows/release.yml").read_text()
 require("attestations: write" in release, "release.yml must grant the reusable release attestation permission")
-for workflow_name, workflow, reusable_name in (
-    ("ci.yml", ci, "reusable-ci.yml"),
-    ("release.yml", release, "reusable-release.yml"),
+for workflow_name, workflow, reusable_name, approved_revision in (
+    ("ci.yml", ci, "reusable-ci.yml", CI_AUTOMATION_REVISION),
+    ("release.yml", release, "reusable-release.yml", AUTOMATION_REVISION),
 ):
     callers = re.findall(rf"uses:\s+groovemap-music/automation/\.github/workflows/{reusable_name}@([^\s]+)", workflow)
-    require(callers == [AUTOMATION_REVISION], f"{workflow_name} must pin {reusable_name} to the approved automation commit")
+    require(callers == [approved_revision], f"{workflow_name} must pin {reusable_name} to the approved automation commit")
     require("groovemap-music/.github/" not in workflow, f"{workflow_name} retains the superseded shared-workflow repository")
     require("secrets: inherit" not in workflow, f"{workflow_name} must pass only the secrets required by its reusable workflow")
 
