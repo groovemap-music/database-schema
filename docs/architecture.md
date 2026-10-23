@@ -327,6 +327,8 @@ The executable PostgreSQL inventory is in
   `gm-design-4804`, recommendation for B) and read by catalog-api:
   - `style_year_counts`: release and master counts per style and year, keyed by `(style, year)`,
     from which the style lifecycle stages are computed;
+  - `genre_year_counts`: release counts per genre and year, keyed by `(genre, year)`, from which
+    genre emergence years are computed; it mirrors `style_year_counts` without the master count;
   - `style_parents`: every parent genre of a style at share >= 0.20, keyed by `(style, genre)`,
     with `share` in (0, 1] and exactly one `is_dominant` parent per style (at most one is enforced
     by a partial unique index; "at least one" is the writer's contract);
