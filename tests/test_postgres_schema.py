@@ -165,6 +165,7 @@ class TestInsightsSchema:
         assert "insights.data_completeness table" in table_names
         assert "insights.computation_log table" in table_names
         assert "insights.style_year_counts table" in table_names
+        assert "insights.genre_year_counts table" in table_names
         assert "insights.style_parents table" in table_names
         assert "insights.genre_atlas_sectors table" in table_names
         assert "insights.style_atlas_layout table" in table_names

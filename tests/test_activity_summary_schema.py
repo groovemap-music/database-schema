@@ -27,6 +27,7 @@ _NAMES_THROUGH_COMPUTATION_LOG = [
 # migrations; test_style_atlas_schema.py covers them.
 _NAMES_STYLE_ATLAS = [
     "insights.style_year_counts table",
+    "insights.genre_year_counts table",
     "insights.style_parents table",
     "idx_style_parents_one_dominant",
     "insights.genre_atlas_sectors table",

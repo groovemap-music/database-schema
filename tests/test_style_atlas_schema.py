@@ -15,6 +15,7 @@ _STATEMENTS = dict(_INSIGHTS_TABLES)
 
 _TABLES = {
     "insights.style_year_counts table": ("style", "year", "release_count", "master_count", "computed_at"),
+    "insights.genre_year_counts table": ("genre", "year", "release_count", "computed_at"),
     "insights.style_parents table": ("style", "genre", "share", "is_dominant", "computed_at"),
     "insights.genre_atlas_sectors table": (
         "month",
@@ -58,6 +59,14 @@ def test_style_year_counts_primary_key_and_non_negative_counts() -> None:
     assert "master_count    BIGINT NOT NULL CHECK (master_count >= 0)" in ddl
 
 
+def test_genre_year_counts_primary_key_and_non_negative_counts() -> None:
+    ddl = _STATEMENTS["insights.genre_year_counts table"]
+    assert "PRIMARY KEY (genre, year)" in ddl
+    assert "genre           TEXT NOT NULL" in ddl
+    assert "year            INT NOT NULL" in ddl
+    assert "release_count   BIGINT NOT NULL CHECK (release_count >= 0)" in ddl
+
+
 def test_style_parents_share_is_a_fraction_in_the_half_open_unit_interval() -> None:
     ddl = _STATEMENTS["insights.style_parents table"]
     assert "PRIMARY KEY (style, genre)" in ddl
@@ -96,8 +105,9 @@ def test_style_atlas_layout_places_only_styles_and_ghosts() -> None:
 def test_atlas_statements_sit_after_the_activity_summary_index() -> None:
     names = [name for name, _ddl in _INSIGHTS_TABLES]
     start = names.index("idx_activity_summary_date") + 1
-    assert names[start : start + 5] == [
+    assert names[start : start + 6] == [
         "insights.style_year_counts table",
+        "insights.genre_year_counts table",
         "insights.style_parents table",
         "idx_style_parents_one_dominant",
         "insights.genre_atlas_sectors table",
