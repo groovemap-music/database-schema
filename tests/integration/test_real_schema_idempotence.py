@@ -78,6 +78,7 @@ EXPECTED_POSTGRES_TABLES = {
         "community_counts",
         "computation_log",
         "data_completeness",
+        "genre_atlas_sectors",
         "genre_trends",
         "label_longevity",
         "monthly_anniversaries",
@@ -3004,31 +3005,43 @@ async def test_style_atlas_tables_enforce_their_keys_and_checks() -> None:
             await cursor.execute("INSERT INTO insights.style_parents (style, genre, share) VALUES ('it-style', 'it-whole', 1)")
             await connection.rollback()
 
-            # The layout keeps prior months and refuses a malformed node.
-            insert = (
-                "INSERT INTO insights.style_atlas_layout (month, node_kind, style, genre, x, y, ring_order, sector_start, sector_end) "
-                "VALUES (%s, %s, %s, %s, 0, 0, %s, %s, %s)"
-            )
-            await cursor.execute(insert, ("2026-09-01", "genre", "", "it-rock", 0, 0.0, 1.0))
-            await cursor.execute(insert, ("2026-10-01", "genre", "", "it-rock", 0, 0.0, 1.0))
-            await cursor.execute(insert, ("2026-10-01", "style", "it-style", "it-rock", None, None, None))
-            await cursor.execute(insert, ("2026-10-01", "ghost", "it-style", "it-jazz", None, None, None))
+            # The genre ring keeps prior months and has no nullable column.
+            sector = "INSERT INTO insights.genre_atlas_sectors (month, genre, ring_order, sector_start, sector_end, x, y) VALUES (%s, %s, %s, %s, %s, %s, %s)"
+            await cursor.execute(sector, ("2026-09-01", "it-rock", 0, 0.0, 7.0, 0.0, 0.0))
+            await cursor.execute(sector, ("2026-10-01", "it-rock", 0, 6.0, 8.5, 0.0, 0.0))  # a sector may wrap past 2*pi
             await connection.commit()
-            bad_rows = [
-                ("2026-10-01", "genre", "", "it-rock", 0, 0.0, 1.0),  # duplicate key
-                ("2026-10-02", "style", "it-style", "it-rock", None, None, None),  # not a month start
-                ("2026-10-01", "planet", "it-style", "it-rock", None, None, None),  # unknown kind
-                ("2026-10-01", "style", "", "it-rock", None, None, None),  # style node without a style
-                ("2026-10-01", "genre", "it-style", "it-rock", 0, 0.0, 1.0),  # genre node naming a style
-                ("2026-10-01", "genre", "", "it-pop", None, None, None),  # genre node without its frame
+            bad_sectors = [
+                ("2026-10-01", "it-rock", 1, 0.0, 1.0, 0.0, 0.0),  # duplicate key
+                ("2026-10-02", "it-pop", 1, 0.0, 1.0, 0.0, 0.0),  # not a month start
+                ("2026-10-01", "it-pop", None, 0.0, 1.0, 0.0, 0.0),  # no ring order
+                ("2026-10-01", "it-pop", 1, None, 1.0, 0.0, 0.0),  # no sector frame
             ]
-            for row in bad_rows:
-                with pytest.raises((psycopg.errors.UniqueViolation, psycopg.errors.CheckViolation)):
-                    await cursor.execute(insert, row)
+            for row in bad_sectors:
+                with pytest.raises((psycopg.errors.UniqueViolation, psycopg.errors.CheckViolation, psycopg.errors.NotNullViolation)):
+                    await cursor.execute(sector, row)
+                await connection.rollback()
+
+            # The style layout keeps prior months and places only styles and ghosts.
+            placement = "INSERT INTO insights.style_atlas_layout (month, node_kind, style, genre, x, y) VALUES (%s, %s, %s, %s, 0, 0)"
+            await cursor.execute(placement, ("2026-09-01", "style", "it-style", "it-rock"))
+            await cursor.execute(placement, ("2026-10-01", "style", "it-style", "it-rock"))
+            await cursor.execute(placement, ("2026-10-01", "ghost", "it-style", "it-jazz"))
+            await connection.commit()
+            bad_placements = [
+                ("2026-10-01", "style", "it-style", "it-rock"),  # duplicate key
+                ("2026-10-02", "style", "it-style", "it-rock"),  # not a month start
+                ("2026-10-01", "genre", "it-style", "it-rock"),  # genres live in genre_atlas_sectors
+                ("2026-10-01", "style", None, "it-rock"),  # no style
+                ("2026-10-01", "ghost", "it-style", None),  # no host genre
+            ]
+            for row in bad_placements:
+                with pytest.raises((psycopg.errors.UniqueViolation, psycopg.errors.CheckViolation, psycopg.errors.NotNullViolation)):
+                    await cursor.execute(placement, row)
                 await connection.rollback()
         finally:
             await connection.rollback()
             await cursor.execute("DELETE FROM insights.style_parents WHERE style LIKE 'it-%'")
+            await cursor.execute("DELETE FROM insights.genre_atlas_sectors WHERE genre LIKE 'it-%'")
             await cursor.execute("DELETE FROM insights.style_atlas_layout WHERE genre LIKE 'it-%'")
             await connection.commit()
 

@@ -1006,7 +1006,7 @@ _INSIGHTS_TABLES: list[tuple[str, str]] = [
         "CREATE INDEX IF NOT EXISTS idx_activity_summary_date ON insights.activity_summary (summary_date DESC)",
     ),
     # Genre Atlas (gm-design-4804): analytics-engine precomputes the style
-    # lifecycle and the monthly atlas layout, like genre_trends. The layout keeps
+    # lifecycle and the monthly atlas layout, like genre_trends. The layout tables keep
     # prior months so the next run can pin its ring order and sector frames to the
     # previous frame.
     (
@@ -1039,29 +1039,40 @@ _INSIGHTS_TABLES: list[tuple[str, str]] = [
         "idx_style_parents_one_dominant",
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_style_parents_one_dominant ON insights.style_parents (style) WHERE is_dominant",
     ),
-    # A genre node has no style, but the primary key cannot hold NULL, so its
-    # `style` is the empty string; every other node names its style. `genre` is the
-    # host sector: the genre itself for a genre node, the dominant parent for a
-    # style node, and the secondary parent for a ghost copy.
+    # The genre ring: one row per genre per month, carrying the frame the next
+    # monthly run pins to. Angles are radians and a sector may wrap past 2*pi, so
+    # sector_end is not constrained against sector_start. x and y are in the
+    # layout's unit plane.
+    (
+        "insights.genre_atlas_sectors table",
+        """
+        CREATE TABLE IF NOT EXISTS insights.genre_atlas_sectors (
+            month           DATE NOT NULL CHECK (EXTRACT(DAY FROM month) = 1),
+            genre           TEXT NOT NULL,
+            ring_order      INT NOT NULL,
+            sector_start    DOUBLE PRECISION NOT NULL,
+            sector_end      DOUBLE PRECISION NOT NULL,
+            x               DOUBLE PRECISION NOT NULL,
+            y               DOUBLE PRECISION NOT NULL,
+            computed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (month, genre)
+        )
+        """,
+    ),
+    # Style placements inside their host sector. `genre` is the dominant parent
+    # for a style row and the secondary parent for a ghost copy.
     (
         "insights.style_atlas_layout table",
         """
         CREATE TABLE IF NOT EXISTS insights.style_atlas_layout (
             month           DATE NOT NULL CHECK (EXTRACT(DAY FROM month) = 1),
-            node_kind       TEXT NOT NULL CHECK (node_kind IN ('genre', 'style', 'ghost')),
+            node_kind       TEXT NOT NULL CHECK (node_kind IN ('style', 'ghost')),
             style           TEXT NOT NULL,
             genre           TEXT NOT NULL,
             x               DOUBLE PRECISION NOT NULL,
             y               DOUBLE PRECISION NOT NULL,
-            ring_order      INT,
-            sector_start    DOUBLE PRECISION,
-            sector_end      DOUBLE PRECISION,
             computed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            PRIMARY KEY (month, node_kind, style, genre),
-            CONSTRAINT style_atlas_layout_style_check CHECK ((node_kind = 'genre') = (style = '')),
-            CONSTRAINT style_atlas_layout_genre_frame_check CHECK (
-                node_kind <> 'genre' OR (ring_order IS NOT NULL AND sector_start IS NOT NULL AND sector_end IS NOT NULL)
-            )
+            PRIMARY KEY (month, node_kind, style, genre)
         )
         """,
     ),

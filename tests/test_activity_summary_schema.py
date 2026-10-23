@@ -29,6 +29,7 @@ _NAMES_STYLE_ATLAS = [
     "insights.style_year_counts table",
     "insights.style_parents table",
     "idx_style_parents_one_dominant",
+    "insights.genre_atlas_sectors table",
     "insights.style_atlas_layout table",
 ]
 

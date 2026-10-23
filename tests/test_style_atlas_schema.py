@@ -16,18 +16,17 @@ _STATEMENTS = dict(_INSIGHTS_TABLES)
 _TABLES = {
     "insights.style_year_counts table": ("style", "year", "release_count", "master_count", "computed_at"),
     "insights.style_parents table": ("style", "genre", "share", "is_dominant", "computed_at"),
-    "insights.style_atlas_layout table": (
+    "insights.genre_atlas_sectors table": (
         "month",
-        "node_kind",
-        "style",
         "genre",
-        "x",
-        "y",
         "ring_order",
         "sector_start",
         "sector_end",
+        "x",
+        "y",
         "computed_at",
     ),
+    "insights.style_atlas_layout table": ("month", "node_kind", "style", "genre", "x", "y", "computed_at"),
 }
 
 
@@ -71,29 +70,36 @@ def test_style_parents_allows_one_dominant_parent_per_style() -> None:
     )
 
 
+def test_genre_atlas_sectors_primary_key_and_no_nullable_column() -> None:
+    ddl = _STATEMENTS["insights.genre_atlas_sectors table"]
+    assert "PRIMARY KEY (month, genre)" in ddl
+    assert "month           DATE NOT NULL" in ddl
+    for column in _TABLES["insights.genre_atlas_sectors table"]:
+        assert re.search(rf"^\s+{column}\s+[A-Z]+.*NOT NULL", ddl, re.MULTILINE), column
+
+
 def test_style_atlas_layout_primary_key_keeps_prior_months() -> None:
     ddl = _STATEMENTS["insights.style_atlas_layout table"]
     assert "PRIMARY KEY (month, node_kind, style, genre)" in ddl
     assert "month           DATE NOT NULL" in ddl
 
 
-def test_style_atlas_layout_node_kinds() -> None:
+def test_style_atlas_layout_places_only_styles_and_ghosts() -> None:
     ddl = _STATEMENTS["insights.style_atlas_layout table"]
-    assert "CHECK (node_kind IN ('genre', 'style', 'ghost'))" in ddl
-
-
-def test_style_atlas_layout_genre_rows_carry_the_frame_to_pin() -> None:
-    ddl = _STATEMENTS["insights.style_atlas_layout table"]
-    assert "CHECK ((node_kind = 'genre') = (style = ''))" in ddl
-    assert "node_kind <> 'genre' OR (ring_order IS NOT NULL AND sector_start IS NOT NULL AND sector_end IS NOT NULL)" in ddl
+    assert "CHECK (node_kind IN ('style', 'ghost'))" in ddl
+    assert "style           TEXT NOT NULL" in ddl
+    assert "genre           TEXT NOT NULL" in ddl
+    assert "ring_order" not in ddl
+    assert "sector_" not in ddl
 
 
 def test_atlas_statements_sit_after_the_activity_summary_index() -> None:
     names = [name for name, _ddl in _INSIGHTS_TABLES]
     start = names.index("idx_activity_summary_date") + 1
-    assert names[start : start + 4] == [
+    assert names[start : start + 5] == [
         "insights.style_year_counts table",
         "insights.style_parents table",
         "idx_style_parents_one_dominant",
+        "insights.genre_atlas_sectors table",
         "insights.style_atlas_layout table",
     ]
