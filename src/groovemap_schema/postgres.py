@@ -1005,6 +1005,66 @@ _INSIGHTS_TABLES: list[tuple[str, str]] = [
         "idx_activity_summary_date",
         "CREATE INDEX IF NOT EXISTS idx_activity_summary_date ON insights.activity_summary (summary_date DESC)",
     ),
+    # Genre Atlas (gm-design-4804): analytics-engine precomputes the style
+    # lifecycle and the monthly atlas layout, like genre_trends. The layout keeps
+    # prior months so the next run can pin its ring order and sector frames to the
+    # previous frame.
+    (
+        "insights.style_year_counts table",
+        """
+        CREATE TABLE IF NOT EXISTS insights.style_year_counts (
+            style           TEXT NOT NULL,
+            year            INT NOT NULL,
+            release_count   BIGINT NOT NULL CHECK (release_count >= 0),
+            master_count    BIGINT NOT NULL CHECK (master_count >= 0),
+            computed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (style, year)
+        )
+        """,
+    ),
+    (
+        "insights.style_parents table",
+        """
+        CREATE TABLE IF NOT EXISTS insights.style_parents (
+            style           TEXT NOT NULL,
+            genre           TEXT NOT NULL,
+            share           DOUBLE PRECISION NOT NULL CHECK (share > 0 AND share <= 1),
+            is_dominant     BOOLEAN NOT NULL DEFAULT FALSE,
+            computed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (style, genre)
+        )
+        """,
+    ),
+    (
+        "idx_style_parents_one_dominant",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_style_parents_one_dominant ON insights.style_parents (style) WHERE is_dominant",
+    ),
+    # A genre node has no style, but the primary key cannot hold NULL, so its
+    # `style` is the empty string; every other node names its style. `genre` is the
+    # host sector: the genre itself for a genre node, the dominant parent for a
+    # style node, and the secondary parent for a ghost copy.
+    (
+        "insights.style_atlas_layout table",
+        """
+        CREATE TABLE IF NOT EXISTS insights.style_atlas_layout (
+            month           DATE NOT NULL CHECK (EXTRACT(DAY FROM month) = 1),
+            node_kind       TEXT NOT NULL CHECK (node_kind IN ('genre', 'style', 'ghost')),
+            style           TEXT NOT NULL,
+            genre           TEXT NOT NULL,
+            x               DOUBLE PRECISION NOT NULL,
+            y               DOUBLE PRECISION NOT NULL,
+            ring_order      INT,
+            sector_start    DOUBLE PRECISION,
+            sector_end      DOUBLE PRECISION,
+            computed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (month, node_kind, style, genre),
+            CONSTRAINT style_atlas_layout_style_check CHECK ((node_kind = 'genre') = (style = '')),
+            CONSTRAINT style_atlas_layout_genre_frame_check CHECK (
+                node_kind <> 'genre' OR (ring_order IS NOT NULL AND sector_start IS NOT NULL AND sector_end IS NOT NULL)
+            )
+        )
+        """,
+    ),
     (
         "idx_anniversaries_month_year",
         "CREATE INDEX IF NOT EXISTS idx_anniversaries_month_year ON insights.monthly_anniversaries (computed_year, computed_month)",

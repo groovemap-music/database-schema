@@ -164,6 +164,9 @@ class TestInsightsSchema:
         assert "insights.monthly_anniversaries table" in table_names
         assert "insights.data_completeness table" in table_names
         assert "insights.computation_log table" in table_names
+        assert "insights.style_year_counts table" in table_names
+        assert "insights.style_parents table" in table_names
+        assert "insights.style_atlas_layout table" in table_names
 
 
 class TestAppTokensTable:

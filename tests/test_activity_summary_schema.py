@@ -23,6 +23,15 @@ _NAMES_THROUGH_COMPUTATION_LOG = [
     "idx_computation_log_type_started",
 ]
 
+# The Genre Atlas tables sit between the activity_summary index and the trailing
+# migrations; test_style_atlas_schema.py covers them.
+_NAMES_STYLE_ATLAS = [
+    "insights.style_year_counts table",
+    "insights.style_parents table",
+    "idx_style_parents_one_dominant",
+    "insights.style_atlas_layout table",
+]
+
 _NAMES_AFTER_ACTIVITY_SUMMARY = [
     "idx_anniversaries_month_year",
     "idx_genre_trends_genre",
@@ -88,6 +97,7 @@ class TestActivitySummarySchema:
             *_NAMES_THROUGH_COMPUTATION_LOG,
             "insights.activity_summary table",
             "idx_activity_summary_date",
+            *_NAMES_STYLE_ATLAS,
             *_NAMES_AFTER_ACTIVITY_SUMMARY,
         ]
         assert names == expected
