@@ -211,6 +211,7 @@ _ADDED_STATEMENT_NAMES = frozenset(
         "insights.activity_summary table",
         "idx_activity_summary_date",
         "insights.style_year_counts table",
+        "insights.genre_year_counts table",
         "insights.style_parents table",
         "idx_style_parents_one_dominant",
         "insights.genre_atlas_sectors table",

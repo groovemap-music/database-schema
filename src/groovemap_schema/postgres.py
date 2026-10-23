@@ -1023,6 +1023,18 @@ _INSIGHTS_TABLES: list[tuple[str, str]] = [
         """,
     ),
     (
+        "insights.genre_year_counts table",
+        """
+        CREATE TABLE IF NOT EXISTS insights.genre_year_counts (
+            genre           TEXT NOT NULL,
+            year            INT NOT NULL,
+            release_count   BIGINT NOT NULL CHECK (release_count >= 0),
+            computed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (genre, year)
+        )
+        """,
+    ),
+    (
         "insights.style_parents table",
         """
         CREATE TABLE IF NOT EXISTS insights.style_parents (

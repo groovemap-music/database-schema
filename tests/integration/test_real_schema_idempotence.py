@@ -80,6 +80,7 @@ EXPECTED_POSTGRES_TABLES = {
         "data_completeness",
         "genre_atlas_sectors",
         "genre_trends",
+        "genre_year_counts",
         "label_longevity",
         "monthly_anniversaries",
         "release_rarity",
@@ -3005,6 +3006,23 @@ async def test_style_atlas_tables_enforce_their_keys_and_checks() -> None:
             await cursor.execute("INSERT INTO insights.style_parents (style, genre, share) VALUES ('it-style', 'it-whole', 1)")
             await connection.rollback()
 
+            # Genre release counts are keyed by (genre, year), never negative, and have no nullable column.
+            genre_year = "INSERT INTO insights.genre_year_counts (genre, year, release_count) VALUES (%s, %s, %s)"
+            await cursor.execute(genre_year, ("it-rock", 1969, 0))
+            await cursor.execute(genre_year, ("it-rock", 1970, 12))
+            await connection.commit()
+            bad_genre_years = [
+                ("it-rock", 1970, 1),  # duplicate key
+                ("it-rock", 1971, -1),  # negative count
+                ("it-rock", None, 1),  # no year
+                (None, 1971, 1),  # no genre
+                ("it-rock", 1971, None),  # no count
+            ]
+            for row in bad_genre_years:
+                with pytest.raises((psycopg.errors.UniqueViolation, psycopg.errors.CheckViolation, psycopg.errors.NotNullViolation)):
+                    await cursor.execute(genre_year, row)
+                await connection.rollback()
+
             # The genre ring keeps prior months and has no nullable column.
             sector = "INSERT INTO insights.genre_atlas_sectors (month, genre, ring_order, sector_start, sector_end, x, y) VALUES (%s, %s, %s, %s, %s, %s, %s)"
             await cursor.execute(sector, ("2026-09-01", "it-rock", 0, 0.0, 7.0, 0.0, 0.0))
@@ -3041,6 +3059,7 @@ async def test_style_atlas_tables_enforce_their_keys_and_checks() -> None:
         finally:
             await connection.rollback()
             await cursor.execute("DELETE FROM insights.style_parents WHERE style LIKE 'it-%'")
+            await cursor.execute("DELETE FROM insights.genre_year_counts WHERE genre LIKE 'it-%'")
             await cursor.execute("DELETE FROM insights.genre_atlas_sectors WHERE genre LIKE 'it-%'")
             await cursor.execute("DELETE FROM insights.style_atlas_layout WHERE genre LIKE 'it-%'")
             await connection.commit()
