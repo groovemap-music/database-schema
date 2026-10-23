@@ -78,10 +78,14 @@ EXPECTED_POSTGRES_TABLES = {
         "community_counts",
         "computation_log",
         "data_completeness",
+        "genre_atlas_sectors",
         "genre_trends",
         "label_longevity",
         "monthly_anniversaries",
         "release_rarity",
+        "style_atlas_layout",
+        "style_parents",
+        "style_year_counts",
     },
     "musicbrainz": {
         "artists",
@@ -2976,6 +2980,70 @@ async def test_supersession_and_dependent_indexes_exist() -> None:
     assert "UNIQUE" in definitions["idx_catalog_item_supersessions_superseded_id"]
     assert definitions["idx_catalog_item_supersessions_superseded_id"].endswith("WHERE (valid_to IS NULL)")
     assert "idx_catalog_item_moves_user_id" in definitions
+
+
+@pytest.mark.asyncio
+async def test_style_atlas_tables_enforce_their_keys_and_checks() -> None:
+    await apply_schema()
+    connection = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params())
+    async with connection, connection.cursor() as cursor:
+        try:
+            await cursor.execute(
+                "INSERT INTO insights.style_parents (style, genre, share, is_dominant) VALUES "
+                "('it-style', 'it-rock', 0.6, TRUE), ('it-style', 'it-jazz', 0.25, FALSE)"
+            )
+            await connection.commit()
+            # A style has at most one dominant parent.
+            with pytest.raises(psycopg.errors.UniqueViolation):
+                await cursor.execute("UPDATE insights.style_parents SET is_dominant = TRUE WHERE style = 'it-style' AND genre = 'it-jazz'")
+            await connection.rollback()
+            # A share is a fraction in (0, 1].
+            for bad_share in (0, 1.01):
+                with pytest.raises(psycopg.errors.CheckViolation):
+                    await cursor.execute("INSERT INTO insights.style_parents (style, genre, share) VALUES ('it-style', 'it-bad', %s)", (bad_share,))
+                await connection.rollback()
+            await cursor.execute("INSERT INTO insights.style_parents (style, genre, share) VALUES ('it-style', 'it-whole', 1)")
+            await connection.rollback()
+
+            # The genre ring keeps prior months and has no nullable column.
+            sector = "INSERT INTO insights.genre_atlas_sectors (month, genre, ring_order, sector_start, sector_end, x, y) VALUES (%s, %s, %s, %s, %s, %s, %s)"
+            await cursor.execute(sector, ("2026-09-01", "it-rock", 0, 0.0, 7.0, 0.0, 0.0))
+            await cursor.execute(sector, ("2026-10-01", "it-rock", 0, 6.0, 8.5, 0.0, 0.0))  # a sector may wrap past 2*pi
+            await connection.commit()
+            bad_sectors = [
+                ("2026-10-01", "it-rock", 1, 0.0, 1.0, 0.0, 0.0),  # duplicate key
+                ("2026-10-02", "it-pop", 1, 0.0, 1.0, 0.0, 0.0),  # not a month start
+                ("2026-10-01", "it-pop", None, 0.0, 1.0, 0.0, 0.0),  # no ring order
+                ("2026-10-01", "it-pop", 1, None, 1.0, 0.0, 0.0),  # no sector frame
+            ]
+            for row in bad_sectors:
+                with pytest.raises((psycopg.errors.UniqueViolation, psycopg.errors.CheckViolation, psycopg.errors.NotNullViolation)):
+                    await cursor.execute(sector, row)
+                await connection.rollback()
+
+            # The style layout keeps prior months and places only styles and ghosts.
+            placement = "INSERT INTO insights.style_atlas_layout (month, node_kind, style, genre, x, y) VALUES (%s, %s, %s, %s, 0, 0)"
+            await cursor.execute(placement, ("2026-09-01", "style", "it-style", "it-rock"))
+            await cursor.execute(placement, ("2026-10-01", "style", "it-style", "it-rock"))
+            await cursor.execute(placement, ("2026-10-01", "ghost", "it-style", "it-jazz"))
+            await connection.commit()
+            bad_placements = [
+                ("2026-10-01", "style", "it-style", "it-rock"),  # duplicate key
+                ("2026-10-02", "style", "it-style", "it-rock"),  # not a month start
+                ("2026-10-01", "genre", "it-style", "it-rock"),  # genres live in genre_atlas_sectors
+                ("2026-10-01", "style", None, "it-rock"),  # no style
+                ("2026-10-01", "ghost", "it-style", None),  # no host genre
+            ]
+            for row in bad_placements:
+                with pytest.raises((psycopg.errors.UniqueViolation, psycopg.errors.CheckViolation, psycopg.errors.NotNullViolation)):
+                    await cursor.execute(placement, row)
+                await connection.rollback()
+        finally:
+            await connection.rollback()
+            await cursor.execute("DELETE FROM insights.style_parents WHERE style LIKE 'it-%'")
+            await cursor.execute("DELETE FROM insights.genre_atlas_sectors WHERE genre LIKE 'it-%'")
+            await cursor.execute("DELETE FROM insights.style_atlas_layout WHERE genre LIKE 'it-%'")
+            await connection.commit()
 
 
 # ── The MusicBrainz vertices' native id (design ADR 0012 amendment, section 3) ─
