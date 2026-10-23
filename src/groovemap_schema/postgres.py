@@ -1652,6 +1652,14 @@ _MUSICBRAINZ_INDEXES: list[tuple[str, str]] = [
         "idx_mb_links_updated_at",
         "CREATE INDEX IF NOT EXISTS idx_mb_links_updated_at ON musicbrainz.external_links (updated_at)",
     ),
+    # MusicBrainz-only releases attach to a Discogs master mostly through the
+    # release group's native-id alias (spike gm-design-1h2l, section 2), so the
+    # strata read joins `releases` to `release_groups` on this column. Without the
+    # index that join scans the table.
+    (
+        "idx_mb_releases_release_group_mbid",
+        "CREATE INDEX IF NOT EXISTS idx_mb_releases_release_group_mbid ON musicbrainz.releases (release_group_mbid)",
+    ),
     (
         "idx_mb_artists_gm_item_id",
         "CREATE INDEX IF NOT EXISTS idx_mb_artists_gm_item_id ON musicbrainz.artists (gm_item_id)",

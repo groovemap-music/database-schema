@@ -161,6 +161,7 @@ EXPECTED_MUSICBRAINZ_INDEXES = {
     ("musicbrainz", "artists", "idx_mb_artists_discogs_id"),
     ("musicbrainz", "relationships", "idx_mb_rels_updated_at"),
     ("musicbrainz", "external_links", "idx_mb_links_updated_at"),
+    ("musicbrainz", "releases", "idx_mb_releases_release_group_mbid"),
 }
 
 # Native identity keys rely on the engine's built-in uuidv7(), which both the required

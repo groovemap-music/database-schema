@@ -121,6 +121,16 @@ def test_relationships_and_external_links_updated_at_are_indexed():
     assert index_sql["idx_mb_links_updated_at"] == "CREATE INDEX IF NOT EXISTS idx_mb_links_updated_at ON musicbrainz.external_links (updated_at)"
 
 
+def test_releases_release_group_mbid_is_indexed():
+    # The strata release-group join reads `releases` by `release_group_mbid`;
+    # the column was declared with no index, so that read scanned the table.
+    index_sql = dict(_MUSICBRAINZ_INDEXES)
+    assert (
+        index_sql["idx_mb_releases_release_group_mbid"]
+        == "CREATE INDEX IF NOT EXISTS idx_mb_releases_release_group_mbid ON musicbrainz.releases (release_group_mbid)"
+    )
+
+
 class TestWideningGuard:
     """The BIGINT widening has to stay a no-op in every state it can meet.
 
