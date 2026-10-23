@@ -1005,6 +1005,77 @@ _INSIGHTS_TABLES: list[tuple[str, str]] = [
         "idx_activity_summary_date",
         "CREATE INDEX IF NOT EXISTS idx_activity_summary_date ON insights.activity_summary (summary_date DESC)",
     ),
+    # Genre Atlas (gm-design-4804): analytics-engine precomputes the style
+    # lifecycle and the monthly atlas layout, like genre_trends. The layout tables keep
+    # prior months so the next run can pin its ring order and sector frames to the
+    # previous frame.
+    (
+        "insights.style_year_counts table",
+        """
+        CREATE TABLE IF NOT EXISTS insights.style_year_counts (
+            style           TEXT NOT NULL,
+            year            INT NOT NULL,
+            release_count   BIGINT NOT NULL CHECK (release_count >= 0),
+            master_count    BIGINT NOT NULL CHECK (master_count >= 0),
+            computed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (style, year)
+        )
+        """,
+    ),
+    (
+        "insights.style_parents table",
+        """
+        CREATE TABLE IF NOT EXISTS insights.style_parents (
+            style           TEXT NOT NULL,
+            genre           TEXT NOT NULL,
+            share           DOUBLE PRECISION NOT NULL CHECK (share > 0 AND share <= 1),
+            is_dominant     BOOLEAN NOT NULL DEFAULT FALSE,
+            computed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (style, genre)
+        )
+        """,
+    ),
+    (
+        "idx_style_parents_one_dominant",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_style_parents_one_dominant ON insights.style_parents (style) WHERE is_dominant",
+    ),
+    # The genre ring: one row per genre per month, carrying the frame the next
+    # monthly run pins to. Angles are radians and a sector may wrap past 2*pi, so
+    # sector_end is not constrained against sector_start. x and y are in the
+    # layout's unit plane.
+    (
+        "insights.genre_atlas_sectors table",
+        """
+        CREATE TABLE IF NOT EXISTS insights.genre_atlas_sectors (
+            month           DATE NOT NULL CHECK (EXTRACT(DAY FROM month) = 1),
+            genre           TEXT NOT NULL,
+            ring_order      INT NOT NULL,
+            sector_start    DOUBLE PRECISION NOT NULL,
+            sector_end      DOUBLE PRECISION NOT NULL,
+            x               DOUBLE PRECISION NOT NULL,
+            y               DOUBLE PRECISION NOT NULL,
+            computed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (month, genre)
+        )
+        """,
+    ),
+    # Style placements inside their host sector. `genre` is the dominant parent
+    # for a style row and the secondary parent for a ghost copy.
+    (
+        "insights.style_atlas_layout table",
+        """
+        CREATE TABLE IF NOT EXISTS insights.style_atlas_layout (
+            month           DATE NOT NULL CHECK (EXTRACT(DAY FROM month) = 1),
+            node_kind       TEXT NOT NULL CHECK (node_kind IN ('style', 'ghost')),
+            style           TEXT NOT NULL,
+            genre           TEXT NOT NULL,
+            x               DOUBLE PRECISION NOT NULL,
+            y               DOUBLE PRECISION NOT NULL,
+            computed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (month, node_kind, style, genre)
+        )
+        """,
+    ),
     (
         "idx_anniversaries_month_year",
         "CREATE INDEX IF NOT EXISTS idx_anniversaries_month_year ON insights.monthly_anniversaries (computed_year, computed_month)",
@@ -1651,6 +1722,14 @@ _MUSICBRAINZ_INDEXES: list[tuple[str, str]] = [
     (
         "idx_mb_links_updated_at",
         "CREATE INDEX IF NOT EXISTS idx_mb_links_updated_at ON musicbrainz.external_links (updated_at)",
+    ),
+    # MusicBrainz-only releases attach to a Discogs master mostly through the
+    # release group's native-id alias (spike gm-design-1h2l, section 2), so the
+    # strata read joins `releases` to `release_groups` on this column. Without the
+    # index that join scans the table.
+    (
+        "idx_mb_releases_release_group_mbid",
+        "CREATE INDEX IF NOT EXISTS idx_mb_releases_release_group_mbid ON musicbrainz.releases (release_group_mbid)",
     ),
     (
         "idx_mb_artists_gm_item_id",

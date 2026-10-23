@@ -323,6 +323,24 @@ The executable PostgreSQL inventory is in
   `community_counts`, `computation_log`, and `activity_summary` (analytics-engine's
   daily per-dimension rollup of `activity` events and impressions, keyed by
   `summary_date`, `dimension`, and `dimension_key`);
+- the Genre Atlas insight tables, all written by analytics-engine (design spike
+  `gm-design-4804`, recommendation for B) and read by catalog-api:
+  - `style_year_counts`: release and master counts per style and year, keyed by `(style, year)`,
+    from which the style lifecycle stages are computed;
+  - `style_parents`: every parent genre of a style at share >= 0.20, keyed by `(style, genre)`,
+    with `share` in (0, 1] and exactly one `is_dominant` parent per style (at most one is enforced
+    by a partial unique index; "at least one" is the writer's contract);
+  - `genre_atlas_sectors`: the genre ring, one row per genre per month, keyed by `(month, genre)`
+    with every column NOT NULL. `ring_order` is the genre's position on the ring;
+    `sector_start` and `sector_end` are the sector bounds in radians and may wrap past 2π,
+    so `sector_end` is not constrained against `sector_start`; `x` and `y` are the genre
+    node's position in the layout's unit plane; and
+  - `style_atlas_layout`: one row per placed style node per month, keyed by
+    `(month, node_kind, style, genre)`, with `node_kind` either `style` or `ghost` (a copy under
+    a secondary parent). `genre` is the host sector: the dominant parent for a style row and the
+    secondary parent for a ghost row. `x` and `y` are in the same unit plane. Genre nodes live in
+    `genre_atlas_sectors`, so no key column holds a sentinel. Both layout tables keep prior months
+    so the next monthly run can pin the ring order and sector frames to the previous frame;
 - activity tables in the `activity` schema (see Activity above): `user_subjects`,
   `consent_grants`, `events`, `impressions`, and `erasures`;
 - MusicBrainz tables in the `musicbrainz` schema: `artists`, `labels`, `releases`,
