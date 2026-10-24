@@ -427,7 +427,10 @@ class TestCreatePostgresSchema:
             # no state to reapply and is trivially idempotent by never writing
             # anything.
             read_only = upper.strip().startswith("SELECT")
-            exempt = ("ALTER COLUMN" in upper and "TYPE " in upper) or "CREATE OR REPLACE" in upper or guarded_block or read_only
+            # A retirement is `DROP TABLE IF EXISTS`: the guard makes it a no-op
+            # once the table is gone, which the DROP guard below also checks.
+            retirement = upper.startswith("DROP TABLE IF EXISTS ")
+            exempt = ("ALTER COLUMN" in upper and "TYPE " in upper) or "CREATE OR REPLACE" in upper or guarded_block or read_only or retirement
             if not exempt:
                 assert "IF NOT EXISTS" in upper, f"Statement is not idempotent: {stmt[:80]}..."
             if guarded_block:

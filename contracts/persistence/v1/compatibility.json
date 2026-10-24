@@ -688,6 +688,24 @@
   "owners": [
     "database-schema"
   ],
+  "retired_relations": {
+    "consumer_rollout": "contract phase of expand, migrate consumers, then contract: catalog-api stopped writing and reading both tables (gm-catalog-api-gz4r) and operations-console reads queue and service-health history from VictoriaMetrics, so the drop lands only after a catalog-api release containing that removal is deployed",
+    "data": "historical rows are not migrated; VictoriaMetrics holds the same series at finer resolution for its retention window (ADR 0018)",
+    "decision": "design ADR 0018",
+    "drop_statements": {
+      "public.queue_metrics": "DROP TABLE IF EXISTS queue_metrics",
+      "public.service_health_metrics": "DROP TABLE IF EXISTS service_health_metrics"
+    },
+    "indexes_dropped_with_table": [
+      "idx_queue_metrics_recorded_queue",
+      "idx_service_health_recorded_service"
+    ],
+    "kind": "retirement",
+    "relations": [
+      "public.queue_metrics",
+      "public.service_health_metrics"
+    ]
+  },
   "sources": [
     "src/groovemap_schema/neo4j.py",
     "src/groovemap_schema/postgres.py"

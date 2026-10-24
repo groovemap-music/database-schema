@@ -96,10 +96,6 @@ _LEGACY_STATEMENT_NAMES = [
     "extraction_history",
     "idx_extraction_history_status",
     "idx_extraction_history_created_at",
-    "queue_metrics table",
-    "idx_queue_metrics_recorded_queue",
-    "service_health_metrics table",
-    "idx_service_health_recorded_service",
     "admin_audit_log table",
     "idx_admin_audit_log_created_at",
     "idx_admin_audit_log_admin_id",
@@ -155,6 +151,8 @@ _LEGACY_STATEMENT_NAMES = [
 # before the legacy comparison will pass.
 _ADDED_STATEMENT_NAMES = frozenset(
     {
+        "queue_metrics table retired",
+        "service_health_metrics table retired",
         "artists add gm_item_id column",
         "idx_artists_gm_item_id",
         "labels add gm_item_id column",

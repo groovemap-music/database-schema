@@ -63,6 +63,18 @@ for column in jobs["job"]["columns"]:
 assert "WHERE state IN ('pending', 'retry')" in user_statements["idx_loader_derived_refresh_job_due"]
 assert "WHERE state = 'leased'" in user_statements["idx_loader_derived_refresh_job_lease_expiry"]
 
+# The metrics-history tables are retired (ADR 0018): the schema drops them and
+# never creates them, so a consumer reading the contract sees them gone.
+retired = contract["retired_relations"]
+assert retired["kind"] == "retirement"
+for relation in retired["relations"]:
+    table = relation.removeprefix("public.")
+    assert retired["drop_statements"][relation] == f"DROP TABLE IF EXISTS {table}"
+    assert user_statements[f"{table} table retired"] == retired["drop_statements"][relation]
+    assert f"{table} table" not in user_statements, table
+for index in retired["indexes_dropped_with_table"]:
+    assert index not in user_statements, index
+
 # Catalog-item supersession (ADR 0009's 2026-09-25 amendment) is consumed by
 # catalog-api's merge steps, so every column, cause, key, and index the contract
 # names must be in the statement that declares it.

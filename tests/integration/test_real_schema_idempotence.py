@@ -64,9 +64,7 @@ EXPECTED_POSTGRES_TABLES = {
         "observations",
         "owned_copies",
         "provider_aliases",
-        "queue_metrics",
         "releases",
-        "service_health_metrics",
         "sync_history",
         "user_collections",
         "user_wantlists",
@@ -720,6 +718,30 @@ async def test_both_schema_initializers_are_real_engine_idempotent() -> None:
     assert await postgres_snapshot() == first_postgres
     assert await neo4j_snapshot() == first_neo4j
     await assert_sentinels_survive()
+
+
+@pytest.mark.asyncio
+async def test_retired_metrics_tables_are_dropped_and_the_drop_is_a_no_op_twice() -> None:
+    """A database still holding the retired tables loses them; reapplying changes nothing."""
+    await apply_schema()
+    connection = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params())
+    async with connection, connection.cursor() as cursor:
+        await cursor.execute("CREATE TABLE queue_metrics (id BIGINT PRIMARY KEY, recorded_at TIMESTAMPTZ, queue_name TEXT)")
+        await cursor.execute("CREATE INDEX idx_queue_metrics_recorded_queue ON queue_metrics (recorded_at, queue_name)")
+        await cursor.execute("CREATE TABLE service_health_metrics (id BIGINT PRIMARY KEY, recorded_at TIMESTAMPTZ, service_name TEXT)")
+        await cursor.execute("CREATE INDEX idx_service_health_recorded_service ON service_health_metrics (recorded_at, service_name)")
+        await connection.commit()
+
+    for _ in range(2):
+        await apply_schema()
+        remaining = await postgres_rows(
+            """
+            SELECT relname FROM pg_class
+            WHERE relname IN ('queue_metrics', 'service_health_metrics',
+                              'idx_queue_metrics_recorded_queue', 'idx_service_health_recorded_service')
+            """
+        )
+        assert remaining == []
 
 
 # ── The artist embeddings HNSW index and its build procedure (ADR 0013) ──────
