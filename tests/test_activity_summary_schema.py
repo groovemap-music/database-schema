@@ -32,6 +32,7 @@ _NAMES_STYLE_ATLAS = [
     "idx_style_parents_one_dominant",
     "insights.genre_atlas_sectors table",
     "insights.style_atlas_layout table",
+    "insights.style_landmark_masters table",
 ]
 
 _NAMES_AFTER_ACTIVITY_SUMMARY = [
