@@ -342,11 +342,16 @@ The executable PostgreSQL inventory is in
     a secondary parent). `genre` is the host sector: the dominant parent for a style row and the
     secondary parent for a ghost row. `x` and `y` are in the same unit plane. Genre nodes live in
     `genre_atlas_sectors`, so no key column holds a sentinel. Both layout tables keep prior months
-    so the next monthly run can pin the ring order and sector frames to the previous frame; and
+    so the next monthly run can pin the ring order and sector frames to the previous frame;
   - `style_landmark_masters`: the landmark masters of a style for the Genre Atlas master plane,
     keyed by `(style, master_id)`, each with a `title`, an optional `year`, a non-negative
     `release_count`, and a `rank` from 1 to 25 that is unique within the style
-    (`UNIQUE (style, rank)`);
+    (`UNIQUE (style, rank)`); and
+  - `style_cotags`: the lateral co-tag edges of a style for the Genre Atlas, on demand: the top 25
+    other styles that share releases with it, keyed by `(style, other)`, with every column NOT NULL,
+    a non-negative `release_count` of shared releases, and a `rank` from 1 to 25 that is unique
+    within the style (`UNIQUE (style, rank)`). A style is never its own co-tag
+    (`CHECK (style <> other)`);
 - activity tables in the `activity` schema (see Activity above): `user_subjects`,
   `consent_grants`, `events`, `impressions`, and `erasures`;
 - MusicBrainz tables in the `musicbrainz` schema: `artists`, `labels`, `releases`,

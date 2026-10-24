@@ -29,6 +29,7 @@ _TABLES = {
     ),
     "insights.style_atlas_layout table": ("month", "node_kind", "style", "genre", "x", "y", "computed_at"),
     "insights.style_landmark_masters table": ("style", "master_id", "title", "year", "release_count", "rank", "computed_at"),
+    "insights.style_cotags table": ("style", "other", "release_count", "rank", "computed_at"),
 }
 
 
@@ -116,10 +117,23 @@ def test_style_landmark_masters_keys_rank_and_nullability() -> None:
     assert re.search(r"^\s+year\s+INT,?$", ddl, re.MULTILINE)
 
 
+def test_style_cotags_keys_rank_and_self_edge_check() -> None:
+    ddl = _STATEMENTS["insights.style_cotags table"]
+    assert "PRIMARY KEY (style, other)" in ddl
+    assert "UNIQUE (style, rank)" in ddl
+    assert "CHECK (style <> other)" in ddl
+    assert "style           TEXT NOT NULL" in ddl
+    assert "other           TEXT NOT NULL" in ddl
+    assert "release_count   BIGINT NOT NULL CHECK (release_count >= 0)" in ddl
+    assert "rank            INT NOT NULL CHECK (rank BETWEEN 1 AND 25)" in ddl
+    # Every column is NOT NULL: there is no nullable column to list.
+    assert re.search(r"^\s+\w+\s+\w+,?$", ddl, re.MULTILINE) is None
+
+
 def test_atlas_statements_sit_after_the_activity_summary_index() -> None:
     names = [name for name, _ddl in _INSIGHTS_TABLES]
     start = names.index("idx_activity_summary_date") + 1
-    assert names[start : start + 7] == [
+    assert names[start : start + 8] == [
         "insights.style_year_counts table",
         "insights.genre_year_counts table",
         "insights.style_parents table",
@@ -127,4 +141,5 @@ def test_atlas_statements_sit_after_the_activity_summary_index() -> None:
         "insights.genre_atlas_sectors table",
         "insights.style_atlas_layout table",
         "insights.style_landmark_masters table",
+        "insights.style_cotags table",
     ]

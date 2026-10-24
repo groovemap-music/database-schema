@@ -1106,6 +1106,23 @@ _INSIGHTS_TABLES: list[tuple[str, str]] = [
         )
         """,
     ),
+    # Lateral co-tag edges for the Genre Atlas: the top 25 other styles that share
+    # releases with a style, ranked 1 to 25. A style is never its own co-tag.
+    (
+        "insights.style_cotags table",
+        """
+        CREATE TABLE IF NOT EXISTS insights.style_cotags (
+            style           TEXT NOT NULL,
+            other           TEXT NOT NULL,
+            release_count   BIGINT NOT NULL CHECK (release_count >= 0),
+            rank            INT NOT NULL CHECK (rank BETWEEN 1 AND 25),
+            computed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (style, other),
+            UNIQUE (style, rank),
+            CHECK (style <> other)
+        )
+        """,
+    ),
     (
         "idx_anniversaries_month_year",
         "CREATE INDEX IF NOT EXISTS idx_anniversaries_month_year ON insights.monthly_anniversaries (computed_year, computed_month)",

@@ -33,6 +33,7 @@ _NAMES_STYLE_ATLAS = [
     "insights.genre_atlas_sectors table",
     "insights.style_atlas_layout table",
     "insights.style_landmark_masters table",
+    "insights.style_cotags table",
 ]
 
 _NAMES_AFTER_ACTIVITY_SUMMARY = [

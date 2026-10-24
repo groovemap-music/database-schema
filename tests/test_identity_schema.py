@@ -217,6 +217,7 @@ _ADDED_STATEMENT_NAMES = frozenset(
         "insights.genre_atlas_sectors table",
         "insights.style_atlas_layout table",
         "insights.style_landmark_masters table",
+        "insights.style_cotags table",
         "idx_releases_identifiers",
         "idx_releases_companies",
         "musicbrainz.relationships.updated_at column",
