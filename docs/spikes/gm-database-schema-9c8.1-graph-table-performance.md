@@ -141,7 +141,7 @@ are derived from the same generator output, by the rules the graph views encode.
 ### The three reads
 
 Ported from catalog-api, read-only, at
-`/Users/Robert/workspaces/github/groovemap-music/catalog-api/api/queries/`. The
+`<workspace>/catalog-api/api/queries/`. The
 Cypher is used verbatim for backend (c); the `GRAPH_TABLE` ports are in
 [`gm-database-schema-9c8.1/queries/`](gm-database-schema-9c8.1/queries/).
 
