@@ -55,6 +55,7 @@ EXPECTED_POSTGRES_TABLES = {
         "catalog_items",
         "collection_snapshots",
         "extraction_history",
+        "identity_link_events",
         "labels",
         "loader_extraction_latch",
         "loader_derived_refresh_cursor",
@@ -155,6 +156,12 @@ EXPECTED_COLUMNS = {
     ("public", "catalog_item_moves", "to_item_id", "uuid"),
     ("public", "catalog_item_moves", "user_id", "uuid"),
     ("public", "catalog_item_moves", "moved_at", "timestamp with time zone"),
+    # The ledger's Discogs ids are pinned at the type of musicbrainz.*.discogs_*_id.
+    ("public", "identity_link_events", "discogs_id_before", "bigint"),
+    ("public", "identity_link_events", "discogs_id_after", "bigint"),
+    ("public", "identity_link_events", "event_at", "timestamp with time zone"),
+    ("public", "identity_link_events", "decision_ref", "uuid"),
+    ("public", "identity_link_events", "recorded_at", "timestamp with time zone"),
 }
 
 # The endpoint-pair indexes every one of the sixteen typed MusicBrainz
@@ -177,6 +184,7 @@ EXPECTED_UUIDV7_DEFAULTS = {
     ("public", "catalog_item_supersessions", "id"),
     ("public", "catalog_items", "id"),
     ("public", "collection_snapshots", "id"),
+    ("public", "identity_link_events", "id"),
     ("public", "observations", "id"),
     ("public", "owned_copies", "id"),
     ("public", "provider_aliases", "id"),
@@ -3076,6 +3084,106 @@ async def test_supersession_and_dependent_indexes_exist() -> None:
     assert "UNIQUE" in definitions["idx_catalog_item_supersessions_superseded_id"]
     assert definitions["idx_catalog_item_supersessions_superseded_id"].endswith("WHERE (valid_to IS NULL)")
     assert "idx_catalog_item_moves_user_id" in definitions
+
+
+_LINK_EVENT = (
+    "INSERT INTO identity_link_events "
+    "(provider, entity_kind, external_id, event, discogs_id_before, discogs_id_after, event_at, dated_from, source_ref) "
+    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)"
+)
+
+
+@pytest.mark.asyncio
+async def test_identity_link_events_enforce_their_checks_and_idempotence_key() -> None:
+    await apply_schema()
+    connection = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params(), autocommit=True)
+    async with connection, connection.cursor() as cursor:
+        source_ref = f"it-{uuid4().hex}"
+        mbid = str(uuid4())
+        event_at = "2020-01-02T03:04:05Z"
+        try:
+
+            def row(event: str, before: int | None, after: int | None, /, **override: Any) -> tuple[Any, ...]:
+                values: dict[str, Any] = {
+                    "provider": "musicbrainz",
+                    "entity_kind": "release",
+                    "external_id": mbid,
+                    "event": event,
+                    "before": before,
+                    "after": after,
+                    "event_at": event_at,
+                    "dated_from": "musicbrainz_fullexport",
+                    "source_ref": source_ref,
+                }
+                values.update(override)
+                return tuple(values.values())
+
+            # Each event admits exactly its own shape; Discogs ids past int4 are BIGINT.
+            await cursor.execute(_LINK_EVENT, row("link_added", None, 3_000_000_000))
+            await cursor.execute(_LINK_EVENT, row("link_changed", 3_000_000_000, 7, event_at="2020-02-02T00:00:00Z"))
+            await cursor.execute(_LINK_EVENT, row("link_removed", 7, None, event_at="2020-03-03T00:00:00Z"))
+            await cursor.execute(
+                "SELECT count(*), count(id), count(decision_ref), count(recorded_at) FROM identity_link_events WHERE source_ref = %s",
+                (source_ref,),
+            )
+            assert await cursor.fetchone() == (3, 3, 0, 3)
+
+            mismatched = [
+                row("link_added", 1, 2),  # added: a before id
+                row("link_added", None, None),  # added: no after id
+                row("link_added", 1, None),  # added: removed's shape
+                row("link_removed", None, None),  # removed: no before id
+                row("link_removed", 1, 2),  # removed: an after id
+                row("link_removed", None, 2),  # removed: added's shape
+                row("link_changed", None, 2),  # changed: no before id
+                row("link_changed", 1, None),  # changed: no after id
+                row("link_changed", None, None),  # changed: neither
+                row("link_changed", 5, 5),  # changed: not a change
+            ]
+            for bad in mismatched:
+                with pytest.raises(psycopg.errors.CheckViolation, match="identity_link_events_link_matches_event"):
+                    await cursor.execute(_LINK_EVENT, bad)
+
+            # Each closed set rejects a value outside it.
+            for bad in (
+                row("link_added", None, 2, event="link_renamed"),
+                row("link_added", None, 2, provider="discogs"),
+                row("link_added", None, 2, dated_from="backfill"),
+            ):
+                with pytest.raises(psycopg.errors.CheckViolation):
+                    await cursor.execute(_LINK_EVENT, bad)
+
+            # Every key column is required.
+            for column in ("entity_kind", "external_id", "event", "event_at", "dated_from", "source_ref"):
+                with pytest.raises(psycopg.errors.NotNullViolation):
+                    await cursor.execute(_LINK_EVENT, row("link_added", None, 2, **{column: None}))
+
+            # The idempotence key: the same event from the same run is refused, and ON CONFLICT DO NOTHING makes a rerun a no-op.
+            with pytest.raises(psycopg.errors.UniqueViolation, match="identity_link_events_idempotence_key"):
+                await cursor.execute(_LINK_EVENT, row("link_added", None, 9))
+            await cursor.execute(
+                _LINK_EVENT + " ON CONFLICT ON CONSTRAINT identity_link_events_idempotence_key DO NOTHING", row("link_added", None, 9)
+            )
+            assert cursor.rowcount == 0
+
+            # Any one key column that differs is a different event.
+            await cursor.execute(_LINK_EVENT, row("link_added", None, 2, source_ref=f"{source_ref}-next"))
+            await cursor.execute(_LINK_EVENT, row("link_added", None, 2, dated_from="groovemap_load"))
+            await cursor.execute(_LINK_EVENT, row("link_added", None, 2, event_at="2021-01-01T00:00:00Z"))
+            await cursor.execute(_LINK_EVENT, row("link_added", None, 2, entity_kind="master"))
+            await cursor.execute(_LINK_EVENT, row("link_added", None, 2, external_id=str(uuid4())))
+            await cursor.execute("SELECT count(*) FROM identity_link_events WHERE source_ref LIKE %s", (f"{source_ref}%",))
+            assert await cursor.fetchone() == (8,)
+
+            # The indexes exist as declared.
+            rows = await postgres_rows(
+                "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = 'public' AND tablename = 'identity_link_events'"
+            )
+            definitions = dict(rows)
+            assert definitions["idx_identity_link_events_entity_event_at"].endswith("(provider, entity_kind, external_id, event_at)")
+            assert definitions["idx_identity_link_events_event_at"].endswith("(event_at)")
+        finally:
+            await cursor.execute("DELETE FROM identity_link_events WHERE source_ref LIKE %s", (f"{source_ref}%",))
 
 
 @pytest.mark.asyncio

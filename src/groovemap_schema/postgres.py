@@ -612,6 +612,63 @@ _USER_TABLES: list[tuple[str, str]] = [
         $resolve_catalog_item$
         """,
     ),
+    # The Identity Ledger's dated link history: one row per change of a
+    # MusicBrainz row's Discogs link.  `provider_aliases` and
+    # `catalog_item_supersessions` stamp NOW() at write time, so neither can say
+    # when a link changed.  Two writers fill this table and `dated_from` keeps
+    # them apart: the one-time backfill from the MusicBrainz full export dates an
+    # event by the row-id creation bound, which belongs to an older, since
+    # replaced link for about 9% of rows, so it reads "dated from the
+    # MusicBrainz full export"; the live load dates an event by its own
+    # transaction.  `entity_kind` takes the values `provider_aliases` uses for
+    # MusicBrainz rows (`artist`, `label`, `master`, `release`) and
+    # `external_id` is the MBID as text, as it is there.  The Discogs ids are
+    # BIGINT, the type of the `musicbrainz.*.discogs_*_id` columns.
+    # `decision_ref` names the backfill run's `admin_audit_log` entry, so it is a
+    # bare UUID and NULL for a load row.  No user data is stored.
+    #
+    # The CHECKs are closed at the one provider, the three events and the two
+    # provenances; another joins only by amendment.  The before and after ids
+    # must match the event: a link added has nothing before it, a link removed
+    # nothing after it, and a link changed has both and they differ.  The unique
+    # key is the idempotence key: a rerun of the same backfill or load inserts
+    # the same rows, and `ON CONFLICT DO NOTHING` makes the rerun a no-op.
+    (
+        "identity_link_events table",
+        """
+        CREATE TABLE IF NOT EXISTS identity_link_events (
+            id                UUID PRIMARY KEY DEFAULT uuidv7(),
+            provider          TEXT NOT NULL CHECK (provider = 'musicbrainz'),
+            entity_kind       TEXT NOT NULL,
+            external_id       TEXT NOT NULL,
+            event             TEXT NOT NULL CHECK (event IN ('link_added', 'link_changed', 'link_removed')),
+            discogs_id_before BIGINT,
+            discogs_id_after  BIGINT,
+            event_at          TIMESTAMPTZ NOT NULL,
+            dated_from        TEXT NOT NULL CHECK (dated_from IN ('musicbrainz_fullexport', 'groovemap_load')),
+            source_ref        TEXT NOT NULL,
+            decision_ref      UUID,
+            recorded_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT identity_link_events_link_matches_event CHECK (
+                (event = 'link_added' AND discogs_id_before IS NULL AND discogs_id_after IS NOT NULL)
+                OR (event = 'link_removed' AND discogs_id_before IS NOT NULL AND discogs_id_after IS NULL)
+                OR (event = 'link_changed' AND discogs_id_before IS NOT NULL AND discogs_id_after IS NOT NULL
+                    AND discogs_id_before <> discogs_id_after)
+            ),
+            CONSTRAINT identity_link_events_idempotence_key
+                UNIQUE (dated_from, source_ref, provider, entity_kind, external_id, event, event_at)
+        )
+        """,
+    ),
+    # One row's history in order, and the ledger's per-month reads by date.
+    (
+        "idx_identity_link_events_entity_event_at",
+        "CREATE INDEX IF NOT EXISTS idx_identity_link_events_entity_event_at ON identity_link_events (provider, entity_kind, external_id, event_at)",
+    ),
+    (
+        "idx_identity_link_events_event_at",
+        "CREATE INDEX IF NOT EXISTS idx_identity_link_events_event_at ON identity_link_events (event_at)",
+    ),
     (
         "sync_history table",
         """

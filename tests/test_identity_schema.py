@@ -243,6 +243,9 @@ _ADDED_STATEMENT_NAMES = frozenset(
         "catalog_item_moves table",
         "idx_catalog_item_moves_user_id",
         "resolve_catalog_item function",
+        "identity_link_events table",
+        "idx_identity_link_events_entity_event_at",
+        "idx_identity_link_events_event_at",
         "public.artist_similar_artists table",
         "artist similarity K guard function",
         "artist similarity K guard trigger",
@@ -774,6 +777,71 @@ class TestCatalogItemMoves:
         names = _user_table_names()
         assert names.index("catalog_item_supersessions table") < names.index("catalog_item_moves table")
         assert names.index("catalog_item_moves table") < names.index("idx_catalog_item_moves_user_id")
+
+
+class TestIdentityLinkEvents:
+    """identity_link_events — the Identity Ledger's dated link history (Strata M6)."""
+
+    def _stmt(self) -> str:
+        return _user_tables()["identity_link_events table"]
+
+    def test_is_idempotent(self) -> None:
+        assert "CREATE TABLE IF NOT EXISTS identity_link_events" in self._stmt()
+
+    def test_columns(self) -> None:
+        stmt = self._stmt()
+        for fragment in (
+            "id                UUID PRIMARY KEY DEFAULT uuidv7()",
+            "provider          TEXT NOT NULL CHECK (provider = 'musicbrainz')",
+            "entity_kind       TEXT NOT NULL,",
+            "external_id       TEXT NOT NULL,",
+            "event             TEXT NOT NULL CHECK (event IN ('link_added', 'link_changed', 'link_removed'))",
+            "event_at          TIMESTAMPTZ NOT NULL,",
+            "dated_from        TEXT NOT NULL CHECK (dated_from IN ('musicbrainz_fullexport', 'groovemap_load'))",
+            "source_ref        TEXT NOT NULL,",
+            "recorded_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+        ):
+            assert fragment in stmt, f"Missing column '{fragment}'"
+
+    def test_discogs_ids_are_bigint_and_nullable(self) -> None:
+        """BIGINT is the type of `musicbrainz.releases.discogs_release_id`; the CHECK decides which side is NULL."""
+        stmt = self._stmt()
+        assert "discogs_id_before BIGINT," in stmt
+        assert "discogs_id_after  BIGINT," in stmt
+
+    def test_decision_ref_is_a_nullable_bare_uuid(self) -> None:
+        """It names the backfill run's audit entry, and a load row has none."""
+        assert "decision_ref      UUID," in self._stmt()
+
+    def test_ids_must_match_the_event(self) -> None:
+        stmt = self._stmt()
+        assert "CONSTRAINT identity_link_events_link_matches_event CHECK" in stmt
+        assert "event = 'link_added' AND discogs_id_before IS NULL AND discogs_id_after IS NOT NULL" in stmt
+        assert "event = 'link_removed' AND discogs_id_before IS NOT NULL AND discogs_id_after IS NULL" in stmt
+        assert "event = 'link_changed' AND discogs_id_before IS NOT NULL AND discogs_id_after IS NOT NULL" in stmt
+        assert "discogs_id_before <> discogs_id_after" in stmt
+
+    def test_idempotence_key(self) -> None:
+        assert (
+            "CONSTRAINT identity_link_events_idempotence_key\n"
+            "                UNIQUE (dated_from, source_ref, provider, entity_kind, external_id, event, event_at)"
+        ) in self._stmt()
+
+    def test_indexes(self) -> None:
+        tables = _user_tables()
+        assert tables["idx_identity_link_events_entity_event_at"].endswith("ON identity_link_events (provider, entity_kind, external_id, event_at)")
+        assert tables["idx_identity_link_events_event_at"].endswith("ON identity_link_events (event_at)")
+
+    def test_index_names_fit_the_identifier_limit(self) -> None:
+        """PostgreSQL silently truncates a name past 63 bytes, so a longer one would not match its statement name."""
+        for name in ("idx_identity_link_events_entity_event_at", "idx_identity_link_events_event_at"):
+            assert len(name) <= 63
+
+    def test_declared_after_the_identity_tables_and_before_its_indexes(self) -> None:
+        names = _user_table_names()
+        table = names.index("identity_link_events table")
+        assert names.index("catalog_item_supersessions table") < table
+        assert table < names.index("idx_identity_link_events_entity_event_at") < names.index("idx_identity_link_events_event_at")
 
 
 class TestResolveCatalogItem:

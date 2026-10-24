@@ -116,6 +116,29 @@ assert "CREATE OR REPLACE FUNCTION public.resolve_catalog_item(native_id UUID)" 
 for index in supersession["dependent_indexes"]:
     assert index in user_statements, index
 
+# The Identity Ledger's dated link history is written by catalog-api (the
+# full-export backfill) and musicbrainz-sql-loader (live loads). Pin its
+# columns, closed CHECK sets, idempotence key, and indexes to the statements.
+link_events = contract["identity_link_events"]
+link_events_statement = user_statements["identity_link_events table"]
+assert link_events["kind"] == "additive"
+assert link_events["introduced_in_contract_version"] == contract["version"]
+assert link_events["relation"] == "public.identity_link_events"
+for column in link_events["columns"]:
+    assert f"\n            {column} " in link_events_statement, column
+for check, column in (("provider", "provider"), ("events", "event"), ("dated_from", "dated_from")):
+    allowed = ", ".join(f"'{value}'" for value in link_events["checks"][check])
+    if check == "provider":
+        assert f"CHECK (provider = {allowed})" in link_events_statement
+    else:
+        assert f"CHECK ({column} IN ({allowed}))" in link_events_statement
+assert f"CONSTRAINT {link_events['checks']['link_matches_event']['constraint']} CHECK" in link_events_statement
+idempotence = link_events["idempotence_key"]
+assert f"CONSTRAINT {idempotence['constraint']}\n                UNIQUE ({', '.join(idempotence['columns'])})" in link_events_statement
+for index in link_events["indexes"]:
+    name = index.split(" ", 1)[0]
+    assert index == user_statements[name].removeprefix("CREATE INDEX IF NOT EXISTS "), name
+
 # The graph schema is recorded as an additive object of contract v1. Every count
 # and every relation below is read back from the statement list rather than
 # restated, so a relation added, removed, or reshaped in postgres.py fails this
