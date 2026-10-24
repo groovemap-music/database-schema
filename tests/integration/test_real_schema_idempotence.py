@@ -85,6 +85,7 @@ EXPECTED_POSTGRES_TABLES = {
         "monthly_anniversaries",
         "release_rarity",
         "style_atlas_layout",
+        "style_cotags",
         "style_landmark_masters",
         "style_parents",
         "style_year_counts",
@@ -3084,8 +3085,35 @@ async def test_style_atlas_tables_enforce_their_keys_and_checks() -> None:
             # The same rank in another style is fine.
             await cursor.execute(landmark, ("it-other", "m1", "First", 1969, 40, 1))
             await connection.rollback()
+
+            # Co-tags are keyed by (style, other), ranked 1 to 25 once per style, never a style with itself, and every column is required.
+            cotag = "INSERT INTO insights.style_cotags (style, other, release_count, rank) VALUES (%s, %s, %s, %s)"
+            await cursor.execute(cotag, ("it-style", "it-a", 40, 1))
+            await cursor.execute(cotag, ("it-style", "it-b", 0, 25))
+            await cursor.execute(cotag, ("it-a", "it-style", 40, 1))  # the edge is directed: the reverse is its own row
+            await connection.commit()
+            bad_cotags = [
+                ("it-style", "it-a", 1, 2),  # duplicate key
+                ("it-style", "it-c", 1, 1),  # rank taken within the style
+                ("it-style", "it-c", 1, 0),  # rank below 1
+                ("it-style", "it-c", 1, 26),  # rank above 25
+                ("it-style", "it-c", -1, 2),  # negative count
+                ("it-style", "it-style", 1, 2),  # a style is not its own co-tag
+                ("it-style", "it-c", 1, None),  # no rank
+                ("it-style", "it-c", None, 2),  # no count
+                (None, "it-c", 1, 2),  # no style
+                ("it-style", None, 1, 2),  # no other
+            ]
+            for row in bad_cotags:
+                with pytest.raises((psycopg.errors.UniqueViolation, psycopg.errors.CheckViolation, psycopg.errors.NotNullViolation)):
+                    await cursor.execute(cotag, row)
+                await connection.rollback()
+            # The same rank in another style is fine.
+            await cursor.execute(cotag, ("it-other", "it-a", 40, 1))
+            await connection.rollback()
         finally:
             await connection.rollback()
+            await cursor.execute("DELETE FROM insights.style_cotags WHERE style LIKE 'it-%'")
             await cursor.execute("DELETE FROM insights.style_landmark_masters WHERE style LIKE 'it-%'")
             await cursor.execute("DELETE FROM insights.style_parents WHERE style LIKE 'it-%'")
             await cursor.execute("DELETE FROM insights.genre_year_counts WHERE genre LIKE 'it-%'")
