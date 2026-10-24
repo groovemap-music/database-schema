@@ -1088,6 +1088,24 @@ _INSIGHTS_TABLES: list[tuple[str, str]] = [
         )
         """,
     ),
+    # The master plane's landmark masters: up to 25 per style, ranked 1 to 25. The
+    # (style, rank) key keeps a style's ranks distinct.
+    (
+        "insights.style_landmark_masters table",
+        """
+        CREATE TABLE IF NOT EXISTS insights.style_landmark_masters (
+            style           TEXT NOT NULL,
+            master_id       TEXT NOT NULL,
+            title           TEXT NOT NULL,
+            year            INT,
+            release_count   BIGINT NOT NULL CHECK (release_count >= 0),
+            rank            INT NOT NULL CHECK (rank BETWEEN 1 AND 25),
+            computed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (style, master_id),
+            UNIQUE (style, rank)
+        )
+        """,
+    ),
     (
         "idx_anniversaries_month_year",
         "CREATE INDEX IF NOT EXISTS idx_anniversaries_month_year ON insights.monthly_anniversaries (computed_year, computed_month)",
