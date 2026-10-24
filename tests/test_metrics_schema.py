@@ -1,29 +1,26 @@
-"""Tests for metrics schema table definitions."""
+"""Tests for the retired metrics-history tables (ADR 0018)."""
 
 from __future__ import annotations
 
-from groovemap_schema.postgres import _USER_TABLES
+import pytest
+
+from groovemap_schema.postgres import _schema_statements
 
 
-def test_queue_metrics_table_in_schema() -> None:
-    """Verify queue_metrics table definition exists in schema."""
-    names = [name for name, _ in _USER_TABLES]
-    assert "queue_metrics table" in names
+RETIRED_TABLES = ["queue_metrics", "service_health_metrics"]
 
 
-def test_service_health_metrics_table_in_schema() -> None:
-    """Verify service_health_metrics table definition exists in schema."""
-    names = [name for name, _ in _USER_TABLES]
-    assert "service_health_metrics table" in names
+def test_retired_tables_are_dropped_idempotently() -> None:
+    """Each retired table has one DROP TABLE IF EXISTS step."""
+    statements = dict(_schema_statements())
+    for table in RETIRED_TABLES:
+        assert statements[f"{table} table retired"] == f"DROP TABLE IF EXISTS {table}"
 
 
-def test_queue_metrics_index_in_schema() -> None:
-    """Verify composite index for queue_metrics exists."""
-    names = [name for name, _ in _USER_TABLES]
-    assert "idx_queue_metrics_recorded_queue" in names
-
-
-def test_service_health_metrics_index_in_schema() -> None:
-    """Verify composite index for service_health_metrics exists."""
-    names = [name for name, _ in _USER_TABLES]
-    assert "idx_service_health_recorded_service" in names
+@pytest.mark.parametrize("table", RETIRED_TABLES)
+def test_retired_tables_are_never_created(table: str) -> None:
+    """No statement creates a retired table or an index on it."""
+    for _name, statement in _schema_statements():
+        text = str(statement)
+        assert f"CREATE TABLE IF NOT EXISTS {table}" not in text
+        assert not (text.lstrip().startswith("CREATE") and f"ON {table} " in text)
