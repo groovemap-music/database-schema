@@ -660,6 +660,35 @@ _USER_TABLES: list[tuple[str, str]] = [
         "idx_extraction_history_created_at",
         "CREATE INDEX IF NOT EXISTS idx_extraction_history_created_at ON extraction_history(created_at DESC)",
     ),
+    # Which extractor a run went to. Nullable with no default and no backfill:
+    # rows written before the column existed keep NULL, meaning "not recorded".
+    (
+        "extraction_history.source column",
+        "ALTER TABLE extraction_history ADD COLUMN IF NOT EXISTS source VARCHAR(20)",
+    ),
+    (
+        "extraction_history.source check",
+        """DO $eh_source$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint c
+                JOIN pg_class t ON t.oid = c.conrelid
+                JOIN pg_namespace n ON n.oid = t.relnamespace
+                WHERE n.nspname = 'public'
+                  AND t.relname = 'extraction_history'
+                  AND c.conname = 'extraction_history_source_check'
+            ) THEN
+                ALTER TABLE extraction_history
+                    ADD CONSTRAINT extraction_history_source_check
+                    CHECK (source IN ('discogs', 'musicbrainz'));
+            END IF;
+        END
+        $eh_source$""",
+    ),
+    (
+        "idx_extraction_history_source_created_at",
+        "CREATE INDEX IF NOT EXISTS idx_extraction_history_source_created_at ON extraction_history (source, created_at DESC)",
+    ),
     # Retired (ADR 0018): the operations console reads queue and service-health
     # history from VictoriaMetrics, so the collector that wrote these two tables
     # is gone. Dropping the table takes its index with it. Historical rows are

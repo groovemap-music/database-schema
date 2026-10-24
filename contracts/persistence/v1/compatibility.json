@@ -76,6 +76,27 @@
     "rollback": "every destructive migration requires a tested rollback or restore procedure"
   },
   "contract": "groovemap.persistence",
+  "extraction_history_source": {
+    "check": {
+      "allowed": [
+        "discogs",
+        "musicbrainz"
+      ],
+      "constraint": "extraction_history_source_check",
+      "null_allowed": true
+    },
+    "column": "source",
+    "consumers": [
+      "catalog-api"
+    ],
+    "data": "no default and no backfill: rows written before the column existed keep source NULL, meaning the extractor was not recorded",
+    "index": "idx_extraction_history_source_created_at ON extraction_history (source, created_at DESC)",
+    "introduced_in_contract_version": 1,
+    "kind": "additive",
+    "relation": "public.extraction_history",
+    "type": "VARCHAR(20) NULL",
+    "consumer_rollout": "expand phase: catalog-api pins the revision containing this column before it writes or reads source"
+  },
   "extraction_latch": {
     "columns": {
       "loader_extraction_latch.created_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",

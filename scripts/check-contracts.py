@@ -75,6 +75,21 @@ for relation in retired["relations"]:
 for index in retired["indexes_dropped_with_table"]:
     assert index not in user_statements, index
 
+# extraction_history.source is an additive nullable column: pin its type, the
+# NULL-tolerant CHECK, and the index to the statements that declare them.
+source = contract["extraction_history_source"]
+assert source["kind"] == "additive"
+assert source["introduced_in_contract_version"] == contract["version"]
+assert source["relation"] == "public.extraction_history"
+assert user_statements["extraction_history.source column"] == (
+    f"ALTER TABLE extraction_history ADD COLUMN IF NOT EXISTS {source['column']} VARCHAR(20)"
+)
+allowed = ", ".join(f"'{value}'" for value in source["check"]["allowed"])
+assert source["check"]["null_allowed"] is True
+assert f"c.conname = '{source['check']['constraint']}'" in user_statements["extraction_history.source check"]
+assert f"CHECK ({source['column']} IN ({allowed}))" in user_statements["extraction_history.source check"]
+assert source["index"] == user_statements["idx_extraction_history_source_created_at"].removeprefix("CREATE INDEX IF NOT EXISTS ")
+
 # Catalog-item supersession (ADR 0009's 2026-09-25 amendment) is consumed by
 # catalog-api's merge steps, so every column, cause, key, and index the contract
 # names must be in the statement that declares it.
