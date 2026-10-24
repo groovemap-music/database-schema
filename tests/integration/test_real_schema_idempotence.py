@@ -744,6 +744,77 @@ async def test_retired_metrics_tables_are_dropped_and_the_drop_is_a_no_op_twice(
         assert remaining == []
 
 
+_EXTRACTION_HISTORY_SOURCE_OBJECTS = """
+    SELECT 'column', column_name, data_type, character_maximum_length::text, is_nullable, column_default
+    FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'extraction_history' AND column_name = 'source'
+    UNION ALL
+    SELECT 'check', conname, pg_get_constraintdef(oid), NULL, NULL, NULL
+    FROM pg_constraint WHERE conname = 'extraction_history_source_check'
+    UNION ALL
+    SELECT 'index', indexname, indexdef, NULL, NULL, NULL
+    FROM pg_indexes WHERE indexname = 'idx_extraction_history_source_created_at'
+    ORDER BY 1
+"""
+
+
+async def _insert_extraction_run(cursor: Any, user_id: Any, source: str | None) -> None:
+    await cursor.execute("INSERT INTO extraction_history (triggered_by, source) VALUES (%s, %s)", (user_id, source))
+
+
+async def _extraction_history_user(cursor: Any) -> Any:
+    await cursor.execute(
+        "INSERT INTO users (email, hashed_password) VALUES (%s, 'x') RETURNING id",
+        (f"extraction-source-{uuid4().hex}@example.invalid",),
+    )
+    return (await cursor.fetchone())[0]
+
+
+@pytest.mark.asyncio
+async def test_extraction_history_source_is_constrained_and_applying_twice_is_a_no_op() -> None:
+    """Both accepted sources and NULL insert, an unknown source is rejected, and reapplying changes nothing."""
+    await apply_schema()
+    first = await postgres_rows(_EXTRACTION_HISTORY_SOURCE_OBJECTS)
+    assert [row[:2] for row in first] == [
+        ("check", "extraction_history_source_check"),
+        ("column", "source"),
+        ("index", "idx_extraction_history_source_created_at"),
+    ]
+    column = next(row for row in first if row[0] == "column")
+    assert column[2:] == ("character varying", "20", "YES", None)
+    await apply_schema()
+    assert await postgres_rows(_EXTRACTION_HISTORY_SOURCE_OBJECTS) == first
+
+    connection = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params())
+    async with connection, connection.cursor() as cursor:
+        user_id = await _extraction_history_user(cursor)
+        for source in (None, "discogs", "musicbrainz"):
+            await _insert_extraction_run(cursor, user_id, source)
+        with pytest.raises(psycopg.errors.CheckViolation):
+            await _insert_extraction_run(cursor, user_id, "spotify")
+        await connection.rollback()
+
+
+@pytest.mark.asyncio
+async def test_extraction_history_source_is_added_to_a_table_that_predates_it() -> None:
+    """A table without the column gains it; rows written before keep source NULL."""
+    await apply_schema()
+    connection = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params())
+    async with connection, connection.cursor() as cursor:
+        await cursor.execute("DROP INDEX idx_extraction_history_source_created_at")
+        await cursor.execute("ALTER TABLE extraction_history DROP COLUMN source")
+        user_id = await _extraction_history_user(cursor)
+        await cursor.execute("INSERT INTO extraction_history (triggered_by) VALUES (%s) RETURNING id", (user_id,))
+        run_id = (await cursor.fetchone())[0]
+        await connection.commit()
+
+    for _ in range(2):
+        await apply_schema()
+        rows = await postgres_rows("SELECT source FROM extraction_history WHERE id = %s", (run_id,))
+        assert rows == [(None,)]
+    assert len(await postgres_rows(_EXTRACTION_HISTORY_SOURCE_OBJECTS)) == 3
+
+
 # ── The artist embeddings HNSW index and its build procedure (ADR 0013) ──────
 # Runs on both tiers, but only the advisory PostgreSQL 19 tier has pgvector
 # (see `just test-integration-pg19`): the required PostgreSQL 18 tier proves

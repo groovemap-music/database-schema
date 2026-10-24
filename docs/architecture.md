@@ -315,6 +315,13 @@ The executable PostgreSQL inventory is in
 - account and operational tables: `users`, `oauth_tokens`, `app_tokens`, `app_config`,
   `user_collections`, `user_wantlists`, `sync_history`, `extraction_history`,
   `admin_audit_log`, and `loader_extraction_latch`;
+- `extraction_history.source` (`VARCHAR(20)`, nullable, no default, no backfill) records which
+  extractor a run went to. A named CHECK, `extraction_history_source_check`, allows NULL,
+  `'discogs'`, or `'musicbrainz'`, and `idx_extraction_history_source_created_at` indexes
+  `(source, created_at DESC)`. Rows written before the column existed keep `source` NULL. Each
+  step is idempotent, so a second application is a no-op and a database whose table predates
+  the column gains it. See `extraction_history_source` in
+  [the persistence compatibility contract](../contracts/persistence/);
 - native identity tables (see Identity above): `catalog_items`, `artifacts`, `owned_copies`,
   `collection_snapshots`, `observations`, `provider_aliases`, `catalog_item_supersessions`,
   and `catalog_item_moves`;
