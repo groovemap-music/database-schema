@@ -169,6 +169,7 @@ class TestInsightsSchema:
         assert "insights.style_parents table" in table_names
         assert "insights.genre_atlas_sectors table" in table_names
         assert "insights.style_atlas_layout table" in table_names
+        assert "insights.style_landmark_masters table" in table_names
 
 
 class TestAppTokensTable:

@@ -28,6 +28,7 @@ _TABLES = {
         "computed_at",
     ),
     "insights.style_atlas_layout table": ("month", "node_kind", "style", "genre", "x", "y", "computed_at"),
+    "insights.style_landmark_masters table": ("style", "master_id", "title", "year", "release_count", "rank", "computed_at"),
 }
 
 
@@ -102,14 +103,28 @@ def test_style_atlas_layout_places_only_styles_and_ghosts() -> None:
     assert "sector_" not in ddl
 
 
+def test_style_landmark_masters_keys_rank_and_nullability() -> None:
+    ddl = _STATEMENTS["insights.style_landmark_masters table"]
+    assert "PRIMARY KEY (style, master_id)" in ddl
+    assert "UNIQUE (style, rank)" in ddl
+    assert "style           TEXT NOT NULL" in ddl
+    assert "master_id       TEXT NOT NULL" in ddl
+    assert "title           TEXT NOT NULL" in ddl
+    assert "release_count   BIGINT NOT NULL CHECK (release_count >= 0)" in ddl
+    assert "rank            INT NOT NULL CHECK (rank BETWEEN 1 AND 25)" in ddl
+    # year is the only nullable column: a master may have no release year.
+    assert re.search(r"^\s+year\s+INT,?$", ddl, re.MULTILINE)
+
+
 def test_atlas_statements_sit_after_the_activity_summary_index() -> None:
     names = [name for name, _ddl in _INSIGHTS_TABLES]
     start = names.index("idx_activity_summary_date") + 1
-    assert names[start : start + 6] == [
+    assert names[start : start + 7] == [
         "insights.style_year_counts table",
         "insights.genre_year_counts table",
         "insights.style_parents table",
         "idx_style_parents_one_dominant",
         "insights.genre_atlas_sectors table",
         "insights.style_atlas_layout table",
+        "insights.style_landmark_masters table",
     ]

@@ -336,13 +336,17 @@ The executable PostgreSQL inventory is in
     with every column NOT NULL. `ring_order` is the genre's position on the ring;
     `sector_start` and `sector_end` are the sector bounds in radians and may wrap past 2π,
     so `sector_end` is not constrained against `sector_start`; `x` and `y` are the genre
-    node's position in the layout's unit plane; and
+    node's position in the layout's unit plane;
   - `style_atlas_layout`: one row per placed style node per month, keyed by
     `(month, node_kind, style, genre)`, with `node_kind` either `style` or `ghost` (a copy under
     a secondary parent). `genre` is the host sector: the dominant parent for a style row and the
     secondary parent for a ghost row. `x` and `y` are in the same unit plane. Genre nodes live in
     `genre_atlas_sectors`, so no key column holds a sentinel. Both layout tables keep prior months
-    so the next monthly run can pin the ring order and sector frames to the previous frame;
+    so the next monthly run can pin the ring order and sector frames to the previous frame; and
+  - `style_landmark_masters`: the landmark masters of a style for the Genre Atlas master plane,
+    keyed by `(style, master_id)`, each with a `title`, an optional `year`, a non-negative
+    `release_count`, and a `rank` from 1 to 25 that is unique within the style
+    (`UNIQUE (style, rank)`);
 - activity tables in the `activity` schema (see Activity above): `user_subjects`,
   `consent_grants`, `events`, `impressions`, and `erasures`;
 - MusicBrainz tables in the `musicbrainz` schema: `artists`, `labels`, `releases`,

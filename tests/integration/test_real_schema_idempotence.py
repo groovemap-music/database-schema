@@ -85,6 +85,7 @@ EXPECTED_POSTGRES_TABLES = {
         "monthly_anniversaries",
         "release_rarity",
         "style_atlas_layout",
+        "style_landmark_masters",
         "style_parents",
         "style_year_counts",
     },
@@ -3056,8 +3057,36 @@ async def test_style_atlas_tables_enforce_their_keys_and_checks() -> None:
                 with pytest.raises((psycopg.errors.UniqueViolation, psycopg.errors.CheckViolation, psycopg.errors.NotNullViolation)):
                     await cursor.execute(placement, row)
                 await connection.rollback()
+
+            # Landmark masters are keyed by (style, master_id), ranked 1 to 25 once per style, and only year is nullable.
+            landmark = (
+                "INSERT INTO insights.style_landmark_masters (style, master_id, title, year, release_count, rank) VALUES (%s, %s, %s, %s, %s, %s)"
+            )
+            await cursor.execute(landmark, ("it-style", "m1", "First", 1969, 40, 1))
+            await cursor.execute(landmark, ("it-style", "m2", "Undated", None, 0, 25))  # a master may have no year
+            await connection.commit()
+            bad_landmarks = [
+                ("it-style", "m1", "Again", 1970, 1, 2),  # duplicate key
+                ("it-style", "m3", "Same rank", 1970, 1, 1),  # rank taken within the style
+                ("it-style", "m3", "Rank zero", 1970, 1, 0),  # rank below 1
+                ("it-style", "m3", "Rank 26", 1970, 1, 26),  # rank above 25
+                ("it-style", "m3", "Negative", 1970, -1, 2),  # negative count
+                ("it-style", "m3", None, 1970, 1, 2),  # no title
+                ("it-style", "m3", "No rank", 1970, 1, None),  # no rank
+                ("it-style", "m3", "No count", 1970, None, 2),  # no count
+                (None, "m3", "No style", 1970, 1, 2),  # no style
+                ("it-style", None, "No master", 1970, 1, 2),  # no master
+            ]
+            for row in bad_landmarks:
+                with pytest.raises((psycopg.errors.UniqueViolation, psycopg.errors.CheckViolation, psycopg.errors.NotNullViolation)):
+                    await cursor.execute(landmark, row)
+                await connection.rollback()
+            # The same rank in another style is fine.
+            await cursor.execute(landmark, ("it-other", "m1", "First", 1969, 40, 1))
+            await connection.rollback()
         finally:
             await connection.rollback()
+            await cursor.execute("DELETE FROM insights.style_landmark_masters WHERE style LIKE 'it-%'")
             await cursor.execute("DELETE FROM insights.style_parents WHERE style LIKE 'it-%'")
             await cursor.execute("DELETE FROM insights.genre_year_counts WHERE genre LIKE 'it-%'")
             await cursor.execute("DELETE FROM insights.genre_atlas_sectors WHERE genre LIKE 'it-%'")
