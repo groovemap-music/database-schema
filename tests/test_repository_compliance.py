@@ -11,7 +11,7 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CI_REVISION = "2f890111657d9f3e6f55d8bd5a5e7b8f9ca97b26"
+CI_REVISION = "dbf22ed83d486e9484fc8c6385c7c3e5995700e4"
 RELEASE_REVISION = "833cb464507678c38ab78bd4718ce697399463e9"
 
 
