@@ -96,6 +96,9 @@ _LEGACY_STATEMENT_NAMES = [
     "extraction_history",
     "idx_extraction_history_status",
     "idx_extraction_history_created_at",
+    "extraction_history.source column",
+    "extraction_history.source check",
+    "idx_extraction_history_source_created_at",
     "admin_audit_log table",
     "idx_admin_audit_log_created_at",
     "idx_admin_audit_log_admin_id",
@@ -412,6 +415,30 @@ def _user_table_names() -> list[str]:
 
 def _entity_statements() -> dict[str, str]:
     return {name: str(stmt) for name, stmt in _entity_schema_statements()}
+
+
+class TestExtractionHistorySource:
+    """extraction_history.source - which extractor a run went to, NULL when not recorded."""
+
+    def test_column_is_nullable_without_default_or_backfill(self) -> None:
+        stmt = _user_tables()["extraction_history.source column"]
+        assert stmt == "ALTER TABLE extraction_history ADD COLUMN IF NOT EXISTS source VARCHAR(20)"
+
+    def test_check_is_named_idempotent_and_closed(self) -> None:
+        stmt = _user_tables()["extraction_history.source check"]
+        assert "c.conname = 'extraction_history_source_check'" in stmt
+        assert "CHECK (source IN ('discogs', 'musicbrainz'))" in stmt
+
+    def test_index_leads_with_source_then_newest_first(self) -> None:
+        stmt = _user_tables()["idx_extraction_history_source_created_at"]
+        assert stmt.startswith("CREATE INDEX IF NOT EXISTS")
+        assert stmt.endswith("ON extraction_history (source, created_at DESC)")
+
+    def test_steps_follow_the_table_in_order(self) -> None:
+        names = _user_table_names()
+        assert names.index("extraction_history") < names.index("extraction_history.source column")
+        assert names.index("extraction_history.source column") < names.index("extraction_history.source check")
+        assert names.index("extraction_history.source column") < names.index("idx_extraction_history_source_created_at")
 
 
 class TestCatalogItems:
