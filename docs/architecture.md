@@ -246,6 +246,25 @@ row; this repository declares the shape and `catalog-api` writes every row, insi
 `idx_owned_copies_item_id`), because the merge re-point and `catalog-api`'s dependents guard
 both walk from an item to its dependents.
 
+`identity_link_events` is the Identity Ledger's dated link history: one row per change of a
+MusicBrainz row's Discogs link. `provider_aliases` and `catalog_item_supersessions` stamp
+`now()` at write time, so neither can say when a link changed. Two writers fill it:
+`catalog-api`'s one-time backfill from the MusicBrainz full export and
+`musicbrainz-sql-loader`'s live recording at load, and `dated_from`
+(`musicbrainz_fullexport` or `groovemap_load`) keeps their provenance apart, because a
+backfilled date is a row-id creation bound that belongs to an older, since replaced link for
+about 9% of rows. The columns are `provider` (checked to `musicbrainz`), `entity_kind` (the
+values `provider_aliases` uses for MusicBrainz rows), the MBID as `external_id`, `event`
+(checked to `link_added`, `link_changed`, or `link_removed`), `discogs_id_before` and
+`discogs_id_after` (`BIGINT`, the type of the `musicbrainz.*.discogs_*_id` columns), `event_at`,
+`dated_from`, `source_ref` (the full-export name or the dump version), `decision_ref` (the
+backfill run's `admin_audit_log` id, a bare UUID, NULL for a load row), and `recorded_at`. A
+CHECK ties the ids to the event: an added link has no before id and an after id, a removed link
+the reverse, and a changed link has both and they differ. The unique key over `(dated_from,
+source_ref, provider, entity_kind, external_id, event, event_at)` makes a rerun of the same
+backfill or load idempotent. Indexes lead with `(provider, entity_kind, external_id, event_at)`
+and `(event_at)`. No user data is stored.
+
 Every table and column above is additive within persistence contract v1 — see
 [the persistence compatibility contract](../contracts/persistence/).
 
@@ -324,7 +343,7 @@ The executable PostgreSQL inventory is in
   [the persistence compatibility contract](../contracts/persistence/);
 - native identity tables (see Identity above): `catalog_items`, `artifacts`, `owned_copies`,
   `collection_snapshots`, `observations`, `provider_aliases`, `catalog_item_supersessions`,
-  and `catalog_item_moves`;
+  `catalog_item_moves`, and `identity_link_events`;
 - retired: `queue_metrics` and `service_health_metrics` are no longer created. The schema
   runs `DROP TABLE IF EXISTS` for each (their indexes go with them), so applying it to a
   database that still has them removes them and a second application is a no-op. Their rows

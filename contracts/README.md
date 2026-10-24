@@ -103,6 +103,13 @@ contract check pins every column, cause, and key it names to the declaring state
 `analytics-engine` reads activity history through the resolution. `graph.catalog_item`
 excludes currently superseded items.
 
+`identity_link_events` records the Identity Ledger's dated link history: one row per change
+of a MusicBrainz row's Discogs link, written by `catalog-api`'s one-time full-export backfill
+and by `musicbrainz-sql-loader` at load, with `dated_from` keeping the two provenances apart.
+The contract check pins its columns, the closed `provider`, `event`, and `dated_from` sets,
+the `identity_link_events_link_matches_event` CHECK, the idempotence key, and its two indexes
+to the declaring statements. It stores no user data.
+
 Catalog event shapes are not owned here. Discogs events belong to
 [`discogs-ingestion`](https://github.com/groovemap-music/discogs-ingestion), and MusicBrainz
 events belong to
