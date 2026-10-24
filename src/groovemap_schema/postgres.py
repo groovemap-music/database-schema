@@ -2,7 +2,8 @@
 
 Single source of truth for all PostgreSQL tables and indexes.
 All statements use IF NOT EXISTS — safe to run on every startup; subsequent
-runs are no-ops for already-created schema objects. Schema is never dropped.
+runs are no-ops for already-created schema objects. Schema is only dropped for
+an object a decision has retired, always with DROP ... IF EXISTS.
 """
 
 from __future__ import annotations
@@ -659,41 +660,17 @@ _USER_TABLES: list[tuple[str, str]] = [
         "idx_extraction_history_created_at",
         "CREATE INDEX IF NOT EXISTS idx_extraction_history_created_at ON extraction_history(created_at DESC)",
     ),
+    # Retired (ADR 0018): the operations console reads queue and service-health
+    # history from VictoriaMetrics, so the collector that wrote these two tables
+    # is gone. Dropping the table takes its index with it. Historical rows are
+    # not migrated; VictoriaMetrics already holds the same series.
     (
-        "queue_metrics table",
-        """
-        CREATE TABLE IF NOT EXISTS queue_metrics (
-            id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-            recorded_at TIMESTAMPTZ NOT NULL,
-            queue_name VARCHAR(100) NOT NULL,
-            messages_ready INTEGER,
-            messages_unacknowledged INTEGER,
-            consumers INTEGER,
-            publish_rate REAL,
-            ack_rate REAL
-        )
-        """,
+        "queue_metrics table retired",
+        "DROP TABLE IF EXISTS queue_metrics",
     ),
     (
-        "idx_queue_metrics_recorded_queue",
-        "CREATE INDEX IF NOT EXISTS idx_queue_metrics_recorded_queue ON queue_metrics (recorded_at, queue_name)",
-    ),
-    (
-        "service_health_metrics table",
-        """
-        CREATE TABLE IF NOT EXISTS service_health_metrics (
-            id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-            recorded_at TIMESTAMPTZ NOT NULL,
-            service_name VARCHAR(50) NOT NULL,
-            status VARCHAR(20),
-            response_time_ms REAL,
-            endpoint_stats JSONB
-        )
-        """,
-    ),
-    (
-        "idx_service_health_recorded_service",
-        "CREATE INDEX IF NOT EXISTS idx_service_health_recorded_service ON service_health_metrics (recorded_at, service_name)",
+        "service_health_metrics table retired",
+        "DROP TABLE IF EXISTS service_health_metrics",
     ),
     (
         "admin_audit_log table",

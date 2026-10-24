@@ -313,11 +313,16 @@ The executable PostgreSQL inventory is in
 
 - public Discogs document tables: `artists`, `labels`, `masters`, and `releases`;
 - account and operational tables: `users`, `oauth_tokens`, `app_tokens`, `app_config`,
-  `user_collections`, `user_wantlists`, `sync_history`, `extraction_history`, `queue_metrics`,
-  `service_health_metrics`, `admin_audit_log`, and `loader_extraction_latch`;
+  `user_collections`, `user_wantlists`, `sync_history`, `extraction_history`,
+  `admin_audit_log`, and `loader_extraction_latch`;
 - native identity tables (see Identity above): `catalog_items`, `artifacts`, `owned_copies`,
   `collection_snapshots`, `observations`, `provider_aliases`, `catalog_item_supersessions`,
   and `catalog_item_moves`;
+- retired: `queue_metrics` and `service_health_metrics` are no longer created. The schema
+  runs `DROP TABLE IF EXISTS` for each (their indexes go with them), so applying it to a
+  database that still has them removes them and a second application is a no-op. Their rows
+  are not migrated: VictoriaMetrics holds the same series (ADR 0018). See `retired_relations`
+  in [the persistence compatibility contract](../contracts/persistence/);
 - insight tables in the `insights` schema: `artist_centrality`, `genre_trends`,
   `label_longevity`, `monthly_anniversaries`, `data_completeness`, `release_rarity`,
   `community_counts`, `computation_log`, and `activity_summary` (analytics-engine's
