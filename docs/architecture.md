@@ -265,6 +265,94 @@ source_ref, provider, entity_kind, external_id, event, event_at)` makes a rerun 
 backfill or load idempotent. Indexes lead with `(provider, entity_kind, external_id, event_at)`
 and `(event_at)`. No user data is stored.
 
+### The precomputed Identity Ledger
+
+`catalog-api`'s Identity Ledger works list and density routes used to compute every release
+item's event history on each request: a window function over all of `provider_aliases` joined
+to `catalog_items`, and only then the filter. gm-catalog-api-278z measured the default works
+list at 71.5 s p95 at 50% scale, against a 2 s budget, and no index helps, because each
+statement aggregates the whole history before it filters. Four materialized views in `public`
+now hold what those statements compute, and `catalog-api` reads rows from them instead. They
+are declared in `_IDENTITY_LEDGER_STATEMENTS` in
+[`src/groovemap_schema/postgres.py`](../src/groovemap_schema/postgres.py), after the graph
+statements, because they read `graph.derived_from` as well as `provider_aliases`,
+`catalog_items`, `catalog_item_supersessions`, `identity_link_events`, and
+`musicbrainz.releases`. Their definitions are `catalog-api`'s route SQL with the filters lifted
+out, as its prototype composed them (`scripts/ledger_scale.py`, `_view_statements`). The
+integration suite builds that prototype verbatim beside them and requires every row to match.
+
+An *edition* is a release-kind item resolved one hop through an open supersession, and a
+*work* is a master-kind item resolved the same way.
+
+- `identity_ledger_edition_events (edition_id, at, type, events)` — every non-mint event of a
+  release item, counted per edition, instant, and type. The events are aliases opened after
+  the mint (the first MusicBrainz one on an item that already holds a Discogs alias is
+  `linked_at_ingest`), aliases closed other than by a supersession, both sides of each
+  supersession (`reattached`, `promoted`, and `reverted` when it closes), and the
+  `identity_link_events` rows of the MusicBrainz releases the item currently holds. An alias
+  opened or closed at the instant of a supersession of its item was moved by it and is no
+  event. Unique on `(edition_id, at, type)`, and indexed on `(at)` and `(type, at)` for the
+  windowed works list.
+- `identity_ledger_edition_parents (edition_id, work_id)` — every work parent of every evented
+  edition: the Discogs master its current Discogs release aliases name through
+  `graph.derived_from`, and the release group its current MusicBrainz release aliases name
+  through `musicbrainz.releases`, each through that master's current alias, resolved one hop.
+  An edition with two rows disagrees about its work. Unique on `(edition_id, work_id)`.
+- `identity_ledger_work_summary (work_id, event, evented_editions, repaired_editions,
+  first_event, last_event)` — the works list's rows: one per work with `event = 'any'` over
+  every event type, and one per work and event type. `repaired_editions` counts editions with a
+  `reattached`, `promoted`, or `reverted` event. The unfiltered row uses the `'any'` sentinel
+  rather than NULL because `REFRESH ... CONCURRENTLY` matches rows on a unique index, and NULLs
+  never compare equal. Unique on `(event, work_id)`, and indexed on
+  `(event, last_event DESC, work_id)` for the page.
+- `identity_ledger_density (kind, month, type, dated_from, events)` — events per UTC month,
+  type, and provenance for each of `release`, `master`, `artist`, and `label`. Unlike the
+  edition views it counts mints, counts a supersession once rather than per side, and counts a
+  link change no current alias holds. Unique on `(kind, month, type, dated_from)`.
+
+`identity_ledger_refresh_state` is one row (`singleton BOOLEAN PRIMARY KEY DEFAULT true CHECK
+(singleton)`) holding `refreshed_at`, `duration`, and the caller's `source_watermark` (JSONB,
+nullable). Only the refresh writes it, and it is empty until the first refresh.
+
+`public.identity_ledger_refresh(source_watermark jsonb DEFAULT NULL) RETURNS timestamptz`
+refreshes the four views in dependency order: `edition_events`, then `edition_parents`, which
+reads it, then `work_summary`, which reads both, then `density`. It then upserts the state row, with
+`refreshed_at` set to the instant the refresh started, and returns `refreshed_at`. Everything
+runs in the caller's one transaction, so a failed refresh leaves every view and the state row
+as they were.
+
+- **Unreadable until the first refresh.** Every view is created `WITH NO DATA`, so applying the
+  schema to a loaded catalog never runs the whole history inline. Until the first refresh,
+  reading a view raises `materialized view "…" has not been populated` (SQLSTATE `55000`),
+  which `catalog-api` reports as "not refreshed yet". Applying the schema again never
+  repopulates or empties a view.
+- **Readers never block.** The function refreshes a view that is not yet populated
+  (`pg_class.relispopulated`) plainly, because `CONCURRENTLY` refuses one, and a populated view
+  `CONCURRENTLY`. A concurrent refresh holds an `EXCLUSIVE` lock, which conflicts with no
+  reader's `ACCESS SHARE`: readers keep the previous rows until it commits, and a reader's open
+  transaction does not hold the refresh up either. The first, plain build holds
+  `ACCESS EXCLUSIVE` instead, so a reader that arrives during it waits for the build rather
+  than erroring. `pg_class.relispopulated` answers "refreshed yet?" without taking a lock on
+  the view.
+- **Freshness.** Each `REFRESH` takes its own snapshot, so the four views can differ by writes
+  that commit between them, and `refreshed_at` is a lower bound on freshness rather than one
+  instant. How fresh the ledger is depends on when `catalog-api` triggers the refresh. This
+  repository declares the refresh and never calls it. The prototype measured about 179 s per
+  concurrent refresh at 50% scale and 130 s for the first build, and extrapolated about 6 to 7
+  minutes per refresh at full scale.
+- **Who may refresh.** `REFRESH` needs the view's owner or, on PostgreSQL 17 and later, the
+  `MAINTAIN` privilege. The function is `SECURITY INVOKER`. `catalog-api` refreshes as the
+  owner: every service connects as the one login that owns `public` (deployment's
+  `.env.example`, `POSTGRES_USERNAME`), and `EXECUTE` on a function defaults to `PUBLIC`, so no
+  grant is declared. A separate `catalog-api` login would need `GRANT MAINTAIN` on the four
+  views and `GRANT SELECT, INSERT, UPDATE ON identity_ledger_refresh_state`. `SELECT` is part
+  of that grant because the upsert's `ON CONFLICT DO UPDATE` reads the row. The integration
+  suite shows that this grant set is enough and that a role without it is refused.
+- **Changing a definition.** `CREATE MATERIALIZED VIEW IF NOT EXISTS` never redefines an
+  existing view, so a changed definition needs its own guarded drop-and-recreate migration in
+  reverse dependency order. That migration leaves the recreated views unpopulated until the
+  next refresh.
+
 Every table and column above is additive within persistence contract v1 — see
 [the persistence compatibility contract](../contracts/persistence/).
 
@@ -343,7 +431,7 @@ The executable PostgreSQL inventory is in
   [the persistence compatibility contract](../contracts/persistence/);
 - native identity tables (see Identity above): `catalog_items`, `artifacts`, `owned_copies`,
   `collection_snapshots`, `observations`, `provider_aliases`, `catalog_item_supersessions`,
-  `catalog_item_moves`, and `identity_link_events`;
+  `catalog_item_moves`, `identity_link_events`, and `identity_ledger_refresh_state`;
 - retired: `queue_metrics` and `service_health_metrics` are no longer created. The schema
   runs `DROP TABLE IF EXISTS` for each (their indexes go with them), so applying it to a
   database that still has them removes them and a second application is a no-op. Their rows
