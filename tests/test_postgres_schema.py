@@ -26,6 +26,7 @@ from groovemap_schema.postgres import (
     _ENTITY_TABLES,
     _GRAPH_STATEMENTS,
     _HNSW_BUILD_MAINTENANCE_WORK_MEM,
+    _IDENTITY_LEDGER_STATEMENTS,
     _INSIGHTS_TABLES,
     _IS_SUPERUSER_QUERY,
     _MUSICBRAINZ_INDEXES,
@@ -355,6 +356,7 @@ class TestCreatePostgresSchema:
             + len(_MUSICBRAINZ_INDEXES)
             + len(_ARTIST_SIMILARITY_STATEMENTS)
             + len(_GRAPH_STATEMENTS)
+            + len(_IDENTITY_LEDGER_STATEMENTS)
             # `_apply_vector_schema` always probes pg_extension and pg_roles
             # (CREATEROLE); with the shared fixture's default (False), the
             # extension gate also probes pg_available_extensions before
@@ -390,6 +392,7 @@ class TestCreatePostgresSchema:
             + len(_MUSICBRAINZ_INDEXES)
             + len(_ARTIST_SIMILARITY_STATEMENTS)
             + len(_GRAPH_STATEMENTS)
+            + len(_IDENTITY_LEDGER_STATEMENTS)
             # `_apply_vector_schema` always probes pg_extension and pg_roles
             # (CREATEROLE); with the shared fixture's default (False), the
             # extension gate also probes pg_available_extensions before
@@ -460,6 +463,7 @@ class TestCreatePostgresSchema:
             + len(_MUSICBRAINZ_INDEXES)
             + len(_ARTIST_SIMILARITY_STATEMENTS)
             + len(_GRAPH_STATEMENTS)
+            + len(_IDENTITY_LEDGER_STATEMENTS)
             # `_apply_vector_schema` always probes pg_extension and pg_roles
             # (CREATEROLE); with the shared fixture's default (False), the
             # extension gate also probes pg_available_extensions before

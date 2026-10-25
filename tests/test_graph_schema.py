@@ -13,6 +13,7 @@ from groovemap_schema.postgres import (
     _DERIVED_EDGE_BOOTSTRAP,
     _EDGE_TABLES,
     _GRAPH_STATEMENTS,
+    _IDENTITY_LEDGER_STATEMENTS,
     _PATH_RELATIONS,
     _PATH_RELATIONSHIP_TYPES,
     _TEXT_KEY_RETYPES,
@@ -315,10 +316,15 @@ class TestGraphSchemaStatement:
         assert _GRAPH_STATEMENTS[0][0] == "graph schema"
 
     def test_graph_statements_run_after_every_table(self) -> None:
-        """A view can only be created once the table it reads exists."""
+        """A view can only be created once the table it reads exists.
+
+        Only the Identity Ledger's statements follow them, because its views
+        read `graph.derived_from`.
+        """
         names = [name for name, _statement in _schema_statements()]
         graph_names = [name for name, _statement in _GRAPH_STATEMENTS]
-        assert names[-len(graph_names) :] == graph_names
+        ledger_names = [name for name, _statement in _IDENTITY_LEDGER_STATEMENTS]
+        assert names[-len(graph_names) - len(ledger_names) :] == graph_names + ledger_names
 
     def test_only_a_guarded_migration_drops_anything(self) -> None:
         """A relation is dropped only by the statement replacing it, and only if it is still there."""

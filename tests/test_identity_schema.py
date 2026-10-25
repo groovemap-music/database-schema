@@ -407,6 +407,26 @@ _GRAPH_STATEMENT_NAMES = frozenset(
     }
 )
 
+# The precomputed Identity Ledger (epic gm-database-schema-k8e9), declared
+# after the graph statements; tests/test_identity_ledger_schema.py covers it.
+_IDENTITY_LEDGER_STATEMENT_NAMES = frozenset(
+    {
+        "identity_ledger_edition_events materialized view",
+        "idx_identity_ledger_edition_events_key",
+        "idx_identity_ledger_edition_events_at",
+        "idx_identity_ledger_edition_events_type_at",
+        "identity_ledger_edition_parents materialized view",
+        "idx_identity_ledger_edition_parents_key",
+        "identity_ledger_work_summary materialized view",
+        "idx_identity_ledger_work_summary_key",
+        "idx_identity_ledger_work_summary_page",
+        "identity_ledger_density materialized view",
+        "idx_identity_ledger_density_key",
+        "identity_ledger_refresh_state table",
+        "identity_ledger_refresh function",
+    }
+)
+
 
 def _user_tables() -> dict[str, str]:
     return dict(_USER_TABLES)
@@ -1042,12 +1062,12 @@ class TestLegacyStatementsUnchanged:
 
     def test_legacy_names_are_intact_and_ordered(self) -> None:
         names = [name for name, _stmt in _schema_statements()]
-        added = _ADDED_STATEMENT_NAMES | _GRAPH_STATEMENT_NAMES | _ADDED_MUSICBRAINZ_INDEX_NAMES
+        added = _ADDED_STATEMENT_NAMES | _GRAPH_STATEMENT_NAMES | _ADDED_MUSICBRAINZ_INDEX_NAMES | _IDENTITY_LEDGER_STATEMENT_NAMES
         surviving = [name for name in names if name not in added]
         assert surviving == _LEGACY_STATEMENT_NAMES
 
     def test_no_legacy_name_was_reused_for_a_new_statement(self) -> None:
-        added = _ADDED_STATEMENT_NAMES | _GRAPH_STATEMENT_NAMES | _ADDED_MUSICBRAINZ_INDEX_NAMES
+        added = _ADDED_STATEMENT_NAMES | _GRAPH_STATEMENT_NAMES | _ADDED_MUSICBRAINZ_INDEX_NAMES | _IDENTITY_LEDGER_STATEMENT_NAMES
         assert not (added & set(_LEGACY_STATEMENT_NAMES))
 
     def test_declared_graph_names_match_the_schema(self) -> None:
