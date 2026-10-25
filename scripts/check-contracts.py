@@ -1,6 +1,7 @@
 """Validate the persistence compatibility contract without touching a database."""
 
 import json
+import re
 import tomllib
 from pathlib import Path
 
@@ -8,6 +9,7 @@ from groovemap_schema import __version__
 from groovemap_schema.postgres import (
     _BOOTSTRAP_FILL_ORDER,
     _GRAPH_STATEMENTS,
+    _IDENTITY_LEDGER_STATEMENTS,
     _PATH_RELATIONS,
     _PATH_RELATIONSHIP_TYPES,
     _USER_TABLES,
@@ -16,6 +18,7 @@ from groovemap_schema.postgres import (
     EXPLORE_DEFAULT_ROW_LIMIT,
     EXPLORE_MAX_HOPS,
     EXPLORE_MIN_HOPS,
+    IDENTITY_LEDGER_VIEWS,
     PATH_DEFAULT_DEPTH,
     PATH_MAX_DEPTH,
     PATH_MIN_DEPTH,
@@ -138,6 +141,43 @@ assert f"CONSTRAINT {idempotence['constraint']}\n                UNIQUE ({', '.j
 for index in link_events["indexes"]:
     name = index.split(" ", 1)[0]
     assert index == user_statements[name].removeprefix("CREATE INDEX IF NOT EXISTS "), name
+
+# The precomputed Identity Ledger is read and refreshed by catalog-api. Pin the
+# refresh order, every view's columns, unique key and read indexes, the state
+# row, and the function's signature to the statements.
+ledger = contract["identity_ledger_precompute"]
+ledger_statements = dict(_IDENTITY_LEDGER_STATEMENTS)
+assert ledger["kind"] == "additive"
+assert ledger["introduced_in_contract_version"] == contract["version"]
+assert ledger["consumers"] == ["catalog-api"]
+assert ledger["refresh"]["order"] == list(IDENTITY_LEDGER_VIEWS)
+assert list(ledger["views"]) == list(IDENTITY_LEDGER_VIEWS)
+contracted_indexes = set()
+for view, shape in ledger["views"].items():
+    view_statement = ledger_statements[f"{view} materialized view"]
+    assert f"CREATE MATERIALIZED VIEW IF NOT EXISTS public.{view} AS" in view_statement, view
+    assert view_statement.rstrip().endswith("WITH NO DATA"), view
+    for column in shape["columns"]:
+        assert re.search(rf"\b{column}\b", view_statement), (view, column)
+    unique = shape["unique"]
+    assert (
+        ledger_statements[unique["index"]] == f"CREATE UNIQUE INDEX IF NOT EXISTS {unique['index']} ON public.{view} ({', '.join(unique['columns'])})"
+    )
+    contracted_indexes.add(unique["index"])
+    for index in shape["indexes"]:
+        name = index.split(" ", 1)[0]
+        assert index == ledger_statements[name].removeprefix("CREATE INDEX IF NOT EXISTS "), name
+        contracted_indexes.add(name)
+assert contracted_indexes == {name for name in ledger_statements if name.startswith("idx_")}
+refresh_state = ledger["refresh_state"]
+refresh_state_statement = ledger_statements["identity_ledger_refresh_state table"]
+assert refresh_state["relation"] == "public.identity_ledger_refresh_state"
+assert "CREATE TABLE IF NOT EXISTS identity_ledger_refresh_state" in refresh_state_statement
+for column in refresh_state["columns"]:
+    assert f"\n            {column} " in refresh_state_statement, column
+signature, returns = ledger["refresh"]["function"].split(" RETURNS ")
+refresh_statement = ledger_statements["identity_ledger_refresh function"]
+assert f"CREATE OR REPLACE FUNCTION {signature}\nRETURNS {returns}\n" in refresh_statement
 
 # The graph schema is recorded as an additive object of contract v1. Every count
 # and every relation below is read back from the statement list rather than

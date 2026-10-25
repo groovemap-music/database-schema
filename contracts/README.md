@@ -110,6 +110,16 @@ The contract check pins its columns, the closed `provider`, `event`, and `dated_
 the `identity_link_events_link_matches_event` CHECK, the idempotence key, and its two indexes
 to the declaring statements. It stores no user data.
 
+`identity_ledger_precompute` records the four materialized views that precompute the
+Identity Ledger for `catalog-api`'s works list and density routes, together with
+`identity_ledger_refresh_state` and `identity_ledger_refresh(source_watermark jsonb)`.
+`catalog-api` is the only consumer: it reads the views and calls the refresh, and this
+repository never does either. The contract check pins the refresh order, each view's columns,
+unique key, and read indexes, the state row's columns, and the function's signature to the
+declaring statements. Every view stays unreadable until its first refresh. See
+[the architecture notes](../docs/architecture.md) for what each view holds and why readers
+never block.
+
 Catalog event shapes are not owned here. Discogs events belong to
 [`discogs-ingestion`](https://github.com/groovemap-music/discogs-ingestion), and MusicBrainz
 events belong to
