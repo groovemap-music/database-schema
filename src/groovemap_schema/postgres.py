@@ -5057,6 +5057,394 @@ _GRAPH_STATEMENTS: list[tuple[str, str]] = _build_graph_statements()
 # The ordinary graph relations above remain the supported relational contract.
 
 
+# ── The Identity Ledger, precomputed (epic gm-database-schema-k8e9) ──────────
+# catalog-api's Identity Ledger works list and density routes
+# (`api/queries/identity_ledger_queries.py`) computed every release item's
+# event history on each request: a window function over all of
+# `provider_aliases` joined to `catalog_items`, and only then the filter.
+# gm-catalog-api-278z measured the default works list at 28.5 s p95 at 25%
+# scale and 71.5 s at 50%, against a 2 s budget, and no index helps, because
+# each statement aggregates the whole history before it filters.  These four
+# materialized views hold what those statements compute, once per refresh, so
+# a request reads rows instead of history (the prototype read every works case
+# at 50% scale in at most 291 ms p95, and every density case in at most 3 ms).
+#
+# The definitions are the route statements with their filters lifted out,
+# exactly as catalog-api's prototype composed them (`scripts/ledger_scale.py`,
+# `_view_statements`, at catalog-api 6d744e2).  They are ported here as SQL,
+# kept in the measured shape, with every relation schema-qualified; catalog-api
+# is never imported.  The integration suite builds that prototype's statements
+# verbatim beside these and pins the rows equal on a fixture.
+#
+# An *edition* is a release-kind item resolved one hop through an open
+# supersession; a *work* is a master-kind item, resolved the same way.
+#
+# Populate semantics.  Every view is created WITH NO DATA, so applying the
+# schema to a loaded catalog never runs the whole history inline, and reading
+# one before its first refresh raises "materialized view ... has not been
+# populated" (SQLSTATE 55000), which catalog-api reads as "not refreshed yet".
+# `identity_ledger_refresh()` refreshes them in dependency order: an
+# unpopulated view plainly (CONCURRENTLY needs a populated view), a populated
+# one CONCURRENTLY.  A concurrent refresh takes an EXCLUSIVE lock, which
+# conflicts with no reader's ACCESS SHARE, so readers never block and keep
+# reading the previous rows until the refresh commits.  The first, plain build
+# takes ACCESS EXCLUSIVE instead, so a reader arriving during it waits for the
+# build rather than erroring; `pg_class.relispopulated` answers "refreshed
+# yet?" without taking a lock on the view.  Each REFRESH takes its own
+# snapshot, so the four views can differ by writes that commit between them:
+# `refreshed_at` is a lower bound on freshness, not one instant.
+#
+# Who may refresh.  REFRESH needs the view's owner or, on PostgreSQL 17 and
+# later, the MAINTAIN privilege on it; the function is SECURITY INVOKER, so its
+# caller needs that on all four views and INSERT, UPDATE on the state table.
+# catalog-api holds both as the owner: every service, catalog-api included,
+# connects as the one login that owns `public` (deployment's `.env.example`,
+# `POSTGRES_USERNAME`), and EXECUTE on a function is granted to PUBLIC by
+# default, so no grant is declared, as for `resolve_catalog_item` above.  Were
+# catalog-api ever to connect as its own login, it would need
+# `GRANT MAINTAIN ON` the four views and `GRANT SELECT, INSERT, UPDATE ON
+# identity_ledger_refresh_state`; the integration suite proves that grant set
+# sufficient and a role without it refused.
+#
+# Changing a definition.  `CREATE MATERIALIZED VIEW IF NOT EXISTS` never
+# redefines an existing view, so a changed definition needs its own guarded
+# drop-and-recreate migration, in reverse dependency order, which leaves the
+# recreated views unpopulated until the next refresh.
+
+# The views in refresh order: each reads only the relations before it.
+IDENTITY_LEDGER_VIEWS = (
+    "identity_ledger_edition_events",
+    "identity_ledger_edition_parents",
+    "identity_ledger_work_summary",
+    "identity_ledger_density",
+)
+
+# The catalog kinds the density view reports, in catalog-api's order.
+_LEDGER_KINDS = ("release", "master", "artist", "label")
+
+# The event types that repair an edition's identity rather than add evidence.
+_LEDGER_REPAIRS = "('reattached', 'promoted', 'reverted')"
+
+
+def _ledger_resolved(alias: str, item: str) -> str:
+    """Return the LEFT JOIN naming ITEM's open supersession, if any, as ALIAS.
+
+    `COALESCE(ALIAS.survivor_id, ITEM)` through it is `resolve_catalog_item`
+    without a function call per row.
+    """
+    return f"LEFT JOIN public.catalog_item_supersessions AS {alias} ON {alias}.superseded_id = {item} AND {alias}.valid_to IS NULL"
+
+
+def _ledger_item_events(kind: str) -> str:
+    """Return the CTEs naming every event of each KIND item, ending in `supersession_of_kind`.
+
+    `item_event` holds an item's mint, the aliases opened after it, the aliases
+    closed other than by a supersession, and the dated link changes of the
+    MusicBrainz rows it currently holds (`item_id` is NULL when no current
+    alias holds the row).  An alias opened or closed at the instant of a
+    supersession of its item was moved by it, not attached or closed, so
+    `moved_in` and `moved_out` exclude it.  The first MusicBrainz alias opened
+    later on an item that already holds a Discogs one is `linked_at_ingest`.
+    Supersession events are left to each view, which counts them per side or
+    once.
+    """
+    literal = _sql_literal(kind)
+    return f"""
+kind_alias AS (
+    SELECT alias.native_id, alias.provider, alias.external_id, alias.valid_from, alias.valid_to,
+           min(alias.valid_from) OVER item AS mint,
+           min(alias.valid_from) FILTER (WHERE alias.provider = 'discogs') OVER item AS discogs_at
+    FROM public.provider_aliases AS alias
+    JOIN public.catalog_items AS catalog_item ON catalog_item.id = alias.native_id AND catalog_item.kind = {literal}
+    WINDOW item AS (PARTITION BY alias.native_id)
+),
+moved_in AS (
+    SELECT survivor_id AS item_id, valid_from AS at FROM public.catalog_item_supersessions
+    UNION
+    SELECT superseded_id, valid_to FROM public.catalog_item_supersessions WHERE valid_to IS NOT NULL
+),
+moved_out AS (
+    SELECT superseded_id AS item_id, valid_from AS at FROM public.catalog_item_supersessions
+    UNION
+    SELECT survivor_id, valid_to FROM public.catalog_item_supersessions WHERE valid_to IS NOT NULL
+),
+later AS (
+    SELECT kind_alias.native_id, kind_alias.provider, kind_alias.valid_from, kind_alias.discogs_at,
+           row_number() OVER (
+               PARTITION BY kind_alias.native_id, kind_alias.provider = 'musicbrainz'
+               ORDER BY kind_alias.valid_from, kind_alias.external_id
+           ) AS position
+    FROM kind_alias
+    LEFT JOIN moved_in ON moved_in.item_id = kind_alias.native_id AND moved_in.at = kind_alias.valid_from
+    WHERE kind_alias.valid_from > kind_alias.mint AND moved_in.item_id IS NULL
+),
+item_event AS (
+    SELECT DISTINCT native_id AS item_id, mint AS at, 'minted' AS type, 'groovemap' AS dated_from
+    FROM kind_alias
+    UNION ALL
+    SELECT native_id, valid_from,
+           CASE WHEN provider = 'musicbrainz' AND discogs_at IS NOT NULL AND position = 1
+                THEN 'linked_at_ingest' ELSE 'evidence_attached' END,
+           'groovemap'
+    FROM later
+    UNION ALL
+    SELECT kind_alias.native_id, kind_alias.valid_to, 'alias_closed', 'groovemap'
+    FROM kind_alias
+    LEFT JOIN moved_out ON moved_out.item_id = kind_alias.native_id AND moved_out.at = kind_alias.valid_to
+    WHERE kind_alias.valid_to IS NOT NULL AND moved_out.item_id IS NULL
+    UNION ALL
+    SELECT holder.native_id, link.event_at, link.event,
+           CASE link.dated_from WHEN 'musicbrainz_fullexport' THEN 'musicbrainz_fullexport' ELSE 'groovemap' END
+    FROM public.identity_link_events AS link
+    LEFT JOIN public.provider_aliases AS holder
+           ON holder.provider = link.provider AND holder.entity_kind = link.entity_kind
+          AND holder.external_id = link.external_id AND holder.valid_to IS NULL
+    WHERE link.provider = 'musicbrainz' AND link.entity_kind = {literal}
+),
+supersession_of_kind AS (
+    SELECT supersession.*
+    FROM public.catalog_item_supersessions AS supersession
+    JOIN public.catalog_items AS superseded ON superseded.id = supersession.superseded_id AND superseded.kind = {literal}
+)"""  # noqa: S608 -- KIND is one of the module's own catalog kinds, not caller input
+
+
+def _ledger_edition_events_view() -> str:
+    """Return `identity_ledger_edition_events`: every non-mint event per edition.
+
+    One row per (edition, instant, type) with the number of events behind it.
+    A supersession counts once per side, and each side resolves one hop, so a
+    merge's two sides land on the survivor as two events.
+    """
+    return f"""
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.identity_ledger_edition_events AS
+WITH {_ledger_item_events("release")},
+side_event AS (
+    SELECT item_id, at, type, dated_from FROM item_event WHERE type <> 'minted' AND item_id IS NOT NULL
+    UNION ALL
+    SELECT side.item_id, supersession.valid_from,
+           CASE supersession.cause WHEN 'catalog_reattachment' THEN 'reattached' ELSE 'promoted' END, 'groovemap'
+    FROM supersession_of_kind AS supersession
+    CROSS JOIN LATERAL (VALUES (supersession.superseded_id), (supersession.survivor_id)) AS side (item_id)
+    UNION ALL
+    SELECT side.item_id, supersession.valid_to, 'reverted', 'groovemap'
+    FROM supersession_of_kind AS supersession
+    CROSS JOIN LATERAL (VALUES (supersession.superseded_id), (supersession.survivor_id)) AS side (item_id)
+    WHERE supersession.valid_to IS NOT NULL
+)
+SELECT COALESCE(edition_open.survivor_id, side_event.item_id) AS edition_id, side_event.at, side_event.type, count(*) AS events
+FROM side_event
+{_ledger_resolved("edition_open", "side_event.item_id")}
+GROUP BY 1, 2, 3
+WITH NO DATA
+"""  # noqa: S608 -- composed of module constants only
+
+
+def _ledger_edition_parents_view() -> str:
+    """Return `identity_ledger_edition_parents`: every work parent of every evented edition.
+
+    An edition's members are itself and the items it currently survives.  A
+    member's current Discogs release alias names a master through
+    `graph.derived_from`, and its current MusicBrainz release alias names a
+    release group through `musicbrainz.releases`; each parent is that master's
+    current alias, resolved one hop.  An edition with two rows disagrees about
+    its work.
+    """
+    return f"""
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.identity_ledger_edition_parents AS
+WITH member AS MATERIALIZED (
+    SELECT edition_id, edition_id AS item_id FROM (SELECT DISTINCT edition_id FROM public.identity_ledger_edition_events) AS evented
+    UNION
+    SELECT supersession.survivor_id, supersession.superseded_id
+    FROM public.catalog_item_supersessions AS supersession
+    WHERE supersession.valid_to IS NULL
+      AND supersession.survivor_id IN (SELECT edition_id FROM public.identity_ledger_edition_events)
+),
+member_mbid AS MATERIALIZED (
+    SELECT member.edition_id, release.external_id::uuid AS mbid
+    FROM member
+    JOIN public.provider_aliases AS release ON release.native_id = member.item_id
+    WHERE release.provider = 'musicbrainz' AND release.entity_kind = 'release' AND release.valid_to IS NULL
+),
+edition_parent AS (
+    SELECT member.edition_id, COALESCE(work_open.survivor_id, master.native_id) AS work_id
+    FROM member
+    JOIN public.provider_aliases AS release
+      ON release.native_id = member.item_id AND release.provider = 'discogs'
+     AND release.entity_kind = 'release' AND release.valid_to IS NULL
+    JOIN graph.derived_from AS derived ON derived.release_id = release.external_id
+    JOIN public.provider_aliases AS master
+      ON master.provider = 'discogs' AND master.entity_kind = 'master'
+     AND master.external_id = derived.master_id AND master.valid_to IS NULL
+    {_ledger_resolved("work_open", "master.native_id")}
+    UNION
+    SELECT member_mbid.edition_id, COALESCE(work_open.survivor_id, master.native_id)
+    FROM member_mbid
+    JOIN musicbrainz.releases AS mb_release ON mb_release.mbid = member_mbid.mbid
+    JOIN public.provider_aliases AS master
+      ON master.provider = 'musicbrainz' AND master.entity_kind = 'master'
+     AND master.external_id = mb_release.release_group_mbid::text AND master.valid_to IS NULL
+    {_ledger_resolved("work_open", "master.native_id")}
+)
+SELECT DISTINCT edition_id, work_id FROM edition_parent
+WITH NO DATA
+"""  # noqa: S608 -- composed of module constants only
+
+
+def _ledger_work_summary_view() -> str:
+    """Return `identity_ledger_work_summary`: the works list's rows, per event filter.
+
+    One row per work with `event = 'any'`, over every event type, and one per
+    (work, event type).  `repaired_editions` counts the editions with a
+    reattached, promoted, or reverted event.  The unfiltered row is the
+    sentinel `'any'` rather than NULL because REFRESH ... CONCURRENTLY needs a
+    unique index whose rows compare equal, and NULLs never do.
+    """
+    return f"""
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.identity_ledger_work_summary AS
+WITH by_type AS (
+    SELECT parent.work_id, event.edition_id, event.type, min(event.at) AS first_at, max(event.at) AS last_at
+    FROM public.identity_ledger_edition_events AS event
+    JOIN public.identity_ledger_edition_parents AS parent ON parent.edition_id = event.edition_id
+    GROUP BY parent.work_id, event.edition_id, event.type
+),
+by_edition AS (
+    SELECT work_id, edition_id, min(first_at) AS first_at, max(last_at) AS last_at, bool_or(type IN {_LEDGER_REPAIRS}) AS repaired
+    FROM by_type
+    GROUP BY work_id, edition_id
+)
+SELECT work_id, 'any'::text AS event, count(*) AS evented_editions, count(*) FILTER (WHERE repaired) AS repaired_editions,
+       min(first_at) AS first_event, max(last_at) AS last_event
+FROM by_edition
+GROUP BY work_id
+UNION ALL
+SELECT work_id, type, count(*), count(*) FILTER (WHERE type IN {_LEDGER_REPAIRS}), min(first_at), max(last_at)
+FROM by_type
+GROUP BY work_id, type
+WITH NO DATA
+"""  # noqa: S608 -- composed of module constants only
+
+
+def _ledger_density_view() -> str:
+    """Return `identity_ledger_density`: events per UTC month, type, and provenance, per kind.
+
+    catalog-api's density statement once for each catalog kind.  Unlike the
+    edition views it counts every event, mints included, and a supersession
+    once rather than per side; a link change no alias holds still counts.
+    """
+    branches = [
+        f"""(
+WITH {_ledger_item_events(kind)},
+event AS (
+    SELECT at, type, dated_from FROM item_event
+    UNION ALL
+    SELECT valid_from, CASE cause WHEN 'catalog_reattachment' THEN 'reattached' ELSE 'promoted' END, 'groovemap'
+    FROM supersession_of_kind
+    UNION ALL
+    SELECT valid_to, 'reverted', 'groovemap' FROM supersession_of_kind WHERE valid_to IS NOT NULL
+)
+SELECT {_sql_literal(kind)}::text AS kind, to_char(at AT TIME ZONE 'UTC', 'YYYY-MM') AS month, type, dated_from, count(*) AS events
+FROM event
+GROUP BY 1, 2, 3, 4
+)"""  # noqa: S608 -- KIND is one of the module's own catalog kinds, not caller input
+        for kind in _LEDGER_KINDS
+    ]
+    return "\nCREATE MATERIALIZED VIEW IF NOT EXISTS public.identity_ledger_density AS\n" + "\nUNION ALL\n".join(branches) + "\nWITH NO DATA\n"
+
+
+def _ledger_refresh_function() -> str:
+    """Return `identity_ledger_refresh(source_watermark)`, the one refresh of all four views.
+
+    Each view is refreshed in `IDENTITY_LEDGER_VIEWS` order, plainly while
+    `pg_class.relispopulated` is false and CONCURRENTLY once it is true.  The
+    state row then records `refreshed_at`, the instant the refresh started, the
+    duration, and the caller's watermark (whatever names the source state the
+    caller refreshed from; NULL when it names none), and the function returns
+    `refreshed_at`.  Everything runs in the caller's one transaction, so a
+    failed refresh leaves every view and the state row as they were.
+    """
+    views = ", ".join(_sql_literal(view) for view in IDENTITY_LEDGER_VIEWS)
+    return f"""
+CREATE OR REPLACE FUNCTION public.identity_ledger_refresh(source_watermark jsonb DEFAULT NULL)
+RETURNS timestamptz
+LANGUAGE plpgsql
+AS $identity_ledger_refresh$
+DECLARE
+    started timestamptz := clock_timestamp();
+    view_name text;
+BEGIN
+    FOREACH view_name IN ARRAY ARRAY[{views}] LOOP
+        IF (SELECT relispopulated FROM pg_catalog.pg_class WHERE oid = format('public.%I', view_name)::regclass) THEN
+            EXECUTE format('REFRESH MATERIALIZED VIEW CONCURRENTLY public.%I', view_name);
+        ELSE
+            EXECUTE format('REFRESH MATERIALIZED VIEW public.%I', view_name);
+        END IF;
+    END LOOP;
+    INSERT INTO public.identity_ledger_refresh_state (singleton, refreshed_at, duration, source_watermark)
+    VALUES (true, started, clock_timestamp() - started, identity_ledger_refresh.source_watermark)
+    ON CONFLICT (singleton) DO UPDATE
+        SET refreshed_at = EXCLUDED.refreshed_at, duration = EXCLUDED.duration, source_watermark = EXCLUDED.source_watermark;
+    RETURN started;
+END
+$identity_ledger_refresh$
+"""  # noqa: S608 -- IDENTITY_LEDGER_VIEWS is a module constant, not caller input
+
+
+# Declared after `_GRAPH_STATEMENTS` because the views read `graph.derived_from`
+# as well as the identity and MusicBrainz tables, and each view after the
+# views it reads.  Every view carries a UNIQUE index over plain columns, which
+# REFRESH ... CONCURRENTLY requires; the others serve catalog-api's reads.
+_IDENTITY_LEDGER_STATEMENTS: list[tuple[str, str]] = [
+    ("identity_ledger_edition_events materialized view", _ledger_edition_events_view()),
+    (
+        "idx_identity_ledger_edition_events_key",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_identity_ledger_edition_events_key ON public.identity_ledger_edition_events (edition_id, at, type)",
+    ),
+    # The works list in a time window reads the event rows in its range,
+    # optionally of one type.
+    (
+        "idx_identity_ledger_edition_events_at",
+        "CREATE INDEX IF NOT EXISTS idx_identity_ledger_edition_events_at ON public.identity_ledger_edition_events (at)",
+    ),
+    (
+        "idx_identity_ledger_edition_events_type_at",
+        "CREATE INDEX IF NOT EXISTS idx_identity_ledger_edition_events_type_at ON public.identity_ledger_edition_events (type, at)",
+    ),
+    ("identity_ledger_edition_parents materialized view", _ledger_edition_parents_view()),
+    (
+        "idx_identity_ledger_edition_parents_key",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_identity_ledger_edition_parents_key ON public.identity_ledger_edition_parents (edition_id, work_id)",
+    ),
+    ("identity_ledger_work_summary materialized view", _ledger_work_summary_view()),
+    (
+        "idx_identity_ledger_work_summary_key",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_identity_ledger_work_summary_key ON public.identity_ledger_work_summary (event, work_id)",
+    ),
+    # The works list's page: one event filter, most recent event first.
+    (
+        "idx_identity_ledger_work_summary_page",
+        "CREATE INDEX IF NOT EXISTS idx_identity_ledger_work_summary_page ON public.identity_ledger_work_summary (event, last_event DESC, work_id)",
+    ),
+    ("identity_ledger_density materialized view", _ledger_density_view()),
+    (
+        "idx_identity_ledger_density_key",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_identity_ledger_density_key ON public.identity_ledger_density (kind, month, type, dated_from)",
+    ),
+    # One row, written only by the refresh; absent until the first one.
+    (
+        "identity_ledger_refresh_state table",
+        """
+        CREATE TABLE IF NOT EXISTS identity_ledger_refresh_state (
+            singleton        BOOLEAN PRIMARY KEY DEFAULT true CHECK (singleton),
+            refreshed_at     TIMESTAMPTZ NOT NULL,
+            duration         INTERVAL NOT NULL,
+            source_watermark JSONB
+        )
+        """,
+    ),
+    ("identity_ledger_refresh function", _ledger_refresh_function()),
+]
+
+
 def _entity_schema_statements() -> Iterator[tuple[str, Any]]:
     """Yield each Discogs entity table followed by its shared indexes."""
     for table_name in _ENTITY_TABLES:
@@ -5106,6 +5494,7 @@ def _schema_statements() -> Iterator[tuple[str, Any]]:
     yield from _MUSICBRAINZ_INDEXES
     yield from _ARTIST_SIMILARITY_STATEMENTS
     yield from _GRAPH_STATEMENTS
+    yield from _IDENTITY_LEDGER_STATEMENTS
 
 
 async def _execute_schema_statements(cursor: Any, statements: Iterable[tuple[str, Any]]) -> tuple[int, int]:
