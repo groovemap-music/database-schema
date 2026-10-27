@@ -1111,11 +1111,10 @@ than an enumerated relation list.
 ### The text key rule
 
 Every Discogs vertex and edge key in the `graph` schema is `text`; the keys of the
-application-owned and MusicBrainz relations are `uuid` or `bigint`. The one exception is
-`graph.collected.release_id` and `graph.wants.release_id`, which project `releases.data_id`
-unchanged and so are still `character varying` -- retyping a published view column is a
-breaking change, so the contract records them under `graph_schema.key_columns.types` rather
-than hiding them. None is an appended restatement of another column. The four Discogs entity
+application-owned and MusicBrainz relations are `uuid` or `bigint`. That includes
+`graph.collected.release_id` and `graph.wants.release_id`, which publish `data_id::text`, so a join
+against `graph.release.release_id` needs no cast; the contract records the non-text keys under
+`graph_schema.key_columns.types`. None is an appended restatement of another column. The four Discogs entity
 tables key on `data_id VARCHAR`, so the original vertex views inherited that type and carried
 an appended `text` restatement — `artist_key`, `label_key`, `master_key`, and `release_key` —
 because `CREATE OR REPLACE VIEW` refuses to retype a published column. **Those four columns

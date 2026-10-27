@@ -417,7 +417,7 @@ assert keys["kind"] == "additive"
 assert keys["availability"] == "unconditional"
 assert "type" not in keys, "key columns are not all text; the per-type record is key_columns.types"
 key_types = keys["types"]
-assert sorted(key_types) == ["bigint", "char", "text", "uuid", "varchar"]
+assert sorted(key_types) == ["bigint", "char", "text", "uuid"]
 
 
 def table_columns(statement: str) -> dict[str, str]:
@@ -468,9 +468,12 @@ VIEW_KEYS = {
     "graph.mb_label.mbid": ("musicbrainz.labels", "mbid", "uuid"),
     "graph.mb_release.mbid": ("musicbrainz.releases", "mbid", "uuid"),
     "graph.mb_release_group.mbid": ("musicbrainz.release_groups", "mbid", "uuid"),
-    "graph.collected.release_id": ("releases", "data_id", "varchar"),
-    "graph.wants.release_id": ("releases", "data_id", "varchar"),
+    # A Discogs entity key is varchar at rest and published as text, so the view
+    # body must carry the cast.
+    "graph.collected.release_id": ("releases", "data_id", "text"),
+    "graph.wants.release_id": ("releases", "data_id", "text"),
 }
+CAST_TO_TEXT = {"graph.collected.release_id", "graph.wants.release_id"}
 for view in (name for name in view_statements if name.startswith("graph.mb_rel_")):
     VIEW_KEYS[f"{view}.source_mbid"] = ("musicbrainz.relationships", "source_mbid", "uuid")
     VIEW_KEYS[f"{view}.target_mbid"] = ("musicbrainz.relationships", "target_mbid", "uuid")
@@ -500,11 +503,15 @@ def contract_names(kind: str) -> set[str]:
     return names
 
 
-for kind in ("uuid", "varchar"):
+for kind in ("uuid",):
     assert contract_names(kind) == {name for name, (*_, declared) in VIEW_KEYS.items() if declared == kind}, kind
 assert contract_names("bigint") == derived_table_keys["bigint"] | {name for name, (*_, declared) in VIEW_KEYS.items() if declared == "bigint"}
 for name, (table, column, kind) in VIEW_KEYS.items():
     view, alias = name.rsplit(".", 1)
+    if name in CAST_TO_TEXT:
+        assert source_type(table, column) == "varchar", name
+        assert re.search(rf"\b\w+\.{column}::text\s+AS\s+{alias}\b", view_statements[view]), name
+        continue
     assert source_type(table, column) == kind, name
     assert re.search(rf"\b\w+\.{column}\s+AS\s+{alias}\b", view_statements[view]), name
 

@@ -476,7 +476,7 @@
     "key_columns": {
       "availability": "unconditional",
       "kind": "additive",
-      "note": "Key columns are not all text. Discogs vertex and edge keys (artist_id, label_id, master_id, release_id, medium_id, company_id, sublabel_id, and the genre, style, person, and media-family names) are text: the four Discogs vertex views publish data_id::text and the loader-written tables are declared text from the start, which retires the graph.artist.artist_key, graph.label.label_key, graph.master.master_key, and graph.release.release_key restatements. The exceptions are recorded under types and are the types the relations actually declare: uuid for the identifiers of the application-owned relations and for every MusicBrainz mbid, bigint for track ordinals and MusicBrainz relationship ids, and \"char\" for graph.vertex_degree.kind. graph.collected.release_id and graph.wants.release_id publish the Discogs id as character varying, because they project releases.data_id unchanged; the four Discogs vertex views and the edge tables carry the same id as text. Retyping them would be a breaking change to a published view column, so it is recorded here rather than done.",
+      "note": "Key columns are not all text. Discogs vertex and edge keys (artist_id, label_id, master_id, release_id, medium_id, company_id, sublabel_id, and the genre, style, person, and media-family names) are text: the four Discogs vertex views publish data_id::text and the loader-written tables are declared text from the start, which retires the graph.artist.artist_key, graph.label.label_key, graph.master.master_key, and graph.release.release_key restatements. The exceptions are recorded under types and are the types the relations actually declare: uuid for the identifiers of the application-owned relations and for every MusicBrainz mbid, bigint for track ordinals and MusicBrainz relationship ids, and \"char\" for graph.vertex_degree.kind. graph.collected.release_id and graph.wants.release_id also publish data_id::text, so every Discogs graph key is text and a join against graph.release.release_id needs no cast; schema init converges an existing database by dropping and recreating those two views when the column still reads as another type.",
       "types": {
         "bigint": [
           "graph.mb_rel_*.relationship_id",
@@ -488,7 +488,7 @@
         "char": [
           "graph.vertex_degree.kind"
         ],
-        "text": "every other key column of every loader-written table, and the key column of the Discogs vertex views (graph.artist.artist_id, graph.label.label_id, graph.master.master_id, graph.release.release_id) and of graph.sublabel_of, graph.part_of, graph.in_family, and graph.release_degree",
+        "text": "every other key column of every loader-written table, and the key column of the Discogs vertex views (graph.artist.artist_id, graph.label.label_id, graph.master.master_id, graph.release.release_id) and of graph.collected.release_id, graph.wants.release_id, graph.sublabel_of, graph.part_of, graph.in_family, and graph.release_degree",
         "uuid": [
           "graph.app_user.user_id",
           "graph.catalog_item.item_id",
@@ -507,10 +507,6 @@
           "graph.owns.user_id",
           "graph.wants.user_id",
           "graph.wants.wantlist_id"
-        ],
-        "varchar": [
-          "graph.collected.release_id",
-          "graph.wants.release_id"
         ]
       }
     },

@@ -1443,6 +1443,7 @@ class TestCollectionEdgeViews:
         for view, table in (("collected", "collection"), ("wants", "wantlist")):
             statement = statement_for(view)
             assert f"JOIN public.releases AS releases ON releases.data_id = {table}.release_id::text" in statement
+            assert "releases.data_id::text AS release_id" in statement
 
     def test_collected_exposes_the_instance_key(self) -> None:
         assert "AS instance_id" in statement_for("collected")

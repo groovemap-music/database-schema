@@ -293,9 +293,9 @@ EXPECTED_GRAPH_COLUMNS = {
     ("graph", "app_user", "user_id", "uuid"),
     ("graph", "catalog_item", "item_id", "uuid"),
     ("graph", "collected", "user_id", "uuid"),
-    ("graph", "collected", "release_id", "character varying"),
+    ("graph", "collected", "release_id", "text"),
     ("graph", "collected", "instance_id", "bigint"),
-    ("graph", "wants", "release_id", "character varying"),
+    ("graph", "wants", "release_id", "text"),
     ("graph", "owns", "item_id", "uuid"),
 }
 
@@ -1755,6 +1755,47 @@ async def assert_graph_relations_project_the_enricher_rules() -> None:
     assert await postgres_rows("SELECT release_id, instance_id FROM graph.collected ORDER BY 1") == [("111", 900)]
     assert await postgres_rows("SELECT release_id FROM graph.wants ORDER BY 1") == [("111",)]
     assert await postgres_rows("SELECT count(*) FROM graph.owns") == [(1,)]
+
+
+@pytest.mark.asyncio
+async def test_collected_and_wants_publish_text_and_converge_from_varchar() -> None:
+    """The edge views' release key is text, joins `graph.release` uncast, and heals a legacy varchar view."""
+    await apply_schema()
+    # Reconstruct the legacy shape: the two views projecting data_id unchanged.
+    for view, source, alias in (("collected", "user_collections", "collection"), ("wants", "user_wantlists", "wantlist")):
+        connection = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params())
+        await connection.set_autocommit(True)
+        try:
+            async with connection.cursor() as cursor:
+                await cursor.execute(f"DROP VIEW graph.{view} CASCADE")
+                await cursor.execute(
+                    f"CREATE VIEW graph.{view} AS SELECT {alias}.id AS {'collection_id' if view == 'collected' else 'wantlist_id'}, "  # noqa: S608
+                    f"releases.data_id AS release_id FROM public.{source} AS {alias} "
+                    f"JOIN public.releases AS releases ON releases.data_id = {alias}.release_id::text"
+                )
+        finally:
+            await connection.close()
+        assert await column_type_of(f"graph.{view}", "release_id") == "character varying"
+
+    await apply_schema()
+    await apply_schema()  # a converged database is a no-op
+
+    for view in ("collected", "wants"):
+        assert await column_type_of(f"graph.{view}", "release_id") == "text"
+    view_rows = await postgres_rows("SELECT viewname FROM pg_views WHERE schemaname = 'graph'")
+    assert {row[0] for row in view_rows} == EXPECTED_GRAPH_VIEWS
+    # Joined against the vertex with no cast on either side.
+    for view in ("collected", "wants"):
+        await postgres_rows(f"SELECT 1 FROM graph.{view} AS edge JOIN graph.release AS release ON release.release_id = edge.release_id")  # noqa: S608
+
+
+async def column_type_of(relation: str, column: str) -> str:
+    schema, name = relation.split(".")
+    rows = await postgres_rows(
+        "SELECT data_type FROM information_schema.columns WHERE table_schema = %s AND table_name = %s AND column_name = %s",
+        (schema, name, column),
+    )
+    return str(rows[0][0])
 
 
 @pytest.mark.asyncio
