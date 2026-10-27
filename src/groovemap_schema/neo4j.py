@@ -15,12 +15,30 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from common.credit_roles import ALL_CATEGORIES
+
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
 
 logger = logging.getLogger(__name__)
+
+
+# Person.credit_count_<category> range indexes, one per category in the shared
+# credit vocabulary (common.credit_roles.ALL_CATEGORIES, from python-libraries).
+# Imported rather than copied so a vocabulary change cannot leave a divergent list.
+# Property contract, shared with the Discogs graph enricher (writer) and the
+# catalog-api role leaderboard (reader): credit_count_<category> is the number of
+# distinct releases the person is CREDITED_ON with that category; credit_count is
+# the distinct-release total across all categories.
+PERSON_CREDIT_COUNT_CATEGORY_INDEXES: list[tuple[str, str]] = [
+    (
+        f"person_credit_count_{category}",
+        f"CREATE INDEX person_credit_count_{category} IF NOT EXISTS FOR (p:Person) ON (p.credit_count_{category})",
+    )
+    for category in ALL_CATEGORIES
+]
 
 
 # All schema statements in creation order.
@@ -162,11 +180,14 @@ SCHEMA_STATEMENTS: list[tuple[str, str]] = [
         "style_first_year_index",
         "CREATE INDEX style_first_year_index IF NOT EXISTS FOR (s:Style) ON (s.first_year)",
     ),
-    # Person credit_count index for fast "top credited people" leaderboard queries.
+    # Person credit_count index for fast "top credited people" leaderboard queries
+    # (distinct-release total across all categories), plus one per-category index
+    # on credit_count_<category> for the role leaderboard.
     (
         "person_credit_count",
         "CREATE INDEX person_credit_count IF NOT EXISTS FOR (p:Person) ON (p.credit_count)",
     ),
+    *PERSON_CREDIT_COUNT_CATEGORY_INDEXES,
     # ── Fulltext indexes ──────────────────────────────────────────────────────
     # Used by explore for autocomplete and full-text search.
     (

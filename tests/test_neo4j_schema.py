@@ -125,8 +125,23 @@ class TestSchemaStatements:
 
     def test_total_statement_count(self) -> None:
         # 11 constraints (incl. company_id) + 4 gm_id indexes + 13 range indexes
-        # (incl. release_country) + 4 MBID indexes + 6 fulltext = 38
-        assert len(SCHEMA_STATEMENTS) == 38
+        # (incl. release_country) + 7 per-category Person credit counts
+        # + 4 MBID indexes + 6 fulltext = 45
+        assert len(SCHEMA_STATEMENTS) == 45
+
+    def test_person_credit_count_category_indexes(self) -> None:
+        """One idempotent range index per shared ALL_CATEGORIES entry, plus the total."""
+        from common.credit_roles import ALL_CATEGORIES
+
+        statements = dict(SCHEMA_STATEMENTS)
+        assert statements["person_credit_count"] == "CREATE INDEX person_credit_count IF NOT EXISTS FOR (p:Person) ON (p.credit_count)"
+        assert set(ALL_CATEGORIES) == {"production", "engineering", "mastering", "session", "design", "management", "other"}
+        for category in ALL_CATEGORIES:
+            assert statements[f"person_credit_count_{category}"] == (
+                f"CREATE INDEX person_credit_count_{category} IF NOT EXISTS FOR (p:Person) ON (p.credit_count_{category})"
+            )
+        category_names = {n for n in statements if n.startswith("person_credit_count_")}
+        assert category_names == {f"person_credit_count_{c}" for c in ALL_CATEGORIES}, "index set diverges from ALL_CATEGORIES"
 
     def test_gm_id_indexes_present(self) -> None:
         """ADR 0009: gm_id range indexes on the four catalog labels."""
