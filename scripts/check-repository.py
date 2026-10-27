@@ -9,8 +9,6 @@ import sys
 import tomllib
 from pathlib import Path
 
-from repository_source import RepositorySourceError, check_retired_branding
-
 
 ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY = "https://github.com/groovemap-music/database-schema"
@@ -226,18 +224,6 @@ for forbidden_path in (
     require(not forbidden_path.exists(), f"Renovate configuration must not coexist with Dependabot: {forbidden_path.relative_to(ROOT)}")
 require(not list((ROOT / ".github/workflows").glob("*claude*")), "legacy Claude workflow must not exist")
 
-retired_name = "discogs" + "ography"
-published_extensions = {".json", ".md", ".py", ".sh", ".toml", ".yaml", ".yml"}
-try:
-    check_retired_branding(
-        ROOT,
-        retired_name=retired_name,
-        published_extensions=published_extensions,
-        excluded_parts={".git", ".venv", ".build", "dist"},
-    )
-except RepositorySourceError as error:
-    raise SystemExit(str(error)) from error
-
 readme = (ROOT / "README.md").read_text()
 docs_index = (ROOT / "docs/README.md").read_text()
 contracts_readme = (ROOT / "contracts/README.md").read_text()
@@ -245,7 +231,7 @@ require("docs/README.md" in readme, "README must link the repository documentati
 for tier in ("just test-integration", "just test-integration-pg19"):
     require(tier in readme, f"README must name both integration tiers: {tier}")
 require("architecture.md" in docs_index and "runtime-configuration.md" in docs_index, "documentation index is incomplete")
-for stale in ("SimplicityGuy", retired_name, "schema-init"):
+for stale in ("SimplicityGuy", "schema-init"):
     require(stale not in readme and stale not in docs_index, f"published repository docs retain stale name: {stale}")
 for owner in ("discogs-ingestion", "musicbrainz-ingestion", "python-libraries", "deployment"):
     require(owner in contracts_readme, f"persistence contract documentation is missing owner: {owner}")

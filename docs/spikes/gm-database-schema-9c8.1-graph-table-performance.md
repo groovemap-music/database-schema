@@ -2,6 +2,9 @@
 
 Status: complete. Verdict below.
 
+2026-10-02: superseded. PostgreSQL 19 removed SQL/PGQ before release, so `graph.catalog` and
+`GRAPH_TABLE` are no longer declared; see [SQL/PGQ removal and recovery](../sql-pgq-removal.md).
+
 ## Question
 
 The foundation molecule (gm-database-schema-6z8) landed a `graph` schema of 52

@@ -2,6 +2,10 @@
 
 Status: complete. Verdict below.
 
+2026-09-18: superseded by
+[gm-database-schema-gkt.1](gm-database-schema-gkt.1-procedural-pathfinder.md), whose
+procedural pathfinder `graph.find_shortest_path` is built on.
+
 ## Question
 
 PostgreSQL 19's `GRAPH_TABLE` has no variable-length path pattern. There is no
