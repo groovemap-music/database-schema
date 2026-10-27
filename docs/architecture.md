@@ -414,12 +414,99 @@ sets `groovemap.erasure`, and because the setting is session-local the bypass ne
 the transaction that opened it.
 
 `activity.erasures` records each erasure run: `subject_id`, timing, the count of
-events/impressions deleted, and `model_versions_before` — the model versions that had already
+events/impressions deleted (and, in `idempotency_keys_deleted`, of event idempotency keys), and `model_versions_before` — the model versions that had already
 trained on the data before it was deleted, so the residual question ("which models saw this
 subject's data") stays answerable rather than invisible.
 
 Every table, function, and trigger above is additive within persistence contract v1 — see
 [the persistence compatibility contract](../contracts/persistence/).
+
+### Event idempotency across partitions
+
+A unique key on a partitioned table must include the partition key, so `activity.events`'
+`UNIQUE (occurred_at, idempotency_key)` only catches a retry carrying the original's exact
+`occurred_at`. A retry stamped a second, a minute, or a month later is a different key, and the
+later ones route to a different partition. `activity.event_idempotency` closes that gap. It is
+a plain, non-partitioned table with `PRIMARY KEY (subject_id, idempotency_key)`, plus the
+`event_id`, `occurred_at`, and `recorded_at` of the event that holds the key.
+
+The rule is that a key is held only by an event that is stored. The
+`activity_events_claim_idempotency_key` `BEFORE INSERT` row trigger on `activity.events` runs
+`activity.claim_idempotency_key()`, which enforces it in this order:
+
+1. A row missing one of the key columns passes through untouched, so the `NOT NULL` violation
+   is reported against `activity.events` rather than the key table.
+2. If a stored event already holds the row's `(occurred_at, idempotency_key)`, the occurrence
+   key is going to refuse the row. When that event belongs to the same subject it is this very
+   event, so the row is skipped. When it belongs to another subject, the row is handed to the
+   occurrence key without claiming anything: `ON CONFLICT` skips it and a plain `INSERT`
+   raises, exactly as before this table existed. That way no key is claimed for a row that is
+   never stored, and the second subject's own event under that key, at its own instant, is
+   still recorded.
+3. Otherwise the trigger claims the key with `ON CONFLICT DO NOTHING`. Concurrent retries are
+   serialized on the key's primary-key entry: the second waits for the first transaction, and
+   it is skipped if the first commits or claims the key itself if the first rolls back.
+4. A key that is already held is honoured only while the event it names is stored. In that
+   case the trigger returns `NULL` and the event row is skipped, with no error and no
+   `RETURNING` row: the same result as an `INSERT ... ON CONFLICT DO NOTHING` that meets its
+   conflict, so writers treat both outcomes the same way. A key whose event is not stored is
+   moved onto the new event. That covers a dropped partition, and one race step 2 cannot see:
+   another subject's insert under the same occurrence key that is still uncommitted. The move
+   matches on the old `event_id`, so two racing writers cannot both win it.
+
+Like the immutability trigger, the claim trigger is declared on the parent, so it reaches
+every existing partition and every one `ensure_month_partition()` creates later.
+
+A key is as immutable as the event it names. `activity.reject_key_mutation()`
+(`activity_event_idempotency_reject_mutation`) rejects `UPDATE` and `DELETE` of a key whose
+event is stored unless `groovemap.erasure` is on, as on `activity.events`. A key naming no
+stored event rewrites no history, so the claim may move it and the closures below may remove
+it.
+
+Erasure closes at the schema level, so a caller never has to list this table:
+
+- `activity_events_release_idempotency_key`, an `AFTER DELETE` trigger on `activity.events`,
+  releases the key a deleted event holds. Deleting a subject's events, which already requires
+  the erasure bypass, removes their keys.
+- `activity_user_subjects_release_idempotency_keys`, an `AFTER DELETE` trigger on
+  `activity.user_subjects`, removes the subject's keys that name no stored event: keys no
+  event deletion can release. No writer can reach a subject once its link is gone. A key
+  whose event is still stored stays with that event, so deleting a user outright, which
+  cascades to the link without the bypass, still succeeds.
+- `catalog-api`'s erasure transaction (delete events and impressions by subject, then the
+  link, under `SET LOCAL groovemap.erasure = 'on'`) therefore leaves no key row for the
+  subject. `activity.erasures.idempotency_keys_deleted` records how many there were. Because
+  the triggers do the deleting, the erasure procedure counts the subject's keys before it
+  deletes the events. The column is `NULL` on older rows.
+
+Retention drops whole `activity.events` partitions. That is DDL, so it fires no row trigger and
+leaves the dropped month's keys behind. Run `activity.purge_idempotency_keys(older_than)`
+straight after the drop, passing the dropped partition's upper bound, for example
+`SELECT activity.purge_idempotency_keys('2026-02-01')` after dropping `activity.events_y2026m01`.
+It removes only keys older than the bound whose event is no longer stored, so it can never
+release a key that still dedupes, and it returns the count. The
+`idx_activity_event_idempotency_occurred_at` index serves it. A retry under a dropped month's
+key is stored afresh, purged or not: the original is gone, so the dedup window is the retention
+window.
+
+An existing database converges in one statement. Under a `SHARE ROW EXCLUSIVE` lock on
+`activity.events`, which holds off every insert into the table and its partitions, the
+initializer backfills the key table from the events already stored and then creates the claim
+trigger, so no event can land in between without a key. The backfill runs only when the
+trigger does not exist yet. The trigger is only ever created together with the backfill, so
+its presence means every event has a key: later inits skip the scan and only re-assert the
+trigger. Existing duplicate rows, the retries the old key let through, are kept, because
+deleting them is a separate data decision. Each key goes to its earliest occurrence, the one a
+retry repeats.
+
+The events table keeps `UNIQUE (occurred_at, idempotency_key)`. Writers name it as their
+`ON CONFLICT` target, and subject-scoping it would be a coordinated breaking change, so step 2
+defers to it instead.
+
+`TRUNCATE` fires no row trigger, so truncating `activity.events` leaves its keys behind. They
+name no stored event, so the next insert under one of them takes it over and is recorded. A
+test or tool that empties the behavioural tables should still truncate
+`activity.event_idempotency` too, so the stale keys do not pile up.
 
 ## PostgreSQL media schema
 
@@ -495,7 +582,7 @@ The executable PostgreSQL inventory is in
     within the style (`UNIQUE (style, rank)`). A style is never its own co-tag
     (`CHECK (style <> other)`);
 - activity tables in the `activity` schema (see Activity above): `user_subjects`,
-  `consent_grants`, `events`, `impressions`, and `erasures`;
+  `consent_grants`, `events`, `impressions`, `event_idempotency`, and `erasures`;
 - MusicBrainz tables in the `musicbrainz` schema: `artists`, `labels`, `releases`,
   `release_groups`, `relationships`, and `external_links`;
 - `public.artist_embeddings` (see Vector embeddings and the embedding pipeline role below),

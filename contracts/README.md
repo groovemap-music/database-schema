@@ -124,6 +124,23 @@ declaring statements. Every view stays unreadable until its first refresh. See
 [the architecture notes](../docs/architecture.md) for what each view holds and why readers
 never block.
 
+`activity_event_idempotency` records `activity.event_idempotency`, the non-partitioned
+`(subject_id, idempotency_key)` key that a `BEFORE INSERT` trigger on `activity.events` claims.
+A key is held only by an event that is stored. A second insert of the same key is skipped
+whatever its `occurred_at` or partition, with no error and no `RETURNING` row. A row that
+another subject's stored event refuses under the occurrence key claims nothing. `catalog-api`
+is the consumer, and it treats a skipped retry as already recorded. Erasure closes at the
+schema level: deleting an event releases its key, and deleting the `activity.user_subjects`
+link removes the subject's remaining keys, so `catalog-api`'s erasure transaction needs no new
+statement. The count goes in `activity.erasures.idempotency_keys_deleted`. After a partition
+drop, retention calls `activity.purge_idempotency_keys(older_than)`. The events table keeps
+`UNIQUE (occurred_at, idempotency_key)` because `catalog-api` names it in `ON CONFLICT`. An
+existing database gets a one-time backfill, guarded on the trigger's presence, that keeps any
+duplicate rows already stored. The contract check pins the columns, the primary key, the
+immutability rule, the trigger and its function, the guard, the erasure and retention
+closures, and the retained key to the declaring statements. See
+[the architecture notes](../docs/architecture.md) for the mechanism.
+
 Catalog event shapes are not owned here. Discogs events belong to
 [`discogs-ingestion`](https://github.com/groovemap-music/discogs-ingestion), and MusicBrainz
 events belong to

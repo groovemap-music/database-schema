@@ -252,6 +252,18 @@ _ADDED_STATEMENT_NAMES = frozenset(
         "artist release K guard trigger",
         "public.artist_embedding_releases table",
         "idx_artist_embedding_releases_is_current",
+        "activity.event_idempotency table",
+        "idx_activity_event_idempotency_occurred_at",
+        "activity.reject_key_mutation function",
+        "activity.event_idempotency reject_mutation trigger",
+        "activity.claim_idempotency_key function",
+        "activity.release_idempotency_key function",
+        "activity.events release_idempotency_key trigger",
+        "activity.release_subject_idempotency_keys function",
+        "activity.user_subjects release_idempotency_keys trigger",
+        "activity.purge_idempotency_keys function",
+        "activity.events claim_idempotency_key trigger",
+        "activity.erasures add idempotency_keys_deleted",
     }
 )
 

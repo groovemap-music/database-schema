@@ -7,6 +7,7 @@ from pathlib import Path
 
 from groovemap_schema import __version__
 from groovemap_schema.postgres import (
+    _ACTIVITY_STATEMENTS,
     _BOOTSTRAP_FILL_ORDER,
     _GRAPH_STATEMENTS,
     _IDENTITY_LEDGER_STATEMENTS,
@@ -143,6 +144,54 @@ assert f"CONSTRAINT {idempotence['constraint']}\n                UNIQUE ({', '.j
 for index in link_events["indexes"]:
     name = index.split(" ", 1)[0]
     assert index == user_statements[name].removeprefix("CREATE INDEX IF NOT EXISTS "), name
+
+# Event idempotency across activity.events' partitions is relied on by
+# catalog-api's insert and erasure paths. Pin the key table's columns and key,
+# its immutability rule, the claim trigger and its guarded backfill, the
+# erasure and retention closures, and the occurrence key writers name.
+event_keys = contract["activity_event_idempotency"]
+activity_statements = dict(_ACTIVITY_STATEMENTS)
+assert event_keys["kind"] == "additive"
+assert event_keys["introduced_in_contract_version"] == contract["version"]
+assert event_keys["consumers"] == ["catalog-api"]
+assert event_keys["relation"] == "activity.event_idempotency"
+event_keys_statement = activity_statements["activity.event_idempotency table"]
+assert f"CREATE TABLE IF NOT EXISTS {event_keys['relation']} (" in event_keys_statement
+for column in event_keys["columns"]:
+    assert f"\n            {column} " in event_keys_statement, column
+assert f"PRIMARY KEY ({', '.join(event_keys['primary_key'])})" in event_keys_statement
+assert event_keys["primary_key"][0] == "subject_id"
+assert event_keys["immutability"].startswith("activity.reject_key_mutation():")
+assert "CREATE OR REPLACE FUNCTION activity.reject_key_mutation()" in activity_statements["activity.reject_key_mutation function"]
+assert (
+    f"ON {event_keys['relation']}\n            FOR EACH ROW EXECUTE FUNCTION activity.reject_key_mutation()"
+    in activity_statements["activity.event_idempotency reject_mutation trigger"]
+)
+claim = event_keys["claim"]
+assert f"CREATE OR REPLACE FUNCTION {claim['function']}" in activity_statements["activity.claim_idempotency_key function"]
+claim_trigger_statement = activity_statements["activity.events claim_idempotency_key trigger"]
+assert f"CREATE OR REPLACE TRIGGER {claim['trigger']}\n" in claim_trigger_statement
+assert f"tgname = '{claim['trigger']}'" in claim_trigger_statement
+assert f"EXECUTE FUNCTION {claim['function']};" in claim_trigger_statement
+assert event_keys["retained_unique_key"] in activity_statements["activity.events table"]
+erasure = event_keys["erasure"]
+for release, statement_name, table in (
+    ("event_release", "activity.events release_idempotency_key trigger", "activity.events"),
+    ("subject_release", "activity.user_subjects release_idempotency_keys trigger", "activity.user_subjects"),
+):
+    trigger_name = erasure[release].split(",", 1)[0]
+    assert f"CREATE OR REPLACE TRIGGER {trigger_name}\n            AFTER DELETE ON {table}\n" in activity_statements[statement_name], release
+assert erasure["count"].startswith("activity.erasures.idempotency_keys_deleted,")
+assert "idempotency_keys_deleted BIGINT" in activity_statements["activity.erasures table"]
+assert activity_statements["activity.erasures add idempotency_keys_deleted"] == (
+    "ALTER TABLE activity.erasures ADD COLUMN IF NOT EXISTS idempotency_keys_deleted BIGINT"
+)
+retention = event_keys["retention"]
+purge_signature, purge_returns = retention["function"].split(" RETURNS ")
+purge_statement = activity_statements["activity.purge_idempotency_keys function"]
+assert f"CREATE OR REPLACE FUNCTION {purge_signature}\n        RETURNS {purge_returns}\n" in purge_statement
+purge_index = retention["index"].split(" ", 1)[0]
+assert retention["index"] == activity_statements[purge_index].removeprefix("CREATE INDEX IF NOT EXISTS ")
 
 # The precomputed Identity Ledger is read and refreshed by catalog-api. Pin the
 # refresh order, every view's columns, unique key and read indexes, the state

@@ -4,7 +4,8 @@ Covers ADR 0010 (first-party events, consent, and deletion closure): the
 `activity` schema, the pseudonymous subject link, per-purpose consent grants,
 the two month-partitioned behavioural tables with their DEFAULT partitions and
 monthly-partition function, the immutability trigger that makes append-only a
-property of the database, and the erasure record.
+property of the database, the cross-partition event idempotency key, and the
+erasure record.
 
 Every assertion is made against the statement lists, never against a database.
 """
@@ -382,6 +383,142 @@ class TestRejectMutation:
             assert names.index(f"activity.{table} table") < trigger_position
 
 
+class TestEventIdempotency:
+    """activity.event_idempotency — the cross-partition key a retried event is skipped on.
+
+    The engine-backed proof of the retry, concurrency, erasure, and convergence cases is
+    tests/integration/test_activity_idempotency.py; these pin the statements' shape.
+    """
+
+    def _claim(self) -> str:
+        return _activity()["activity.claim_idempotency_key function"]
+
+    def _trigger(self) -> str:
+        return _activity()["activity.events claim_idempotency_key trigger"]
+
+    def test_table_is_keyed_per_subject_and_not_partitioned(self) -> None:
+        stmt = _activity()["activity.event_idempotency table"]
+        assert "CREATE TABLE IF NOT EXISTS activity.event_idempotency (" in stmt
+        assert "PRIMARY KEY (subject_id, idempotency_key)" in stmt
+        assert "PARTITION BY" not in stmt
+
+    def test_table_names_the_claiming_event(self) -> None:
+        stmt = _activity()["activity.event_idempotency table"]
+        for column in (
+            "subject_id      UUID NOT NULL",
+            "idempotency_key TEXT NOT NULL",
+            "event_id        UUID NOT NULL",
+            "occurred_at     TIMESTAMPTZ NOT NULL",
+            "recorded_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+        ):
+            assert column in stmt, column
+
+    def test_table_has_no_user_id_column(self) -> None:
+        assert "user_id" not in _activity()["activity.event_idempotency table"]
+
+    def test_occurred_at_is_indexed_for_the_purge(self) -> None:
+        stmt = _activity()["idx_activity_event_idempotency_occurred_at"]
+        assert stmt == "CREATE INDEX IF NOT EXISTS idx_activity_event_idempotency_occurred_at ON activity.event_idempotency (occurred_at)"
+
+    def test_key_is_as_immutable_as_its_event(self) -> None:
+        body = _activity()["activity.reject_key_mutation function"]
+        assert "current_setting('groovemap.erasure', true) = 'on' OR NOT EXISTS (" in body
+        assert "WHERE stored.occurred_at = OLD.occurred_at\n                  AND stored.event_id = OLD.event_id" in body
+        assert "RAISE EXCEPTION" in body
+        assert "USING ERRCODE = 'restrict_violation'" in body
+        stmt = _activity()["activity.event_idempotency reject_mutation trigger"]
+        assert "CREATE OR REPLACE TRIGGER activity_event_idempotency_reject_mutation" in stmt
+        assert "BEFORE UPDATE OR DELETE ON activity.event_idempotency" in stmt
+        assert "FOR EACH ROW EXECUTE FUNCTION activity.reject_key_mutation()" in stmt
+
+    def test_claim_defers_to_a_stored_occurrence_key_before_claiming(self) -> None:
+        body = self._claim()
+        occupant = body.index("SELECT stored.subject_id INTO occupant")
+        assert "IF occupant = NEW.subject_id THEN\n                    RETURN NULL;" in body
+        assert occupant < body.index("INSERT INTO activity.event_idempotency")
+
+    def test_claim_skips_the_row_only_while_the_holding_event_is_stored(self) -> None:
+        body = self._claim()
+        assert "CREATE OR REPLACE FUNCTION activity.claim_idempotency_key()" in body
+        assert "ON CONFLICT (subject_id, idempotency_key) DO NOTHING;" in body
+        held = body.index("WHERE stored.occurred_at = held_occurred_at")
+        skip = body.index("RETURN NULL;", held)
+        move = body.index("UPDATE activity.event_idempotency AS held")
+        assert held < skip < move
+        assert "AND held.event_id = held_event_id;" in body
+        assert "LOOP" in body
+        assert "END LOOP;" in body
+
+    def test_claim_leaves_a_missing_key_column_to_activity_events(self) -> None:
+        body = self._claim()
+        for column in ("subject_id", "idempotency_key", "event_id", "occurred_at", "recorded_at"):
+            assert f"NEW.{column} IS NULL" in body, column
+
+    def test_deleting_an_event_releases_its_key(self) -> None:
+        body = _activity()["activity.release_idempotency_key function"]
+        assert "DELETE FROM activity.event_idempotency AS held" in body
+        assert "AND held.event_id = OLD.event_id;" in body
+        stmt = _activity()["activity.events release_idempotency_key trigger"]
+        assert "AFTER DELETE ON activity.events" in stmt
+        assert "FOR EACH ROW EXECUTE FUNCTION activity.release_idempotency_key()" in stmt
+
+    def test_unlinking_a_subject_releases_its_unstored_keys(self) -> None:
+        body = _activity()["activity.release_subject_idempotency_keys function"]
+        assert "WHERE held.subject_id = OLD.subject_id\n              AND NOT EXISTS (" in body
+        stmt = _activity()["activity.user_subjects release_idempotency_keys trigger"]
+        assert "AFTER DELETE ON activity.user_subjects" in stmt
+        assert "FOR EACH ROW EXECUTE FUNCTION activity.release_subject_idempotency_keys()" in stmt
+
+    def test_purge_releases_only_keys_with_no_stored_event(self) -> None:
+        body = _activity()["activity.purge_idempotency_keys function"]
+        assert "CREATE OR REPLACE FUNCTION activity.purge_idempotency_keys(older_than TIMESTAMPTZ)" in body
+        assert "RETURNS BIGINT" in body
+        assert "WHERE held.occurred_at < older_than\n              AND NOT EXISTS (" in body
+        assert "GET DIAGNOSTICS purged = ROW_COUNT;" in body
+
+    def test_trigger_fires_before_insert_on_the_partitioned_parent(self) -> None:
+        body = self._trigger()
+        assert "CREATE OR REPLACE TRIGGER activity_events_claim_idempotency_key" in body
+        assert "BEFORE INSERT ON activity.events" in body
+        assert "FOR EACH ROW EXECUTE FUNCTION activity.claim_idempotency_key();" in body
+
+    def test_backfill_is_guarded_on_the_trigger_and_runs_under_the_insert_lock(self) -> None:
+        body = self._trigger()
+        lock = body.index("LOCK TABLE activity.events IN SHARE ROW EXCLUSIVE MODE;")
+        guard = body.index("tgname = 'activity_events_claim_idempotency_key'")
+        backfill = body.index("INSERT INTO activity.event_idempotency")
+        trigger = body.index("CREATE OR REPLACE TRIGGER")
+        assert lock < guard < backfill < body.index("END IF;") < trigger
+
+    def test_backfill_keeps_duplicates_and_keys_the_earliest(self) -> None:
+        body = self._trigger()
+        assert "DELETE" not in body.upper()
+        assert "SELECT DISTINCT ON (subject_id, idempotency_key)" in body
+        assert "ORDER BY subject_id, idempotency_key, occurred_at, recorded_at, event_id" in body
+
+    def test_the_occurrence_key_writers_name_is_kept(self) -> None:
+        assert "UNIQUE (occurred_at, idempotency_key)" in _activity()["activity.events table"]
+
+    def test_declared_in_dependency_order(self) -> None:
+        names = _activity_names()
+        table = names.index("activity.event_idempotency table")
+        assert names.index("activity.events table") < table
+        assert names.index("activity.user_subjects table") < table
+        for function, trigger in (
+            ("activity.reject_key_mutation function", "activity.event_idempotency reject_mutation trigger"),
+            ("activity.release_idempotency_key function", "activity.events release_idempotency_key trigger"),
+            ("activity.release_subject_idempotency_keys function", "activity.user_subjects release_idempotency_keys trigger"),
+            ("activity.claim_idempotency_key function", "activity.events claim_idempotency_key trigger"),
+        ):
+            assert table < names.index(function) < names.index(trigger), trigger
+        # The claim trigger, and with it the backfill, comes last: every rule it relies on is in place.
+        claim_trigger = names.index("activity.events claim_idempotency_key trigger")
+        rules = [name for name in names[:claim_trigger] if "idempotency" in name]
+        assert len(rules) == len(
+            [name for name in names if "idempotency" in name and not name.startswith("activity.erasures") and name != names[claim_trigger]]
+        )
+
+
 class TestErasures:
     """activity.erasures — the record the deletion claim leaves behind."""
 
@@ -398,8 +535,15 @@ class TestErasures:
             "impressions_deleted",
             "model_versions_before",
             "notes",
+            "idempotency_keys_deleted",
         ):
             assert column in stmt, f"Missing column '{column}' in activity.erasures"
+
+    def test_existing_erasures_tables_gain_the_key_count(self) -> None:
+        stmt = _activity()["activity.erasures add idempotency_keys_deleted"]
+        assert stmt == "ALTER TABLE activity.erasures ADD COLUMN IF NOT EXISTS idempotency_keys_deleted BIGINT"
+        names = _activity_names()
+        assert names.index("activity.erasures table") < names.index("activity.erasures add idempotency_keys_deleted")
 
     def test_keyed_by_subject_not_user(self) -> None:
         """The link row is gone by the time the erasure completes."""
@@ -416,6 +560,7 @@ class TestErasures:
         stmt = _activity()["activity.erasures table"]
         assert "events_deleted        BIGINT" in stmt
         assert "impressions_deleted   BIGINT" in stmt
+        assert "idempotency_keys_deleted BIGINT" in stmt
 
     def test_subject_index_defined(self) -> None:
         stmt = _activity()["idx_activity_erasures_subject_id"]
@@ -434,10 +579,12 @@ class TestActivityIsAdditive:
         assert not (set(_activity_names()) & {name for name, _stmt in _USER_TABLES})
 
     def test_no_existing_object_is_altered(self) -> None:
-        """Nothing outside the activity schema is touched."""
+        """Nothing outside the activity schema is touched, and an activity table only gains columns."""
         for name, stmt in _ACTIVITY_STATEMENTS:
             upper = stmt.upper()
-            assert "ALTER TABLE" not in upper, f"'{name}' alters an existing table"
+            if "ALTER TABLE" in upper:
+                assert upper.startswith("ALTER TABLE ACTIVITY."), f"'{name}' alters a table outside the activity schema"
+                assert " ADD COLUMN IF NOT EXISTS " in upper, f"'{name}' alters an existing table beyond adding a column"
             assert "ALTER COLUMN" not in upper, f"'{name}' alters an existing column"
 
     def test_every_object_lives_in_the_activity_schema(self) -> None:
