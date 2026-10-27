@@ -4252,7 +4252,7 @@ def _bootstrap_fill_function() -> str:
     """Return `graph.bootstrap_fill()`, the one-off fill of every loader-owned table.
 
     One transaction, because the caller's statement is one: `SELECT * FROM
-    graph.bootstrap_fill()` either replaces all twenty-nine relations or
+    graph.bootstrap_fill()` either replaces all thirty-one relations or
     replaces none, so a failure half way through cannot leave edges pointing at
     vertices that were truncated and never refilled.
 

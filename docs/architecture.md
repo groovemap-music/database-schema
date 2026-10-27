@@ -73,7 +73,7 @@ rows survive the second pass.
 | Tier | Recipe | PostgreSQL engine | CI status |
 | --- | --- | --- | --- |
 | Required | `just test-integration` | `postgres:18-alpine`, digest-pinned | Blocks merge |
-| Advisory | `just test-integration-pg19` | `postgres:19beta3-alpine`, digest-pinned | Reports only |
+| Advisory | `just test-integration-pg19` | `postgres:19beta3-alpine`, digest-pinned, with pgvector 0.8.6 built on locally | Reports only |
 
 The required tier is the gate. It pins the PostgreSQL major version deployment runs, and the
 shared reusable workflow executes it as `integration-command`. The advisory tier exists so the
@@ -144,10 +144,11 @@ constraints and index.
 The complete executable inventory is `SCHEMA_STATEMENTS` in
 [`src/groovemap_schema/neo4j.py`](../src/groovemap_schema/neo4j.py). It currently declares
 unique constraints for `Artist.id`, `Label.id`, `Master.id`, `Release.id`, `Genre.name`,
-`Style.name`, `Medium.id`, `MediaFamily.name`, `User.id`, and `Person.name`. Constraint-backed
-properties deliberately have no duplicate range index. Additional range indexes cover
-ingestion hashes, selected names and years, `Release.media_families`, genre/style first years,
-`Person.credit_count`, and MusicBrainz identifiers; six full-text indexes cover artist,
+`Style.name`, `Medium.id`, `MediaFamily.name`, `User.id`, `Person.name`, and `Company.id`.
+Constraint-backed properties deliberately have no duplicate range index. Additional range
+indexes cover native `gm_id` identifiers, ingestion hashes, selected names and years,
+`Release.media_families`, `Release.country`, genre/style first years, `Person.credit_count`,
+and MusicBrainz identifiers; six full-text indexes cover artist,
 release, label, genre, style, and person text search. These are schema declarations, not node
 or relationship creation: the source-specific producers populate the graph.
 
@@ -278,8 +279,10 @@ are declared in `_IDENTITY_LEDGER_STATEMENTS` in
 statements, because they read `graph.derived_from` as well as `provider_aliases`,
 `catalog_items`, `catalog_item_supersessions`, `identity_link_events`, and
 `musicbrainz.releases`. Their definitions are `catalog-api`'s route SQL with the filters lifted
-out, as its prototype composed them (`scripts/ledger_scale.py`, `_view_statements`). The
-integration suite builds that prototype verbatim beside them and requires every row to match.
+out, as its prototype composed them (`_view_statements` in `scripts/ledger_scale.py` at
+`catalog-api` `6d744e2`). The integration suite builds that prototype verbatim beside them,
+from [`tests/integration/fixtures/identity_ledger_reference.sql`](../tests/integration/fixtures/identity_ledger_reference.sql),
+and requires every row to match.
 
 An *edition* is a release-kind item resolved one hop through an open supersession, and a
 *work* is a master-kind item resolved the same way.
@@ -421,7 +424,9 @@ The executable PostgreSQL inventory is in
 - public Discogs document tables: `artists`, `labels`, `masters`, and `releases`;
 - account and operational tables: `users`, `oauth_tokens`, `app_tokens`, `app_config`,
   `user_collections`, `user_wantlists`, `sync_history`, `extraction_history`,
-  `admin_audit_log`, and `loader_extraction_latch`;
+  `admin_audit_log`, `loader_extraction_latch`, `loader_derived_refresh_cursor`, and
+  `loader_derived_refresh_job` (see Loader extraction-latch coordination and Durable
+  derived-refresh job state below);
 - `extraction_history.source` (`VARCHAR(20)`, nullable, no default, no backfill) records which
   extractor a run went to. A named CHECK, `extraction_history_source_check`, allows NULL,
   `'discogs'`, or `'musicbrainz'`, and `idx_extraction_history_source_created_at` indexes
@@ -431,7 +436,10 @@ The executable PostgreSQL inventory is in
   [the persistence compatibility contract](../contracts/persistence/);
 - native identity tables (see Identity above): `catalog_items`, `artifacts`, `owned_copies`,
   `collection_snapshots`, `observations`, `provider_aliases`, `catalog_item_supersessions`,
-  `catalog_item_moves`, `identity_link_events`, and `identity_ledger_refresh_state`;
+  `catalog_item_moves`, `identity_link_events`, and `identity_ledger_refresh_state`, plus the
+  four Identity Ledger materialized views (`identity_ledger_edition_events`,
+  `identity_ledger_edition_parents`, `identity_ledger_work_summary`, and
+  `identity_ledger_density`);
 - retired: `queue_metrics` and `service_health_metrics` are no longer created. The schema
   runs `DROP TABLE IF EXISTS` for each (their indexes go with them), so applying it to a
   database that still has them removes them and a second application is a no-op. Their rows
@@ -474,9 +482,12 @@ The executable PostgreSQL inventory is in
 - activity tables in the `activity` schema (see Activity above): `user_subjects`,
   `consent_grants`, `events`, `impressions`, and `erasures`;
 - MusicBrainz tables in the `musicbrainz` schema: `artists`, `labels`, `releases`,
-  `release_groups`, `relationships`, and `external_links`; and
+  `release_groups`, `relationships`, and `external_links`;
 - `public.artist_embeddings` (see Vector embeddings and the embedding pipeline role below),
-  guarded on the `vector` extension being present, alongside the `embedding_pipeline` role.
+  guarded on the `vector` extension being present, alongside the `embedding_pipeline` role;
+  and
+- `public.artist_embedding_releases` and `public.artist_similar_artists` (see Precomputed
+  similar-artist lists below), which do not depend on the `vector` extension.
 
 The statement lists also carry the migrations required for an existing database: additive
 authentication and media columns, rarity-signal columns, Discogs cross-reference widening to
@@ -535,8 +546,8 @@ CREATE TABLE IF NOT EXISTS loader_extraction_latch (
 
 It is named for the loader family, not for one loader, and carries the mandatory `loader`
 discriminator column the probe requires: the loader keys and scopes every statement on it to
-`loader = 'discogs'` (its `_key_columns()` returns `(loader, version)` rather than
-`(version,)`), which is why the primary key is declared on `(loader, version)` up front. The
+`loader = 'discogs'` (its `KEY_COLUMNS` is `(loader, version)` rather than `(version,)`),
+which is why the primary key is declared on `(loader, version)` up front. The
 probe verifies via `pg_constraint` that a PRIMARY KEY or UNIQUE constraint spans exactly those
 two columns — a bare unique index is declined by design — before its `ON CONFLICT` upsert
 runs, so that constraint must exist from the start, not be added later.
@@ -554,12 +565,14 @@ the full column and primary-key record.
 The measured million-release refresh did not certify the full Discogs dump against
 RabbitMQ's 1,800-second acknowledgement timeout. The schema therefore also declares
 `public.loader_derived_refresh_cursor` and `public.loader_derived_refresh_job`, plus a
-nullable `generation BIGINT` on the existing latch. This is an **additive schema-only
-prerequisite**: the current loader still refreshes inline and acknowledges only after
-the transaction commits. No database trigger or schema initializer starts a job.
+nullable `generation BIGINT` on the existing latch. They are **additive**: `discogs-sql-loader`
+schedules its refresh through them by default (`DERIVED_REFRESH_MODE=durable`, implemented in
+its `tableinator/durable_refresh.py`), and `DERIVED_REFRESH_MODE=inline` is its explicit
+rollback to refreshing inline and acknowledging only after the transaction commits. No database
+trigger or schema initializer starts a job.
 
 The cursor has one row per loader and records its latest accepted `(generation,
-version)`. The future loader must compare source extraction order before advancing
+version)`. The loader must compare source extraction order before advancing
 that cursor: an old signal arriving first *at this consumer* is not thereby a new
 extraction. Discogs' producer sends its ordered dump version and `started_at`;
 another loader must establish an equally reliable ordering rule. It must serialize
@@ -594,9 +607,9 @@ version visible in health; an acknowledged but stuck job is degraded health, not
 success. The full transition and crash-injection requirements are in the
 [`discogs-sql-loader` measurement](https://github.com/groovemap-music/discogs-sql-loader/blob/bd0a32b/docs/derived-refresh-ack-budget.md).
 
-The old inline loader can run against this expanded schema unchanged. Rollback of
-the future worker is to restore inline behavior while retaining these unused
-additive relations; dropping them would be a separate contract migration.
+The inline path can run against this expanded schema unchanged. Rollback of the
+durable worker is to restore inline behavior while retaining these unused additive
+relations; dropping them would be a separate contract migration.
 
 ## Catalog identifiers, manufacturing credits, and release country
 
@@ -697,9 +710,11 @@ Changing a relation's *shape* is the one case the schema handles itself, and it 
 place anything here drops anything. A relation that becomes a loader-written table is preceded
 by a guarded migration: a `DO` block that reads `pg_class`, drops the view only if a view of
 that name is still there, and does nothing otherwise. A fresh database drops nothing. A second
-apply finds a table rather than a view and drops nothing either. `CASCADE` also cleans up dependencies left by the retired experimental SQL/PGQ declaration. The four Discogs vertex relations that stay views carry the same guard for the
-same reason, conditioned on their key column still reading as `character varying`, which makes
-it self-healing from any half-applied state.
+apply finds a table rather than a view and drops nothing either. `CASCADE` also cleans up
+dependencies left by the retired experimental SQL/PGQ declaration. The four Discogs vertex
+relations that stay views carry the same guard for the same reason, conditioned on their key
+column still reading as `character varying`, which makes it self-healing from any half-applied
+state.
 
 The same rule binds the base tables underneath. PostgreSQL will not retype a column a view
 reads, so once a graph view exposes a column, an `ALTER COLUMN ... TYPE` against it fails
@@ -735,19 +750,19 @@ that pads otherwise is the known gap.
 ### Neo4j type to relation mapping
 
 This is the whole mapping between each Neo4j label or relationship type and the ordinary SQL
-relation that re-presents it. See [labels](#labels) for the reserved words handled by the
-relational names.
+relation that re-presents it. See [the graph schema](#graph-schema) for the reserved words
+handled by the relational names.
 
 Vertex relations. The key column is what edge relations join to, and every one of them is
 `text`, `uuid`, or `bigint` — never `character varying`; see
 [the text key rule](#the-text-key-rule). "Shape" is `table` where a loader writes the rows and
 `view` where the relation is a projection of a table written elsewhere.
 
-Four of these relations hold the rows of a label without being the element table the property
-graph binds. `:Genre`, `:Style`, `:Label`, and `:Artist` bind a `<label>_vertex` view that
-joins the relation below to its counter relation, so that the counters `graphinator` writes
-onto those four nodes read as properties of the same label here. The rows, the key, and every
-column in this table are unchanged by that; the projection only adds columns. See
+Four of these relations also have a `<label>_vertex` view. `:Genre`, `:Style`, `:Label`, and
+`:Artist` each get one that joins the relation below to its counter relation, so that the
+counters `graphinator` writes onto those four nodes read as columns beside the same rows here.
+The rows, the key, and every column in this table are unchanged by that; the projection only
+adds columns. See
 [the counter relations](#the-counter-degree-and-aggregate-relations).
 
 | Neo4j label | Relation | Shape | Key column | Other columns |
@@ -1078,6 +1093,66 @@ than an enumerated relation list.
   requested type is the one it already has, and the graph schema exposes exactly those
   columns as the bridge between the MusicBrainz and Discogs halves of the graph.
 
+### The text key rule
+
+Every vertex key in the `graph` schema is `text`, `uuid`, or `bigint`. None is `character
+varying`, and none is an appended restatement of another column. The four Discogs entity
+tables key on `data_id VARCHAR`, so the original vertex views inherited that type and carried
+an appended `text` restatement — `artist_key`, `label_key`, `master_key`, and `release_key` —
+because `CREATE OR REPLACE VIEW` refuses to retype a published column. **Those four columns
+are retired.** The loader-written tables are declared `text` from the start, and the four
+Discogs vertex views now publish `data_id::text` as `<entity>_id` itself, so ordinary SQL
+joins between Discogs vertices and edges compare one type throughout. A guarded migration drops and recreates each view when its key column still reads
+as `character varying`; on a database that has already been migrated it does nothing.
+
+The change is invisible to a consumer: psycopg returns `str` for both types, and the column
+name and its position are unchanged. The persistence contract records the retirement under
+`graph_schema.key_columns`.
+
+### The counter, degree, and aggregate relations
+
+`catalog-api` reads node properties that `graphinator`'s post-import pass writes and that no
+phase 0 view carried: the `Genre`, `Style`, and `Label` counters and the two `first_year`
+values, plus the artist and release degrees. Re-aggregating them on request would turn a
+property read into a traversal over the whole catalog, so the loaders write them into
+relations of their own:
+
+| Relation | Replaces | Key | Other indexes |
+| --- | --- | --- | --- |
+| `graph.genre_stats` | `Genre.release_count`, `.artist_count`, `.label_count`, `.style_count`, `.first_year` | `name` | `(first_year)` |
+| `graph.style_stats` | `Style.release_count`, `.artist_count`, `.label_count`, `.genre_count`, `.first_year` | `name` | `(first_year)` |
+| `graph.label_stats` | `Label.release_count`, `.artist_count`, `.genre_count` | `label_id` | `(release_count)` |
+| `graph.artist_degree` | `size([(a)-[]-() \| 1])`, `COUNT { (a)--() }` | `artist_id` | `(degree DESC)` |
+| `graph.release_degree_base` | the catalog half of `COUNT { (r)--() }` | `release_id` | — |
+| [`graph.vertex_degree`](#the-per-vertex-degree) | nothing — an expansion-ordering heuristic with no Neo4j counterpart | `(kind, key)` | — |
+| `graph.artist_genre` | a two-hop expansion `catalog-api` walks today | `(artist_id, genre_name)` | `(genre_name, artist_id)` |
+| `graph.label_genre` | the same for labels | `(label_id, genre_name)` | `(genre_name, label_id)` |
+
+`discogs-sql-loader` refreshes all of them on the `extraction_complete` message it already
+handles, the same latch `graphinator` uses to start its own post-import pass.
+`graph.vertex_degree` is refreshed on that latch too, but it is not a counter: nothing reads it
+as a property, it orders frontier expansion in the path functions, and it has its own rebuild
+in `graph.refresh_vertex_degree()`. Every count is a sum over the edge tables rather than a
+re-read of a JSONB document.
+
+**Four of them read back beside the rows of the label Neo4j carries them on.**
+`graph.genre_vertex`, `graph.style_vertex`, `graph.label_vertex`, and `graph.artist_vertex`
+are views that `LEFT JOIN` the storage relation (`graph.genre`, `graph.style`, `graph.label`,
+`graph.artist`) to its counter relation (`genre_stats`, `style_stats`, `label_stats`,
+`artist_degree`); `graph_schema.counter_properties` in the contract records which label carries
+which counters. Each counter relation is unique on the join column, so the planner removes the
+join outright for a query that reads no counter. A count reads zero where the loader has not
+computed one yet, because every caller does arithmetic on it; `first_year` is deliberately not
+defaulted, because an unknown first year must not read as year zero.
+
+**`graph.release_degree` stays a relation of its own.** Release degree as Neo4j computes it
+counts `COLLECTED` and `WANTS` edges, which `catalog-api` writes and the loader never sees. So
+it is a view summing `graph.release_degree_base` against a live count over `user_collections`
+and `user_wantlists`, and that live half is a pair of lateral counts no unique key makes
+removable; folding it onto the `release` vertex would make every release read pay for it. It is
+the one relation in the edge model split across two owners, `discogs-sql-loader` and
+`catalog-api`, and the contract records it as such.
+
 ### The MEMBER_OF union
 
 `graph.artist_member_of` is the one relation here derived from two others rather than projected
@@ -1120,10 +1195,9 @@ evidenced by, and a traversal that does not care simply does not read the column
 index is `(group_artist_id, member_artist_id)`, for the same reason every other edge table
 carries one: a walk enters this relation from the group end as often as from the member end.
 
-**It binds no property-graph label.** `graph.catalog` goes on binding `member_of` alone. A
-second artist-to-artist edge label overlapping it would double-count every Discogs membership
-in a pattern that matched both, and there is no Neo4j relationship type this union corresponds
-to — it is a relation the path functions read directly.
+**It has no Neo4j counterpart.** There is no Neo4j relationship type this union corresponds
+to — it is a relation the path functions read directly, and a consumer that wants the Discogs
+membership alone goes on reading `graph.member_of`.
 
 `graph.refresh_artist_member_of()` rebuilds it, and the contract records its owner:
 **`discogs-sql-loader` calls it on the `extraction_complete` latch it already handles**, the
@@ -1223,10 +1297,8 @@ substitutions, and the integration suite states them as arithmetic rather than a
 artist on the fixture, and where both substitutions are inert the two relations agree
 outright.
 
-**It binds no property-graph label**, for the same kind of reason
-[`graph.artist_member_of`](#the-member_of-union) binds none: there is no Neo4j node property it
-corresponds to, nothing in `graph.catalog` would read it, and a label over it would publish a
-second identity for every vertex the graph already binds under its own label.
+**It has no Neo4j counterpart**, like [`graph.artist_member_of`](#the-member_of-union): there
+is no Neo4j node property it corresponds to, and nothing but the path functions reads it.
 
 `graph.refresh_vertex_degree()` rebuilds it, and the contract records its owner under
 `graph_schema.vertex_degree`: **`discogs-sql-loader` calls it on the `extraction_complete`
@@ -1647,9 +1719,8 @@ amendment's own wording — "`SELECT` on the graph edge and vertex relations it 
 That is deliberate rather than an over-grant. Every relation the `graph` schema holds today is
 either a vertex or edge relation itself, or one of the small set of counter, degree, and
 aggregate relations (`graph.vertex_degree`, `graph.artist_degree`, `graph.genre_stats`, and
-similar; see `STORAGE_ONLY_RELATIONS` in
-[`tests/integration/test_real_schema_idempotence.py`](../tests/integration/test_real_schema_idempotence.py))
-that exist solely to back the same schema's own traversal functions over that graph — nothing
+similar; see [the counter, degree, and aggregate
+relations](#the-counter-degree-and-aggregate-relations)) that exist solely to back the same schema's own traversal functions over that graph — nothing
 unrelated to the catalog graph lives here (see Graph schema above). Naming every relation
 one by one in the grant would restate the schema's own contents rather than narrow it. The grant
 also stays exactly as narrow as the ADR intends in practice: a plain `SELECT` grant on a view is
