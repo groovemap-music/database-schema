@@ -2,6 +2,42 @@
 
 All notable changes to the GrooveMap database schema will be documented here.
 
+## v0.5.0 (2026-10-27)
+
+### Feat
+
+- **neo4j**: index per-category Person credit counts
+- **postgres**: declare the Identity Ledger materialized views and identity_ledger_refresh()
+- **postgres**: add public.identity_link_events
+- **postgres**: record the extraction source on extraction_history
+- **postgres**: retire the queue_metrics and service_health_metrics tables
+- **postgres**: add insights.style_cotags
+- **postgres**: add insights.style_landmark_masters
+- **postgres**: add insights.genre_year_counts
+- **postgres**: add style-lifecycle and atlas-layout insights tables
+- **postgres**: index musicbrainz.releases on release_group_mbid
+- **schema**: compact similar artists into release-keyed arrays
+- **postgres**: add artist_similar_artists and artist_embedding_releases
+- **graph**: add track-level credits and track performer relations
+- **embeddings**: serve artist kNN via per-model_version partial HNSW indexes
+
+### Fix
+
+- **activity**: enforce event idempotency across partitions
+- **graph**: publish collected and wants release_id as text
+- **contracts**: correct stale table counts and key-column types in the persistence contract
+- **deps**: upgrade filelock to 4.2.1 past CVE-2026-112940
+- **deps**: upgrade certifi and opentelemetry past PYSEC-2026-4320 and CVE-2026-114603
+- **ci**: adopt verified signed coverage workflow
+- **deps**: update urllib3 lock to 2.8.0
+- **graph**: unwrap tracklist's raw xmltodict shape and key tracks by ordinal
+- **graph**: re-declare graph.catalog when its definition changed (0.4.1) (#9)
+
+### Refactor
+
+- **postgres**: move genre nodes out of style_atlas_layout into genre_atlas_sectors
+- **postgres**: remove SQL PGQ activation
+
 ## v0.4.1 (2026-09-25)
 
 ### Fix

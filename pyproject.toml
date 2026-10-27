@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "groovemap-database-schema"
-version = "0.4.1"
+version = "0.5.0"
 description = "Runnable Neo4j and PostgreSQL schema initializer for GrooveMap"
 authors = [{name = "Robert Wlodarczyk", email = "robert@simplicityguy.com"}]
 readme = "README.md"
@@ -129,6 +129,7 @@ exclude_lines = [
 name = "cz_conventional_commits"
 version_provider = "uv"
 version_scheme = "pep440"
+major_version_zero = true
 version_files = ["src/groovemap_schema/__init__.py"]
 tag_format = "v$version"
 annotated_tag = true
