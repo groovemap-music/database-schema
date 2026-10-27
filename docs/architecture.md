@@ -147,10 +147,25 @@ unique constraints for `Artist.id`, `Label.id`, `Master.id`, `Release.id`, `Genr
 `Style.name`, `Medium.id`, `MediaFamily.name`, `User.id`, `Person.name`, and `Company.id`.
 Constraint-backed properties deliberately have no duplicate range index. Additional range
 indexes cover native `gm_id` identifiers, ingestion hashes, selected names and years,
-`Release.media_families`, `Release.country`, genre/style first years, `Person.credit_count`,
+`Release.media_families`, `Release.country`, genre/style first years, `Person.credit_count` and the per-category `Person.credit_count_<category>` counts (below),
 and MusicBrainz identifiers; six full-text indexes cover artist,
 release, label, genre, style, and person text search. These are schema declarations, not node
 or relationship creation: the source-specific producers populate the graph.
+
+### Person credit counts
+
+`Person.credit_count_<category>` is the number of distinct releases the person is
+`CREDITED_ON` with that category, and `Person.credit_count` is the distinct-release total
+across all categories. The Discogs graph enricher writes them; the catalog-api role
+leaderboard reads them. One `IF NOT EXISTS` range index covers each:
+`person_credit_count` (`credit_count`), `person_credit_count_production`,
+`person_credit_count_engineering`, `person_credit_count_mastering`,
+`person_credit_count_session`, `person_credit_count_design`,
+`person_credit_count_management`, and `person_credit_count_other`. The category list is
+imported from `common.credit_roles.ALL_CATEGORIES` in the pinned `groovemap-runtime`
+(python-libraries), not copied, so the index set follows the shared vocabulary. Adding a
+category upstream adds its index here on the next runtime pin bump. The indexes are
+additive within persistence contract v1.
 
 ## Neo4j identity projection
 
