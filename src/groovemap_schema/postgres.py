@@ -1265,10 +1265,14 @@ _ACTIVITY_STATEMENTS: list[tuple[str, str]] = [
         "CREATE INDEX IF NOT EXISTS idx_activity_consent_grants_user_purpose ON activity.consent_grants (user_id, purpose)",
     ),
     # The typed event envelope.  `occurred_at` and `recorded_at` are split so a
-    # late or replayed write stays honest, and the idempotency key is scoped to
-    # the occurrence time because the uniqueness of a partitioned table must
-    # include its partition key.  `consent_purposes` is snapshotted at write, so
-    # an old row stays interpretable without reconstructing the grant history.
+    # late or replayed write stays honest.  The unique key here is scoped to the
+    # occurrence time because the uniqueness of a partitioned table must include
+    # its partition key, so on its own it cannot see a retry stamped a moment
+    # later; activity.event_idempotency below is what dedupes across occurrence
+    # times and partitions.  This key stays because writers name it in
+    # `ON CONFLICT (occurred_at, idempotency_key)`.  `consent_purposes` is
+    # snapshotted at write, so an old row stays interpretable without
+    # reconstructing the grant history.
     (
         "activity.events table",
         """
@@ -1418,6 +1422,284 @@ _ACTIVITY_STATEMENTS: list[tuple[str, str]] = [
             FOR EACH ROW EXECUTE FUNCTION activity.reject_mutation()
         """,
     ),
+    # Event idempotency across partitions.  The events table's own unique key
+    # has to include the partition key, so it can only see a retry that carries
+    # the original's exact `occurred_at`; a retry stamped a second, a minute, or
+    # a month later is a different key, and in a different partition.  This
+    # table is not partitioned, so its primary key spans every month: one row
+    # per (subject, idempotency key), naming the event that holds it.  The
+    # primary key leads with `subject_id`, so a subject's keys are one index
+    # range, and the `occurred_at` index serves the retention purge below.
+    # TRUNCATE fires no row trigger, here as on activity.events.
+    (
+        "activity.event_idempotency table",
+        """
+        CREATE TABLE IF NOT EXISTS activity.event_idempotency (
+            subject_id      UUID NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            event_id        UUID NOT NULL,
+            occurred_at     TIMESTAMPTZ NOT NULL,
+            recorded_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (subject_id, idempotency_key)
+        )
+        """,
+    ),
+    (
+        "idx_activity_event_idempotency_occurred_at",
+        "CREATE INDEX IF NOT EXISTS idx_activity_event_idempotency_occurred_at ON activity.event_idempotency (occurred_at)",
+    ),
+    # A key is as immutable as the event it names: while that event is stored,
+    # UPDATE and DELETE are rejected unless `groovemap.erasure` is on, exactly as
+    # on activity.events.  A key whose event is not stored (its partition was
+    # dropped, or a racing insert under another subject's occurrence key never
+    # stored it) rewrites no history, so it may be moved onto a new event by the
+    # claim or removed by the purge and the subject release below.
+    (
+        "activity.reject_key_mutation function",
+        """
+        CREATE OR REPLACE FUNCTION activity.reject_key_mutation()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $reject_key_mutation$
+        BEGIN
+            IF current_setting('groovemap.erasure', true) = 'on' OR NOT EXISTS (
+                SELECT 1
+                FROM activity.events AS stored
+                WHERE stored.occurred_at = OLD.occurred_at
+                  AND stored.event_id = OLD.event_id
+            ) THEN
+                IF TG_OP = 'DELETE' THEN
+                    RETURN OLD;
+                END IF;
+                RETURN NEW;
+            END IF;
+            RAISE EXCEPTION
+                '%.% is append-only while the event a key names is stored: % is rejected unless groovemap.erasure is on',
+                TG_TABLE_SCHEMA, TG_TABLE_NAME, TG_OP
+                USING ERRCODE = 'restrict_violation';
+        END
+        $reject_key_mutation$
+        """,
+    ),
+    (
+        "activity.event_idempotency reject_mutation trigger",
+        """
+        CREATE OR REPLACE TRIGGER activity_event_idempotency_reject_mutation
+            BEFORE UPDATE OR DELETE ON activity.event_idempotency
+            FOR EACH ROW EXECUTE FUNCTION activity.reject_key_mutation()
+        """,
+    ),
+    # The claim, run by a BEFORE INSERT row trigger on activity.events.  A key
+    # is held only by an event that is stored, and a held key skips the row:
+    # the trigger returns NULL, so the retry gets no row, no RETURNING and no
+    # error, exactly like an INSERT ... ON CONFLICT DO NOTHING that hit its
+    # conflict.
+    #
+    # 1. A row missing a key column passes through, so activity.events' own NOT
+    #    NULL constraint reports it rather than this table's.
+    # 2. A stored row already holding this (occurred_at, idempotency_key) means
+    #    the occurrence key will refuse this one.  For the same subject it is
+    #    this very event, so the row is skipped; for another subject the row is
+    #    handed to the occurrence key unclaimed (ON CONFLICT skips it, a plain
+    #    INSERT raises, as before), so no key is claimed for a row never stored.
+    # 3. Otherwise the key is claimed with ON CONFLICT DO NOTHING, which makes
+    #    concurrent retries safe: the second waits on the first's uncommitted
+    #    key, then skips if it committed or claims the key if it rolled back.
+    # 4. A key already held is honoured only while the event it names is
+    #    stored.  One whose event is not (a concurrent insert under another
+    #    subject's occurrence key, which step 2 cannot see uncommitted, or a
+    #    dropped partition) is moved onto this event instead; the UPDATE's
+    #    `event_id` match means two racing movers cannot both win.  The loop
+    #    only repeats when a concurrent claim, move or release changed the key
+    #    between two statements, and reads it again.
+    (
+        "activity.claim_idempotency_key function",
+        """
+        CREATE OR REPLACE FUNCTION activity.claim_idempotency_key()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $claim_idempotency_key$
+        DECLARE
+            occupant         UUID;
+            held_event_id    UUID;
+            held_occurred_at TIMESTAMPTZ;
+        BEGIN
+            IF NEW.subject_id IS NULL OR NEW.idempotency_key IS NULL OR NEW.event_id IS NULL
+               OR NEW.occurred_at IS NULL OR NEW.recorded_at IS NULL THEN
+                RETURN NEW;
+            END IF;
+            SELECT stored.subject_id INTO occupant
+            FROM activity.events AS stored
+            WHERE stored.occurred_at = NEW.occurred_at
+              AND stored.idempotency_key = NEW.idempotency_key;
+            IF FOUND THEN
+                IF occupant = NEW.subject_id THEN
+                    RETURN NULL;
+                END IF;
+                RETURN NEW;
+            END IF;
+            LOOP
+                INSERT INTO activity.event_idempotency (subject_id, idempotency_key, event_id, occurred_at, recorded_at)
+                VALUES (NEW.subject_id, NEW.idempotency_key, NEW.event_id, NEW.occurred_at, NEW.recorded_at)
+                ON CONFLICT (subject_id, idempotency_key) DO NOTHING;
+                IF FOUND THEN
+                    RETURN NEW;
+                END IF;
+                SELECT held.event_id, held.occurred_at INTO held_event_id, held_occurred_at
+                FROM activity.event_idempotency AS held
+                WHERE held.subject_id = NEW.subject_id
+                  AND held.idempotency_key = NEW.idempotency_key;
+                IF FOUND THEN
+                    IF EXISTS (
+                        SELECT 1
+                        FROM activity.events AS stored
+                        WHERE stored.occurred_at = held_occurred_at
+                          AND stored.event_id = held_event_id
+                    ) THEN
+                        RETURN NULL;
+                    END IF;
+                    UPDATE activity.event_idempotency AS held
+                    SET event_id = NEW.event_id, occurred_at = NEW.occurred_at, recorded_at = NEW.recorded_at
+                    WHERE held.subject_id = NEW.subject_id
+                      AND held.idempotency_key = NEW.idempotency_key
+                      AND held.event_id = held_event_id;
+                    IF FOUND THEN
+                        RETURN NEW;
+                    END IF;
+                END IF;
+            END LOOP;
+        END
+        $claim_idempotency_key$
+        """,
+    ),
+    # Erasure closes at the schema level, without a caller listing this table.
+    # Deleting an event (only possible under the erasure bypass) releases the
+    # key it holds, so deleting a subject's events removes their keys.
+    (
+        "activity.release_idempotency_key function",
+        """
+        CREATE OR REPLACE FUNCTION activity.release_idempotency_key()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $release_idempotency_key$
+        BEGIN
+            DELETE FROM activity.event_idempotency AS held
+            WHERE held.subject_id = OLD.subject_id
+              AND held.idempotency_key = OLD.idempotency_key
+              AND held.event_id = OLD.event_id;
+            RETURN NULL;
+        END
+        $release_idempotency_key$
+        """,
+    ),
+    (
+        "activity.events release_idempotency_key trigger",
+        """
+        CREATE OR REPLACE TRIGGER activity_events_release_idempotency_key
+            AFTER DELETE ON activity.events
+            FOR EACH ROW EXECUTE FUNCTION activity.release_idempotency_key()
+        """,
+    ),
+    # Removing the pseudonym link is the last step of an erasure, and no writer
+    # can reach the subject again once it is gone, so it also removes every key
+    # of the subject that names no stored event: a key no event deletion can
+    # release.  A key whose event is still stored stays with that event.
+    (
+        "activity.release_subject_idempotency_keys function",
+        """
+        CREATE OR REPLACE FUNCTION activity.release_subject_idempotency_keys()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $release_subject_idempotency_keys$
+        BEGIN
+            DELETE FROM activity.event_idempotency AS held
+            WHERE held.subject_id = OLD.subject_id
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM activity.events AS stored
+                  WHERE stored.occurred_at = held.occurred_at
+                    AND stored.event_id = held.event_id
+              );
+            RETURN NULL;
+        END
+        $release_subject_idempotency_keys$
+        """,
+    ),
+    (
+        "activity.user_subjects release_idempotency_keys trigger",
+        """
+        CREATE OR REPLACE TRIGGER activity_user_subjects_release_idempotency_keys
+            AFTER DELETE ON activity.user_subjects
+            FOR EACH ROW EXECUTE FUNCTION activity.release_subject_idempotency_keys()
+        """,
+    ),
+    # Retention drops whole events partitions, which fires no row trigger, so the
+    # keys of a dropped month would otherwise stay forever.  The operator runs
+    # this right after a partition drop, with the dropped partition's upper
+    # bound; it removes only keys whose event is no longer stored, so it can
+    # never release a key that still dedupes, and returns how many it removed.
+    # Until a key is purged, a retry under it is stored afresh: a dropped
+    # month's events are gone, so the dedup window is the retention window.
+    (
+        "activity.purge_idempotency_keys function",
+        """
+        CREATE OR REPLACE FUNCTION activity.purge_idempotency_keys(older_than TIMESTAMPTZ)
+        RETURNS BIGINT
+        LANGUAGE plpgsql
+        AS $purge_idempotency_keys$
+        DECLARE
+            purged BIGINT;
+        BEGIN
+            DELETE FROM activity.event_idempotency AS held
+            WHERE held.occurred_at < older_than
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM activity.events AS stored
+                  WHERE stored.occurred_at = held.occurred_at
+                    AND stored.event_id = held.event_id
+              );
+            GET DIAGNOSTICS purged = ROW_COUNT;
+            RETURN purged;
+        END
+        $purge_idempotency_keys$
+        """,
+    ),
+    # The trigger, and the one-time backfill that lets an existing database
+    # converge on it.  Both run in one statement under a lock that holds off
+    # every insert into activity.events (and, recursively, its partitions), so
+    # no row can land between the backfill and the trigger without a key.  The
+    # trigger's presence is the guard: it is only ever created together with
+    # the backfill, so once it exists every event has its key, and later runs
+    # skip the scan and only re-assert the trigger, which takes the same lock
+    # CREATE OR REPLACE TRIGGER always takes.  The backfill keeps every existing
+    # row, duplicates included (removing them is a separate data decision), and
+    # gives each key to its earliest occurrence, the one a retry repeats.
+    (
+        "activity.events claim_idempotency_key trigger",
+        """
+        DO $claim_idempotency_key_trigger$
+        BEGIN
+            LOCK TABLE activity.events IN SHARE ROW EXCLUSIVE MODE;
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_trigger
+                WHERE tgrelid = 'activity.events'::regclass
+                  AND tgname = 'activity_events_claim_idempotency_key'
+            ) THEN
+                INSERT INTO activity.event_idempotency (subject_id, idempotency_key, event_id, occurred_at, recorded_at)
+                SELECT DISTINCT ON (subject_id, idempotency_key)
+                       subject_id, idempotency_key, event_id, occurred_at, recorded_at
+                FROM activity.events
+                ORDER BY subject_id, idempotency_key, occurred_at, recorded_at, event_id
+                ON CONFLICT (subject_id, idempotency_key) DO NOTHING;
+            END IF;
+            CREATE OR REPLACE TRIGGER activity_events_claim_idempotency_key
+                BEFORE INSERT ON activity.events
+                FOR EACH ROW EXECUTE FUNCTION activity.claim_idempotency_key();
+        END
+        $claim_idempotency_key_trigger$
+        """,
+    ),
     # The erasure record.  `model_versions_before` names the model versions that
     # had already been trained when the erasure ran: deleting rows does not
     # retrain a model, and naming the affected versions is what makes the
@@ -1433,9 +1715,18 @@ _ACTIVITY_STATEMENTS: list[tuple[str, str]] = [
             events_deleted        BIGINT,
             impressions_deleted   BIGINT,
             model_versions_before TEXT[],
-            notes                 JSONB
+            notes                 JSONB,
+            idempotency_keys_deleted BIGINT
         )
         """,
+    ),
+    # The keys the erasure removed, beside the events and impressions it
+    # deleted.  The triggers above delete them, so the erasure procedure counts
+    # a subject's keys before it deletes the events.  NULL on a row written
+    # before the column existed, or by a writer that does not record it.
+    (
+        "activity.erasures add idempotency_keys_deleted",
+        "ALTER TABLE activity.erasures ADD COLUMN IF NOT EXISTS idempotency_keys_deleted BIGINT",
     ),
     (
         "idx_activity_erasures_subject_id",
