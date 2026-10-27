@@ -2380,7 +2380,7 @@ WHERE NOT EXISTS (
             """
 SELECT collection.id          AS collection_id,
        collection.user_id     AS user_id,
-       releases.data_id       AS release_id,
+       releases.data_id::text AS release_id,
        collection.instance_id AS instance_id,
        collection.folder_id   AS folder_id,
        collection.condition   AS condition,
@@ -2395,7 +2395,7 @@ JOIN public.releases AS releases ON releases.data_id = collection.release_id::te
             """
 SELECT wantlist.id         AS wantlist_id,
        wantlist.user_id    AS user_id,
-       releases.data_id    AS release_id,
+       releases.data_id::text AS release_id,
        wantlist.rating     AS rating,
        wantlist.date_added AS date_added
 FROM public.user_wantlists AS wantlist
@@ -3707,13 +3707,17 @@ _DERIVED_EDGES = tuple(relation for relation, _columns, _reverse in _DERIVED_EDG
 # Discogs vertices do it because a property-graph vertex key cannot be
 # `character varying`; `sublabel_of` does it because a UNION takes the type of
 # its first branch and that branch reads `labels.data_id`, so the column came
-# out `character varying` while every other edge key in the schema is `text`.
+# out `character varying` while every other edge key in the schema is `text`;
+# `collected` and `wants` do it because every Discogs graph key is text so that
+# ordinary joins against `graph.release.release_id` need no cast.
 _TEXT_KEY_RETYPES: tuple[tuple[str, str], ...] = (
     ("artist", "artist_id"),
     ("label", "label_id"),
     ("master", "master_id"),
     ("release", "release_id"),
     ("sublabel_of", "sublabel_id"),
+    ("collected", "release_id"),
+    ("wants", "release_id"),
 )
 
 

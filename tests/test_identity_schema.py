@@ -301,6 +301,8 @@ _GRAPH_STATEMENT_NAMES = frozenset(
         "graph.master key-type migration",
         "graph.release key-type migration",
         "graph.sublabel_of key-type migration",
+        "graph.collected key-type migration",
+        "graph.wants key-type migration",
         "graph.genre table",
         "graph.genre_name_trgm index",
         "graph.style table",
