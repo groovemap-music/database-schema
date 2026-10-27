@@ -58,8 +58,12 @@ already exposes, so appending is the only view change that ships on its own; eve
 change needs a coordinated `DROP ... CASCADE` under the same expand/migrate/contract ordering.
 A relation that changes shape is the exception the schema handles itself, through a guarded
 migration that drops the view only when one is still there and creates the table in the same
-pass. Every key column is `text`, which retired the four appended `<entity>_key` columns the
-Discogs vertex views carried; the contract records that under `graph_schema.key_columns`.
+pass. Discogs vertex and edge keys are `text`, which retired the four appended `<entity>_key`
+columns the Discogs vertex views carried. Not every key is `text`: the application-owned views
+and MusicBrainz mbids are `uuid`, track ordinals and MusicBrainz relationship ids are `bigint`,
+and `graph.collected.release_id` and `graph.wants.release_id` are still `character varying`.
+The contract records each under `graph_schema.key_columns.types`, and `just contract-check`
+derives them from the DDL.
 
 SQL/PGQ is no longer part of the persistence contract. The ordinary `graph` relations remain
 unconditional and Neo4j remains the authoritative graph query backend. Recovery details are in

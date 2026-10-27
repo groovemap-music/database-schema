@@ -10,6 +10,7 @@ from groovemap_schema.postgres import (
     _BOOTSTRAP_FILL_ORDER,
     _GRAPH_STATEMENTS,
     _IDENTITY_LEDGER_STATEMENTS,
+    _MUSICBRAINZ_TABLES,
     _PATH_RELATIONS,
     _PATH_RELATIONSHIP_TYPES,
     _USER_TABLES,
@@ -23,6 +24,7 @@ from groovemap_schema.postgres import (
     PATH_MAX_DEPTH,
     PATH_MIN_DEPTH,
     PATH_SEEN_RELATION,
+    _entity_schema_statements,
 )
 
 
@@ -413,7 +415,103 @@ assert evolution["forbidden"] == [
 keys = graph["key_columns"]
 assert keys["kind"] == "additive"
 assert keys["availability"] == "unconditional"
-assert keys["type"] == "text"
+assert "type" not in keys, "key columns are not all text; the per-type record is key_columns.types"
+key_types = keys["types"]
+assert sorted(key_types) == ["bigint", "char", "text", "uuid", "varchar"]
+
+
+def table_columns(statement: str) -> dict[str, str]:
+    """Return `column -> declared type` for one `CREATE TABLE` body."""
+    columns: dict[str, str] = {}
+    for line in statement.splitlines():
+        match = re.match(r'\s+(\w+)\s+("char"|\w+)', line)
+        if match and match.group(1).upper() not in {"PRIMARY", "UNIQUE", "CONSTRAINT"}:
+            columns[match.group(1)] = match.group(2).lower()
+    return columns
+
+
+def table_key(statement: str, columns: dict[str, str]) -> list[str]:
+    """Return the primary-key columns of one `CREATE TABLE` body."""
+    composite = re.search(r"PRIMARY KEY \(([^)]*)\)", statement)
+    if composite:
+        return [name.strip() for name in composite.group(1).split(",")]
+    return [name for name in columns if re.search(rf"\b{name}\s+\S+\s+PRIMARY KEY", statement)]
+
+
+# Tables: every primary-key column's declared type is derived from the DDL, so a
+# table key that is not text cannot go unrecorded here.
+derived_table_keys: dict[str, set[str]] = {}
+for relation, statement in table_statements.items():
+    declared = table_columns(statement)
+    for column in table_key(statement, declared):
+        derived_table_keys.setdefault(declared[column], set()).add(f"{relation}.{column}")
+assert set(derived_table_keys) <= {"text", "bigint", '"char"'}, sorted(derived_table_keys)
+assert derived_table_keys["bigint"] == {name for name in key_types["bigint"] if "mb_rel_*" not in name}
+assert key_types["char"] == sorted(derived_table_keys['"char"'])
+
+# Views: a published key column is an alias of a source column, so pin the alias
+# in the view body and the source column's type in the DDL it reads.
+public_ddl = {**user_statements, **dict(_MUSICBRAINZ_TABLES)}
+VIEW_KEYS = {
+    "graph.app_user.user_id": ("users", "id", "uuid"),
+    "graph.catalog_item.item_id": ("catalog_items", "id", "uuid"),
+    "graph.collected.collection_id": ("user_collections", "id", "uuid"),
+    "graph.collected.user_id": ("user_collections", "user_id", "uuid"),
+    "graph.wants.wantlist_id": ("user_wantlists", "id", "uuid"),
+    "graph.wants.user_id": ("user_wantlists", "user_id", "uuid"),
+    "graph.owns.owned_copy_id": ("owned_copies", "id", "uuid"),
+    "graph.owns.user_id": ("owned_copies", "user_id", "uuid"),
+    "graph.owns.item_id": ("owned_copies", "item_id", "uuid"),
+    "graph.owns.artifact_id": ("owned_copies", "artifact_id", "uuid"),
+    "graph.owns.collection_row_id": ("owned_copies", "collection_row_id", "uuid"),
+    "graph.mb_artist.mbid": ("musicbrainz.artists", "mbid", "uuid"),
+    "graph.mb_label.mbid": ("musicbrainz.labels", "mbid", "uuid"),
+    "graph.mb_release.mbid": ("musicbrainz.releases", "mbid", "uuid"),
+    "graph.mb_release_group.mbid": ("musicbrainz.release_groups", "mbid", "uuid"),
+    "graph.collected.release_id": ("releases", "data_id", "varchar"),
+    "graph.wants.release_id": ("releases", "data_id", "varchar"),
+}
+for view in (name for name in view_statements if name.startswith("graph.mb_rel_")):
+    VIEW_KEYS[f"{view}.source_mbid"] = ("musicbrainz.relationships", "source_mbid", "uuid")
+    VIEW_KEYS[f"{view}.target_mbid"] = ("musicbrainz.relationships", "target_mbid", "uuid")
+    VIEW_KEYS[f"{view}.relationship_id"] = ("musicbrainz.relationships", "id", "bigint")
+
+
+def source_type(table: str, column: str) -> str:
+    """Return the declared type of `column` in `table`, a public or `musicbrainz.`-qualified table."""
+    if table == "releases":  # a Discogs entity table, built from a template rather than a literal
+        assert "data_id    VARCHAR PRIMARY KEY" in repr(
+            next(statement for name, statement in _entity_schema_statements() if name == "releases table")
+        )
+        return "varchar"
+    statement = public_ddl[f"{table} table"]
+    return table_columns(statement)[column]
+
+
+def contract_names(kind: str) -> set[str]:
+    """Expand the contract's `graph.mb_rel_*` wildcard against the declared views."""
+    names: set[str] = set()
+    for entry in key_types[kind]:
+        if "mb_rel_*" in entry:
+            suffix = entry.rsplit(".", 1)[1]
+            names |= {f"{view}.{suffix}" for view in view_statements if view.startswith("graph.mb_rel_")}
+        else:
+            names.add(entry)
+    return names
+
+
+for kind in ("uuid", "varchar"):
+    assert contract_names(kind) == {name for name, (*_, declared) in VIEW_KEYS.items() if declared == kind}, kind
+assert contract_names("bigint") == derived_table_keys["bigint"] | {name for name, (*_, declared) in VIEW_KEYS.items() if declared == "bigint"}
+for name, (table, column, kind) in VIEW_KEYS.items():
+    view, alias = name.rsplit(".", 1)
+    assert source_type(table, column) == kind, name
+    assert re.search(rf"\b\w+\.{column}\s+AS\s+{alias}\b", view_statements[view]), name
+
+# Every Discogs vertex view casts its id to text; the retired restatements stay retired.
+for entity, view in (("artists", "artist"), ("labels", "label"), ("masters", "master"), ("releases", "release")):
+    assert f"{entity}.data_id::text" in view_statements[f"graph.{view}"], view
+assert derived_table_keys["text"]
 for body in (*view_statements.values(), *table_statements.values()):
     for retired in ("artist_key", "label_key", "master_key", "release_key"):
         assert retired not in body, retired
