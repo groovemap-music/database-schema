@@ -58,8 +58,8 @@ applied; any administrative connection, connectivity, or schema failure returns 
 Deployment may retry or stop the rollout, but it must not reinterpret a failed initializer as
 healthy.
 
-The image runs as numeric user and group `1000:1000`, writes optional logs under `/logs`, and
-is named `ghcr.io/groovemap-music/database-schema` when released.
+The image runs as numeric user and group `1000:1000`, writes its file log under `/logs` (optional outside the
+container), and is named `ghcr.io/groovemap-music/database-schema` when released.
 
 ## Integration tiers
 
