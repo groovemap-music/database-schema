@@ -48,7 +48,7 @@
       "otel",
       "postgres"
     ],
-    "tested_commit": "9bac0220df80fdb550fde78d4db8228ca4273625",
+    "tested_commit": "6d0425f908e01a446b040e2993045e2afe30460e",
     "tested_version": "0.1.0"
   },
   "catalog_item_supersession": {

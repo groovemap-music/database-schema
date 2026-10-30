@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY = "https://github.com/groovemap-music/database-schema"
 AUTOMATION_REVISION = "833cb464507678c38ab78bd4718ce697399463e9"
 CI_AUTOMATION_REVISION = "dbf22ed83d486e9484fc8c6385c7c3e5995700e4"
-PYTHON_LIBRARIES_REVISION = "9bac0220df80fdb550fde78d4db8228ca4273625"
+PYTHON_LIBRARIES_REVISION = "6d0425f908e01a446b040e2993045e2afe30460e"
 
 
 def require(condition: bool, message: str) -> None:

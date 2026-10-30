@@ -429,7 +429,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "groovemap-runtime", extras = ["neo4j", "otel", "postgres"], git = "https://github.com/groovemap-music/python-libraries.git?rev=9bac0220df80fdb550fde78d4db8228ca4273625" },
+    { name = "groovemap-runtime", extras = ["neo4j", "otel", "postgres"], git = "https://github.com/groovemap-music/python-libraries.git?rev=6d0425f908e01a446b040e2993045e2afe30460e" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.3.5" },
 ]
 
@@ -452,7 +452,7 @@ dev = [
 [[package]]
 name = "groovemap-runtime"
 version = "0.1.0"
-source = { git = "https://github.com/groovemap-music/python-libraries.git?rev=9bac0220df80fdb550fde78d4db8228ca4273625#9bac0220df80fdb550fde78d4db8228ca4273625" }
+source = { git = "https://github.com/groovemap-music/python-libraries.git?rev=6d0425f908e01a446b040e2993045e2afe30460e#6d0425f908e01a446b040e2993045e2afe30460e" }
 dependencies = [
     { name = "orjson" },
     { name = "structlog" },
