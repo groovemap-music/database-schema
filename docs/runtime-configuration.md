@@ -36,7 +36,9 @@ Secrets also support the Docker secret-file convention. Set
 file path instead of placing the corresponding value directly in the environment.
 
 The image writes its file log to `/logs/database-schema.log`; mount `/logs` when the log
-must persist beyond the one-shot container.
+must persist beyond the one-shot container. Outside the container `/logs` is not required:
+if the log file cannot be opened, the runtime warns once and logs to the console only. Set
+`LOG_FILE` to write the file elsewhere, or to an empty value to disable the file log.
 
 ## The bootstrap fill
 
