@@ -78,10 +78,11 @@ them and writes rows into none. Every relation is applied on every supported Pos
 
 | Owner | Relations |
 | --- | --- |
-| `discogs-sql-loader` | Most of them |
-| `musicbrainz-sql-loader` | The MusicBrainz half; co-owns the shared medium vocabulary |
-| `catalog-api` | The personal-collection views |
-| `discogs-sql-loader` and `catalog-api` | `graph.release_degree`, split |
+| `discogs-sql-loader` | 38 |
+| `musicbrainz-sql-loader` | 20 (the MusicBrainz half) |
+| `discogs-sql-loader` and `musicbrainz-sql-loader` | 4, co-owned (the shared medium vocabulary) |
+| `catalog-api` | 5 (the personal-collection views) |
+| `discogs-sql-loader` and `catalog-api` | 1: `graph.release_degree`, split |
 
 The contract names the owner of each relation individually. See the
 [graph schema](docs/architecture.md#graph-schema) and the
@@ -95,8 +96,7 @@ explicit migration. Rollouts follow expand, migrate consumers, then contract.
 
 [`contracts/persistence/v1/compatibility.json`](contracts/persistence/v1/compatibility.json)
 records the tested `groovemap-runtime` version and source revision, and records the `graph`
-schema and its relations as additive objects of
-contract version 1. The lockfile is the
+schema and its relations as additive objects of contract version 1. The lockfile is the
 machine-readable dependency authority. A deployment repository owns rollout and rollback.
 
 ## Versioning and release safety
