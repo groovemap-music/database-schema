@@ -18,7 +18,7 @@ services.
 | `NEO4J_PASSWORD` | `groovemap` | Neo4j password |
 | `NEO4J_TLS_ENABLED` | `false` | Enable encrypted Bolt transport |
 | `NEO4J_TLS_VERIFY` | `true` | Verify the Neo4j server certificate when TLS is enabled |
-| `LOG_LEVEL` | runtime default | Structured-log level |
+| `LOG_LEVEL` | `INFO` | Structured-log level |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | OTLP/HTTP collector base URL, for example `http://otel-collector:4318`. Unset disables both metrics and trace export |
 | `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | falls back to `OTEL_EXPORTER_OTLP_ENDPOINT` | Metrics-only endpoint override |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | falls back to `OTEL_EXPORTER_OTLP_ENDPOINT` | Traces-only endpoint override |
@@ -37,7 +37,6 @@ file path instead of placing the corresponding value directly in the environment
 
 The image writes its file log to `/logs/database-schema.log`; mount `/logs` when the log
 must persist beyond the one-shot container.
-
 
 ## The bootstrap fill
 
