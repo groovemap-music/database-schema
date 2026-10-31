@@ -6819,8 +6819,55 @@ async def _apply_vector_schema(cursor: Any) -> int:
     return failures
 
 
-async def create_postgres_schema(pool: Any) -> int:
+_ROLE_EXISTS_QUERY = "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = %s)"
+
+_PREPROVISIONED_EXTENSION_STATEMENT_NAMES = frozenset({_PG_TRGM_STATEMENT[0], _VECTOR_EXTENSION_STATEMENT[0]})
+
+
+async def _apply_preprovisioned_vector_schema(cursor: Any) -> int:
+    """Apply the vector-gated objects and pipeline grants without creating any cluster object.
+
+    Pre-provisioned mode never issues `CREATE EXTENSION` or `CREATE ROLE`: the operator owns
+    both. `vector` is therefore either already installed (its table and index are created, its
+    extension statement is not) or absent (skipped, exactly as an unavailable extension is in
+    the dedicated mode). The pipeline role's grants run only when the operator created the role;
+    a missing role degrades the embedding feature and never fails the schema.
+    """
+    failures = 0
+    if await _vector_extension_installed(cursor):
+        statements = [item for item in _VECTOR_SCHEMA_STATEMENTS if item[0] not in _PREPROVISIONED_EXTENSION_STATEMENT_NAMES]
+        _success, extension_failures = await _execute_schema_statements(cursor, statements)
+        failures += extension_failures
+        vector_present = True
+    else:
+        logger.info("⏭️  Skipped %s and public.artist_embeddings: pre-provisioned database has no %s extension", VECTOR_EXTENSION, VECTOR_EXTENSION)
+        vector_present = False
+
+    try:
+        await cursor.execute(_ROLE_EXISTS_QUERY, (EMBEDDING_PIPELINE_ROLE,))
+        row = await cursor.fetchone()
+        role_present = bool(row is not None and row[0])
+    except Exception as error:
+        logger.error("❌ Could not read pg_roles: %s", error)
+        role_present = False
+
+    if not role_present:
+        logger.info("⏭️  Skipped %s role and grants: the role was not pre-provisioned", EMBEDDING_PIPELINE_ROLE)
+        return failures
+
+    grants = [item for item in _PIPELINE_ROLE_STATEMENTS if item is not _CREATE_EMBEDDING_PIPELINE_ROLE_STATEMENT]
+    if vector_present:
+        grants.append(_EMBEDDINGS_TABLE_GRANT)
+    grants.extend([_ARTIST_SIMILARITY_TABLES_GRANT, _ARTIST_SIMILARITY_SEQUENCE_GRANT])
+    _success, grant_failures = await _execute_schema_statements(cursor, grants)
+    return failures + grant_failures
+
+
+async def create_postgres_schema(pool: Any, *, preprovisioned: bool = False) -> int:
     """Create all PostgreSQL tables and indexes.
+
+    With `preprovisioned=True` the operator owns the cluster-level objects: no
+    `CREATE EXTENSION` or `CREATE ROLE` is issued (see `_apply_preprovisioned_vector_schema`).
 
     Safe to call on every startup; all statements use IF NOT EXISTS so
     subsequent calls are no-ops for already-created schema objects. The vector
@@ -6846,8 +6893,13 @@ async def create_postgres_schema(pool: Any) -> int:
         async with conn.cursor() as cursor_cm:
             cursor = cast("Any", cursor_cm)
             statements = list(_schema_statements())
+            if preprovisioned:
+                statements = [item for item in statements if item[0] not in _PREPROVISIONED_EXTENSION_STATEMENT_NAMES]
             success_count, failure_count = await _execute_schema_statements(cursor, statements)
-            failure_count += await _apply_vector_schema(cursor)
+            if preprovisioned:
+                failure_count += await _apply_preprovisioned_vector_schema(cursor)
+            else:
+                failure_count += await _apply_vector_schema(cursor)
 
     total = len(statements)
     logger.info(f"✅ PostgreSQL schema creation complete: {success_count} succeeded, {failure_count} failed (total: {total})")

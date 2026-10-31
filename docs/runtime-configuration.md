@@ -12,6 +12,7 @@ services.
 | `POSTGRES_DATABASE` | `groovemap` | Database to create and initialize |
 | `POSTGRES_USERNAME` | `groovemap` | PostgreSQL user |
 | `POSTGRES_PASSWORD` | `groovemap` | PostgreSQL password |
+| `POSTGRES_PREPROVISIONED` | `false` | `true` selects pre-provisioned mode: verify an operator-provisioned database instead of creating one (see [Pre-provisioned PostgreSQL](#pre-provisioned-postgresql)) |
 | `NEO4J_HOST` | `localhost` | Neo4j hostname or full connection URI |
 | `NEO4J_PORT` | `7687` | Bolt port when the host is not a full URI |
 | `NEO4J_USERNAME` | `neo4j` | Neo4j user |
@@ -39,6 +40,84 @@ The image writes its file log to `/logs/database-schema.log`; mount `/logs` when
 must persist beyond the one-shot container. Outside the container `/logs` is not required:
 if the log file cannot be opened, the runtime warns once and logs to the console only. Set
 `LOG_FILE` to write the file elsewhere, or to an empty value to disable the file log.
+
+## Pre-provisioned PostgreSQL
+
+By default (dedicated mode) the initializer connects to the `postgres` maintenance database and
+runs `CREATE DATABASE` when the target is missing, then `CREATE EXTENSION pg_trgm`, `vector`
+(when installable), and the `embedding_pipeline` role where the connecting role may. That needs
+a privileged login and is wrong for a shared server.
+
+Set `POSTGRES_PREPROVISIONED=true` (also accepts `1`, `yes`, `on`) when an administrator has
+provisioned the database, role and extensions. In this mode the initializer:
+
+- never connects to `postgres` and never issues `CREATE DATABASE`, `CREATE ROLE`, or `CREATE EXTENSION`;
+- verifies, before any DDL, that the target database is reachable, that the runtime role can create
+  schemas in it and objects in `public`, and that `pg_trgm` is installed. Any failure exits
+  nonzero and logs the exact SQL the administrator must run;
+- reports whether `vector` is installed. Absent is **not** fatal: `public.artist_embeddings` is
+  skipped, as in dedicated mode;
+- reports whether the `embedding_pipeline` role exists. Absent is **not** fatal: the embedding
+  feature degrades (its grants are skipped) and the log names the SQL that enables it. When the
+  role exists, the initializer applies its grants, which only need ownership of the objects;
+- then applies the same schema DDL as dedicated mode, inside that one database only.
+
+The runtime role needs no `SUPERUSER`, `CREATEROLE`, or `CREATEDB`. Dedicated mode is unchanged.
+
+### Least-privilege provisioning SQL
+
+Run once as a PostgreSQL administrator. Replace the names and password.
+
+```sql
+-- 1. The runtime role: a plain login, no cluster-wide privileges.
+CREATE ROLE groovemap LOGIN PASSWORD '<password>' NOSUPERUSER NOCREATEDB NOCREATEROLE;
+
+-- 2. The database, owned by that role. Ownership is what lets it create schemas and objects
+--    (on PostgreSQL 15+ it also owns `public` through pg_database_owner).
+CREATE DATABASE groovemap OWNER groovemap;
+
+-- 3. Extensions, connected to the new database (\c groovemap). pg_trgm is required.
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+--    Optional, superuser only (pgvector is not a trusted extension); needed for artist embeddings.
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- 4. Optional: the embedding pipeline's role. The initializer grants it read access to
+--    `graph` and read/write on the embedding tables once it exists.
+CREATE ROLE embedding_pipeline NOLOGIN;
+--    Let the pipeline's login role use it (replace pipeline_login with the pipeline's own login).
+GRANT embedding_pipeline TO pipeline_login;
+```
+
+`embedding_pipeline` is cluster-wide, so on a server shared with another GrooveMap database it is
+created once. To keep the owner but a different login for the runtime, use
+`GRANT CREATE ON DATABASE groovemap TO groovemap;` and `GRANT CREATE ON SCHEMA public TO groovemap;`
+instead of step 2's `OWNER`.
+
+### Required PostgreSQL version
+
+PostgreSQL **18** or newer. The schema uses the built-in `uuidv7()` introduced in 18; the required
+integration tier runs PostgreSQL 18 and the stack pins 18. PostgreSQL 19 is exercised by an
+advisory tier only.
+
+### Connection budget
+
+Plan `max_connections` (and any `ALTER ROLE ... CONNECTION LIMIT`) from the pool ceilings of the
+stack's services. Each connection past the pool minimum is opened on demand, so size for the
+maximum:
+
+| Service | Ceiling | Setting |
+| --- | --- | --- |
+| `tableinator` (discogs-sql-loader) | 12 | `POSTGRES_POOL_MAX_SIZE` |
+| `brainztableinator` (musicbrainz-sql-loader) | 12 | `POSTGRES_POOL_MAX_SIZE` |
+| `catalog-api` | 8, plus 4 for its projection pool | `POSTGRES_POOL_MAX_SIZE` |
+| `analytics-engine` insights | 4 | `POSTGRES_POOL_MAX_SIZE` |
+| `schema-init` (this image) | 5, only while it runs | fixed |
+| one-shot jobs (embedding pipeline 1, ledger backfill 2, reattach 2) | 1-2 each | fixed |
+
+The always-on services sum to 40 connections (44 with the projection pool); with one-shots and
+`schema-init` running, peak is under 60. Provide at least 60 usable connections for GrooveMap,
+on top of `superuser_reserved_connections` and whatever other applications on the shared server
+need, or lower the pool maximums. Per-replica ceilings multiply with replica count.
 
 ## The bootstrap fill
 
