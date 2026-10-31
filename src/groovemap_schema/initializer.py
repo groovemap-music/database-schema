@@ -34,7 +34,7 @@ from psycopg import sql
 
 from groovemap_schema import __version__
 from groovemap_schema.neo4j import create_neo4j_schema
-from groovemap_schema.postgres import create_postgres_schema
+from groovemap_schema.postgres import EMBEDDING_PIPELINE_ROLE, VECTOR_EXTENSION, create_postgres_schema
 
 
 if TYPE_CHECKING:
@@ -50,6 +50,10 @@ POSTGRES_HOST = os.environ.get("POSTGRES_HOST", "localhost")
 POSTGRES_USERNAME = get_secret("POSTGRES_USERNAME", "groovemap")
 POSTGRES_PASSWORD = get_secret("POSTGRES_PASSWORD", "groovemap")
 POSTGRES_DATABASE = os.environ.get("POSTGRES_DATABASE", "groovemap")
+
+# Pre-provisioned mode: an operator created the database, the runtime role and the extensions on
+# a shared server. The initializer then verifies and applies schema inside that database only.
+PREPROVISIONED_ENV = "POSTGRES_PREPROVISIONED"
 
 SERVICE_NAME = "database-schema"
 BANNER = r"""
@@ -200,6 +204,79 @@ def _ensure_postgres_database(params: dict[str, Any]) -> None:
         logger.info("PostgreSQL database created", database=POSTGRES_DATABASE)
 
 
+def _preprovisioned_enabled() -> bool:
+    """Return whether POSTGRES_PREPROVISIONED asks for the verify-only PostgreSQL mode."""
+    return os.environ.get(PREPROVISIONED_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _admin_sql_for_database(user: str, database: str) -> str:
+    return (
+        f"CREATE ROLE \"{user}\" LOGIN PASSWORD '<password>' NOSUPERUSER NOCREATEDB NOCREATEROLE;\n"
+        f'CREATE DATABASE "{database}" OWNER "{user}";\n'
+        f'\\c "{database}"\n'
+        "CREATE EXTENSION IF NOT EXISTS pg_trgm;"
+    )
+
+
+def _verify_preprovisioned_database(params: dict[str, Any]) -> list[str]:
+    """Check an operator-provisioned database without creating or altering anything.
+
+    Returns the fatal problems, each carrying the exact SQL an administrator must run. A missing
+    `vector` extension or `embedding_pipeline` role is reported but is not a problem: the
+    embedding feature degrades, as it already does in the dedicated mode.
+    """
+    database = str(params["dbname"])
+    user = str(params["user"])
+    try:
+        connection = psycopg.connect(**params, autocommit=True)
+    except psycopg.Error as error:
+        return [
+            f"cannot connect to database {database!r} as {user!r}: {error}\nRun as a PostgreSQL administrator:\n{_admin_sql_for_database(user, database)}"
+        ]
+
+    problems: list[str] = []
+    with connection, connection.cursor() as cursor:
+        cursor.execute("SELECT has_database_privilege(current_user, current_database(), 'CREATE')")
+        row = cursor.fetchone()
+        if not (row and row[0]):
+            problems.append(
+                f"role {user!r} cannot create schemas in database {database!r}\n"
+                f'Run as a PostgreSQL administrator:\nALTER DATABASE "{database}" OWNER TO "{user}";\n'
+                f'-- or, keeping another owner:\nGRANT CREATE ON DATABASE "{database}" TO "{user}";'
+            )
+        cursor.execute("SELECT has_schema_privilege(current_user, 'public', 'CREATE')")
+        row = cursor.fetchone()
+        if not (row and row[0]):
+            problems.append(
+                f'role {user!r} cannot create objects in schema public of {database!r}\nRun as a PostgreSQL administrator (connected to "{database}"):\n'
+                f'GRANT CREATE ON SCHEMA public TO "{user}";'
+            )
+        cursor.execute("SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm')")
+        row = cursor.fetchone()
+        if not (row and row[0]):
+            problems.append(
+                f"extension pg_trgm is not installed in database {database!r}\n"
+                f'Run as a PostgreSQL administrator (connected to "{database}"):\nCREATE EXTENSION IF NOT EXISTS pg_trgm;'
+            )
+        cursor.execute("SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = %s)", (VECTOR_EXTENSION,))
+        row = cursor.fetchone()
+        if row and row[0]:
+            logger.info("Pre-provisioned database has the vector extension", database=database)
+        else:
+            logger.warning(
+                "Pre-provisioned database has no vector extension; artist embeddings are skipped. To enable them, run as a "
+                f'superuser connected to "{database}": CREATE EXTENSION IF NOT EXISTS vector;'
+            )
+        cursor.execute("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = %s)", (EMBEDDING_PIPELINE_ROLE,))
+        row = cursor.fetchone()
+        if not (row and row[0]):
+            logger.warning(
+                f"Role {EMBEDDING_PIPELINE_ROLE} does not exist; its grants are skipped. To enable the embedding pipeline, run as a "
+                f"PostgreSQL administrator: CREATE ROLE {EMBEDDING_PIPELINE_ROLE} NOLOGIN;"
+            )
+    return problems
+
+
 def _schema_succeeded(store: str, failure_count: int) -> bool:
     """Convert a best-effort schema result into the initializer's fail-closed result."""
     if failure_count:
@@ -208,7 +285,7 @@ def _schema_succeeded(store: str, failure_count: int) -> bool:
     return True
 
 
-async def _apply_postgres_schema(params: dict[str, Any]) -> bool:
+async def _apply_postgres_schema(params: dict[str, Any], *, preprovisioned: bool = False) -> bool:
     """Apply all PostgreSQL schema statements. Telemetry is owned by _initialize_store."""
     pool: AsyncPostgreSQLPool | None = None
     try:
@@ -220,6 +297,8 @@ async def _apply_postgres_schema(params: dict[str, Any]) -> bool:
             health_check_interval=30,
         )
         await pool.initialize()
+        if preprovisioned:
+            return _schema_succeeded("PostgreSQL", await create_postgres_schema(pool, preprovisioned=True))
         return _schema_succeeded("PostgreSQL", await create_postgres_schema(pool))
     except Exception as error:
         logger.error("PostgreSQL schema initialization failed", error=str(error))
@@ -230,8 +309,10 @@ async def _apply_postgres_schema(params: dict[str, Any]) -> bool:
             await pool.close()
 
 
-async def _init_postgres(params: dict[str, Any]) -> bool:
+async def _init_postgres(params: dict[str, Any], *, preprovisioned: bool = False) -> bool:
     """Apply the PostgreSQL schema inside its measured `schema_init postgresql` span."""
+    if preprovisioned:
+        return await _initialize_store("postgresql", lambda: _apply_postgres_schema(params, preprovisioned=True))
     return await _initialize_store("postgresql", lambda: _apply_postgres_schema(params))
 
 
@@ -276,14 +357,25 @@ async def main() -> int:
 
         overall_start = time.perf_counter()
         params = _postgres_connection_params()
-        try:
-            _ensure_postgres_database(params)
-        except Exception as error:
-            logger.error("Failed to ensure PostgreSQL database exists", error=str(error))
-            _record_schema_init_duration("all", "failure", time.perf_counter() - overall_start)
-            return 1
+        preprovisioned = _preprovisioned_enabled()
+        if preprovisioned:
+            logger.info("Pre-provisioned mode: verifying the database, creating no database, role, or extension")
+            problems = _verify_preprovisioned_database(params)
+            if problems:
+                for problem in problems:
+                    logger.error("Pre-provisioned database check failed", problem=problem)
+                _record_schema_init_duration("all", "failure", time.perf_counter() - overall_start)
+                return 1
+        else:
+            try:
+                _ensure_postgres_database(params)
+            except Exception as error:
+                logger.error("Failed to ensure PostgreSQL database exists", error=str(error))
+                _record_schema_init_duration("all", "failure", time.perf_counter() - overall_start)
+                return 1
 
-        postgres_ok, neo4j_ok = await asyncio.gather(_init_postgres(params), _init_neo4j())
+        postgres_task = _init_postgres(params, preprovisioned=True) if preprovisioned else _init_postgres(params)
+        postgres_ok, neo4j_ok = await asyncio.gather(postgres_task, _init_neo4j())
         overall_outcome = "success" if postgres_ok and neo4j_ok else "failure"
         _record_schema_init_duration("all", overall_outcome, time.perf_counter() - overall_start)
 
