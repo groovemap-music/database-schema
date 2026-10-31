@@ -2,6 +2,16 @@
 
 All notable changes to the GrooveMap database schema will be documented here.
 
+## v0.6.0 (2026-10-30)
+
+### Feat
+
+- **schema-init**: add pre-provisioned mode with verify-only checks
+
+### Fix
+
+- **deps**: upgrade msgpack past CVE-2026-114613
+
 ## v0.5.0 (2026-10-27)
 
 ### Feat
