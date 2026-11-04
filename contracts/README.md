@@ -16,7 +16,7 @@ The `graph` schema is recorded in
 [`persistence/v1/compatibility.json`](persistence/v1/compatibility.json) under `graph_schema`
 as an additive object of contract version 1: sixty-eight relations — thirty-one loader-written
 tables and thirty-seven read-only views over tables the same contract already declares — plus
-eight functions. Four of those views exist so a vertex label can publish the counters
+nine functions. Four of those views exist so a vertex label can publish the counters
 Neo4j carries on the node of the same name; `graph_schema.counter_properties` records which
 label carries which. The contract lists every relation with its shape and the service
 that writes it, because a consumer reading one needs both: the shape says whether an index is
@@ -43,11 +43,12 @@ relation: a track-level credit's artist id resolves through the same `(person_na
 artist_id)` key a release-level one does, so the loader's extended population of `same_as`
 needed no contract change of its own.
 
-`graph_schema.free_text_keys` records the six relations keyed on text nothing bounds. Their key
-columns are unchanged and so is every statement a writer runs, but a UNIQUE index over
-`graph.text_key` enforces the key in place of a primary key, so a writer can use only the
-target-less `ON CONFLICT DO NOTHING` the loaders already use. Consumers need no change; the
-vendored copy of this file is refreshed as usual.
+`graph.text_key` is the one function that is neither of these: `graph_schema.free_text_keys`
+records it and the six relations keyed on text nothing bounds. Their key columns are unchanged
+and so is every statement a writer runs, but a UNIQUE index over `graph.text_key` enforces the key
+in place of a primary key, so a writer can use only the target-less `ON CONFLICT DO NOTHING` the
+loaders already use. Consumers need no change; the vendored copy of this file is refreshed as
+usual.
 
 The remaining four functions are the two loader-owned refreshes and the two procedural read
 functions. `graph_schema.member_of_union` and `graph_schema.vertex_degree` name
