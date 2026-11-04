@@ -147,6 +147,23 @@ async def test_the_key_is_the_whole_value_not_a_prefix(database: str) -> None:
     assert await _rows(database, "SELECT count(*) FROM graph.track_credited_on") == [(4,)]
 
 
+async def test_a_person_and_role_that_concatenate_alike_stay_two_credits(database: str) -> None:
+    """One hash over both values must not move the boundary between them."""
+    moved = LONG_ROLE[0]
+    for name, role in (("ab", "c"), ("a", "bc"), ("1:a", "b"), (LONG_NAME, LONG_ROLE), (LONG_NAME + moved, LONG_ROLE[1:])):
+        await _write_credit(database, name, role)
+
+    assert await _rows(database, "SELECT count(*) FROM graph.credited_on") == [(5,)]
+    assert await _rows(database, "SELECT count(*) FROM graph.track_credited_on") == [(5,)]
+
+
+async def test_the_credit_key_hashes_the_length_prefixed_text_and_inlines(database: str) -> None:
+    assert await _rows(database, "SELECT graph.credit_key('ab', 'c') = sha256(convert_to('2:abc', 'UTF8'))") == [(True,)]
+    assert await _rows(database, "SELECT graph.credit_key(NULL, 'c') IS NULL, graph.credit_key('a', NULL) IS NULL") == [(True, True)]
+    plan = await _rows(database, "EXPLAIN VERBOSE SELECT graph.credit_key(person_name, role) FROM graph.credited_on")
+    assert "credit_key" not in "\n".join(line for (line,) in plan)
+
+
 async def test_the_same_credit_still_deduplicates_to_one_row(database: str) -> None:
     for _ in range(2):
         await _write_credit(database, LONG_NAME, LONG_ROLE)
@@ -253,7 +270,8 @@ async def test_lookups_by_name_stay_on_an_index(database: str) -> None:
     await _rows(database, "ANALYZE graph.same_as")
 
     assert "person_name_hash" in await _plan(database, "SELECT name FROM graph.person WHERE name = 'Person 42'")
-    assert "credited_on_person_name_hash" in await _plan(database, "SELECT release_id FROM graph.credited_on WHERE person_name = 'Person 42'")
+    assert await _rows(database, "SELECT to_regclass('graph.credited_on_person_name_hash')") == [(None,)]
+    assert await _rows(database, "SELECT to_regclass('graph.track_credited_on_person_name_hash')") == [(None,)]
     assert "same_as_person_name_hash" in await _plan(database, "SELECT artist_id FROM graph.same_as WHERE person_name = 'Person 42'")
     assert "credited_on_key" in await _plan(database, "SELECT person_name FROM graph.credited_on WHERE release_id = '7'")
     assert "same_as_key" in await _plan(database, "SELECT person_name FROM graph.same_as WHERE artist_id = '7'")
@@ -323,6 +341,25 @@ async def _key_shape(dbname: str) -> list[tuple[Any, ...]]:
     )
 
 
+CREDIT_KEY = "CREATE UNIQUE INDEX credited_on_key ON graph.credited_on USING btree (release_id, graph.credit_key(person_name, role))"
+
+# What v0.6.1 and v0.6.2 built for the two credit relations, on today's shape of everything else.
+_TWO_HASH_SHAPE = """
+DROP INDEX graph.credited_on_key, graph.track_credited_on_key;
+DROP FUNCTION graph.credit_key(text, text);
+CREATE UNIQUE INDEX credited_on_key ON graph.credited_on (release_id, graph.text_key(person_name), graph.text_key(role));
+CREATE INDEX credited_on_person_name_hash ON graph.credited_on USING hash (person_name);
+CREATE UNIQUE INDEX track_credited_on_key ON graph.track_credited_on
+    (release_id, track_ordinal, sub_track_ordinal, graph.text_key(person_name), graph.text_key(role));
+CREATE INDEX track_credited_on_person_name_hash ON graph.track_credited_on USING hash (person_name);
+"""
+
+
+async def _key_definition(dbname: str, index: str) -> str:
+    rows = await _rows(dbname, "SELECT indexdef FROM pg_indexes WHERE schemaname = 'graph' AND indexname = %s", (index,))
+    return str(rows[0][0])
+
+
 async def _index_method(dbname: str, index: str) -> str:
     rows = await _rows(
         dbname,
@@ -365,6 +402,14 @@ async def test_an_existing_database_upgrades_in_place_and_converges(database: st
     )
     assert ("company_id", True) in required
     assert ("name", True) in required
+    credit_columns = await _rows(
+        database,
+        "SELECT bool_and(attnotnull) FROM pg_attribute WHERE attrelid IN ('graph.credited_on'::regclass, 'graph.track_credited_on'::regclass) "
+        "AND attname IN ('person_name', 'role', 'release_id')",
+    )
+    assert credit_columns == [(True,)]
+    assert await _key_definition(database, "credited_on_key") == CREDIT_KEY
+    assert await _rows(database, "SELECT to_regclass('graph.credited_on_person_name_hash')") == [(None,)]
 
     # Everything already loaded survived, and is still the key it was.
     assert await _rows(database, "SELECT name FROM graph.person") == [("Alice",)]
@@ -380,6 +425,70 @@ async def test_an_existing_database_upgrades_in_place_and_converges(database: st
     await _apply_schema(database)
     assert await _key_shape(database) == fresh
     assert await _rows(database, "SELECT count(*) FROM graph.credited_on") == [(2,)]
+
+
+async def test_a_two_hash_database_upgrades_in_place_and_converges(database: str) -> None:
+    fresh = await _key_shape(database)
+    async with await psycopg.AsyncConnection.connect(**_params(database), autocommit=True) as connection:
+        await connection.execute(_TWO_HASH_SHAPE)  # type: ignore[arg-type]
+    await _write_credit(database, "Alice", "Producer")
+    await _write_credit(database, LONG_NAME, LONG_ROLE)
+    heap_files = await _rows(database, "SELECT pg_relation_filenode('graph.credited_on'), pg_relation_filenode('graph.track_credited_on')")
+
+    await _apply_schema(database)
+
+    # The same indexes a fresh database has, and no table rewrite to get them.
+    assert await _key_shape(database) == fresh
+    assert await _rows(database, "SELECT pg_relation_filenode('graph.credited_on'), pg_relation_filenode('graph.track_credited_on')") == heap_files
+
+    # Everything already loaded survived, and is still the key it was.
+    await _write_credit(database, "Alice", "Producer")
+    await _write_credit(database, LONG_NAME, LONG_ROLE)
+    assert await _rows(database, "SELECT count(*) FROM graph.credited_on") == [(2,)]
+    assert await _rows(database, "SELECT count(*) FROM graph.track_credited_on") == [(2,)]
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        await _rows(database, "INSERT INTO graph.credited_on (person_name, release_id, role) VALUES ('Alice', '111', 'Producer')")
+
+    # A second apply finds nothing left to do, down to the key's own file.
+    keys = await _rows(database, "SELECT pg_relation_filenode('graph.credited_on_key'), pg_relation_filenode('graph.track_credited_on_key')")
+    await _apply_schema(database)
+    assert await _key_shape(database) == fresh
+    assert await _rows(database, "SELECT pg_relation_filenode('graph.credited_on_key'), pg_relation_filenode('graph.track_credited_on_key')") == keys
+
+
+@pytest.mark.parametrize(
+    "step",
+    [
+        "DROP INDEX graph.credited_on_key;",
+        "ALTER INDEX graph.credited_on_key_combined RENAME TO credited_on_key;",
+        "DROP INDEX IF EXISTS graph.credited_on_person_name_hash;",
+    ],
+)
+async def test_an_interrupted_two_hash_upgrade_leaves_the_old_key_whole(database: str, step: str) -> None:
+    async with await psycopg.AsyncConnection.connect(**_params(database), autocommit=True) as connection:
+        await connection.execute(_TWO_HASH_SHAPE)  # type: ignore[arg-type]
+    await _rows(database, dict(_schema_statements())["graph.credit_key function"])
+    await _write_credit(database, "Alice", "Producer")
+    old_key = await _key_definition(database, "credited_on_key")
+    migration = dict(_schema_statements())["graph.credited_on two-hash key migration"]
+    failing = migration.replace(step, "RAISE EXCEPTION 'interrupted';")
+    assert failing != migration
+
+    with pytest.raises(psycopg.errors.RaiseException):
+        await _rows(database, failing)
+
+    assert await _key_definition(database, "credited_on_key") == old_key
+    assert "text_key(role)" in old_key
+    assert await _rows(database, "SELECT to_regclass('graph.credited_on_key_combined')") == [(None,)]
+    assert await _rows(database, "SELECT to_regclass('graph.credited_on_person_name_hash')") == [("graph.credited_on_person_name_hash",)]
+    await _write_credit(database, "Alice", "Producer")
+    assert await _rows(database, "SELECT count(*) FROM graph.credited_on") == [(1,)]
+
+    # The next run finishes the move.
+    await _apply_schema(database)
+    assert await _key_definition(database, "credited_on_key") == CREDIT_KEY
+    assert await _rows(database, "SELECT to_regclass('graph.credited_on_person_name_hash')") == [(None,)]
+    assert await _rows(database, "SELECT count(*) FROM graph.credited_on") == [(1,)]
 
 
 _LEGACY_ROLE_CATEGORY = """
@@ -444,6 +553,7 @@ async def test_an_interrupted_upgrade_leaves_the_old_key_whole(database: str) ->
     await _apply_schema(database)
     assert await _rows(database, "SELECT count(*) FROM graph.credited_on") == [(1,)]
     assert await _rows(database, "SELECT conname FROM pg_constraint WHERE conrelid = 'graph.credited_on'::regclass AND contype = 'p'") == []
+    assert await _key_definition(database, "credited_on_key") == CREDIT_KEY
 
 
 async def test_the_mirrored_neo4j_key_takes_the_same_long_name() -> None:

@@ -460,16 +460,23 @@ assert evolution["forbidden"] == [
     "retyping a column",
 ]
 
+
+def free_text_key_columns(key: str) -> list[str]:
+    """Return the columns of one unique key, reading through the function hashing them."""
+    return [member.strip() for member in re.sub(r"graph\.\w+\(([^)]*)\)", r"\1", key).split(",")]
+
+
 # A free-text key is declared in one place and recorded in the other, so a relation
 # moved onto the hash, or a key column dropped from it, has to be recorded.
 free_text_keys = graph["free_text_keys"]
 assert free_text_keys["kind"] == "additive"
 assert free_text_keys["availability"] == "unconditional"
 assert free_text_keys["function"] in graph["functions"]
+assert free_text_keys["credit_key_function"] in graph["functions"]
 assert sorted(free_text_keys["relations"]) == sorted(_FREE_TEXT_KEYS)
 for relation, recorded in free_text_keys["relations"].items():
     key, lookup, _stale = _FREE_TEXT_KEYS[relation]
-    assert recorded["key"] == [re.sub(r"graph\.text_key\((\w+)\)", r"\1", member.strip()) for member in key.split(",")], relation
+    assert recorded["key"] == free_text_key_columns(key), relation
     assert recorded["lookup"] == lookup, relation
 
 # Every vertex key is a published column now, not an appended restatement. The
@@ -496,7 +503,7 @@ def table_key(relation: str, statement: str, columns: dict[str, str]) -> list[st
     """Return the key columns of one `CREATE TABLE` body, or of its free-text unique index."""
     free_text_key = _FREE_TEXT_KEYS.get(relation.removeprefix("graph."))
     if free_text_key:
-        return [re.sub(r"graph\.text_key\((\w+)\)", r"\1", member.strip()) for member in free_text_key[0].split(",")]
+        return free_text_key_columns(free_text_key[0])
     composite = re.search(r"PRIMARY KEY \(([^)]*)\)", statement)
     if composite:
         return [name.strip() for name in composite.group(1).split(",")]

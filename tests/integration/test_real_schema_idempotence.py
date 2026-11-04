@@ -348,9 +348,12 @@ async def assert_every_edge_table_is_indexed_both_ways() -> None:
         )
         definitions = [row[0] for row in rows]
         if relation in _FREE_TEXT_KEYS:
-            # A UNIQUE key over the hash, and a hash index on the free-text end.
+            # A UNIQUE key over the hash, and a hash index on the free-text end where a consumer walks it.
             assert any(f"UNIQUE INDEX {relation}_key" in definition for definition in definitions), (relation, definitions)
-            assert any("USING hash" in definition for definition in definitions), (relation, definitions)
+            assert any("USING hash" in definition for definition in definitions) == (_FREE_TEXT_KEYS[relation][1] is not None), (
+                relation,
+                definitions,
+            )
             continue
         assert any(definition.endswith(f"({reverse})") for definition in definitions), (relation, definitions)
         assert any("_pkey" in definition for definition in definitions), (relation, definitions)
