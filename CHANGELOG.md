@@ -2,6 +2,12 @@
 
 All notable changes to the GrooveMap database schema will be documented here.
 
+## v0.6.2 (2026-11-04)
+
+### Fix
+
+- **graph**: make credit_role_category cheap per row
+
 ## v0.6.1 (2026-11-04)
 
 ### Fix
