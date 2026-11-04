@@ -307,6 +307,15 @@ containers busy:
 The proposed shape won all five pairs, by a median of 10.2 s (24%). Index size and WAL were
 identical on every run. The load effect is about 18 minutes over the 107.6M credit rows left.
 
+> **Superseded by the final code, 2026-11-04.** `gm-database-schema-bfuh` re-measured this on the
+> real tables with [`measure_credit_key.py`](2026-11-04-index-view-function-audit/measure_credit_key.py).
+> The estimate for the track key below was too low: it measures 140 MB per million rows, not about
+> 108 MB, because the disk table assumed only the ordinals added to it. So the saving is 13.7 GB
+> (44%), from 31.5 GB to 17.8 GB, not 15.9 GB (52%), and 10.5 GB rather than 9.6 GB after a rebuild.
+> WAL saved is about 27 GB. The paired load gain was 7.8 s on `credited_on` and 9.6 s on
+> `track_credited_on`, in 9 of 10 pairs. [Keys over free text](../architecture.md#keys-over-free-text)
+> holds the final figures.
+
 **Disk at 147.5M credit rows**
 
 | Key plus person hash | v0.6.1 | Proposed | After `REINDEX` |
