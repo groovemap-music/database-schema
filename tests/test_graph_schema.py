@@ -1576,8 +1576,8 @@ def statement_for_function(function: str) -> str:
 def rendered_role_branches() -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
     """Return the (exact, contained) branch lists the rendered CASE actually carries."""
     statement = statement_for_function("credit_role_category")
-    exact = re.findall(r"WHEN normalized\.role = '(.*?)' THEN '(.*?)'", statement)
-    contained = re.findall(r"WHEN strpos\(normalized\.role, '(.*?)'\) > 0 THEN '(.*?)'", statement)
+    exact = re.findall(r"WHEN normalized_role = '(.*?)' THEN '(.*?)'", statement)
+    contained = re.findall(r"WHEN strpos\(normalized_role, '(.*?)'\) > 0 THEN '(.*?)'", statement)
     return exact, contained
 
 
@@ -1606,6 +1606,13 @@ class TestRenderedVocabularies:
             assert "IMMUTABLE" in statement
             assert "PARALLEL SAFE" in statement
             assert "RETURNS NULL ON NULL INPUT" in statement
+
+    def test_the_role_function_is_plpgsql_with_a_pinned_search_path(self) -> None:
+        """LANGUAGE sql with a FROM clause is never inlined; this runs once per credit row."""
+        statement = statement_for_function("credit_role_category")
+        assert "LANGUAGE plpgsql" in statement
+        assert "LANGUAGE sql" not in statement
+        assert "SET search_path = pg_catalog, pg_temp" in statement
 
     def test_every_role_fragment_is_rendered_with_its_category(self) -> None:
         expected = {role: category for category, roles in ROLE_CATEGORIES.items() for role in roles}

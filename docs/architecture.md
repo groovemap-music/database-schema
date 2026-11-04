@@ -1064,6 +1064,12 @@ Python, so the taxonomy is rendered into an `IMMUTABLE` SQL function,
 `categorize_role` exactly: an exact match on the lowered, trimmed role first, then a
 fragment scan ordered longest-first globally across categories, so a generic fragment
 declared in an earlier category cannot pre-empt a longer, more specific one declared later.
+The function is `LANGUAGE plpgsql` with `SET search_path = pg_catalog, pg_temp`, not
+`LANGUAGE sql`: it backs a stored generated column, so it runs once per credit row on every
+insert, and a SQL function with a `FROM` clause is never inlined (154 us per call against
+2.3 us, measured with a per-row value, since a constant argument folds at plan time). Its
+name, signature, volatility and every result are unchanged, so `CREATE OR REPLACE` swaps the
+body under the generated column without rewriting or recomputing a stored row.
 `graph.medium_label(text)` is rendered the same way from the vendored media taxonomy, and
 falls back to the id itself for a medium a newer producer taxonomy names. When the
 `groovemap-runtime` pin moves, both functions move with it; nothing in this repository
