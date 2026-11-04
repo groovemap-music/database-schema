@@ -2,6 +2,12 @@
 
 All notable changes to the GrooveMap database schema will be documented here.
 
+## v0.6.3 (2026-11-04)
+
+### Fix
+
+- **graph**: key credits on one hash and drop their person hash indexes
+
 ## v0.6.2 (2026-11-04)
 
 ### Fix
