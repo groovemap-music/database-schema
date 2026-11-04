@@ -2,6 +2,12 @@
 
 All notable changes to the GrooveMap database schema will be documented here.
 
+## v0.6.1 (2026-11-04)
+
+### Fix
+
+- **graph**: key free-text relations through a fixed-size hash
+
 ## v0.6.0 (2026-10-30)
 
 ### Feat
