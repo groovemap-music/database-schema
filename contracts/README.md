@@ -43,6 +43,12 @@ relation: a track-level credit's artist id resolves through the same `(person_na
 artist_id)` key a release-level one does, so the loader's extended population of `same_as`
 needed no contract change of its own.
 
+`graph_schema.free_text_keys` records the six relations keyed on text nothing bounds. Their key
+columns are unchanged and so is every statement a writer runs, but a UNIQUE index over
+`graph.text_key` enforces the key in place of a primary key, so a writer can use only the
+target-less `ON CONFLICT DO NOTHING` the loaders already use. Consumers need no change; the
+vendored copy of this file is refreshed as usual.
+
 The remaining four functions are the two loader-owned refreshes and the two procedural read
 functions. `graph_schema.member_of_union` and `graph_schema.vertex_degree` name
 `discogs-sql-loader` as the refresh owner for `graph.refresh_artist_member_of()` and

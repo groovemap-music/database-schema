@@ -20,6 +20,7 @@ from groovemap_schema import initializer
 from groovemap_schema.neo4j import SCHEMA_STATEMENTS
 from groovemap_schema.postgres import (
     _EDGE_TABLES,
+    _FREE_TEXT_KEYS,
     _GRAPH_STATEMENTS,
     _VERTEX_KIND_NAMES,
     ARTIST_EMBEDDINGS_HNSW_INDEX_NAME,
@@ -346,6 +347,11 @@ async def assert_every_edge_table_is_indexed_both_ways() -> None:
             (relation,),
         )
         definitions = [row[0] for row in rows]
+        if relation in _FREE_TEXT_KEYS:
+            # A UNIQUE key over the hash, and a hash index on the free-text end.
+            assert any(f"UNIQUE INDEX {relation}_key" in definition for definition in definitions), (relation, definitions)
+            assert any("USING hash" in definition for definition in definitions), (relation, definitions)
+            continue
         assert any(definition.endswith(f"({reverse})") for definition in definitions), (relation, definitions)
         assert any("_pkey" in definition for definition in definitions), (relation, definitions)
 
