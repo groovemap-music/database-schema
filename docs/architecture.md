@@ -875,8 +875,8 @@ adds columns. See
 | `:Release` | `graph.release` | view | `release_id` | `title`, `year`, `country`, `genres`, `styles`, `media_families`, `gm_item_id`, `hash`, `updated_at`, `formats`, `catalog_number`, `gm_id` |
 | `:Genre` | `graph.genre` | **table** | `name` | — |
 | `:Style` | `graph.style` | **table** | `name` | — |
-| `:Person` | `graph.person` | **table** | `name` | — |
-| `:Company` | `graph.company` | **table** | `company_id` | `name`, `discogs_label_id` |
+| `:Person` | `graph.person` | **table** | `name` (hashed, see [Keys over free text](#keys-over-free-text)) | — |
+| `:Company` | `graph.company` | **table** | `company_id` (hashed, as above) | `name`, `discogs_label_id` |
 | `:Medium` | `graph.medium` | **table** | `medium_id` | `family`, `label` |
 | `:MediaFamily` | `graph.media_family` | **table** | `name` | — |
 | `:User` | `graph.app_user` | view | `user_id` | `is_active`, `is_admin`, `created_at`, `updated_at` |
@@ -928,7 +928,10 @@ columns that join the vertex relations above. **Every edge table is indexed in b
 directions**: the primary key serves the forward walk and a second index serves the reverse,
 because the ported Cypher enters these edges from the target end as often as from the source.
 A table indexed one way only reproduces the exact failure the views had. "Reverse index" is
-that second index; the primary key is the key column set in the column before it.
+that second index; the primary key is the key column set in the column before it. The four
+edge relations keyed on free text have no primary key: the UNIQUE index that replaces it and the
+hash index beside it serve the two directions, as [Keys over free text](#keys-over-free-text)
+sets out.
 
 | Neo4j relationship | Relation | Shape | Key columns | Reverse index | Source → target | Source |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -945,11 +948,11 @@ that second index; the primary key is the key column set in the column before it
 | (`MEMBER_OF`, both provenances) | `graph.artist_member_of` | **table** | `member_artist_id`, `group_artist_id`, `source` | `(group_artist_id, member_artist_id)` | `member_artist_id` → `group_artist_id` | `graph.member_of` and `graph.mb_rel_artist_artist` |
 | `(:Artist)-[:ALIAS_OF]->(:Artist)` | `graph.alias_of` | **table** | `alias_artist_id`, `artist_id` | `(artist_id, alias_artist_id)` | `alias_artist_id` → `artist_id` | `artists.data->'aliases'` |
 | `(:Label)-[:SUBLABEL_OF]->(:Label)` | `graph.sublabel_of` | view | `sublabel_id`, `parent_label_id` | — | `sublabel_id` → `parent_label_id` | `labels.data->'parentLabel'` and `->'sublabels'` |
-| `(:Person)-[:CREDITED_ON]->(:Release)` | `graph.credited_on` | **table** | `person_name`, `release_id`, `role` | `(release_id, person_name)` | `person_name` → `release_id` | `releases.data->'extraartists'` |
-| `(:Person)-[:SAME_AS]->(:Artist)` | `graph.same_as` | **table** | `person_name`, `artist_id` | `(artist_id)` | `person_name` → `artist_id` | `releases.data->'extraartists'` and `->'tracklist'[].extraartists` (and their `sub_tracks`) |
-| (track credit — no Neo4j equivalent) | `graph.track_credited_on` | **table** | `person_name`, `release_id`, `track_ordinal`, `sub_track_ordinal`, `role` | `(release_id, track_ordinal, sub_track_ordinal, person_name)` | `person_name` → `release_id` | `releases.data->'tracklist'` (xmltodict-wrapped; and its `sub_tracks`) |
+| `(:Person)-[:CREDITED_ON]->(:Release)` | `graph.credited_on` | **table** | `person_name`, `release_id`, `role` | `credited_on_key`, leading with `release_id`; `person_name` by hash | `person_name` → `release_id` | `releases.data->'extraartists'` |
+| `(:Person)-[:SAME_AS]->(:Artist)` | `graph.same_as` | **table** | `person_name`, `artist_id` | `same_as_key`, leading with `artist_id`; `person_name` by hash | `person_name` → `artist_id` | `releases.data->'extraartists'` and `->'tracklist'[].extraartists` (and their `sub_tracks`) |
+| (track credit — no Neo4j equivalent) | `graph.track_credited_on` | **table** | `person_name`, `release_id`, `track_ordinal`, `sub_track_ordinal`, `role` | `track_credited_on_key`, leading with `(release_id, track_ordinal, sub_track_ordinal)`; `person_name` by hash | `person_name` → `release_id` | `releases.data->'tracklist'` (xmltodict-wrapped; and its `sub_tracks`) |
 | (track performer — no Neo4j equivalent) | `graph.track_by_artist` | **table** | `release_id`, `track_ordinal`, `sub_track_ordinal`, `artist_id` | `(artist_id, release_id, track_ordinal, sub_track_ordinal)` | `release_id` → `artist_id` | `releases.data->'tracklist'` (xmltodict-wrapped; and its `sub_tracks`) |
-| `(:Release)-[:CREDITED_TO]->(:Company)` | `graph.credited_to` | **table** | `release_id`, `company_id`, `role`, `source` | `(company_id, release_id)` | `release_id` → `company_id` | `releases.data->'companies'` |
+| `(:Release)-[:CREDITED_TO]->(:Company)` | `graph.credited_to` | **table** | `release_id`, `company_id`, `role`, `source` | `company_id` by hash | `release_id` → `company_id` | `releases.data->'companies'` |
 | `(:Release)-[:ISSUED_ON]->(:Medium)` | `graph.issued_on` | **table** | `release_id`, `medium_id`, `source` | `(medium_id, release_id)` | `release_id` → `medium_id` | `releases.media` and `musicbrainz.releases.media` |
 | `(:Medium)-[:IN_FAMILY]->(:MediaFamily)` | `graph.in_family` | view | `medium_id`, `family_name` | — | `medium_id` → `family_name` | `graph.medium` |
 | (artist genre aggregate) | `graph.artist_genre` | **table** | `artist_id`, `genre_name` | `(genre_name, artist_id)` | `artist_id` → `genre_name` | `graph.by_artist` × `graph.in_genre` |
@@ -1088,7 +1091,9 @@ across two Discogs entries — are one edge whose `qty` is their sum, and an abs
 non-integer, or non-positive `qty` defaults to one.
 
 `:Person` is keyed on the credit name, verbatim: `Person.name` is the Neo4j key, so folding
-it here would key the vertex differently from the node it mirrors. `graph.person` reads both
+it here would key the vertex differently from the node it mirrors. The whole name is stored
+and the key is enforced over its hash, because the name has no upper bound; see
+[Keys over free text](#keys-over-free-text). `graph.person` reads both
 `releases.data->'extraartists'` and `->'tracklist'[].extraartists` (and their `sub_tracks`,
 gm-database-schema-ug3v) so a person credited only on a track, never on the release itself,
 is still a `:Person` row rather than a `graph.track_credited_on` edge referencing a vertex this
@@ -1155,13 +1160,14 @@ rather than a key column, so a consumer that wants the dump's own string for dis
 it is simply never filtered on and never assumed unique.
 
 **Indexes are sized for the embedding pipeline's block reads.** Both tables carry the same
-"indexed in both directions" shape every edge table in this schema does — the natural key as
-primary key, plus a reverse index — but the reverse index leads with `release_id` (then the two
-ordinals) rather than with the natural key's own leading column, because the pipeline's dominant
+"indexed in both directions" shape every edge table in this schema does, and the release-led
+direction leads with `release_id` (then the two ordinals), because the pipeline's dominant
 access pattern is a block read walking release by release, not the person- or artist-led lookup
-`credited_on`/`by_artist` serve. `graph.track_credited_on` also carries the
+`credited_on`/`by_artist` serve. In `graph.track_credited_on` that direction is the
+`track_credited_on_key` unique index itself; see [Keys over free text](#keys-over-free-text).
+`graph.track_credited_on` also carries the
 `(role_category, release_id, track_ordinal, sub_track_ordinal)` fan-out index `credited_on`
-carries on `(role_category, person_name)`, for the categorized block reads spike
+carries on `(role_category, release_id)`, for the categorized block reads spike
 gm-analytics-engine-ieu.2 calls for — `role_category` is the same generated column, over the same
 `graph.credit_role_category(role)`, so a track credit's category is computed by the identical
 rule a release-level one is. `graph.track_by_artist` needs no equivalent, mirroring
@@ -1213,6 +1219,116 @@ as `character varying`; on a database that has already been migrated it does not
 The change is invisible to a consumer: psycopg returns `str` for both types, and the column
 name and its position are unchanged. The persistence contract records the retirement under
 `graph_schema.key_columns`.
+
+### Keys over free text
+
+PostgreSQL refuses a btree entry over 2704 bytes after compression, and it refuses the row, not
+the index. A Discogs credit whose name compressed to 2888 bytes stopped the first SQL load on
+`person_pkey` on 2026-11-04 (gm-database-schema-brim). Discogs bounds neither a credit's name
+nor its role, so the release could not be stored at all, and the edge tables keyed on the same
+text would have failed next. Truncating would have merged two people, so the whole value stays
+in its column and the key no longer stores it.
+
+**`graph.text_key(value)` is SHA-256 of the value's UTF-8 bytes**, 32 bytes whatever the input.
+A collision would make `ON CONFLICT DO NOTHING` drop a real credit in silence, which rules out
+a 32- or 64-bit hash, and SHA-256 is why that outcome is not a case to handle. Equality is byte
+equality, the same as the deterministic collation the btree keys compared under.
+
+| Relation | Unique key (`<relation>_key`) | Hash index (`<relation>_<column>_hash`) |
+| --- | --- | --- |
+| `graph.person` | `text_key(name)` | `name` |
+| `graph.company` | `text_key(company_id)` | `company_id` |
+| `graph.credited_on` | `release_id, text_key(person_name), text_key(role)` | `person_name` |
+| `graph.same_as` | `artist_id, text_key(person_name)` | `person_name` |
+| `graph.track_credited_on` | `release_id, track_ordinal, sub_track_ordinal, text_key(person_name), text_key(role)` | `person_name` |
+| `graph.credited_to` | `release_id, text_key(company_id), role, source` | `company_id` |
+
+The natural keys are unchanged: the same rows are the same row and two rows that differed still
+do. A primary key cannot hold an expression, so these six relations have a unique index instead.
+Each unique index leads with the relation's fixed-size column, so it also serves that direction
+and the old `_reverse` index retires into it. The other direction is a hash index on the column
+itself, because consumers write `WHERE person_name = %s` and `ON same_as.person_name =
+credited_on.person_name`. A hash index stores a 32-bit hash per entry and answers those
+unchanged; a btree over `text_key` would serve only a query rewritten to hash its parameter.
+`credited_on_role_category` moves from `(role_category, person_name)` to
+`(role_category, release_id)` for the same reason. The trigram index on `graph.person.name` needs
+no change: `pg_trgm` stores three-byte trigrams, not the value.
+
+**Writers change nothing.** Every loader statement names its columns and uses a target-less
+`ON CONFLICT DO NOTHING`, which fires on any unique index, so `discogs-sql-loader`'s
+`VERTEX_COLUMNS` and `EDGE_COLUMNS` and its `_BOOTSTRAP_COLUMNS` mirror stay exact. An
+`ON CONFLICT (name)` with a target would no longer infer an index, and none exists.
+
+**A generated key column was the other candidate, and the measurement ruled it out.** Both were
+loaded with 4,965,111 credited rows and 661,775 Zipf-distributed names on PostgreSQL 18, against
+the old shape:
+
+| `graph.credited_on` shape | Heap | Indexes | Total | Load |
+| --- | --- | --- | --- | --- |
+| v0.6.0, btree primary key | 380 MB | 789 MB | 1169 MB | 137 s |
+| Stored generated `bytea` key columns | 696 MB | 1361 MB | 2057 MB | 255 s |
+| **Expression unique index, as shipped** | 380 MB | 929 MB | 1309 MB | 205 s |
+
+A stored column also has to be added by rewriting the table under `ACCESS EXCLUSIVE`, on a
+relation that reaches 147M rows across the two credit tables, to hold a value nothing reads.
+
+**The query plans keep their shape.** On the same data, against the v0.6.0 shape:
+
+| Query | v0.6.0 | Now |
+| --- | --- | --- |
+| Credits of one person (34 rows) | Index Only Scan, 25 buffers | Bitmap Heap Scan on the hash index, 44 buffers |
+| Credits on one release | Index Scan on `_reverse` | Index Scan on `_key` |
+| `same_as` by person | Index Only Scan | Index Scan on the hash index |
+| Person to artist credit join | Nested Loop over indexes | Nested Loop over indexes |
+| `analytics-engine` credited-artist edges | Seq Scan, Memoize, 6.8 s | Seq Scan, Memoize, 5.2 s |
+| Releases of a credit category | Seq Scan, 1.6 s | Seq Scan, 1.5 s |
+
+The one real cost is a person-led read of a person with tens of thousands of credits. The old
+indexes answered it without the heap; no index holds that pair now, so it reads the heap. A
+`count(*)` over the top name's 84,272 rows went from 18 ms to 382 ms cold. Nothing reads
+`graph.credited_on` that way today, since the person queries run on Neo4j. If they move here, add
+`(graph.text_key(person_name), release_id)` and have that query hash its parameter.
+
+#### What the audit found
+
+Every btree index in the schema with a text member was read from `pg_index` on a real engine.
+"Fixed" means the value may now be any length.
+
+| Column | Finding |
+| --- | --- |
+| `graph.person.name`; `person_name` and `role` on `graph.credited_on` and `graph.track_credited_on`; `graph.same_as.person_name` | **Fixed**, above. Free text with no bound. |
+| `graph.company.company_id`, `graph.credited_to.company_id` | **Fixed**, above. A numeric Discogs id, or `name:` plus the folded free-text name when the source has no id. |
+| `idx_artists_name`, `idx_labels_name`, `idx_masters_title`, `idx_releases_title`, `idx_mb_artists_name`, `idx_mb_labels_name` | **Fixed**: hash indexes now. The 2026-11-01 masters dump tops out at 352 bytes of title and 242 of artist name, which suggests a field limit, but that dump is one of four and the failing credit shows Discogs text can pass the limit. No query in the organisation orders or ranges on these, so the hash index keeps everything they serve. |
+| `graph.credited_to.role` | Safe: Discogs' `entity_type_name`, a closed list `common.company_role_vocabulary` maps. |
+| `genre`, `style`, and every `genre_name`, `style_name`, and `insights.*` genre or style column | Safe: Discogs' closed vocabularies. The same dump holds 16 genres of at most 26 bytes and 756 styles of at most 27. |
+| `graph.media_family.name`, `graph.medium.medium_id`, `graph.issued_on.medium_id` | Safe: rendered from the media taxonomy, a closed list. |
+| Every `*_id`, `graph.vertex_degree.key`, `data_id` | Safe: numeric ids, or the closed vocabularies above for a genre or style vertex. |
+| `role_category`, `source`, `relationship_type`, `kind`, `status` | Safe: closed vocabularies or literals this schema or its writers state. |
+| `idx_releases_country`, `idx_masters_year`, `idx_releases_year` | Safe: a closed country list and a date fragment. |
+| `public.provider_aliases.external_id` | **Not fixed, and not shown safe.** A matrix or runout inscription is free text and lands here on the release's own transaction. Not a credit or a name, and `common.identity` names this key in its `ON CONFLICT`, so moving it is a change coordinated with `python-libraries`. |
+| `musicbrainz.external_links.url` | **Not fixed, and not shown safe.** Not a credit or a name, and `musicbrainz-sql-loader` names this key in its `ON CONFLICT`. |
+| `Person.name` in Neo4j | Not this limit. The `person_name` constraint's RANGE index took 8,160 bytes and refused 12,000 on the integration image, against values Neo4j does not compress. |
+
+#### Upgrading an existing database
+
+Schema init does it: run the new image once with the loaders stopped. Stop the writers because
+`CREATE INDEX` takes a lock that blocks them and the key swap takes `ACCESS EXCLUSIVE`. The swap
+is one guarded transaction per relation, so it builds the new indexes, drops the primary key and
+its old indexes, and commits or leaves the old key whole. It keys on the primary key's presence,
+so a fresh database and a converged one skip it. The heap is not rewritten. The six name and
+title indexes are dropped and rebuilt as hash indexes by the same run.
+
+Every row already in the table satisfied the stricter old key, so a partly loaded database
+migrates without cleaning anything, and the loader resumes where it stopped: a batch refused by
+the old key rolled back whole and is still on the queue. On 2M `credited_on` rows the swap and
+the category index took 14 s at the default `maintenance_work_mem`, so expect minutes on a
+partial load and tens of minutes on the full 147M rows.
+
+Rolling back is a code rollback. The new shape serves the old loaders unchanged, so an older
+service image keeps working. An older schema init does not restore the primary keys, because
+`CREATE TABLE IF NOT EXISTS` skips an existing table, and it does recreate the btree `_reverse`
+indexes, which fails once a long value is stored. Pin schema init to this version or later once
+one is.
 
 ### The counter, degree, and aggregate relations
 

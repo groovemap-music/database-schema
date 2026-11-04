@@ -33,6 +33,7 @@ from groovemap_schema.postgres import (
     _MUSICBRAINZ_TABLES,
     _PIPELINE_ROLE_STATEMENTS,
     _RESET_MAINTENANCE_WORK_MEM,
+    _RETIRED_BTREE_INDEXES,
     _SPECIFIC_INDEXES,
     _USER_TABLES,
     _VECTOR_EXTENSION_INSTALLED_QUERY,
@@ -348,6 +349,7 @@ class TestCreatePostgresSchema:
         # + musicbrainz tables/indexes
         expected_calls = (
             len(_ENTITY_TABLES) * 5
+            + len(_RETIRED_BTREE_INDEXES)
             + len(_SPECIFIC_INDEXES)
             + len(_USER_TABLES)
             + len(_INSIGHTS_TABLES)
@@ -384,6 +386,7 @@ class TestCreatePostgresSchema:
 
         expected_calls = (
             len(_ENTITY_TABLES) * 5
+            + len(_RETIRED_BTREE_INDEXES)
             + len(_SPECIFIC_INDEXES)
             + len(_USER_TABLES)
             + len(_INSIGHTS_TABLES)
@@ -455,6 +458,7 @@ class TestCreatePostgresSchema:
 
         expected_calls = (
             len(_ENTITY_TABLES) * 5
+            + len(_RETIRED_BTREE_INDEXES)
             + len(_SPECIFIC_INDEXES)
             + len(_USER_TABLES)
             + len(_INSIGHTS_TABLES)

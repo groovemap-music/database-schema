@@ -9,6 +9,7 @@ from groovemap_schema import __version__
 from groovemap_schema.postgres import (
     _ACTIVITY_STATEMENTS,
     _BOOTSTRAP_FILL_ORDER,
+    _FREE_TEXT_KEYS,
     _GRAPH_STATEMENTS,
     _IDENTITY_LEDGER_STATEMENTS,
     _MUSICBRAINZ_TABLES,
@@ -459,6 +460,18 @@ assert evolution["forbidden"] == [
     "retyping a column",
 ]
 
+# A free-text key is declared in one place and recorded in the other, so a relation
+# moved onto the hash, or a key column dropped from it, has to be recorded.
+free_text_keys = graph["free_text_keys"]
+assert free_text_keys["kind"] == "additive"
+assert free_text_keys["availability"] == "unconditional"
+assert free_text_keys["function"] in graph["functions"]
+assert sorted(free_text_keys["relations"]) == sorted(_FREE_TEXT_KEYS)
+for relation, recorded in free_text_keys["relations"].items():
+    key, lookup, _stale = _FREE_TEXT_KEYS[relation]
+    assert recorded["key"] == [re.sub(r"graph\.text_key\((\w+)\)", r"\1", member.strip()) for member in key.split(",")], relation
+    assert recorded["lookup"] == lookup, relation
+
 # Every vertex key is a published column now, not an appended restatement. The
 # contract records the retirement; this is what proves it happened.
 keys = graph["key_columns"]
@@ -479,8 +492,11 @@ def table_columns(statement: str) -> dict[str, str]:
     return columns
 
 
-def table_key(statement: str, columns: dict[str, str]) -> list[str]:
-    """Return the primary-key columns of one `CREATE TABLE` body."""
+def table_key(relation: str, statement: str, columns: dict[str, str]) -> list[str]:
+    """Return the key columns of one `CREATE TABLE` body, or of its free-text unique index."""
+    free_text_key = _FREE_TEXT_KEYS.get(relation.removeprefix("graph."))
+    if free_text_key:
+        return [re.sub(r"graph\.text_key\((\w+)\)", r"\1", member.strip()) for member in free_text_key[0].split(",")]
     composite = re.search(r"PRIMARY KEY \(([^)]*)\)", statement)
     if composite:
         return [name.strip() for name in composite.group(1).split(",")]
@@ -492,7 +508,7 @@ def table_key(statement: str, columns: dict[str, str]) -> list[str]:
 derived_table_keys: dict[str, set[str]] = {}
 for relation, statement in table_statements.items():
     declared = table_columns(statement)
-    for column in table_key(statement, declared):
+    for column in table_key(relation, statement, declared):
         derived_table_keys.setdefault(declared[column], set()).add(f"{relation}.{column}")
 assert set(derived_table_keys) <= {"text", "bigint", '"char"'}, sorted(derived_table_keys)
 assert derived_table_keys["bigint"] == {name for name in key_types["bigint"] if "mb_rel_*" not in name}

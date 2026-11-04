@@ -38,17 +38,17 @@ _SPECIFIC_INDEXES: list[tuple[str, str]] = [
     # Artists
     (
         "idx_artists_name",
-        "CREATE INDEX IF NOT EXISTS idx_artists_name ON artists ((data->>'name'))",
+        "CREATE INDEX IF NOT EXISTS idx_artists_name ON artists USING hash ((data->>'name'))",
     ),
     # Labels
     (
         "idx_labels_name",
-        "CREATE INDEX IF NOT EXISTS idx_labels_name ON labels ((data->>'name'))",
+        "CREATE INDEX IF NOT EXISTS idx_labels_name ON labels USING hash ((data->>'name'))",
     ),
     # Masters
     (
         "idx_masters_title",
-        "CREATE INDEX IF NOT EXISTS idx_masters_title ON masters ((data->>'title'))",
+        "CREATE INDEX IF NOT EXISTS idx_masters_title ON masters USING hash ((data->>'title'))",
     ),
     (
         "idx_masters_year",
@@ -57,7 +57,7 @@ _SPECIFIC_INDEXES: list[tuple[str, str]] = [
     # Releases
     (
         "idx_releases_title",
-        "CREATE INDEX IF NOT EXISTS idx_releases_title ON releases ((data->>'title'))",
+        "CREATE INDEX IF NOT EXISTS idx_releases_title ON releases USING hash ((data->>'title'))",
     ),
     (
         "idx_releases_year",
@@ -2073,11 +2073,11 @@ _MUSICBRAINZ_INDEXES: list[tuple[str, str]] = [
     ),
     (
         "idx_mb_artists_name",
-        "CREATE INDEX IF NOT EXISTS idx_mb_artists_name ON musicbrainz.artists (name)",
+        "CREATE INDEX IF NOT EXISTS idx_mb_artists_name ON musicbrainz.artists USING hash (name)",
     ),
     (
         "idx_mb_labels_name",
-        "CREATE INDEX IF NOT EXISTS idx_mb_labels_name ON musicbrainz.labels (name)",
+        "CREATE INDEX IF NOT EXISTS idx_mb_labels_name ON musicbrainz.labels USING hash (name)",
     ),
     (
         "idx_mb_rels_source",
@@ -2768,6 +2768,36 @@ def _credit_role_category_function() -> str:
         """  # noqa: S608
 
 
+# A btree entry cannot exceed 2704 bytes after compression, and PostgreSQL refuses
+# the row rather than the index: a Discogs credit whose name compressed to 2888 bytes
+# stopped the first SQL load on `person_pkey` on 2026-11-04. The credit text is
+# free-form and Discogs bounds neither its name nor its role, so every key over
+# such a column hashes that column instead of storing it. SHA-256 rather than
+# `hashtextextended` or `md5`: a collision would make `ON CONFLICT DO NOTHING` drop
+# a real credit in silence, so the hash has to be one a collision is not a
+# possibility of, and 32 bytes is a fixed cost however long the name gets.
+#
+# `convert_to` is STABLE only because its source encoding is the database's, which
+# cannot change under a table; naming the destination encoding fixes the bytes the
+# hash reads, which is what lets this be IMMUTABLE and so usable in an index. The
+# equality this enforces is byte equality, the same as a deterministic collation's
+# and therefore the same as the btree keys it replaces: two names differing only in
+# Unicode normalization or case stay two rows, as `Person.name` does in Neo4j.
+def _text_key_function() -> str:
+    """Return the IMMUTABLE function turning a free-text value into a fixed-size key."""
+    return """
+        CREATE OR REPLACE FUNCTION graph.text_key(value text)
+        RETURNS bytea
+        LANGUAGE sql
+        IMMUTABLE
+        PARALLEL SAFE
+        RETURNS NULL ON NULL INPUT
+        AS $text_key$
+        SELECT pg_catalog.sha256(pg_catalog.convert_to(value, 'UTF8'))
+        $text_key$
+        """
+
+
 # The MusicBrainz relationship vocabulary, copied verbatim from
 # `musicbrainz-graph-enricher`'s `brainzgraphinator/_projections.py`. The two
 # stores disagree today and that disagreement is the gap this closes:
@@ -3283,6 +3313,108 @@ def _trigram_index(relation: str, column: str) -> tuple[str, str]:
     )
 
 
+# ── Keys over free text ──────────────────────────────────────────────────────
+# Six relations are keyed on text nothing bounds: the credit name and role, and the
+# `name:` company identity. Their natural keys are unchanged and every writer still
+# inserts the same columns under a target-less `ON CONFLICT DO NOTHING`, which fires on
+# any unique index. What moves is how the key is enforced, so that a value of any
+# length can be stored whole:
+#
+# - Uniqueness is a UNIQUE index whose free-text members are `graph.text_key(column)`.
+#   A primary key cannot hold an expression, so these six have none. A stored generated
+#   column would have kept one, at the price of a full rewrite of 147M credit rows to
+#   migrate and 33 bytes of heap per key column for ever, to hold a value nothing reads;
+#   docs/architecture.md, "Keys over free text", has the measurement.
+# - That index leads with the relation's fixed-size column, so it is also the walk from
+#   that end, and each relation's `<relation>_reverse` index retires into it.
+# - The walk from the free-text end is a hash index on the column itself, because a
+#   consumer's `WHERE person_name = %s` and `ON same_as.person_name = ...` name the
+#   column. A btree over the hash could only serve a query rewritten to hash its own
+#   parameter; this keeps every existing query, and its plan's shape, as it is.
+#
+# Each entry is the relation, its unique key, the column the hash index covers, and the
+# indexes of the old shape that named that column and so go with the primary key.
+_FREE_TEXT_KEYS: dict[str, tuple[str, str, tuple[str, ...]]] = {
+    "person": ("graph.text_key(name)", "name", ()),
+    "company": ("graph.text_key(company_id)", "company_id", ()),
+    "credited_on": (
+        "release_id, graph.text_key(person_name), graph.text_key(role)",
+        "person_name",
+        ("credited_on_reverse", "credited_on_role_category"),
+    ),
+    "same_as": ("artist_id, graph.text_key(person_name)", "person_name", ("same_as_reverse",)),
+    "track_credited_on": (
+        "release_id, track_ordinal, sub_track_ordinal, graph.text_key(person_name), graph.text_key(role)",
+        "person_name",
+        ("track_credited_on_reverse",),
+    ),
+    # `role` stays a plain member: it is Discogs' `entity_type_name`, a closed list.
+    "credited_to": ("release_id, graph.text_key(company_id), role, source", "company_id", ("credited_to_reverse",)),
+}
+
+# Moves one relation off its btree primary key. Everything it does is one transaction,
+# so an interrupted run leaves the old key whole, and the guard is the primary key
+# itself, so a converged database, a fresh one, and a relation that is not a table yet
+# all skip it. The new indexes are built before the old key goes: the relation is
+# never without a uniqueness rule, and `CREATE INDEX` here takes the lock that stops a
+# concurrent loader, which is why the upgrade is run with the loaders stopped
+# (docs/architecture.md, "Keys over free text").
+_FREE_TEXT_KEY_MIGRATION = """
+DO $rekey_{relation}$
+DECLARE
+    primary_key name;
+BEGIN
+    SELECT constraint_row.conname INTO primary_key
+    FROM pg_constraint AS constraint_row
+    WHERE constraint_row.conrelid = to_regclass('graph.{relation}')
+      AND constraint_row.contype = 'p';
+    IF FOUND THEN
+        {key_statement};
+        {lookup_statement};
+        ALTER TABLE graph.{relation} ALTER COLUMN {column} SET NOT NULL;
+        EXECUTE format('ALTER TABLE graph.{relation} DROP CONSTRAINT IF EXISTS %I', primary_key);{stale_drops}
+    END IF;
+END
+$rekey_{relation}$
+"""
+
+
+def _free_text_key_index(relation: str) -> str:
+    """Return the UNIQUE index enforcing one relation's natural key over its hash."""
+    return f"CREATE UNIQUE INDEX IF NOT EXISTS {relation}_key ON graph.{relation} ({_FREE_TEXT_KEYS[relation][0]})"
+
+
+def _free_text_lookup_index(relation: str) -> str:
+    """Return the hash index answering `=` on one relation's free-text column."""
+    column = _FREE_TEXT_KEYS[relation][1]
+    return f"CREATE INDEX IF NOT EXISTS {relation}_{column}_hash ON graph.{relation} USING hash ({column})"
+
+
+def _free_text_key_statements(relation: str) -> list[tuple[str, str]]:
+    """Return the two named indexes replacing one relation's primary key, if it has them."""
+    if relation not in _FREE_TEXT_KEYS:
+        return []
+    column = _FREE_TEXT_KEYS[relation][1]
+    return [
+        (f"graph.{relation}_key index", _free_text_key_index(relation)),
+        (f"graph.{relation}_{column}_hash index", _free_text_lookup_index(relation)),
+    ]
+
+
+def _free_text_key_migration(relation: str) -> tuple[str, str]:
+    """Return the guarded statement moving one existing relation off its primary key."""
+    _key, column, stale = _FREE_TEXT_KEYS[relation]
+    stale_drops = "".join(f"\n        DROP INDEX IF EXISTS graph.{index};" for index in stale)
+    statement = _FREE_TEXT_KEY_MIGRATION.format(
+        relation=relation,
+        column=column,
+        key_statement=_free_text_key_index(relation),
+        lookup_statement=_free_text_lookup_index(relation),
+        stale_drops=stale_drops,
+    )
+    return (f"graph.{relation} free-text key migration", statement.strip())
+
+
 # The six vertex relations that were `SELECT DISTINCT` over a full unnest of
 # every release and every master to yield a few hundred rows. Each keeps exactly
 # the columns its phase 0 view published, so the property graph's property lists
@@ -3295,8 +3427,11 @@ def _vertex_table_statements() -> list[tuple[str, str]]:
         _table("style", "name text PRIMARY KEY"),
         _trigram_index("style", "name"),
         # `:Person` is keyed on the verbatim credit name, exactly as Neo4j keys
-        # it. Folding it here would key the vertex differently from the node.
-        _table("person", "name text PRIMARY KEY"),
+        # it. Folding it here would key the vertex differently from the node, and
+        # truncating it would merge two people, so the name stays whole and the
+        # key is enforced over its hash; see `_FREE_TEXT_KEYS`.
+        _table("person", "name text NOT NULL"),
+        *_free_text_key_statements("person"),
         _trigram_index("person", "name"),
         _table("media_family", "name text PRIMARY KEY"),
         _table(
@@ -3315,15 +3450,17 @@ def _vertex_table_statements() -> list[tuple[str, str]]:
         # which disagrees on the German eszett and a handful of other characters.
         # `discogs-sql-loader` writes the rule's own answer, so the approximation
         # retires with the view rather than being carried forward as a generated
-        # column that would re-introduce it.
+        # column that would re-introduce it. That `name:` branch is why the key is
+        # free text and goes through `_FREE_TEXT_KEYS` as `:Person` does.
         _table(
             "company",
             """
-    company_id       text PRIMARY KEY,
+    company_id       text NOT NULL,
     name             text,
     discogs_label_id text
 """,
         ),
+        *_free_text_key_statements("company"),
     ]
 
 
@@ -3331,7 +3468,8 @@ def _vertex_table_statements() -> list[tuple[str, str]]:
 # its column block, the reverse index that makes the target-end walk cheap, and
 # any extra index the table lists. `part_of`, `in_family`, and `sublabel_of` are
 # absent on purpose and stay views; see `_discogs_edge_views` and `_credit_views`.
-_EDGE_TABLES: list[tuple[str, str, str, tuple[tuple[str, str], ...]]] = [
+# A relation with no reverse index here takes both directions from `_FREE_TEXT_KEYS`.
+_EDGE_TABLES: list[tuple[str, str, str | None, tuple[tuple[str, str], ...]]] = [
     (
         "by_artist",
         """
@@ -3447,20 +3585,18 @@ _EDGE_TABLES: list[tuple[str, str, str, tuple[tuple[str, str], ...]]] = [
     person_name   text NOT NULL,
     release_id    text NOT NULL,
     role          text NOT NULL,
-    role_category text GENERATED ALWAYS AS (graph.credit_role_category(role)) STORED,
-    PRIMARY KEY (person_name, release_id, role)
+    role_category text GENERATED ALWAYS AS (graph.credit_role_category(role)) STORED
 """,
-        "release_id, person_name",
-        (("role_category", "role_category, person_name"),),
+        None,
+        (("role_category", "role_category, release_id"),),
     ),
     (
         "same_as",
         """
     person_name text NOT NULL,
-    artist_id   text NOT NULL,
-    PRIMARY KEY (person_name, artist_id)
+    artist_id   text NOT NULL
 """,
-        "artist_id",
+        None,
         (),
     ),
     # Follow-up from gm-analytics-engine-ieu (maintainer decision 2026-09-25).
@@ -3512,12 +3648,13 @@ _EDGE_TABLES: list[tuple[str, str, str, tuple[tuple[str, str], ...]]] = [
     # `_xmltodict_array`'s docstring for the exact shape and the four cases it
     # handles.
     #
-    # **Indexes for the embedding pipeline's block reads.** The reverse index
-    # leads with `release_id` (then the two ordinals) rather than with the
-    # natural key's leading column, because the pipeline's dominant access
-    # pattern is a block read walking release by release — the same "indexed
-    # in both directions" rule every edge table here follows, applied to the
-    # direction this consumer actually reads. `track_credited_on` carries the
+    # **Indexes for the embedding pipeline's block reads.** The release-led
+    # direction leads with `release_id` (then the two ordinals), because the
+    # pipeline's dominant access pattern is a block read walking release by
+    # release — the same "indexed in both directions" rule every edge table here
+    # follows, applied to the direction this consumer actually reads; in
+    # `track_credited_on` that index is the unique key `_FREE_TEXT_KEYS` declares.
+    # `track_credited_on` carries the
     # same `role_category` fan-out index `credited_on` does, for the
     # categorized block reads the chw.2 spike calls for; `track_by_artist`
     # needs no equivalent, mirroring `by_artist`.
@@ -3530,10 +3667,9 @@ _EDGE_TABLES: list[tuple[str, str, str, tuple[tuple[str, str], ...]]] = [
     sub_track_ordinal bigint NOT NULL,
     track_position    text,
     role              text NOT NULL,
-    role_category     text GENERATED ALWAYS AS (graph.credit_role_category(role)) STORED,
-    PRIMARY KEY (person_name, release_id, track_ordinal, sub_track_ordinal, role)
+    role_category     text GENERATED ALWAYS AS (graph.credit_role_category(role)) STORED
 """,
-        "release_id, track_ordinal, sub_track_ordinal, person_name",
+        None,
         (("role_category", "role_category, release_id, track_ordinal, sub_track_ordinal"),),
     ),
     (
@@ -3558,10 +3694,9 @@ _EDGE_TABLES: list[tuple[str, str, str, tuple[tuple[str, str], ...]]] = [
     company_id    text NOT NULL,
     role          text NOT NULL,
     role_category text NOT NULL DEFAULT 'other',
-    source        text NOT NULL,
-    PRIMARY KEY (release_id, company_id, role, source)
+    source        text NOT NULL
 """,
-        "company_id, release_id",
+        None,
         (("source", "source"),),
     ),
     # `:Medium` and `:MediaFamily` are shared across catalogs and each provider
@@ -3589,7 +3724,9 @@ def _edge_table_statements() -> list[tuple[str, str]]:
     statements: list[tuple[str, str]] = []
     for relation, columns, reverse, extras in _EDGE_TABLES:
         statements.append(_table(relation, columns))
-        statements.append(_table_index(relation, "reverse", reverse))
+        statements.extend(_free_text_key_statements(relation))
+        if reverse is not None:
+            statements.append(_table_index(relation, "reverse", reverse))
         statements.extend(_table_index(relation, suffix, index_columns) for suffix, index_columns in extras)
     return statements
 
@@ -4016,6 +4153,7 @@ def _graph_relation_statements() -> list[tuple[str, str]]:
     """Return every loader-owned table, preceded by the migrations that free its name."""
     migrations = [_view_to_table_migration(relation) for relation in (*_MATERIALIZED_VERTICES, *_MATERIALIZED_EDGES)]
     migrations.extend(_key_retype_migration(relation, column) for relation, column in _TEXT_KEY_RETYPES)
+    migrations.extend(_free_text_key_migration(relation) for relation in _FREE_TEXT_KEYS)
     return [
         *migrations,
         *_vertex_table_statements(),
@@ -5300,7 +5438,8 @@ def _build_graph_statements() -> list[tuple[str, str]]:
 
     The order is load-bearing four times over. The rendered vocabulary
     functions precede everything, because `graph.credited_on` generates a column
-    with one of them and four views call the others. The tables precede the
+    with one of them and four views call the others, and `graph.text_key` precedes
+    the unique indexes that call it. The tables precede the
     views, because `part_of`, `in_family`, and `release_degree` now read tables
     rather than documents. Every migration that frees a name precedes the
     relation that takes it, which is what `_graph_relation_statements` returns. And
@@ -5317,6 +5456,7 @@ def _build_graph_statements() -> list[tuple[str, str]]:
         _PG_TRGM_STATEMENT,
         # The rendered vocabulary functions precede the relations that call them.
         ("graph.credit_role_category function", _credit_role_category_function()),
+        ("graph.text_key function", _text_key_function()),
         ("graph.medium_label function", _medium_label_function()),
         ("graph.mb_relationship_type function", _mb_relationship_type_function()),
         *_graph_relation_statements(),
@@ -5778,9 +5918,51 @@ def _entity_schema_statements() -> Iterator[tuple[str, Any]]:
         )
 
 
+# A btree entry cannot exceed 2704 bytes after compression, so a btree over a name or a
+# title refuses the whole document the first time an unbounded one arrives. These six
+# indexes exist for `=` and nothing reads them in order, so they are hash indexes now,
+# which store a 32-bit hash per entry whatever the value's length. `IF NOT EXISTS` alone
+# would keep the btree of the same name on a database that has one, so each is dropped
+# first, only while it is still something other than a hash index. The drop loses nothing
+# a reader could see: the index of that name comes back in the statement that follows.
+_RETIRED_BTREE_INDEXES: tuple[str, ...] = (
+    "public.idx_artists_name",
+    "public.idx_labels_name",
+    "public.idx_masters_title",
+    "public.idx_releases_title",
+    "musicbrainz.idx_mb_artists_name",
+    "musicbrainz.idx_mb_labels_name",
+)
+
+_RETIRE_BTREE_INDEX = """
+DO $retire_{tag}$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM pg_class AS relation
+        JOIN pg_am AS method ON method.oid = relation.relam
+        WHERE relation.oid = to_regclass('{index}')
+          AND method.amname <> 'hash'
+    ) THEN
+        DROP INDEX {index};
+    END IF;
+END
+$retire_{tag}$
+"""
+
+
+def _retired_btree_index_statements() -> list[tuple[str, str]]:
+    """Return the guarded drops that let a hash index take over a btree's name."""
+    return [
+        (f"{index} hash index migration", _RETIRE_BTREE_INDEX.format(tag=index.rsplit(".", 1)[-1], index=index).strip())
+        for index in _RETIRED_BTREE_INDEXES
+    ]
+
+
 def _schema_statements() -> Iterator[tuple[str, Any]]:
     """Yield the complete PostgreSQL schema in compatibility-sensitive order."""
     yield from _entity_schema_statements()
+    yield from _retired_btree_index_statements()
     yield from _SPECIFIC_INDEXES
     yield from _USER_TABLES
     yield from _INSIGHTS_TABLES

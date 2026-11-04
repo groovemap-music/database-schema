@@ -12,6 +12,7 @@ from groovemap_schema.postgres import (
     _COUNTER_BOOTSTRAP,
     _DERIVED_EDGE_BOOTSTRAP,
     _EDGE_TABLES,
+    _FREE_TEXT_KEYS,
     _GRAPH_STATEMENTS,
     _IDENTITY_LEDGER_STATEMENTS,
     _PATH_RELATIONS,
@@ -188,6 +189,7 @@ EXPECTED_FUNCTIONS = VOCABULARY_FUNCTIONS | {
     "refresh_vertex_degree",
     "find_shortest_path",
     "explore_traversal",
+    "text_key",
 }
 
 MUSICBRAINZ_PAIRS = [
@@ -332,6 +334,8 @@ class TestGraphSchemaStatement:
             if "DROP" not in statement.upper():
                 continue
             assert name.endswith(" migration"), f"{name} contains a DROP"
+            if name.endswith(" free-text key migration"):
+                continue  # `test_a_free_text_key_migration_...` holds these to their own guard.
             relation = name.removeprefix("graph.").rsplit(" ", 2)[0]
             assert f"DROP VIEW graph.{relation} CASCADE;" in statement, name
             assert ("IF EXISTS (" in statement and "relkind = 'v'" in statement) or "data_type <> 'text'" in statement, name
@@ -340,6 +344,7 @@ class TestGraphSchemaStatement:
         migrations = [name for name, _statement in _GRAPH_STATEMENTS if name.endswith(" migration")]
         expected = {f"graph.{relation} view-to-table migration" for relation in MATERIALIZED - NEVER_A_VIEW}
         expected |= {f"graph.{relation} key-type migration" for relation, _column in _TEXT_KEY_RETYPES}
+        expected |= {f"graph.{relation} free-text key migration" for relation in _FREE_TEXT_KEYS}
         assert set(migrations) == expected
         assert len(migrations) == len(expected)
 
@@ -362,7 +367,7 @@ class TestGraphSchemaStatement:
     def test_every_index_uses_if_not_exists(self) -> None:
         for name, statement in _GRAPH_STATEMENTS:
             if name.endswith(" index"):
-                assert "CREATE INDEX IF NOT EXISTS" in statement, name
+                assert "INDEX IF NOT EXISTS" in statement, name
 
     def test_the_tables_precede_the_views_that_read_them(self) -> None:
         names = [name for name, _statement in _GRAPH_STATEMENTS]
@@ -446,6 +451,10 @@ class TestVertexViews:
             if relation not in VERTEX_KEYS:
                 continue
             (key,) = VERTEX_KEYS[relation]
+            if relation in _FREE_TEXT_KEYS:
+                assert re.search(rf"^\s+{key}\s+text NOT NULL", ddl_for(relation), re.MULTILINE), relation
+                assert f"graph.text_key({key})" in _FREE_TEXT_KEYS[relation][0], relation
+                continue
             assert re.search(rf"^\s+{key}\s+text PRIMARY KEY", ddl_for(relation), re.MULTILINE), relation
 
     def test_every_counter_relation_carries_the_columns_table_3_lists(self) -> None:
@@ -508,7 +517,7 @@ class TestVertexViews:
         statement = ddl_for("company")
         assert "lower(" not in statement
         assert "regexp_replace" not in statement
-        assert "company_id       text PRIMARY KEY" in statement
+        assert "company_id       text NOT NULL" in statement
 
     def test_discogs_vertices_publish_their_key_as_text(self) -> None:
         """A `character varying` vertex key has no equality operator in PostgreSQL 19 beta 3."""
@@ -581,11 +590,22 @@ class TestEdgeViews:
         for relation, (keys, _source, _target) in EDGE_KEYS.items():
             if relation not in table_names():
                 continue
+            if relation in _FREE_TEXT_KEYS:
+                # A free-text key column is hashed; every natural key column is still in it.
+                for key in keys:
+                    assert key in _FREE_TEXT_KEYS[relation][0], (relation, key)
+                continue
             assert f"PRIMARY KEY ({', '.join(keys)})" in ddl_for(relation), relation
 
     def test_every_edge_table_indexes_the_reverse_pair(self) -> None:
         """A table indexed one way only is a sequential scan in the other."""
         for relation, _columns, reverse, _extras in _EDGE_TABLES:
+            if relation in _FREE_TEXT_KEYS:
+                assert reverse is None, relation
+                indexes = index_statements_for(relation)
+                assert any(statement.startswith(f"CREATE UNIQUE INDEX IF NOT EXISTS {relation}_key") for statement in indexes), relation
+                assert any(" USING hash (" in statement for statement in indexes), relation
+                continue
             assert f"CREATE INDEX IF NOT EXISTS {relation}_reverse ON graph.{relation} ({reverse})" in index_statements_for(relation), relation
 
     def test_every_edge_key_column_is_text(self) -> None:
@@ -612,14 +632,15 @@ class TestEdgeViews:
     def test_credited_on_generates_its_category_rather_than_trusting_the_writer(self) -> None:
         statement = ddl_for("credited_on")
         assert "role_category text GENERATED ALWAYS AS (graph.credit_role_category(role)) STORED" in statement
-        assert any(statement.endswith("(role_category, person_name)") for statement in index_statements_for("credited_on"))
+        assert any(statement.endswith("(role_category, release_id)") for statement in index_statements_for("credited_on"))
 
     def test_source_stays_in_the_key_of_both_provider_written_edges(self) -> None:
         """Two providers write the same edge and must not collide, as ADR 0011 has it."""
         for relation in ("credited_to", "issued_on"):
             statement = ddl_for(relation)
             assert "source        text NOT NULL" in statement or "source     text NOT NULL" in statement, relation
-            assert ", source)" in statement, relation
+            key = _FREE_TEXT_KEYS[relation][0] + ")" if relation in _FREE_TEXT_KEYS else statement
+            assert ", source)" in key, relation
             assert any(candidate.endswith("(source)") for candidate in index_statements_for(relation)), relation
 
     def test_reference_edges_skip_elements_without_a_usable_id(self) -> None:
@@ -656,6 +677,79 @@ class TestEdgeViews:
         assert "public.masters" in statement
 
 
+class TestFreeTextKeys:
+    """A key over text nothing bounds must not store that text in a btree."""
+
+    # Discogs states these as free text: the credit name and role, and a company's
+    # `name:` fallback identity. Every other text key is a numeric id or a closed
+    # vocabulary, which is what docs/architecture.md records for each.
+    FREE_TEXT_COLUMNS: ClassVar[dict[str, tuple[str, ...]]] = {
+        "person": ("name",),
+        "company": ("company_id",),
+        "credited_on": ("person_name", "role"),
+        "same_as": ("person_name",),
+        "track_credited_on": ("person_name", "role"),
+        "credited_to": ("company_id",),
+    }
+
+    def test_every_free_text_relation_is_keyed_through_the_hash(self) -> None:
+        assert set(_FREE_TEXT_KEYS) == set(self.FREE_TEXT_COLUMNS)
+        for relation, columns in self.FREE_TEXT_COLUMNS.items():
+            key, _lookup, _stale = _FREE_TEXT_KEYS[relation]
+            for column in columns:
+                assert f"graph.text_key({column})" in key, (relation, column)
+
+    def test_no_btree_over_a_free_text_relation_stores_the_raw_column(self) -> None:
+        for relation, columns in self.FREE_TEXT_COLUMNS.items():
+            assert "PRIMARY KEY" not in ddl_for(relation), relation
+            for statement in index_statements_for(relation):
+                if " USING hash (" in statement or "gin_trgm_ops" in statement:
+                    continue
+                definition = statement.split(f"ON graph.{relation} ", 1)[1].replace("graph.text_key(", "hashed(")
+                members = [member.strip() for member in definition.strip("()").split(",")]
+                for column in columns:
+                    assert column not in members, (relation, statement)
+
+    def test_every_free_text_column_keeps_its_equality_lookup(self) -> None:
+        """A consumer's `WHERE person_name = %s` names the column, so the column is indexed."""
+        for relation, (_key, column, _stale) in _FREE_TEXT_KEYS.items():
+            expected = f"CREATE INDEX IF NOT EXISTS {relation}_{column}_hash ON graph.{relation} USING hash ({column})"
+            assert expected in index_statements_for(relation), relation
+
+    def test_a_free_text_key_migration_is_atomic_and_guarded_on_the_primary_key(self) -> None:
+        for relation, (_key, column, stale) in _FREE_TEXT_KEYS.items():
+            statement = GRAPH_STATEMENTS[f"graph.{relation} free-text key migration"]
+            assert statement.startswith("DO $"), relation
+            assert "constraint_row.contype = 'p'" in statement, relation
+            built = statement.index(f"CREATE UNIQUE INDEX IF NOT EXISTS {relation}_key")
+            dropped = statement.index("DROP CONSTRAINT")
+            assert built < dropped, f"{relation} must never be without a uniqueness rule"
+            assert f"ALTER COLUMN {column} SET NOT NULL" in statement, relation
+            for index in stale:
+                assert f"DROP INDEX IF EXISTS graph.{index};" in statement, relation
+
+    def test_the_migrations_follow_the_function_their_indexes_call(self) -> None:
+        names = [name for name, _statement in _GRAPH_STATEMENTS]
+        function = names.index("graph.text_key function")
+        for relation in _FREE_TEXT_KEYS:
+            assert function < names.index(f"graph.{relation} free-text key migration"), relation
+            assert names.index(f"graph.{relation} free-text key migration") < names.index(f"graph.{relation} table"), relation
+
+    def test_text_key_is_a_fixed_size_immutable_hash_of_the_whole_value(self) -> None:
+        statement = GRAPH_STATEMENTS["graph.text_key function"]
+        assert "sha256" in statement
+        assert "convert_to(value, 'UTF8')" in statement
+        assert "IMMUTABLE" in statement
+        assert "PARALLEL SAFE" in statement
+        assert "RETURNS NULL ON NULL INPUT" in statement
+        assert "left(" not in statement and "substr" not in statement
+
+    def test_writers_still_supply_the_same_columns(self) -> None:
+        """No key adds a column, so a loader's INSERT and its mirror need no change."""
+        for relation in self.FREE_TEXT_COLUMNS:
+            assert "GENERATED ALWAYS AS (graph.text_key" not in ddl_for(relation), relation
+
+
 class TestTrackCredits:
     """gm-database-schema-ug3v: track-level credits and performers.
 
@@ -683,7 +777,7 @@ class TestTrackCredits:
             statement = ddl_for(relation)
             assert "track_ordinal     bigint NOT NULL" in statement
             assert "sub_track_ordinal bigint NOT NULL" in statement
-            key = statement.split("PRIMARY KEY")[1]
+            key = _FREE_TEXT_KEYS[relation][0] if relation in _FREE_TEXT_KEYS else statement.split("PRIMARY KEY")[1]
             assert "track_ordinal" in key and "sub_track_ordinal" in key
             assert "track_position" not in key
 
@@ -705,9 +799,9 @@ class TestTrackCredits:
     def test_reverse_indexes_lead_with_release_id_for_block_reads(self) -> None:
         """The pipeline walks release by release, unlike `credited_on`/`by_artist`'s own reverse."""
         assert (
-            "CREATE INDEX IF NOT EXISTS track_credited_on_reverse "
-            "ON graph.track_credited_on (release_id, track_ordinal, sub_track_ordinal, person_name)" in index_statements_for("track_credited_on")
-        )
+            "CREATE UNIQUE INDEX IF NOT EXISTS track_credited_on_key ON graph.track_credited_on "
+            "(release_id, track_ordinal, sub_track_ordinal, graph.text_key(person_name), graph.text_key(role))"
+        ) in index_statements_for("track_credited_on")
         assert (
             "CREATE INDEX IF NOT EXISTS track_by_artist_reverse "
             "ON graph.track_by_artist (artist_id, release_id, track_ordinal, sub_track_ordinal)" in index_statements_for("track_by_artist")
