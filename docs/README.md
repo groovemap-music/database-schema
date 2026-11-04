@@ -28,6 +28,9 @@
   - [Schema successor source and live compatibility](spikes/gm-database-schema-bvhb-schema-successor.md)
     — which source can produce a supported successor release, and whether it is compatible with
     the live stores.
+- [Audits](audits/) — dated measurements of the shipped schema.
+  - [Index, view and function audit, 2026-11-04](audits/2026-11-04-index-view-function-audit.md)
+    — every index with size, scans and verdict, the load-time savings, and the follow-up beads.
 - [Design decisions](design/) — dated decision records.
   - [MusicBrainz relational migration decision](design/gm-database-schema-dgmd-musicbrainz-relational-migration.md)
     and its [research receipt index](design/evidence/gm-database-schema-a704-schema-research-receipts.md).
