@@ -1305,9 +1305,75 @@ Every btree index in the schema with a text member was read from `pg_index` on a
 | Every `*_id`, `graph.vertex_degree.key`, `data_id` | Safe: numeric ids, or the closed vocabularies above for a genre or style vertex. |
 | `role_category`, `source`, `relationship_type`, `kind`, `status` | Safe: closed vocabularies or literals this schema or its writers state. |
 | `idx_releases_country`, `idx_masters_year`, `idx_releases_year` | Safe: a closed country list and a date fragment. |
-| `public.provider_aliases.external_id` | **Not fixed, and not shown safe.** A matrix or runout inscription is free text and lands here on the release's own transaction. Not a credit or a name, and `common.identity` names this key in its `ON CONFLICT`, so moving it is a change coordinated with `python-libraries`. |
-| `musicbrainz.external_links.url` | **Not fixed, and not shown safe.** Not a credit or a name, and `musicbrainz-sql-loader` names this key in its `ON CONFLICT`. |
+| `public.provider_aliases.external_id` | **Measured, and left a btree**: the longest real value is 758 bytes. See [the two keys that stay btrees](#the-two-keys-that-stay-btrees). |
+| `musicbrainz.external_links.url` | **Measured, and left a btree**: MusicBrainz's own unique index bounds it, and the largest real URL stores at 2,252 bytes. Same section. |
 | `Person.name` in Neo4j | Not this limit. The `person_name` constraint's RANGE index took 8,160 bytes and refused 12,000 on the integration image, against values Neo4j does not compress. |
+
+#### The two keys that stay btrees
+
+gm-database-schema-bmxc measured the two keys the audit left open, across every value in the public
+dumps, and left both as they are. Every real value fits its key, and moving them means a strict
+release order across three repositories for a value no dump contains. Neither key changed, so no
+writer changes and a database needs no upgrade.
+
+| Key | Source | Values | Largest real value | Largest the key accepts |
+| --- | --- | --- | --- | --- |
+| `external_id`, `matrix` | Discogs 2026-11-01, 19,575,942 releases | 14,654,067 | 758 bytes | 2,677 bytes |
+| `external_id`, `catalog_number` | same | 19,402,462 | 138 bytes | about 2,670 bytes |
+| `external_id`, `barcode` | same | 6,707,375 | 241 bytes | about 2,670 bytes |
+| `external_id`, MusicBrainz barcode and catalogue number | `VARCHAR(255)` upstream | not measured | 1,020 bytes at most, by schema | about 2,670 bytes |
+| `url` | MusicBrainz 20261104-002222, `url` table | 22,939,582 | 3,046 bytes raw, 2,252 stored | 2,621 bytes |
+
+Values are sized after the normalization `common.identifiers` applies. "Largest the key accepts" is
+incompressible text on PostgreSQL 18 through the writers' own statements, found by bisection: a
+`matrix` alias of kind `release`, and a `release-group` link with a 40-byte `service_name`. A longer
+provider or service name takes that many bytes off, which is the "about" above. The 500 longest URLs
+and the 433 matrix values of 200 bytes or more then went through the same statements into the real
+schema, and none was refused. The MusicBrainz table is a superset of what the loader sees, because
+it also holds URLs no entity links to.
+
+**`external_id` is a measurement, not a bound.** Only 10 of the 14.65M matrix values pass 512 bytes.
+Discogs does not cap the field: among the types that mint no alias, one value reaches 3,629 bytes,
+which is 19 once its padding collapses, and another holds 1,837 bytes of real text.
+The credit list that stopped the first load compressed from 4,159 characters to 2,888 bytes, so
+matrix text at that ratio needs about 3,900 characters to reach this key's limit, five times the
+longest in the catalogue.
+
+**`url` is bounded upstream, with a small gap.** MusicBrainz declares `CREATE UNIQUE INDEX
+url_idx_url ON url (url)`, the same btree limit, so a URL it holds fits a one-column key. That index
+refuses an incompressible 3,000-byte URL on PostgreSQL 18, which is why one cannot arrive here, and
+it is how the 3,046-byte URL exists: that one compresses to 2,252. This key is four columns wide, so
+it takes 2,621 incompressible bytes against the 2,692 the one-column index takes. Only a URL storing
+between those two sizes could be held upstream and refused here, and the largest of 22.9M stores 369
+bytes short of that.
+
+Reopen either key if an `index row size` error names `idx_provider_aliases_provider_entity_kind_external_id`
+or `external_links_mbid_entity_type_service_name_url_key`, if an `external_id` passes 2,000 bytes, or
+if a stored URL passes 2,500. These two read-only queries answer that:
+
+```sql
+SELECT provider, max(octet_length(external_id)) FROM provider_aliases GROUP BY provider;
+SELECT max(pg_column_size(url)) FROM musicbrainz.external_links;
+```
+
+Moving a key is not the swap above, because both are named by `ON CONFLICT` targets and a named
+target fails outright once its index is gone. Each of these was run against PostgreSQL 18:
+
+- **`provider_aliases`** has two such writers, `common.identity` and `catalog-api`'s `api/reattach.py`.
+  Both are `DO NOTHING`, so they can go target-less first, which works on either shape. Every
+  deployed writer must be moved before the schema step. That step adds a unique index on
+  `(provider, entity_kind, graph.text_key(external_id)) WHERE valid_to IS NULL` and a hash index on
+  `external_id`, and drops the old key. `catalog-api`'s `api/projection.py` pages with
+  `external_id > %s ORDER BY external_id`, which a hash index cannot serve, so it also needs
+  `(entity_kind, external_id) WHERE provider = 'discogs' AND valid_to IS NULL`, whose values are
+  numeric.
+- **`external_links`** cannot go target-less, because `DO UPDATE` requires a target. The order is
+  three steps: add the unique index over `graph.text_key(url)` beside the old key, move
+  `musicbrainz-sql-loader` to `ON CONFLICT (mbid, entity_type, service_name, graph.text_key(url))`,
+  then drop the old key.
+
+After either move, rolling back to an older writer needs the old index, which cannot be rebuilt once
+a long value is stored.
 
 #### Upgrading an existing database
 
