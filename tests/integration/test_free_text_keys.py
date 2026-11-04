@@ -4,6 +4,9 @@ PostgreSQL refuses a btree entry over 2704 bytes after compression, and a Discog
 past that limit stopped the first SQL load on `person_pkey` on 2026-11-04. Every test here writes
 through the statements the loaders run: named columns under a target-less `ON CONFLICT DO NOTHING`.
 Each one gets its own database, so the upgrade test can stand up the shape a deployed database has.
+
+The tests at the end cover the two keys that stay btrees, `provider_aliases.external_id` and
+`musicbrainz.external_links.url`. They hold the sizes docs/architecture.md measured to the engine.
 """
 
 from __future__ import annotations
@@ -51,6 +54,29 @@ LONG_NAME = incompressible(1)
 LONG_ROLE = "Featuring [" + incompressible(2) + "]"
 # A second person who differs from the first only past the limit, where a prefix key would stop.
 SHARED_PREFIX_NAME = LONG_NAME + incompressible(3, characters=4)
+
+# Sized from the dumps docs/architecture.md measured, as incompressible text so the engine has to
+# take them at full size: the longest matrix value is 758 bytes, and the longest real URL stores at
+# 2252. The service name is the 40 bytes docs/architecture.md measured the link key's room with.
+LARGEST_ALIAS = incompressible(4, characters=253)
+LARGEST_URL = "https://example.org/#" + incompressible(5, characters=744)
+LONG_SERVICE = "s" * 40
+# Past the limit raw and under it once compressed, the shape of the 3046-byte URL MusicBrainz holds.
+COMPRESSIBLE_URL = "https://example.org/#" + "beepbox" * 450
+TOO_LONG = incompressible(6, characters=1001)
+
+# The statements `common.identity` and `brainztableinator._persistence` run today.
+_WRITE_ALIAS = """
+INSERT INTO provider_aliases (provider, entity_kind, external_id, native_id, source, confidence)
+SELECT candidate.provider, candidate.entity_kind, candidate.external_id, candidate.native_id, 'catalog', 1.0
+FROM unnest(%s::text[], %s::text[], %s::text[], %s::uuid[]) AS candidate(provider, entity_kind, external_id, native_id)
+ON CONFLICT (provider, entity_kind, external_id) WHERE valid_to IS NULL DO NOTHING
+"""
+_WRITE_LINK = """
+INSERT INTO musicbrainz.external_links (mbid, entity_type, url, service_name)
+VALUES ('00000000-0000-0000-0000-000000000001', 'release-group', %s, %s)
+ON CONFLICT (mbid, entity_type, service_name, url) DO UPDATE SET url = EXCLUDED.url, updated_at = NOW()
+"""
 
 
 def _params(dbname: str) -> dict[str, Any]:
@@ -391,3 +417,55 @@ async def test_the_mirrored_neo4j_key_takes_the_same_long_name() -> None:
             await (await session.run("MATCH (person:Person {name: $name}) DELETE person", name=LONG_NAME)).consume()
     finally:
         await driver.close()
+
+
+async def _write_alias(dbname: str, external_id: str) -> None:
+    await _rows(dbname, _WRITE_ALIAS, (["matrix"], ["release"], [external_id], [uuid4()]))
+
+
+async def test_the_largest_measured_alias_is_stored_and_keyed_on_the_whole_value(database: str) -> None:
+    assert len(LARGEST_ALIAS.encode()) >= 758
+
+    for _ in range(2):
+        await _write_alias(database, LARGEST_ALIAS)
+    await _write_alias(database, LARGEST_ALIAS + "x")
+
+    stored = await _rows(database, "SELECT external_id FROM provider_aliases ORDER BY length(external_id)")
+    assert stored == [(LARGEST_ALIAS,), (LARGEST_ALIAS + "x",)]
+
+
+async def test_the_largest_measured_url_is_stored_and_keyed_on_the_whole_value(database: str) -> None:
+    assert len(LARGEST_URL.encode()) >= 2252
+
+    for _ in range(2):
+        await _rows(database, _WRITE_LINK, (LARGEST_URL, LONG_SERVICE))
+    await _rows(database, _WRITE_LINK, (LARGEST_URL + "x", LONG_SERVICE))
+
+    stored = await _rows(database, "SELECT url FROM musicbrainz.external_links ORDER BY length(url)")
+    assert stored == [(LARGEST_URL,), (LARGEST_URL + "x",)]
+
+
+async def test_a_url_past_the_limit_that_compresses_is_stored_whole(database: str) -> None:
+    assert len(COMPRESSIBLE_URL.encode()) > LIMIT_BYTES
+
+    await _rows(database, _WRITE_LINK, (COMPRESSIBLE_URL, LONG_SERVICE))
+
+    assert await _rows(database, "SELECT url FROM musicbrainz.external_links") == [(COMPRESSIBLE_URL,)]
+
+
+async def test_musicbrainz_cannot_hold_a_url_its_own_index_refuses(database: str) -> None:
+    """`url_idx_url` is why an incompressible 3000-byte URL never reaches the link key."""
+    assert len(TOO_LONG.encode()) > 3000
+    await _rows(database, "CREATE TABLE url (url TEXT NOT NULL)")
+    await _rows(database, "CREATE UNIQUE INDEX url_idx_url ON url (url)")
+
+    with pytest.raises(psycopg.errors.ProgramLimitExceeded):
+        await _rows(database, "INSERT INTO url (url) VALUES (%s)", (TOO_LONG,))
+
+
+async def test_the_measured_keys_still_refuse_a_value_past_the_limit(database: str) -> None:
+    """Pins the limit the measurement relies on: moving either key must revisit its section."""
+    with pytest.raises(psycopg.errors.ProgramLimitExceeded):
+        await _write_alias(database, TOO_LONG)
+    with pytest.raises(psycopg.errors.ProgramLimitExceeded):
+        await _rows(database, _WRITE_LINK, (TOO_LONG, LONG_SERVICE))
