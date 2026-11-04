@@ -929,9 +929,10 @@ directions**: the primary key serves the forward walk and a second index serves 
 because the ported Cypher enters these edges from the target end as often as from the source.
 A table indexed one way only reproduces the exact failure the views had. "Reverse index" is
 that second index; the primary key is the key column set in the column before it. The four
-edge relations keyed on free text have no primary key: the UNIQUE index that replaces it and the
-hash index beside it serve the two directions, as [Keys over free text](#keys-over-free-text)
-sets out.
+edge relations keyed on free text have no primary key. The UNIQUE index that replaces it serves
+the walk from the release or artist, a hash index serves `same_as` and `credited_to` from the
+other end, and the two credit relations have no second index, as
+[Keys over free text](#keys-over-free-text) sets out.
 
 | Neo4j relationship | Relation | Shape | Key columns | Reverse index | Source → target | Source |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -1240,22 +1241,35 @@ A collision would make `ON CONFLICT DO NOTHING` drop a real credit in silence, w
 a 32- or 64-bit hash, and SHA-256 is why that outcome is not a case to handle. Equality is byte
 equality, the same as the deterministic collation the btree keys compared under.
 
+**`graph.credit_key(person_name, role)` is `text_key` over the name's length, a colon, the name,
+and the role.** The two credit relations key on it, so a credit costs one hash rather than two.
+The length is what keeps `('ab', 'c')` and `('a', 'bc')` apart: without it the two would share a
+key, and `ON CONFLICT DO NOTHING` would drop the second in silence. The function is one
+expression, so the planner inlines it.
+
 | Relation | Unique key (`<relation>_key`) | Hash index (`<relation>_<column>_hash`) |
 | --- | --- | --- |
 | `graph.person` | `text_key(name)` | `name` |
 | `graph.company` | `text_key(company_id)` | `company_id` |
-| `graph.credited_on` | `release_id, text_key(person_name), text_key(role)` | `person_name` |
+| `graph.credited_on` | `release_id, credit_key(person_name, role)` | none |
 | `graph.same_as` | `artist_id, text_key(person_name)` | `person_name` |
-| `graph.track_credited_on` | `release_id, track_ordinal, sub_track_ordinal, text_key(person_name), text_key(role)` | `person_name` |
+| `graph.track_credited_on` | `release_id, track_ordinal, sub_track_ordinal, credit_key(person_name, role)` | none |
 | `graph.credited_to` | `release_id, text_key(company_id), role, source` | `company_id` |
 
 The natural keys are unchanged: the same rows are the same row and two rows that differed still
 do. A primary key cannot hold an expression, so these six relations have a unique index instead.
 Each unique index leads with the relation's fixed-size column, so it also serves that direction
-and the old `_reverse` index retires into it. The other direction is a hash index on the column
-itself, because consumers write `WHERE person_name = %s` and `ON same_as.person_name =
-credited_on.person_name`. A hash index stores a 32-bit hash per entry and answers those
-unchanged; a btree over `text_key` would serve only a query rewritten to hash its parameter.
+and the old `_reverse` index retires into it. Where a consumer walks the other direction, that is
+a hash index on the column itself, because `ON same_as.person_name = credited_on.person_name`
+names the column. A hash index stores a 32-bit hash per entry and answers that unchanged; a btree
+over `text_key` would serve only a query rewritten to hash its parameter.
+
+The two credit relations have no such index, because no repository reads them by person. It would
+cost more than a wasted write: a hash insert walks the bucket's overflow chain, so one value
+repeated a million times cost 906 µs an insert against a btree's 6.7 µs, and `Traditional` heads
+for about 386,000 track credits. `same_as` keeps its index, because the embedding pipeline's join
+reads it.
+
 `credited_on_role_category` moves from `(role_category, person_name)` to
 `(role_category, release_id)` for the same reason. The trigram index on `graph.person.name` needs
 no change: `pg_trgm` stores three-byte trigrams, not the value.
@@ -1278,22 +1292,36 @@ the old shape:
 A stored column also has to be added by rewriting the table under `ACCESS EXCLUSIVE`, on a
 relation that reaches 147M rows across the two credit tables, to hold a value nothing reads.
 
+**One hash and no person index cut the credit relations by about a third.** v0.6.3 against v0.6.2,
+per million rows on PostgreSQL 18, five interleaved pairs on each relation, on a laptop other
+containers were using:
+
+| Relation | Key | All indexes | WAL | Load, median | Paired gain |
+| --- | --- | --- | --- | --- | --- |
+| `credited_on`, v0.6.2 | 168 MB | 256 MB | 609 MB | 47.4 s | |
+| `credited_on`, v0.6.3 | 93 MB | 146 MB | 412 MB | 35.7 s | 7.8 s, faster in 4 of 5 |
+| `track_credited_on`, v0.6.2 | 194 MB | 315 MB | 674 MB | 46.9 s | |
+| `track_credited_on`, v0.6.3 | 140 MB | 227 MB | 489 MB | 34.7 s | 9.6 s, faster in 5 of 5 |
+
+At 51.0M and 96.5M rows that takes all the indexes on the two relations from 42.4 GB to 28.7 GB,
+and removes about 27 GB of WAL from a full load. The keys and person indexes alone go from 31.5 GB
+to 17.8 GB, or 10.5 GB once rebuilt, because a key built over loaded rows is packed: 56 MB and
+82 MB per million rows. Index sizes and WAL were the same on every run.
+
 **The query plans keep their shape.** On the same data, against the v0.6.0 shape:
 
 | Query | v0.6.0 | Now |
 | --- | --- | --- |
-| Credits of one person (34 rows) | Index Only Scan, 25 buffers | Bitmap Heap Scan on the hash index, 44 buffers |
+| Credits of one person | Index Only Scan | Seq Scan: no index leads with the person |
 | Credits on one release | Index Scan on `_reverse` | Index Scan on `_key` |
 | `same_as` by person | Index Only Scan | Index Scan on the hash index |
 | Person to artist credit join | Nested Loop over indexes | Nested Loop over indexes |
 | `analytics-engine` credited-artist edges | Seq Scan, Memoize, 6.8 s | Seq Scan, Memoize, 5.2 s |
 | Releases of a credit category | Seq Scan, 1.6 s | Seq Scan, 1.5 s |
 
-The one real cost is a person-led read of a person with tens of thousands of credits. The old
-indexes answered it without the heap; no index holds that pair now, so it reads the heap. A
-`count(*)` over the top name's 84,272 rows went from 18 ms to 382 ms cold. Nothing reads
-`graph.credited_on` that way today, since the person queries run on Neo4j. If they move here, add
-`(graph.text_key(person_name), release_id)` and have that query hash its parameter.
+The one real cost is a person-led read of a credit relation, which is now a sequential scan.
+Nothing reads `graph.credited_on` that way today, since the person queries run on Neo4j. If they
+move here, add `(graph.text_key(person_name), release_id)` and have that query hash its parameter.
 
 #### What the audit found
 
@@ -1390,6 +1418,16 @@ its old indexes, and commits or leaves the old key whole. It keys on the primary
 so a fresh database and a converged one skip it. The heap is not rewritten. The six name and
 title indexes are dropped and rebuilt as hash indexes by the same run.
 
+A database on v0.6.0 takes that swap straight to the one-hash credit keys. A database that already
+has the two-hash keys, which is v0.6.1 or v0.6.2, needs a second step, because `CREATE UNIQUE INDEX
+IF NOT EXISTS` keeps an index of the same name whatever it holds. One guarded transaction per credit
+relation builds the new key, drops the old one, renames the new one into place, and drops the
+person hash index. It keys on the old key's definition, so any other database skips it, and an
+interrupted run leaves the old key whole for the next run to finish. On 1M rows it took 1.6 s on
+`credited_on` and 1.8 s on `track_credited_on`, which suggests about 4 minutes at 147M rows; allow
+longer once a build outgrows memory. Every pair unique under two hashes is unique under one, so no
+row needs cleaning.
+
 Every row already in the table satisfied the stricter old key, so a partly loaded database
 migrates without cleaning anything, and the loader resumes where it stopped: a batch refused by
 the old key rolled back whole and is still on the queue. On 2M `credited_on` rows the swap and
@@ -1401,6 +1439,9 @@ service image keeps working. An older schema init does not restore the primary k
 `CREATE TABLE IF NOT EXISTS` skips an existing table, and it does recreate the btree `_reverse`
 indexes, which fails once a long value is stored. Pin schema init to this version or later once
 one is.
+
+A schema init from v0.6.1 or v0.6.2 run against the one-hash keys is harmless: `IF NOT EXISTS`
+keeps the key, and it recreates the two person hash indexes, which the next v0.6.3 run drops.
 
 ### The counter, degree, and aggregate relations
 

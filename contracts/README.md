@@ -43,11 +43,11 @@ relation: a track-level credit's artist id resolves through the same `(person_na
 artist_id)` key a release-level one does, so the loader's extended population of `same_as`
 needed no contract change of its own.
 
-`graph.text_key` is the one function that is neither of these: `graph_schema.free_text_keys`
-records it and the six relations keyed on text nothing bounds. Their key columns are unchanged
-and so is every statement a writer runs, but a UNIQUE index over `graph.text_key` enforces the key
-in place of a primary key, so a writer can use only the target-less `ON CONFLICT DO NOTHING` the
-loaders already use. Consumers need no change; the vendored copy of this file is refreshed as
+`graph.text_key` and `graph.credit_key` are neither of these: `graph_schema.free_text_keys`
+records them and the six relations keyed on text nothing bounds. Their key columns are unchanged
+and so is every statement a writer runs, but a UNIQUE index over `graph.text_key` or
+`graph.credit_key` enforces the key in place of a primary key, so a writer can use only the
+target-less `ON CONFLICT DO NOTHING` the loaders already use. Consumers need no change; the vendored copy of this file is refreshed as
 usual.
 
 The remaining four functions are the two loader-owned refreshes and the two procedural read

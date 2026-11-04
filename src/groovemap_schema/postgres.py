@@ -2814,6 +2814,26 @@ def _text_key_function() -> str:
         """
 
 
+# Two hashes per credit row cost 66 bytes of key to say what one says in 33, so the two
+# credit relations key on one hash over both values. Concatenating them alone would make
+# `('ab', 'c')` and `('a', 'bc')` the same credit, and a shared key drops the second in
+# silence, so the name's length goes first: the text up to the first `:` says where the
+# name ends. The body is one expression, so it inlines into the caller.
+def _credit_key_function() -> str:
+    """Return the IMMUTABLE function keying one credit on a single fixed-size hash."""
+    return """
+        CREATE OR REPLACE FUNCTION graph.credit_key(person_name text, role text)
+        RETURNS bytea
+        LANGUAGE sql
+        IMMUTABLE
+        PARALLEL SAFE
+        RETURNS NULL ON NULL INPUT
+        AS $credit_key$
+        SELECT graph.text_key(pg_catalog.length(person_name)::text || ':' || person_name || role)
+        $credit_key$
+        """
+
+
 # The MusicBrainz relationship vocabulary, copied verbatim from
 # `musicbrainz-graph-enricher`'s `brainzgraphinator/_projections.py`. The two
 # stores disagree today and that disagreement is the gap this closes:
@@ -3336,32 +3356,37 @@ def _trigram_index(relation: str, column: str) -> tuple[str, str]:
 # any unique index. What moves is how the key is enforced, so that a value of any
 # length can be stored whole:
 #
-# - Uniqueness is a UNIQUE index whose free-text members are `graph.text_key(column)`.
-#   A primary key cannot hold an expression, so these six have none. A stored generated
+# - Uniqueness is a UNIQUE index whose free-text members are `graph.text_key(column)`, or
+#   one `graph.credit_key(person_name, role)` for the two credit relations, which pay for
+#   that key on every one of 147M rows. A primary key cannot hold an expression, so these
+#   six have none. A stored generated
 #   column would have kept one, at the price of a full rewrite of 147M credit rows to
 #   migrate and 33 bytes of heap per key column for ever, to hold a value nothing reads;
 #   docs/architecture.md, "Keys over free text", has the measurement.
 # - That index leads with the relation's fixed-size column, so it is also the walk from
 #   that end, and each relation's `<relation>_reverse` index retires into it.
-# - The walk from the free-text end is a hash index on the column itself, because a
-#   consumer's `WHERE person_name = %s` and `ON same_as.person_name = ...` name the
-#   column. A btree over the hash could only serve a query rewritten to hash its own
-#   parameter; this keeps every existing query, and its plan's shape, as it is.
+# - The walk from the free-text end, where a consumer takes it, is a hash index on the
+#   column itself, because `ON same_as.person_name = ...` names the column. A btree over
+#   the hash could only serve a query rewritten to hash its own parameter. The two credit
+#   relations have no such index: no consumer reads them by person, and a hash insert
+#   walks the bucket's overflow chain, so one repeated name costs 906 us an insert at a
+#   million rows against a btree's 6.7. docs/audits/2026-11-04-index-view-function-audit.md
+#   has the measurement.
 #
-# Each entry is the relation, its unique key, the column the hash index covers, and the
-# indexes of the old shape that named that column and so go with the primary key.
-_FREE_TEXT_KEYS: dict[str, tuple[str, str, tuple[str, ...]]] = {
+# Each entry is the relation, its unique key, the column the hash index covers, if any, and
+# the indexes of the old shape that named that column and so go with the primary key.
+_FREE_TEXT_KEYS: dict[str, tuple[str, str | None, tuple[str, ...]]] = {
     "person": ("graph.text_key(name)", "name", ()),
     "company": ("graph.text_key(company_id)", "company_id", ()),
     "credited_on": (
-        "release_id, graph.text_key(person_name), graph.text_key(role)",
-        "person_name",
+        "release_id, graph.credit_key(person_name, role)",
+        None,
         ("credited_on_reverse", "credited_on_role_category"),
     ),
     "same_as": ("artist_id, graph.text_key(person_name)", "person_name", ("same_as_reverse",)),
     "track_credited_on": (
-        "release_id, track_ordinal, sub_track_ordinal, graph.text_key(person_name), graph.text_key(role)",
-        "person_name",
+        "release_id, track_ordinal, sub_track_ordinal, graph.credit_key(person_name, role)",
+        None,
         ("track_credited_on_reverse",),
     ),
     # `role` stays a plain member: it is Discogs' `entity_type_name`, a closed list.
@@ -3385,14 +3410,35 @@ BEGIN
     WHERE constraint_row.conrelid = to_regclass('graph.{relation}')
       AND constraint_row.contype = 'p';
     IF FOUND THEN
-        {key_statement};
-        {lookup_statement};
-        ALTER TABLE graph.{relation} ALTER COLUMN {column} SET NOT NULL;
+        {key_statement};{lookup_statements}
         EXECUTE format('ALTER TABLE graph.{relation} DROP CONSTRAINT IF EXISTS %I', primary_key);{stale_drops}
     END IF;
 END
 $rekey_{relation}$
 """
+
+# Moves a credit relation already keyed on two hashes, which is what v0.6.1 and v0.6.2 built,
+# onto the one. `CREATE UNIQUE INDEX IF NOT EXISTS` above keeps an index of the same name
+# whatever it holds, so the old key has to be replaced by name. The guard reads the key
+# itself, so a fresh database, one the primary-key migration just moved, and a converged one
+# all skip it. One transaction, new index before the old one goes, so an interrupted run
+# leaves the old key whole; every pair unique under two hashes is unique under one. The hash
+# index is dropped outside the guard, because nothing else ever will.
+_TWO_HASH_KEY_MIGRATION = """
+DO $combine_{relation}$
+BEGIN
+    IF pg_get_indexdef(to_regclass('graph.{relation}_key')) LIKE '%text_key(role)%' THEN
+        CREATE UNIQUE INDEX {relation}_key_combined ON graph.{relation} ({key});
+        DROP INDEX graph.{relation}_key;
+        ALTER INDEX graph.{relation}_key_combined RENAME TO {relation}_key;
+    END IF;
+    DROP INDEX IF EXISTS graph.{relation}_person_name_hash;
+END
+$combine_{relation}$
+"""
+
+# The relations keyed through `graph.credit_key`.
+_COMBINED_KEY_RELATIONS: tuple[str, ...] = tuple(relation for relation, entry in _FREE_TEXT_KEYS.items() if "graph.credit_key(" in entry[0])
 
 
 def _free_text_key_index(relation: str) -> str:
@@ -3403,32 +3449,46 @@ def _free_text_key_index(relation: str) -> str:
 def _free_text_lookup_index(relation: str) -> str:
     """Return the hash index answering `=` on one relation's free-text column."""
     column = _FREE_TEXT_KEYS[relation][1]
+    if column is None:
+        raise ValueError(f"graph.{relation} has no lookup index")
     return f"CREATE INDEX IF NOT EXISTS {relation}_{column}_hash ON graph.{relation} USING hash ({column})"
 
 
 def _free_text_key_statements(relation: str) -> list[tuple[str, str]]:
-    """Return the two named indexes replacing one relation's primary key, if it has them."""
+    """Return the named indexes replacing one relation's primary key, if it has them."""
     if relation not in _FREE_TEXT_KEYS:
         return []
     column = _FREE_TEXT_KEYS[relation][1]
-    return [
-        (f"graph.{relation}_key index", _free_text_key_index(relation)),
-        (f"graph.{relation}_{column}_hash index", _free_text_lookup_index(relation)),
-    ]
+    statements = [(f"graph.{relation}_key index", _free_text_key_index(relation))]
+    if column is not None:
+        statements.append((f"graph.{relation}_{column}_hash index", _free_text_lookup_index(relation)))
+    return statements
 
 
 def _free_text_key_migration(relation: str) -> tuple[str, str]:
     """Return the guarded statement moving one existing relation off its primary key."""
     _key, column, stale = _FREE_TEXT_KEYS[relation]
     stale_drops = "".join(f"\n        DROP INDEX IF EXISTS graph.{index};" for index in stale)
+    # A column that gave up its only NOT NULL with the primary key gets it back here. A
+    # relation with no lookup declares both of its free-text columns NOT NULL itself.
+    lookup_statements = ""
+    if column is not None:
+        lookup_statements = (
+            f"\n        {_free_text_lookup_index(relation)};\n        ALTER TABLE graph.{relation} ALTER COLUMN {column} SET NOT NULL;"
+        )
     statement = _FREE_TEXT_KEY_MIGRATION.format(
         relation=relation,
-        column=column,
         key_statement=_free_text_key_index(relation),
-        lookup_statement=_free_text_lookup_index(relation),
+        lookup_statements=lookup_statements,
         stale_drops=stale_drops,
     )
     return (f"graph.{relation} free-text key migration", statement.strip())
+
+
+def _two_hash_key_migration(relation: str) -> tuple[str, str]:
+    """Return the guarded statement moving one credit relation off its two-hash key."""
+    statement = _TWO_HASH_KEY_MIGRATION.format(relation=relation, key=_FREE_TEXT_KEYS[relation][0])
+    return (f"graph.{relation} two-hash key migration", statement.strip())
 
 
 # The six vertex relations that were `SELECT DISTINCT` over a full unnest of
@@ -4170,6 +4230,7 @@ def _graph_relation_statements() -> list[tuple[str, str]]:
     migrations = [_view_to_table_migration(relation) for relation in (*_MATERIALIZED_VERTICES, *_MATERIALIZED_EDGES)]
     migrations.extend(_key_retype_migration(relation, column) for relation, column in _TEXT_KEY_RETYPES)
     migrations.extend(_free_text_key_migration(relation) for relation in _FREE_TEXT_KEYS)
+    migrations.extend(_two_hash_key_migration(relation) for relation in _COMBINED_KEY_RELATIONS)
     return [
         *migrations,
         *_vertex_table_statements(),
@@ -5454,8 +5515,8 @@ def _build_graph_statements() -> list[tuple[str, str]]:
 
     The order is load-bearing four times over. The rendered vocabulary
     functions precede everything, because `graph.credited_on` generates a column
-    with one of them and four views call the others, and `graph.text_key` precedes
-    the unique indexes that call it. The tables precede the
+    with one of them and four views call the others, and `graph.text_key` and
+    `graph.credit_key` precede the unique indexes that call them. The tables precede the
     views, because `part_of`, `in_family`, and `release_degree` now read tables
     rather than documents. Every migration that frees a name precedes the
     relation that takes it, which is what `_graph_relation_statements` returns. And
@@ -5473,6 +5534,7 @@ def _build_graph_statements() -> list[tuple[str, str]]:
         # The rendered vocabulary functions precede the relations that call them.
         ("graph.credit_role_category function", _credit_role_category_function()),
         ("graph.text_key function", _text_key_function()),
+        ("graph.credit_key function", _credit_key_function()),
         ("graph.medium_label function", _medium_label_function()),
         ("graph.mb_relationship_type function", _mb_relationship_type_function()),
         *_graph_relation_statements(),
