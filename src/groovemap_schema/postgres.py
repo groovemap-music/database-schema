@@ -2743,29 +2743,45 @@ def _role_category_branches() -> list[tuple[str, str]]:
     return sorted(fragments.items(), key=lambda pair: (-len(pair[0]), pair[0]))
 
 
+# PL/pgSQL rather than SQL, because this function backs a STORED generated column
+# and so runs once per credit row on every insert. A LANGUAGE sql function with a
+# FROM clause is never inlined, and each call then re-enters the SQL-function
+# executor to evaluate the CASE: measured at 154 us per call against 2.3 us here,
+# 67x, on a per-row input mix (a constant argument folds at plan time and measures
+# nothing). PL/pgSQL plans the CASE once per session and normalizes the role once
+# per call. `CREATE OR REPLACE` may change the language of a function a generated
+# column already uses, and does not recompute or rewrite the stored rows.
+#
+# `SET search_path` pins `btrim`, `lower`, `strpos` and the comparison operators to
+# pg_catalog, so a caller's search_path cannot change what a role resolves to;
+# pg_temp is listed last so a temporary object cannot shadow them.
 def _credit_role_category_function() -> str:
     """Return the IMMUTABLE function rendering the shared credit-role taxonomy."""
     branches = _role_category_branches()
-    exact = "\n".join(f"        WHEN normalized.role = {_sql_literal(fragment)} THEN {_sql_literal(category)}" for fragment, category in branches)
+    exact = "\n".join(f"        WHEN normalized_role = {_sql_literal(fragment)} THEN {_sql_literal(category)}" for fragment, category in branches)
     contained = "\n".join(
-        f"        WHEN strpos(normalized.role, {_sql_literal(fragment)}) > 0 THEN {_sql_literal(category)}" for fragment, category in branches
+        f"        WHEN strpos(normalized_role, {_sql_literal(fragment)}) > 0 THEN {_sql_literal(category)}" for fragment, category in branches
     )
     return f"""
         CREATE OR REPLACE FUNCTION graph.credit_role_category(raw_role text)
         RETURNS text
-        LANGUAGE sql
+        LANGUAGE plpgsql
         IMMUTABLE
         PARALLEL SAFE
         RETURNS NULL ON NULL INPUT
+        SET search_path = pg_catalog, pg_temp
         AS $credit_role_category$
-        SELECT CASE
+        DECLARE
+            normalized_role text := btrim(lower(raw_role));
+        BEGIN
+            RETURN CASE
 {exact}
 {contained}
-            ELSE 'other'
+                ELSE 'other'
+            END;
         END
-        FROM (SELECT btrim(lower(raw_role)) AS role) AS normalized
         $credit_role_category$
-        """  # noqa: S608
+        """
 
 
 # A btree entry cannot exceed 2704 bytes after compression, and PostgreSQL refuses

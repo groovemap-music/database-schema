@@ -18,6 +18,7 @@ from uuid import uuid4
 import psycopg
 import pytest
 import pytest_asyncio
+from common.credit_roles import categorize_role
 from neo4j import AsyncGraphDatabase
 from psycopg import sql
 from psycopg.types.json import Jsonb
@@ -379,6 +380,50 @@ async def test_an_existing_database_upgrades_in_place_and_converges(database: st
     await _apply_schema(database)
     assert await _key_shape(database) == fresh
     assert await _rows(database, "SELECT count(*) FROM graph.credited_on") == [(2,)]
+
+
+_LEGACY_ROLE_CATEGORY = """
+CREATE OR REPLACE FUNCTION graph.credit_role_category(raw_role text)
+RETURNS text LANGUAGE sql IMMUTABLE PARALLEL SAFE RETURNS NULL ON NULL INPUT
+AS $f$ SELECT CASE WHEN normalized.role = 'producer' THEN 'legacy-stale' ELSE 'other' END
+FROM (SELECT btrim(lower(raw_role)) AS role) AS normalized $f$
+"""
+
+
+async def test_the_role_category_function_upgrades_under_a_generated_column(database: str) -> None:
+    """Replacing the SQL function with PL/pgSQL neither rewrites nor recomputes stored rows."""
+    language = (
+        "SELECT (SELECT lanname FROM pg_language WHERE oid = prolang) FROM pg_proc WHERE oid = 'graph.credit_role_category(text)'::regprocedure"
+    )
+    definition = "SELECT pg_get_functiondef('graph.credit_role_category(text)'::regprocedure)"
+
+    # A deployed database: the SQL-language function, and rows its column already stored.
+    await _rows(database, _LEGACY_ROLE_CATEGORY)
+    assert await _rows(database, language) == [("sql",)]
+    await _write_credit(database, "Alice", "Producer")
+    stored = "SELECT xmin::text, ctid::text, role_category FROM graph.credited_on UNION ALL SELECT xmin::text, ctid::text, role_category FROM graph.track_credited_on ORDER BY 1"
+    before = await _rows(database, stored)
+    assert {row[2] for row in before} == {"legacy-stale"}
+    heap_files = await _rows(database, "SELECT pg_relation_filenode('graph.credited_on'), pg_relation_filenode('graph.track_credited_on')")
+
+    await _apply_schema(database)
+
+    # The function is the PL/pgSQL one, and the rows are the very tuples that were there.
+    assert await _rows(database, language) == [("plpgsql",)]
+    assert await _rows(database, stored) == before
+    assert await _rows(database, "SELECT pg_relation_filenode('graph.credited_on'), pg_relation_filenode('graph.track_credited_on')") == heap_files
+
+    # A new row takes the new function's answer, so the column is still live.
+    await _write_credit(database, "Bob", "Recorded By, Mastering Engineer", release_id="222")
+    assert await _rows(database, "SELECT role_category FROM graph.credited_on WHERE person_name = 'Bob'") == [
+        (categorize_role("Recorded By, Mastering Engineer"),)
+    ]
+
+    # A second apply is a no-op.
+    installed = await _rows(database, definition)
+    await _apply_schema(database)
+    assert await _rows(database, definition) == installed
+    assert await _rows(database, "SELECT pg_relation_filenode('graph.credited_on'), pg_relation_filenode('graph.track_credited_on')") == heap_files
 
 
 async def test_an_interrupted_upgrade_leaves_the_old_key_whole(database: str) -> None:
