@@ -6407,7 +6407,7 @@ BEGIN
     INSERT INTO public.identity_ledger_work_summary (work_id, event, evented_editions, repaired_editions, first_event, last_event)
     {summary};
 
-    DROP TABLE pg_temp.ledger_density, pg_temp.ledger_editions, pg_temp.ledger_members, pg_temp.ledger_masters,
+    DROP TABLE IF EXISTS pg_temp.ledger_density, pg_temp.ledger_editions, pg_temp.ledger_members, pg_temp.ledger_masters,
                pg_temp.ledger_parent_editions, pg_temp.ledger_works;
 END
 $identity_ledger_maintain$
@@ -6513,7 +6513,7 @@ BEGIN
     ELSIF dirty_items > 0 OR EXISTS (SELECT 1 FROM public.identity_ledger_density_changes) THEN
         PERFORM public.identity_ledger_maintain();
     END IF;
-    DROP TABLE pg_temp.ledger_changed, pg_temp.ledger_items;
+    DROP TABLE IF EXISTS pg_temp.ledger_changed, pg_temp.ledger_items;
 
     INSERT INTO public.identity_ledger_refresh_state (singleton, refreshed_at, duration, source_watermark)
     VALUES (true, started, clock_timestamp() - started, identity_ledger_refresh.source_watermark)
