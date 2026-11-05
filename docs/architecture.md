@@ -437,6 +437,42 @@ this primary key. When only 1% of subjects are eligible a page filters more rows
 total cost stays linear. `tests/integration/test_activity_keyset_paging.py` holds the schema to this:
 an index range scan, no sort, and the same buffers per page at any cursor depth or table size.
 
+### Rarity by label and by artist
+
+`insights.release_rarity` carries `label_ids BIGINT[]` and `artist_ids BIGINT[]`, the Discogs label and
+artist ids of the release, each with a GIN index. A label's or an artist's rarity page and its exact
+total are one statement:
+
+```sql
+SELECT release_id, rarity_score, count(*) OVER () AS total
+FROM insights.release_rarity
+WHERE label_ids @> ARRAY[$1]::bigint[]
+ORDER BY rarity_score DESC, release_id
+LIMIT $2 OFFSET $3
+```
+
+`total` is the count of every matching row, repeated on each row of the page, so there is no second
+count and no list of release ids to ship from Neo4j. A page past the end returns no rows, and so no
+total; a caller that needs one then should treat it as zero more rows. The columns are nullable with
+no default: a release the writer found no label or artist for keeps `NULL`, and does not match.
+`catalog-api`'s rarity writer fills them from the walk it already makes; until it does, the columns
+are `NULL` and these queries return nothing, so deploy the schema first and the writer second.
+
+Upgrade path: additive. `ADD COLUMN IF NOT EXISTS` of a nullable column with no default is a
+metadata-only change, and the GIN indexes are `CREATE INDEX IF NOT EXISTS` on a table that is empty on
+lux, so the change is instant and safe to apply twice. On a populated table the GIN builds take a
+write lock for their duration; build them first with `CREATE INDEX CONCURRENTLY` and the same
+definition and the initializer then skips them. Rollback is `DROP INDEX` for the two indexes and
+`ALTER TABLE ... DROP COLUMN` for the two columns; nothing else reads them.
+
+Measured on PostgreSQL 18 with 300,000 rows, median of 7 runs, 20-row pages, against the same rows
+queried with the member release ids shipped as `release_id = ANY(...)`: the page is identical and the
+total is exact. The one statement took 3.9 ms for a 50-release label, 22.7 ms for a 30,000-release
+artist, and 106.9 ms for a 100,034-release label (the shipped-ids form took 0.9, 58.5 and 183.7 ms,
+before counting the Neo4j walk that produces the ids, which is where the 15.7 s for label 1818 went). A
+large group costs a bitmap scan and a sort of its members, so the cost grows with the group; the total
+needs all of them either way.
+
 ### Event idempotency across partitions
 
 A unique key on a partitioned table must include the partition key, so `activity.events`'

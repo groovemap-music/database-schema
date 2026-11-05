@@ -1213,6 +1213,26 @@ _INSIGHTS_TABLES: list[tuple[str, str]] = [
         "insights.release_rarity add medium_rarity",
         "ALTER TABLE insights.release_rarity ADD COLUMN IF NOT EXISTS medium_rarity REAL",
     ),
+    # The label and artist a release belongs to, so a label's or artist's rarity page and its exact total
+    # come from one statement over this table, instead of shipping every release id from Neo4j to
+    # Postgres. Nullable with no default, so adding them rewrites nothing; the rarity writer fills them.
+    # A GIN index answers `label_ids @> ARRAY[$1]::bigint[]`.
+    (
+        "insights.release_rarity add label_ids",
+        "ALTER TABLE insights.release_rarity ADD COLUMN IF NOT EXISTS label_ids BIGINT[]",
+    ),
+    (
+        "insights.release_rarity add artist_ids",
+        "ALTER TABLE insights.release_rarity ADD COLUMN IF NOT EXISTS artist_ids BIGINT[]",
+    ),
+    (
+        "idx_release_rarity_label_ids",
+        "CREATE INDEX IF NOT EXISTS idx_release_rarity_label_ids ON insights.release_rarity USING gin (label_ids)",
+    ),
+    (
+        "idx_release_rarity_artist_ids",
+        "CREATE INDEX IF NOT EXISTS idx_release_rarity_artist_ids ON insights.release_rarity USING gin (artist_ids)",
+    ),
 ]
 
 
