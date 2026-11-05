@@ -1022,18 +1022,23 @@ _INSIGHTS_TABLES: list[tuple[str, str]] = [
         "idx_release_rarity_gem",
         "CREATE INDEX IF NOT EXISTS idx_release_rarity_gem ON insights.release_rarity (hidden_gem_score DESC NULLS LAST)",
     ),
-    # The tier browse: WHERE tier = $1 ORDER BY rarity_score DESC, release_id DESC,
-    # then the keyset page WHERE tier = $1 AND (rarity_score, release_id) < ($2::real, $3)
-    # in that same order. Both sort columns descend because a row-wise `<` only
-    # expresses a keyset when every column runs the same way, and the cursor score
-    # must be cast to real: rarity_score is REAL, and a float8 cursor does not equal
-    # the stored value it came from, so the page boundary would repeat rows. One composite index serves the filter, the sort and the
-    # keyset seek, so a common-tier page reads one page of index and never sorts
-    # the tier. idx_release_rarity_tier is now a prefix of it; it stays until the
-    # index audit (gm-database-schema-m6jp) decides on evidence.
+    # The tier browse catalog-api serves is WHERE tier = $1 ORDER BY rarity_score DESC,
+    # release_id (release_id ascending, as the route writes it). The index matches that
+    # order exactly: with release_id descending, a page inside a tie group has to sort
+    # the whole group, and the writer rounds scores to 0.1, so a tie group can hold tens
+    # of thousands of rows (about 12 ms against 0.7 ms for a 20-row read).
+    #
+    # The keyset page is not a row-wise `<`, which cannot express a descending score
+    # with an ascending id; it is
+    #   tier = $1 AND rarity_score <= $2::real AND (rarity_score < $2::real OR release_id > $3)
+    # where the first score term is the seek into the index and the second the exact
+    # boundary. The cursor score must be cast to real: rarity_score is REAL, and a
+    # float8 cursor does not equal the stored value it came from, so the page boundary
+    # would repeat rows. idx_release_rarity_tier is now a prefix of this index; it stays
+    # until the index audit (gm-database-schema-m6jp) decides on evidence.
     (
         "idx_release_rarity_tier_score",
-        "CREATE INDEX IF NOT EXISTS idx_release_rarity_tier_score ON insights.release_rarity (tier, rarity_score DESC, release_id DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_release_rarity_tier_score ON insights.release_rarity (tier, rarity_score DESC, release_id)",
     ),
     (
         "insights.community_counts table",

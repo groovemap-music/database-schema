@@ -1,10 +1,12 @@
 """Real-engine proof that the rarity tier browse and the observation cascade use their indexes.
 
-The tier browse is `WHERE tier = $1 ORDER BY rarity_score DESC, release_id DESC` with a keyset page
-`AND (rarity_score, release_id) < ($2, $3)`. On a 4M-row synthetic table the audit measured
-`tier = 'common'` at 1,984 ms; here the same shapes run against a real PostgreSQL, with and without
-`idx_release_rarity_tier_score`, and the rows must be identical either way: the index changes the
-plan, never the answer. Each test gets its own database.
+The tier browse is catalog-api's `get_rarity_leaderboard` statement, run literally:
+`WHERE tier = %s ORDER BY rarity_score DESC, release_id LIMIT %s OFFSET %s`, and its keyset form
+`tier = $1 AND rarity_score <= $2::real AND (rarity_score < $2::real OR release_id > $3)`. The
+data follows the writer: a score rounded to 0.1, the tier derived from that score by the
+thresholds in `api/rarity/core.py`, and one score holding most of a tier, so a tie group is
+large. The rows must be identical with and without `idx_release_rarity_tier_score`: the index
+changes the plan, never the answer. Each test gets its own database.
 """
 
 from __future__ import annotations
@@ -32,11 +34,17 @@ ROWS = 300_000
 PAGE = 1000
 TIER_INDEX = "idx_release_rarity_tier_score"
 
-_PAGE_FIRST = "SELECT release_id, rarity_score FROM insights.release_rarity WHERE tier = %s ORDER BY rarity_score DESC, release_id DESC LIMIT %s"
+_ROUTE = (
+    "SELECT release_id, title, artist_name, year, rarity_score, tier, hidden_gem_score "
+    "FROM insights.release_rarity WHERE tier = %s ORDER BY rarity_score DESC, release_id LIMIT %s OFFSET %s"
+)
+_PAGE_FIRST = "SELECT release_id, rarity_score FROM insights.release_rarity WHERE tier = %s ORDER BY rarity_score DESC, release_id LIMIT %s"
 _PAGE_NEXT = (
     "SELECT release_id, rarity_score FROM insights.release_rarity "
-    "WHERE tier = %s AND (rarity_score, release_id) < (%s::real, %s) ORDER BY rarity_score DESC, release_id DESC LIMIT %s"
+    "WHERE tier = %s AND rarity_score <= %s::real AND (rarity_score < %s::real OR release_id > %s) "
+    "ORDER BY rarity_score DESC, release_id LIMIT %s"
 )
+TIE_SCORE = 8.3
 
 
 def _params(dbname: str) -> dict[str, Any]:
@@ -63,17 +71,19 @@ async def database() -> AsyncIterator[str]:
 
 
 async def _seed_rarity(dbname: str) -> None:
-    # 'common' is the bulk of the table, as in the audit; the score has few distinct values so
-    # the release_id tiebreak is exercised.
+    # Scores are rounded to 0.1 and the tier follows from the score, as the writer does. 55% of
+    # the rows sit on one score (a common release scores low and alike), the rest spread over 0-100.
     await _rows(
         dbname,
         """
         INSERT INTO insights.release_rarity (release_id, rarity_score, tier)
-        SELECT g, (g %% 997) / 997.0,
-               CASE WHEN g %% 100 < 70 THEN 'common' WHEN g %% 100 < 90 THEN 'uncommon' WHEN g %% 100 < 98 THEN 'rare' ELSE 'legendary' END
-        FROM generate_series(1, %s) AS g
+        SELECT g, score,
+               CASE WHEN score >= 80 THEN 'ultra-rare' WHEN score >= 60 THEN 'rare' WHEN score >= 40 THEN 'scarce'
+                    WHEN score >= 20 THEN 'uncommon' ELSE 'common' END
+        FROM (SELECT g, CASE WHEN g %% 100 < 55 THEN %(tie)s::numeric ELSE ((g * 37) %% 1000) / 10.0 END AS score
+              FROM generate_series(1, %(rows)s) AS g) AS scored
         """,
-        (ROWS,),
+        {"tie": TIE_SCORE, "rows": ROWS},
     )
     await _rows(dbname, "ANALYZE insights.release_rarity")
 
@@ -103,52 +113,60 @@ async def _walk(dbname: str) -> list[tuple[Any, ...]]:
         while page:
             collected.extend(page)
             last_id, last_score = page[-1]
-            page = await (await connection.execute(_PAGE_NEXT, ("common", last_score, last_id, PAGE))).fetchall()
+            page = await (await connection.execute(_PAGE_NEXT, ("common", last_score, last_score, last_id, PAGE))).fetchall()
     return collected
 
 
-async def test_the_tier_browse_and_keyset_page_use_the_composite_index(database: str) -> None:
+async def test_the_literal_route_and_the_keyset_page_use_the_composite_index(database: str) -> None:
     await _seed_rarity(database)
-    first = await _plan(database, _PAGE_FIRST, ("common", PAGE))
-    nxt = await _plan(database, _PAGE_NEXT, ("legendary", 0.5, 1000, PAGE))
-    for plan in (first, nxt):
+    plans = [
+        await _plan(database, _ROUTE, ("common", 20, 0)),
+        await _plan(database, _ROUTE, ("ultra-rare", 20, 0)),
+        await _plan(database, _PAGE_FIRST, ("common", PAGE)),
+        await _plan(database, _PAGE_NEXT, ("common", TIE_SCORE, TIE_SCORE, 50_000, PAGE)),
+        await _plan(database, _PAGE_NEXT, ("ultra-rare", 90.0, 90.0, 1000, PAGE)),
+    ]
+    for plan in plans:
         assert TIER_INDEX in plan, plan
-        assert "Sort" not in plan, plan
+        assert "Sort" not in plan, plan  # neither a Sort nor an Incremental Sort of a tie group
 
 
-# (label, tier, keyset cursor or None). legendary is 2% of the table, so without the composite
-# index its deep pages walk the score index past every other tier's rows.
-_CASES = [
-    ("common first page", "common", None),
-    ("legendary first page", "legendary", None),
-    ("legendary deep page", "legendary", (0.05, 5000)),
+# (label, query, parameters). The tie-group page is the case a descending release_id gets wrong.
+_CASES: list[tuple[str, str, tuple[Any, ...]]] = [
+    ("route, common first page", _ROUTE, ("common", 20, 0)),
+    ("route, ultra-rare first page", _ROUTE, ("ultra-rare", 20, 0)),
+    ("keyset, page inside the common tie group", _PAGE_NEXT, ("common", TIE_SCORE, TIE_SCORE, 50_000, 20)),
+    ("keyset, deep ultra-rare page", _PAGE_NEXT, ("ultra-rare", 85.0, 85.0, 5000, 20)),
 ]
-
-
-async def _run_case(dbname: str, tier: str, cursor: tuple[float, int] | None) -> tuple[list[tuple[Any, ...]], float]:
-    if cursor is None:
-        return await _timed(dbname, _PAGE_FIRST, (tier, PAGE))
-    return await _timed(dbname, _PAGE_NEXT, (tier, cursor[0], cursor[1], PAGE))
 
 
 async def test_the_index_changes_the_plan_and_the_speed_but_not_the_rows(database: str) -> None:
     await _seed_rarity(database)
-    with_index = [await _run_case(database, tier, cursor) for _label, tier, cursor in _CASES]
+    with_index = [await _timed(database, query, params) for _label, query, params in _CASES]
     walked_with = await _walk(database)
 
+    # the variant with release_id descending, to show what the ascending order buys in a tie group
     await _rows(database, sql.SQL("DROP INDEX insights.{}").format(sql.Identifier(TIER_INDEX)))
-    without_index = [await _run_case(database, tier, cursor) for _label, tier, cursor in _CASES]
+    await _rows(database, "CREATE INDEX idx_variant_desc ON insights.release_rarity (tier, rarity_score DESC, release_id DESC)")
+    await _rows(database, "ANALYZE insights.release_rarity")
+    variant = [await _timed(database, query, params) for _label, query, params in _CASES]
+    await _rows(database, "DROP INDEX insights.idx_variant_desc")
+
+    without_index = [await _timed(database, query, params) for _label, query, params in _CASES]
     walked_without = await _walk(database)
 
-    for (label, _tier, _cursor), (rows_with, ms_with), (rows_without, ms_without) in zip(_CASES, with_index, without_index, strict=True):
-        print(f"\n{label} over {ROWS} rows: {ms_without:.2f} ms without, {ms_with:.2f} ms with")
-        assert rows_with == rows_without
+    for (label, _query, _unused), (rows_with, ms_with), (rows_var, ms_var), (rows_without, ms_without) in zip(
+        _CASES, with_index, variant, without_index, strict=True
+    ):
+        print(f"\n{label} over {ROWS} rows: {ms_without:.2f} ms no index, {ms_var:.2f} ms release_id DESC index, {ms_with:.2f} ms shipped index")
+        assert rows_with == rows_without == rows_var
         assert rows_with, label
     assert walked_with == walked_without
     # complete: every common row is reached exactly once, in order
     expected = (await _rows(database, "SELECT count(*) FROM insights.release_rarity WHERE tier = 'common'"))[0][0]
     assert len(walked_with) == expected
     assert len({release_id for release_id, _score in walked_with}) == expected
+    assert [row[1] for row in walked_with] == sorted((row[1] for row in walked_with), reverse=True)
 
 
 async def _seed_observations(dbname: str, copies: int = 2000, per_copy: int = 100) -> None:
