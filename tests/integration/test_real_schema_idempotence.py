@@ -483,16 +483,44 @@ async def assert_expected_postgres_schema() -> None:
         assert len(counted) == 1
         assert counted[0][0] >= 0
 
-    # The relationship key is one hash index now, not an eight-column constraint (gm-database-schema-ngw9).
     relationship_key = await postgres_rows(
         """
-        SELECT index_row.indisunique, index_row.indisvalid,
-               (SELECT count(*) FROM pg_constraint WHERE conrelid = 'musicbrainz.relationships'::regclass AND conname = 'relationships_natural_key')
+        SELECT array_agg(attribute.attname ORDER BY key_column.ordinality)
+        FROM pg_constraint AS constraint_row
+        JOIN pg_class AS table_class ON table_class.oid = constraint_row.conrelid
+        JOIN pg_namespace AS namespace ON namespace.oid = table_class.relnamespace
+        CROSS JOIN LATERAL unnest(constraint_row.conkey) WITH ORDINALITY AS key_column(attnum, ordinality)
+        JOIN pg_attribute AS attribute
+          ON attribute.attrelid = table_class.oid AND attribute.attnum = key_column.attnum
+        WHERE namespace.nspname = 'musicbrainz'
+          AND table_class.relname = 'relationships'
+          AND constraint_row.conname = 'relationships_natural_key'
+        """
+    )
+    assert relationship_key == [
+        (
+            [
+                "source_mbid",
+                "target_mbid",
+                "source_entity_type",
+                "target_entity_type",
+                "relationship_type",
+                "begin_date",
+                "end_date",
+                "attributes",
+            ],
+        )
+    ]
+
+    # The hash key sits beside the constraint (gm-database-schema-ngw9): both exist, both unique and valid.
+    hash_key = await postgres_rows(
+        """
+        SELECT index_row.indisunique, index_row.indisvalid
         FROM pg_index AS index_row
         WHERE index_row.indexrelid = 'musicbrainz.relationships_key'::regclass
         """
     )
-    assert relationship_key == [(True, True, 0)]
+    assert hash_key == [(True, True)]
 
     # The loader's startup probe declines the relation unless it carries a
     # primary key (or unique constraint) on exactly its key columns, since its

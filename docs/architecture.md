@@ -589,38 +589,38 @@ an index range scan, no sort, and the same buffers per page at any cursor depth 
 
 ### MusicBrainz relationships: the hash key
 
-`musicbrainz.relationships` is keyed by `musicbrainz.relationship_key(source_mbid, target_mbid,
-source_entity_type, target_entity_type, relationship_type, begin_date, end_date, attributes)`, a
-SHA-256 over the same eight values the old `relationships_natural_key` constraint named, held in the
-unique index `relationships_key`. The constraint was `UNIQUE NULLS NOT DISTINCT` over those eight
-columns, including a `jsonb` one, and was the largest index on the table.
+`musicbrainz.relationships` keeps its eight-column `relationships_natural_key` constraint and gains a second
+unique index, `relationships_key`, over `musicbrainz.relationship_key(source_mbid, target_mbid,
+source_entity_type, target_entity_type, relationship_type, begin_date, end_date, attributes)`: a SHA-256 over the
+same eight values. The constraint carries a `jsonb` column and is the largest index on the table; the hash is 32
+bytes of key whatever the data. The change is additive, so `musicbrainz-sql-loader`'s current `ON CONFLICT (<eight
+columns>)` keeps working and a new `ON CONFLICT (musicbrainz.relationship_key(...))` works beside it.
 
-- **Rule kept.** Two relationships that differ only in date range or attributes are still two rows. Each
-  field is length-prefixed, so a value moved across a field boundary is a different key. A `NULL` is
-  one value: two `NULL` dates are the same key, and `NULL` is not an empty string and not `jsonb`
-  `null`. `attributes` is hashed as `jsonb` text, so key order does not matter. One difference: a
-  number keeps its written scale, so `1` and `1.0` are two keys here where `jsonb` equality called them
-  one. MusicBrainz attributes are strings and arrays of strings, so none is known to hit it.
-- **Measured** on PostgreSQL 18, 200,000 rows in random order with the dates and attributes MusicBrainz
-  carries on a minority of rows: the key index is 111 bytes per row as the eight-column constraint and
-  80 as the hash key (28% less). With every column populated, as in the audit's 144 bytes, the saving is
-  larger; the hash key's size does not depend on the data.
-- **Loader change (breaking).** `musicbrainz-sql-loader`'s `ON CONFLICT (source_mbid, target_mbid,
-  source_entity_type, target_entity_type, relationship_type, begin_date, end_date, attributes)` must
-  become `ON CONFLICT (musicbrainz.relationship_key(source_mbid, target_mbid, source_entity_type,
-  target_entity_type, relationship_type, begin_date, end_date, attributes))`. The column list and the
-  `DO UPDATE` clause do not change. The old target no longer finds a constraint and fails with `there is
-  no unique or exclusion constraint matching the ON CONFLICT specification`. Paired bead:
-  `gm-musicbrainz-sql-loader-1twk`. Deploy the loader change before MusicBrainz is enabled; the table is
-  empty on lux and nothing writes to it today.
-- **Upgrade path.** One initializer run: create the function, build the unique index, then drop the
-  eight-column constraint (and the older five-column one, if present) only once the index exists and is
-  valid, so a database is never without a uniqueness rule. A populated table takes a write lock for the
-  index build; build it first with `CREATE UNIQUE INDEX CONCURRENTLY relationships_key ON
-  musicbrainz.relationships (musicbrainz.relationship_key(...))` and the initializer finds it. Applying
-  twice changes nothing, and a database with duplicate-free rows needs no cleaning.
-- **Rollback.** Add the eight-column constraint back, drop `relationships_key`, and revert the loader's
-  conflict target. The rows are untouched.
+- **Rule kept.** Two relationships that differ only in date range or attributes are still two rows. Each field is
+  length-prefixed, so a value moved across a field boundary is a different key. A `NULL` is one value: two `NULL`
+  dates are the same key, and `NULL` is not an empty string and not `jsonb` `null`. `attributes` is hashed as
+  `jsonb` text, so key order does not matter. One difference: a number keeps its written scale, so `1` and `1.0`
+  are two hash keys where `jsonb` equality calls them one. While the constraint stays it rejects the second, so
+  the pair is an error and not two rows. MusicBrainz attributes are strings and arrays of strings, so none is
+  known to hit it.
+- **Measured** on PostgreSQL 18, 200,000 rows inserted in random order, with the dates and attributes MusicBrainz
+  carries on a minority of rows: the constraint's index is 143 bytes per row and the hash key's is 77. **While both
+  exist the table pays for both**, 220 bytes per row, so this step adds index cost; the saving (66 bytes per row
+  here, more where every column is populated, as in the audit's 144) arrives only when the constraint is dropped.
+- **Later step, not made here.** Drop `relationships_natural_key` after `gm-musicbrainz-sql-loader-1twk` moves the
+  writer, and before MusicBrainz is enabled. The loader change is `ON CONFLICT (source_mbid, target_mbid,
+  source_entity_type, target_entity_type, relationship_type, begin_date, end_date, attributes)` becoming `ON
+  CONFLICT (musicbrainz.relationship_key(source_mbid, target_mbid, source_entity_type, target_entity_type,
+  relationship_type, begin_date, end_date, attributes))`, with the column list and the `DO UPDATE` clause
+  unchanged. After the drop, the old target no longer finds a constraint and fails with `there is no unique or
+  exclusion constraint matching the ON CONFLICT specification`, so the drop is a breaking change and needs its
+  own contract step. The table is empty on lux and nothing writes to it today.
+- **Upgrade path.** Additive: the function and the unique index are created `IF NOT EXISTS`, and applying twice
+  changes nothing. A populated table takes a write lock for the index build; build it first with `CREATE UNIQUE
+  INDEX CONCURRENTLY relationships_key ON musicbrainz.relationships (musicbrainz.relationship_key(...))` and the
+  initializer finds it. A database with duplicate-free rows needs no cleaning.
+- **Rollback.** `DROP INDEX musicbrainz.relationships_key` and `DROP FUNCTION musicbrainz.relationship_key`;
+  nothing depends on them while the constraint stays.
 
 ### Event idempotency across partitions
 
@@ -843,8 +843,8 @@ The executable PostgreSQL inventory is in
 
 The statement lists also carry the migrations required for an existing database: additive
 authentication and media columns, rarity-signal columns, Discogs cross-reference widening to
-`BIGINT`, and the `musicbrainz.relationships` key, a SHA-256 over both entity identifiers and
-types, relationship type, dates, and attributes (see
+`BIGINT`, the widened `musicbrainz.relationships` natural key (`UNIQUE NULLS NOT DISTINCT` across both entity
+identifiers and types, relationship type, dates, and attributes), and the hash key beside it (see
 [MusicBrainz relationships: the hash key](#musicbrainz-relationships-the-hash-key)). These statements intentionally run with the table/index declarations because
 `CREATE TABLE IF NOT EXISTS` cannot update an existing table. Do not translate them into an
 out-of-band migration or remove retained provenance fields.

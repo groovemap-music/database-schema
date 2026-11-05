@@ -1,11 +1,12 @@
 """Real-engine proof for the MusicBrainz relationships hash key (gm-database-schema-ngw9).
 
-`musicbrainz.relationships` was keyed by an eight-column `UNIQUE NULLS NOT DISTINCT` constraint that
-carried a jsonb column. It is keyed now by `musicbrainz.relationship_key(...)`, a SHA-256 over the same
-eight values, and the loader's `ON CONFLICT` names that expression. These tests hold the new key to
-the old rule on a real engine (jsonb attribute order, NULL dates, field boundaries), prove the loader's
-new upsert statement, measure the index per row, and upgrade a database that carries the constraint.
-Each test gets its own database.
+`musicbrainz.relationships` keeps its eight-column `UNIQUE NULLS NOT DISTINCT` constraint, so the loader's
+current `ON CONFLICT (<eight columns>)` still works, and gains a second unique index over
+`musicbrainz.relationship_key(...)`, a SHA-256 over the same eight values. Dropping the constraint is a
+later step, after `musicbrainz-sql-loader` names the expression (gm-musicbrainz-sql-loader-1twk). These
+tests run both upsert targets on a real engine, hold the hash key to the constraint's rule (jsonb attribute
+order, NULL dates, field boundaries), measure the two keys' index per row, and add the hash index to a
+database that predates it. Each test gets its own database.
 """
 
 from __future__ import annotations
@@ -35,10 +36,6 @@ B = "00000000-0000-0000-0000-00000000000b"
 _KEY = (
     "musicbrainz.relationship_key(source_mbid, target_mbid, source_entity_type, target_entity_type, "
     "relationship_type, begin_date, end_date, attributes)"
-)
-_OLD_CONSTRAINT = (
-    "ALTER TABLE musicbrainz.relationships ADD CONSTRAINT relationships_natural_key UNIQUE NULLS NOT DISTINCT "
-    "(source_mbid, target_mbid, source_entity_type, target_entity_type, relationship_type, begin_date, end_date, attributes)"
 )
 # The loader's upsert, with the conflict target changed to the key expression.
 _UPSERT = (
@@ -149,6 +146,28 @@ async def test_the_plain_insert_without_on_conflict_is_still_a_unique_violation(
         )
 
 
+_OLD_UPSERT = (
+    "INSERT INTO musicbrainz.relationships "
+    "(source_mbid, source_entity_type, target_mbid, target_entity_type, relationship_type, attributes, begin_date, end_date, ended) "
+    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+    "ON CONFLICT (source_mbid, target_mbid, source_entity_type, target_entity_type, relationship_type, begin_date, end_date, attributes) "
+    "DO UPDATE SET ended = EXCLUDED.ended, updated_at = NOW() RETURNING (xmax = 0) AS inserted"
+)
+
+
+async def test_the_loaders_current_conflict_target_still_works_beside_the_hash_key(connection: psycopg.AsyncConnection[Any]) -> None:
+    """The change is additive: the unchanged loader inserts once and updates on repeat."""
+    args = (A, "artist", B, "artist", "MEMBER_OF", Jsonb({"instrument": ["guitar"]}), "1990", None, False)
+    first = await (await connection.execute(_OLD_UPSERT, args)).fetchone()
+    second = await (await connection.execute(_OLD_UPSERT, args)).fetchone()
+    assert first == (True,)
+    assert second == (False,)
+    assert await _count(connection) == 1
+    # and the expression target finds the same row
+    assert await _upsert(connection, attributes={"instrument": ["guitar"]}, begin="1990") is False
+    assert await _count(connection) == 1
+
+
 async def test_the_hash_key_costs_less_index_per_row_than_the_constraint(connection: psycopg.AsyncConnection[Any]) -> None:
     rows = 200_000
     await connection.execute(
@@ -163,7 +182,6 @@ async def test_the_hash_key_costs_less_index_per_row_than_the_constraint(connect
         """,
         (rows,),
     )
-    await connection.execute(_OLD_CONSTRAINT)
     sizes = dict(
         await (
             await connection.execute(
@@ -172,14 +190,13 @@ async def test_the_hash_key_costs_less_index_per_row_than_the_constraint(connect
         ).fetchall()
     )
     old, new = sizes["musicbrainz.relationships_natural_key"] / rows, sizes["musicbrainz.relationships_key"] / rows
-    print(f"\nkey index bytes per row: {old:.0f} eight-column constraint, {new:.0f} hash key")
+    print(f"\nkey index bytes per row: {old:.0f} eight-column constraint, {new:.0f} hash key; both present now, so the table pays {old + new:.0f}")
+    print(f"saving once the constraint is dropped in the later step: {old - new:.0f} bytes per row")
     assert new < old
 
 
-async def test_a_database_with_the_old_constraint_is_upgraded_in_place(connection: psycopg.AsyncConnection[Any]) -> None:
-    """Rebuild the shape a deployed database has: the constraint, no hash index, and rows."""
+async def test_a_database_that_predates_the_hash_key_gains_it_and_keeps_the_constraint(connection: psycopg.AsyncConnection[Any]) -> None:
     await connection.execute("DROP INDEX musicbrainz.relationships_key")
-    await connection.execute(_OLD_CONSTRAINT)
     await connection.execute(
         "INSERT INTO musicbrainz.relationships (source_mbid, source_entity_type, target_mbid, target_entity_type, relationship_type, begin_date) "
         "SELECT gen_random_uuid(), 'artist', gen_random_uuid(), 'artist', 'MEMBER_OF', g::text FROM generate_series(1, 500) g"
@@ -192,7 +209,7 @@ async def test_a_database_with_the_old_constraint_is_upgraded_in_place(connectio
         index = await (
             await connection.execute("SELECT indisunique, indisvalid FROM pg_index WHERE indexrelid = 'musicbrainz.relationships_key'::regclass")
         ).fetchone()
-        assert constraint == (0,)
+        assert constraint == (1,)
         assert index == (True, True)
         assert await _count(connection) == 500
     with pytest.raises(psycopg.errors.UniqueViolation):

@@ -131,7 +131,7 @@ _LEGACY_STATEMENT_NAMES = [
     "musicbrainz.releases.media column",
     "musicbrainz.release_groups table",
     "musicbrainz.relationships table",
-    "musicbrainz.relationships retire the eight-column natural key",
+    "musicbrainz.relationships widen natural key to include begin_date/end_date/attributes",
     "musicbrainz.external_links table",
     "musicbrainz.artists.discogs_artist_id widen to BIGINT",
     "musicbrainz.labels.discogs_label_id widen to BIGINT",
