@@ -209,3 +209,117 @@ async def test_no_op_statements_are_the_only_ones_skipped(dbname: str) -> None:
     assert index is not None
     assert index[0] is not None
     assert column is not None
+
+
+# The state of a database deployed before the hash-index and free-text-key migrations, the same
+# statements tests/integration/test_free_text_keys.py upgrades from. Applying it to a database that
+# has the current schema leaves 20 index statements whose CREATE depends on an earlier DROP.
+_OLD_SHAPE = """
+DROP TABLE graph.person, graph.company, graph.credited_on, graph.same_as, graph.track_credited_on, graph.credited_to CASCADE;
+CREATE TABLE graph.person (name text PRIMARY KEY);
+CREATE TABLE graph.company (company_id text PRIMARY KEY, name text, discogs_label_id text);
+CREATE TABLE graph.credited_on (
+    person_name   text NOT NULL,
+    release_id    text NOT NULL,
+    role          text NOT NULL,
+    role_category text GENERATED ALWAYS AS (graph.credit_role_category(role)) STORED,
+    PRIMARY KEY (person_name, release_id, role)
+);
+CREATE INDEX credited_on_reverse ON graph.credited_on (release_id, person_name);
+CREATE INDEX credited_on_role_category ON graph.credited_on (role_category, person_name);
+CREATE TABLE graph.same_as (person_name text NOT NULL, artist_id text NOT NULL, PRIMARY KEY (person_name, artist_id));
+CREATE INDEX same_as_reverse ON graph.same_as (artist_id);
+CREATE TABLE graph.track_credited_on (
+    person_name       text NOT NULL,
+    release_id        text NOT NULL,
+    track_ordinal     bigint NOT NULL,
+    sub_track_ordinal bigint NOT NULL,
+    track_position    text,
+    role              text NOT NULL,
+    role_category     text GENERATED ALWAYS AS (graph.credit_role_category(role)) STORED,
+    PRIMARY KEY (person_name, release_id, track_ordinal, sub_track_ordinal, role)
+);
+CREATE INDEX track_credited_on_reverse ON graph.track_credited_on (release_id, track_ordinal, sub_track_ordinal, person_name);
+CREATE TABLE graph.credited_to (
+    release_id    text NOT NULL,
+    company_id    text NOT NULL,
+    role          text NOT NULL,
+    role_category text NOT NULL DEFAULT 'other',
+    source        text NOT NULL,
+    PRIMARY KEY (release_id, company_id, role, source)
+);
+CREATE INDEX credited_to_reverse ON graph.credited_to (company_id, release_id);
+DROP INDEX public.idx_artists_name, public.idx_labels_name, public.idx_masters_title, public.idx_releases_title;
+DROP INDEX musicbrainz.idx_mb_artists_name, musicbrainz.idx_mb_labels_name;
+CREATE INDEX idx_artists_name ON public.artists ((data->>'name'));
+CREATE INDEX idx_labels_name ON public.labels ((data->>'name'));
+CREATE INDEX idx_masters_title ON public.masters ((data->>'title'));
+CREATE INDEX idx_releases_title ON public.releases ((data->>'title'));
+CREATE INDEX idx_mb_artists_name ON musicbrainz.artists (name);
+CREATE INDEX idx_mb_labels_name ON musicbrainz.labels (name);
+"""
+
+
+_FINGERPRINT = (
+    "SELECT 'index', schemaname || '.' || indexname, indexdef FROM pg_indexes "
+    "WHERE schemaname NOT IN ('pg_catalog', 'information_schema') "
+    "UNION ALL SELECT 'column', table_schema || '.' || table_name || '.' || column_name, data_type || coalesce(column_default, '') "
+    "FROM information_schema.columns WHERE table_schema NOT IN ('pg_catalog', 'information_schema') "
+    "UNION ALL SELECT 'constraint', conrelid::regclass::text || '.' || conname, pg_get_constraintdef(oid) FROM pg_constraint "
+    "WHERE connamespace::regnamespace::text NOT IN ('pg_catalog', 'information_schema') "
+    "ORDER BY 1, 2"
+)
+
+
+async def _create_database(prefix: str) -> str:
+    name = f"{prefix}_{uuid4().hex[:12]}"
+    async with await psycopg.AsyncConnection.connect(**_params("postgres"), autocommit=True) as admin:
+        await admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
+    async with await psycopg.AsyncConnection.connect(**_params(name), autocommit=True) as conn:
+        async with conn.cursor() as cursor:
+            _success, failures = await _execute_schema_statements(cursor, _schema_statements())
+        assert failures == 0
+        await conn.execute(_OLD_SHAPE)
+    return name
+
+
+async def _drop_database(name: str) -> None:
+    async with await psycopg.AsyncConnection.connect(**_params("postgres"), autocommit=True) as admin:
+        await admin.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(name)))
+
+
+async def _fingerprint(name: str) -> list[tuple[Any, ...]]:
+    async with await psycopg.AsyncConnection.connect(**_params(name), autocommit=True) as conn:
+        return await (await conn.execute(_FINGERPRINT)).fetchall()
+
+
+async def test_a_recreate_after_a_drop_in_the_same_init_is_not_skipped() -> None:
+    """The reproduced defect: a btree idx_artists_name was dropped by a migration, then not rebuilt.
+
+    The skip decision is made right before each statement, so the hash index the later CREATE
+    INDEX IF NOT EXISTS builds exists afterwards, exactly as with the unguarded statement list.
+    """
+    plain, guarded = await _create_database("init_plain"), await _create_database("init_guard")
+    try:
+        async with await psycopg.AsyncConnection.connect(**_params(plain), autocommit=True) as conn:
+            async with conn.cursor() as cursor:
+                _success, failures = await _execute_schema_statements(cursor, _schema_statements())
+            assert failures == 0
+        assert await create_postgres_schema(_Pool(guarded)) == 0
+
+        async with await psycopg.AsyncConnection.connect(**_params(guarded), autocommit=True) as conn:
+            method = await (
+                await conn.execute(
+                    "SELECT am.amname FROM pg_class c JOIN pg_am am ON am.oid = c.relam WHERE c.oid = to_regclass('public.idx_artists_name')"
+                )
+            ).fetchone()
+            keys = [
+                (await (await conn.execute("SELECT to_regclass(%s)", (name,))).fetchone())[0]  # type: ignore[index]
+                for name in ("graph.credited_on_key", "graph.track_credited_on_key", "graph.person_key")
+            ]
+        assert method == ("hash",), f"idx_artists_name is {method}"
+        assert all(key is not None for key in keys), keys
+        assert await _fingerprint(guarded) == await _fingerprint(plain)
+    finally:
+        await _drop_database(plain)
+        await _drop_database(guarded)

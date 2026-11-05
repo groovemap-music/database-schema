@@ -7054,19 +7054,16 @@ _NOOP_COLUMN_RE = re.compile(
     r"^\s*ALTER\s+TABLE\s+(?:ONLY\s+)?(?P<table>[\w.]+)\s+ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+(?P<column>\w+)\b",
     re.IGNORECASE,
 )
-_EXISTING_INDEXES_QUERY = """
-    SELECT n.nspname, c.relname
-    FROM pg_catalog.pg_class AS c JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
-    WHERE c.relkind IN ('i', 'I') AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg\\_toast%'
-"""
-_EXISTING_COLUMNS_QUERY = """
-    SELECT n.nspname, c.relname, a.attname
-    FROM pg_catalog.pg_attribute AS a
-    JOIN pg_catalog.pg_class AS c ON c.oid = a.attrelid
-    JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
-    WHERE a.attnum > 0 AND NOT a.attisdropped AND c.relkind IN ('r', 'p')
-      AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg\\_toast%'
-"""
+# Anything after the column name that is not a plain column definition: a second clause, or any
+# other ALTER TABLE action. Such a statement is always sent, never skipped.
+_OTHER_ALTER_ACTION_RE = re.compile(
+    r"\b(?:ADD|DROP|ALTER|RENAME|SET|ENABLE|DISABLE|VALIDATE|OWNER|INHERIT|CLUSTER|ATTACH|DETACH|REPLICA)\b", re.IGNORECASE
+)
+_INDEX_EXISTS_QUERY = "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_class WHERE oid = pg_catalog.to_regclass(%s) AND relkind IN ('i', 'I'))"
+_COLUMN_EXISTS_QUERY = (
+    "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute WHERE attrelid = pg_catalog.to_regclass(%s) "
+    "AND attname = %s AND attnum > 0 AND NOT attisdropped)"
+)
 
 
 def _qualified(table: str) -> tuple[str, str]:
@@ -7074,31 +7071,41 @@ def _qualified(table: str) -> tuple[str, str]:
     return (schema or "public").lower(), name.lower()
 
 
-def _is_noop_statement(statement: Any, indexes: set[tuple[str, str]], columns: set[tuple[str, str, str]]) -> bool:
-    """Return whether a statement only re-declares an index or column that already exists."""
+def _noop_probe(statement: Any) -> tuple[str, tuple[str, ...]] | None:
+    """Return the catalog probe that says whether a statement would be a no-op, or None.
+
+    Only a statement that does nothing but declare one index (CREATE INDEX IF NOT EXISTS) or add
+    one column (ADD COLUMN IF NOT EXISTS) has a probe. Anything else, including an ALTER TABLE with
+    a second clause, has none and is always sent.
+    """
     if not isinstance(statement, str):
-        return False
+        return None
     if match := _NOOP_INDEX_RE.match(statement):
         schema, _ = _qualified(match["table"])
-        return (schema, match["index"].lower()) in indexes
-    if match := _NOOP_COLUMN_RE.match(statement):
+        return _INDEX_EXISTS_QUERY, (f"{schema}.{match['index'].lower()}",)
+    if (match := _NOOP_COLUMN_RE.match(statement)) and not _OTHER_ALTER_ACTION_RE.search(statement[match.end() :]):
         schema, table = _qualified(match["table"])
-        return (schema, table, match["column"].lower()) in columns
-    return False
+        return _COLUMN_EXISTS_QUERY, (f"{schema}.{table}", match["column"].lower())
+    return None
 
 
-async def _existing_indexes_and_columns(cursor: Any) -> tuple[set[tuple[str, str]], set[tuple[str, str, str]]]:
-    """Read which indexes and columns exist, without taking a lock on any table."""
+async def _is_noop_statement(cursor: Any, statement: Any) -> bool:
+    """Return whether the statement would only re-declare an object that exists right now.
+
+    The probe runs immediately before the statement it guards, so a DROP earlier in the same init
+    (a hash-index or key migration that retires an index a later CREATE INDEX recreates) is seen.
+    It reads the catalog and takes no lock on any table. A probe that fails means "send it".
+    """
+    probe = _noop_probe(statement)
+    if probe is None:
+        return False
+    query, params = probe
     try:
-        await cursor.execute(_EXISTING_INDEXES_QUERY)
-        indexes = {(str(row[0]), str(row[1])) for row in await cursor.fetchall()}
-        await cursor.execute(_EXISTING_COLUMNS_QUERY)
-        columns = {(str(row[0]), str(row[1]), str(row[2])) for row in await cursor.fetchall()}
-    except Exception as error:
-        # The read only lets the init skip no-ops. Without it every statement is sent, as before.
-        logger.warning("Schema: could not read the existing indexes and columns (%s); sending every statement", error)
-        return set(), set()
-    return indexes, columns
+        await cursor.execute(query, params)
+        row = await cursor.fetchone()
+    except Exception:
+        return False
+    return bool(row and row[0] is True)
 
 
 async def _execute_schema_statements_bounded(
@@ -7117,11 +7124,10 @@ async def _execute_schema_statements_bounded(
     logged and counted, and the init carries on, exactly as `_execute_schema_statements` does.
     """
     pending = list(statements)
-    indexes, columns = await _existing_indexes_and_columns(cursor)
     success_count = 0
     failure_count = 0
     for position, (name, statement) in enumerate(pending):
-        if _is_noop_statement(statement, indexes, columns):
+        if await _is_noop_statement(cursor, statement):
             logger.info("✅ Schema: %s (already present, not re-sent)", name)
             success_count += 1
             continue

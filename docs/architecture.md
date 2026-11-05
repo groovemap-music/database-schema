@@ -864,12 +864,16 @@ waited 2.96, 9.96 and 30.02 s for a 3, 10 and 30 s wait, against a 6.5 ms p50, a
 
 Two changes, neither of which changes what the schema is:
 
-1. **A statement that would be a no-op is not sent.** `create_postgres_schema` reads which
-   indexes and columns exist in one catalog read (it takes no lock on any table) and skips a
-   `CREATE [UNIQUE] INDEX IF NOT EXISTS` or `ADD COLUMN IF NOT EXISTS` whose object is already
-   there. A re-run against a finished schema takes no lock on `insights.release_rarity` or any
-   other table those statements name. A missing object is still sent, and an unreadable catalog
-   falls back to sending everything, as before.
+1. **A statement that would be a no-op is not sent.** Immediately before a
+   `CREATE [UNIQUE] INDEX IF NOT EXISTS` or a single-clause `ADD COLUMN IF NOT EXISTS`,
+   `create_postgres_schema` asks the catalog whether that one index or column exists now
+   (`to_regclass` and `pg_attribute`; no lock on any table) and skips the statement if it does. The
+   check is made per statement, never from a snapshot taken at the start, because the init itself
+   drops indexes (the hash-index and free-text-key migrations retire an index that a later
+   `CREATE INDEX IF NOT EXISTS` recreates), and a stale answer would skip that recreate. An
+   `ALTER TABLE` with a second clause or any other action is never skipped, a missing object is
+   always sent, and a probe that fails means "send it". A re-run against a finished schema takes no
+   lock on `insights.release_rarity` or any other table those statements name.
 2. **What is sent runs under a `lock_timeout`.** The session sets `lock_timeout` to 2000 ms
    (`SCHEMA_INIT_LOCK_TIMEOUT_MS`), retries a statement that timed out up to 3 times
    (`SCHEMA_INIT_LOCK_ATTEMPTS`) with a 1 s pause, and then **stops**: it logs the statement, says
@@ -897,7 +901,7 @@ and a reader polling the table every 50 ms (`tests/integration/test_schema_init_
 - *A re-run of an unchanged schema:* nothing. It skips the index and column statements, takes no
   lock on the rarity tables, and finishes while the job runs.
 - *An upgrade that adds an index or column to `insights.release_rarity`* (for instance
-  `label_ids` and `artist_ids`): the init stops with `Schema init stopped at '<statement>'` and a
+  `label_ids` and `artist_ids`) **now fails the deploy instead of waiting for the job**: the init stops with `Schema init stopped at '<statement>'` and a
   non-zero failure count. Nothing was half-applied; each statement is idempotent. Wait for the job
   to commit (`SELECT pid, now() - xact_start, state, left(query, 80) FROM pg_stat_activity WHERE
   xact_start IS NOT NULL ORDER BY xact_start` shows it), then run the init again. Do not cancel the
