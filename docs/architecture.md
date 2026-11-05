@@ -441,37 +441,61 @@ an index range scan, no sort, and the same buffers per page at any cursor depth 
 
 `insights.release_rarity` carries `label_ids BIGINT[]` and `artist_ids BIGINT[]`, the Discogs label and
 artist ids of the release, each with a GIN index. A label's or an artist's rarity page and its exact
-total are one statement:
+total are one statement, with the total as its own subquery and the page joined to it by `LATERAL`:
 
 ```sql
-SELECT release_id, rarity_score, count(*) OVER () AS total
-FROM insights.release_rarity
-WHERE label_ids @> ARRAY[$1]::bigint[]
-ORDER BY rarity_score DESC, release_id
-LIMIT $2 OFFSET $3
+SELECT p.release_id, p.rarity_score, t.total
+FROM (SELECT count(*) AS total FROM insights.release_rarity WHERE label_ids @> ARRAY[$1]::bigint[]) AS t
+LEFT JOIN LATERAL (
+    SELECT release_id, rarity_score
+    FROM insights.release_rarity
+    WHERE label_ids @> ARRAY[$1]::bigint[]
+    ORDER BY rarity_score DESC, release_id
+    LIMIT $2 OFFSET $3
+) AS p ON true
 ```
 
-`total` is the count of every matching row, repeated on each row of the page, so there is no second
-count and no list of release ids to ship from Neo4j. A page past the end returns no rows, and so no
-total; a caller that needs one then should treat it as zero more rows. The columns are nullable with
-no default: a release the writer found no label or artist for keeps `NULL`, and does not match.
-`catalog-api`'s rarity writer fills them from the walk it already makes; until it does, the columns
-are `NULL` and these queries return nothing, so deploy the schema first and the writer second.
+It always returns at least one row. A page inside the group returns one row per release, each carrying the
+exact `total`. A page past the last one, and a label or artist no release has, return a single row whose
+`release_id` and `rarity_score` are `NULL` and whose `total` is still right (zero for an empty group); the caller
+drops the `NULL` row. The first form tried, `count(*) OVER ()` beside the page, returns no row at all past
+the last page and so no total there, which is why it is not the route's statement. The same lookup on
+`artist_ids` is identical with that column. There is no second count and no list of release ids to ship from
+Neo4j. The columns are nullable with no default: a release the writer found no label or artist for keeps
+`NULL` and does not match.
 
-Upgrade path: additive. `ADD COLUMN IF NOT EXISTS` of a nullable column with no default is a
-metadata-only change, and the GIN indexes are `CREATE INDEX IF NOT EXISTS` on a table that is empty on
-lux, so the change is instant and safe to apply twice. On a populated table the GIN builds take a
-write lock for their duration; build them first with `CREATE INDEX CONCURRENTLY` and the same
-definition and the initializer then skips them. Rollback is `DROP INDEX` for the two indexes and
-`ALTER TABLE ... DROP COLUMN` for the two columns; nothing else reads them.
+**Order of rollout.** The rarity table is written by `analytics-engine` (`insights/computations.py`,
+`_RARITY_COPY_SQL`), which streams the scored releases from `catalog-api` and `COPY`s them in after clearing the
+table. Until it names the two columns they stay `NULL` and these queries return nothing, so the order is:
+this schema first; then `catalog-api`'s stream carrying the ids; then `analytics-engine`'s `COPY` listing
+`label_ids` and `artist_ids`; then one complete rarity run, which rewrites every row; then the route that reads
+them. Do not switch the route over before that run has finished, or it reports empty groups.
 
-Measured on PostgreSQL 18 with 300,000 rows, median of 7 runs, 20-row pages, against the same rows
-queried with the member release ids shipped as `release_id = ANY(...)`: the page is identical and the
-total is exact. The one statement took 3.9 ms for a 50-release label, 22.7 ms for a 30,000-release
-artist, and 106.9 ms for a 100,034-release label (the shipped-ids form took 0.9, 58.5 and 183.7 ms,
-before counting the Neo4j walk that produces the ids, which is where the 15.7 s for label 1818 went). A
-large group costs a bitmap scan and a sort of its members, so the cost grows with the group; the total
-needs all of them either way.
+**Writer cost of the GIN indexes.** The writer clears the table and `COPY`s every row in one transaction, so both
+indexes are built entry by entry as rows arrive. Measured on PostgreSQL 18 with that statement shape and 200,000
+rows carrying two ids in each column: 2.9 s with the two indexes against 2.5 s without (about 16% more), and the
+indexes hold 5.3 MB (`label_ids`) and 10.1 MB (`artist_ids`) at that size. A full run at the real row count pays
+the same proportion. If that matters, drop the two indexes before the `COPY` and rebuild them after it; the
+statements are `IF NOT EXISTS`, so the initializer restores them.
+
+Upgrade path: additive. `ADD COLUMN IF NOT EXISTS` of a nullable column with no default is a metadata-only change,
+and the GIN indexes are `CREATE INDEX IF NOT EXISTS` on a table that is empty on lux, so the change is instant and
+safe to apply twice. On a populated table the GIN builds take a write lock for their duration; build them first
+with `CREATE INDEX CONCURRENTLY` and the same definition and the initializer then skips them. Rollback is `DROP
+INDEX` for the two indexes and `ALTER TABLE ... DROP COLUMN` for the two columns; nothing else reads them.
+
+Measured on PostgreSQL 18 with 300,000 rows, median of 7 runs, 20-row pages. The page matches the member release
+ids shipped as `release_id = ANY(...)`, and the total is exact. For the statement above against the window form:
+
+| Group | `LATERAL` form | Window form | Shipped ids (ids already in hand) |
+| --- | ---: | ---: | ---: |
+| 50-release label | 9.0 ms | 4.6 ms | 1.1 ms |
+| 30,000-release artist | 18.5 ms | 25.2 ms | 50.2 ms |
+| 100,034-release label | 49.1 ms | 61.8 ms | 214.8 ms |
+
+The `LATERAL` form is the faster on large groups and a few milliseconds slower on a tiny one, and it is the only
+one that answers past the end. The shipped-ids column leaves out the Neo4j walk that produces the ids, which is
+where the 15.7 s for label 1818 went. Both costs grow with the group, since the total needs every member.
 
 ### Event idempotency across partitions
 

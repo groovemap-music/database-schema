@@ -34,7 +34,16 @@ SMALL_LABEL = 999_001
 BIG_ARTIST = 7
 PAGE = 20
 
+# The route's statement: the total is its own subquery and the page hangs off it by LATERAL, so a
+# row always comes back and a page past the end carries the total with NULL page columns.
 _ONE_STATEMENT = (
+    "SELECT p.release_id, p.rarity_score, t.total FROM "
+    "(SELECT count(*) AS total FROM insights.release_rarity WHERE {column} @> ARRAY[%s]::bigint[]) AS t "
+    "LEFT JOIN LATERAL (SELECT release_id, rarity_score FROM insights.release_rarity WHERE {column} @> ARRAY[%s]::bigint[] "
+    "ORDER BY rarity_score DESC, release_id LIMIT %s OFFSET %s) AS p ON true"
+)
+# The earlier window form, kept to show why it was replaced: no row past the last page, so no total.
+_WINDOW = (
     "SELECT release_id, rarity_score, count(*) OVER () AS total FROM insights.release_rarity "
     "WHERE {column} @> ARRAY[%s]::bigint[] ORDER BY rarity_score DESC, release_id LIMIT %s OFFSET %s"
 )
@@ -92,7 +101,7 @@ async def _median_ms(conn: psycopg.AsyncConnection[Any], query: str, params: tup
 @pytest.mark.parametrize(("column", "key"), [("label_ids", SMALL_LABEL), ("artist_ids", BIG_ARTIST), ("label_ids", BIG_LABEL)])
 async def test_page_and_exact_total_come_from_one_statement(connection: psycopg.AsyncConnection[Any], column: str, key: int) -> None:
     await _seed(connection)
-    rows, ms = await _median_ms(connection, _ONE_STATEMENT.format(column=column), (key, PAGE, 0))
+    rows, ms = await _median_ms(connection, _ONE_STATEMENT.format(column=column), (key, key, PAGE, 0))
     truth = (
         await (await connection.execute(f"SELECT count(*) FROM insights.release_rarity WHERE {column} @> ARRAY[%s]::bigint[]", (key,))).fetchone()  # noqa: S608
         or (0,)
@@ -110,6 +119,9 @@ async def test_page_and_exact_total_come_from_one_statement(connection: psycopg.
     old_rows, old_ms = await _median_ms(connection, _SHIPPED_IDS, (members, PAGE, 0))
     print(f"\n{column}={key} ({truth} releases): shipped ids + separate count {old_ms:.1f} ms+, one statement {ms:.1f} ms")
     assert [(i, s) for i, s, _t in rows] == old_rows
+    window_rows, window_ms = await _median_ms(connection, _WINDOW.format(column=column), (key, PAGE, 0))
+    print(f"  window form {window_ms:.1f} ms, LATERAL form {ms:.1f} ms")
+    assert [(i, s, t) for i, s, t in window_rows] == rows
 
 
 async def test_a_deep_page_and_the_total_agree(connection: psycopg.AsyncConnection[Any]) -> None:
@@ -121,18 +133,21 @@ async def test_a_deep_page_and_the_total_agree(connection: psycopg.AsyncConnecti
         or (0,)
     )[0]
     last = (truth // PAGE) * PAGE
-    rows = await (await connection.execute(_ONE_STATEMENT.format(column="label_ids"), (BIG_LABEL, PAGE, last))).fetchall()
+    rows = await (await connection.execute(_ONE_STATEMENT.format(column="label_ids"), (BIG_LABEL, BIG_LABEL, PAGE, last))).fetchall()
     assert rows
     assert {total for _id, _score, total in rows} == {truth}
     assert len(rows) == truth - last
-    assert await (await connection.execute(_ONE_STATEMENT.format(column="label_ids"), (BIG_LABEL, PAGE, truth + PAGE))).fetchall() == []
+    past_end = await (await connection.execute(_ONE_STATEMENT.format(column="label_ids"), (BIG_LABEL, BIG_LABEL, PAGE, truth + PAGE))).fetchall()
+    assert past_end == [(None, None, truth)]  # one row: the total, with no page
 
 
 async def test_the_selective_lookup_uses_the_gin_index(connection: psycopg.AsyncConnection[Any]) -> None:
     await _seed(connection)
     plan = "\n".join(
         line
-        for (line,) in await (await connection.execute("EXPLAIN " + _ONE_STATEMENT.format(column="label_ids"), (SMALL_LABEL, PAGE, 0))).fetchall()
+        for (line,) in await (
+            await connection.execute("EXPLAIN " + _ONE_STATEMENT.format(column="label_ids"), (SMALL_LABEL, SMALL_LABEL, PAGE, 0))
+        ).fetchall()
     )
     assert "idx_release_rarity_label_ids" in plan, plan
 
@@ -159,3 +174,51 @@ async def test_a_table_that_predates_the_columns_gains_them_and_a_second_apply_i
     ]
     indexes = {r[0] for r in await (await connection.execute("SELECT indexname FROM pg_indexes WHERE tablename = 'release_rarity'")).fetchall()}
     assert {"idx_release_rarity_label_ids", "idx_release_rarity_artist_ids"} <= indexes
+
+
+async def test_a_past_the_end_page_and_an_empty_group(connection: psycopg.AsyncConnection[Any]) -> None:
+    await _seed(connection)
+    # a label no release has: still one row, total zero, NULL page columns
+    rows = await (await connection.execute(_ONE_STATEMENT.format(column="label_ids"), (123_456_789, 123_456_789, PAGE, 0))).fetchall()
+    assert rows == [(None, None, 0)]
+    # the window form returns nothing there, which is why the route does not use it
+    assert await (await connection.execute(_WINDOW.format(column="label_ids"), (123_456_789, PAGE, 0))).fetchall() == []
+    # a small group's last page is short and its past-the-end page is the total alone
+    last = await (await connection.execute(_ONE_STATEMENT.format(column="label_ids"), (SMALL_LABEL, SMALL_LABEL, PAGE, 40))).fetchall()
+    assert len(last) == 10
+    assert {total for _i, _s, total in last} == {50}
+    assert await (await connection.execute(_ONE_STATEMENT.format(column="label_ids"), (SMALL_LABEL, SMALL_LABEL, PAGE, 60))).fetchall() == [
+        (None, None, 50)
+    ]
+
+
+async def test_what_the_gin_indexes_cost_the_writer(connection: psycopg.AsyncConnection[Any]) -> None:
+    """The writer clears the table and COPYs every row in one transaction, as insights/computations.py does."""
+    rows = [(g, f"t{g}", "a", 2000, (g % 1000) / 10.0, "common", [g % 5000, 7], [g % 90000, g % 77]) for g in range(1, 200_001)]
+    copy = "COPY insights.release_rarity (release_id, title, artist_name, year, rarity_score, tier, label_ids, artist_ids) FROM STDIN"
+
+    async def load() -> float:
+        start = time.perf_counter()
+        async with connection.transaction():
+            await connection.execute("DELETE FROM insights.release_rarity")
+            async with connection.cursor() as cursor, cursor.copy(copy) as writer:
+                for row in rows:
+                    await writer.write_row(row)
+        return time.perf_counter() - start
+
+    with_gin = await load()
+    sizes = dict(
+        await (
+            await connection.execute(
+                "SELECT indexrelid::regclass::text, pg_relation_size(indexrelid) FROM pg_index WHERE indrelid = 'insights.release_rarity'::regclass"
+            )
+        ).fetchall()
+    )
+    await connection.execute("DROP INDEX insights.idx_release_rarity_label_ids")
+    await connection.execute("DROP INDEX insights.idx_release_rarity_artist_ids")
+    without_gin = await load()
+    print(
+        f"\nCOPY of {len(rows)} rows: {with_gin:.1f} s with the two GIN indexes, {without_gin:.1f} s without; "
+        f"index bytes: label {sizes['insights.idx_release_rarity_label_ids']:,}, artist {sizes['insights.idx_release_rarity_artist_ids']:,}"
+    )
+    assert sizes["insights.idx_release_rarity_label_ids"] > 0
