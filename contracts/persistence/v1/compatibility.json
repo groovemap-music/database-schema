@@ -143,10 +143,16 @@
       "loader_extraction_latch.created_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
       "loader_extraction_latch.generation": "BIGINT NULL (legacy rows retain NULL until the loader cutover)",
       "loader_extraction_latch.loader": "TEXT NOT NULL",
+      "loader_extraction_latch.purge_vetoed": "TEXT[] NOT NULL DEFAULT '{}' (entity types whose stale-row purge this extraction vetoed; rows written before the column read as none)",
       "loader_extraction_latch.refreshed_at": "TIMESTAMPTZ",
       "loader_extraction_latch.signals": "TEXT[] NOT NULL DEFAULT '{}'",
       "loader_extraction_latch.updated_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
       "loader_extraction_latch.version": "TEXT NOT NULL"
+    },
+    "column_writers": {
+      "loader_extraction_latch.purge_vetoed": [
+        "discogs-sql-loader"
+      ]
     },
     "consumers": [
       "discogs-sql-loader",

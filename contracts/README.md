@@ -101,7 +101,12 @@ in the loader, because DDL ownership stays with this repository. `discogs-sql-lo
 writer today (`loader = 'discogs'`); the relation is
 named for the loader family, not for one loader, so `musicbrainz-sql-loader` can write its own
 rows (`loader = 'musicbrainz'`) into the same relation when it adopts the pattern; see
-`design_decision` in the contract. Storage-only: `loader_extraction_latch` is a plain `public`
+`design_decision` in the contract. `purge_vetoed` records which entity types' stale-row purge
+that extraction vetoed, so a count of consecutive vetoes survives the restarts between dumps. It
+is additive, with an empty default: existing rows read as no veto recorded, and a loader that does
+not know the column keeps working. `column_writers` names who writes it, `discogs-sql-loader`
+today, and a `musicbrainz-sql-loader` writer is added here when it adopts the column.
+Storage-only: `loader_extraction_latch` is a plain `public`
 table, not a `graph` schema relation, and is not a property-graph element.
 
 `catalog_item_supersession` records the shape design ADR 0009's 2026-09-25 amendment decides

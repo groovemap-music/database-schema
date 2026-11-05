@@ -243,6 +243,7 @@ _ADDED_STATEMENT_NAMES = frozenset(
         "idx_mb_releases_release_group_mbid",
         "loader_extraction_latch table",
         "loader_extraction_latch generation column",
+        "loader_extraction_latch purge_vetoed column",
         "idx_loader_extraction_latch_generation",
         "idx_loader_extraction_latch_job_generation",
         "loader_derived_refresh_cursor table",

@@ -306,6 +306,7 @@ class TestDurableDerivedRefreshJob:
     def test_additive_latch_generation_and_cursor(self) -> None:
         statements = dict(_USER_TABLES)
         assert "ADD COLUMN IF NOT EXISTS generation BIGINT" in statements["loader_extraction_latch generation column"]
+        assert "ADD COLUMN IF NOT EXISTS purge_vetoed TEXT[] NOT NULL DEFAULT '{}'" in statements["loader_extraction_latch purge_vetoed column"]
         assert "(loader, generation) WHERE generation IS NOT NULL" in statements["idx_loader_extraction_latch_generation"]
         cursor = statements["loader_derived_refresh_cursor table"]
         assert "loader             TEXT PRIMARY KEY" in cursor

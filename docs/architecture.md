@@ -1100,6 +1100,12 @@ into this same relation, without this repository declaring a second table. See
 `extraction_latch` in [the persistence compatibility contract](../contracts/persistence/) for
 the full column and primary-key record.
 
+`purge_vetoed TEXT[] NOT NULL DEFAULT '{}'` records the entity types whose stale-row purge that
+extraction vetoed. Dumps are a month apart, so consecutive vetoes can only be counted from
+something that survives a restart. The column is additive: the constant default adds it without
+a table rewrite, existing rows read as no veto recorded, and a loader that lists its columns keeps
+working unchanged.
+
 `loader_extraction_latch` is storage-only: a plain `public` schema table, not part of the
 `graph` schema and not a property-graph element.
 
