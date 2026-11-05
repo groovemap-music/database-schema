@@ -1013,6 +1013,30 @@
     "kind": "additive",
     "note": "musicbrainz.relationships and musicbrainz.external_links were declared with created_at only, unlike every other MusicBrainz entity table. The additive updated_at column closes the gap: the loader refreshes it on every upsert and reconciles deletes by removing rows where updated_at < run start, the same purge_stale_rows shape discogs-sql-loader already runs against the Discogs entity tables' own updated_at. DDL ownership is database-schema alone, so this column is declared here rather than carried as a startup ALTER in the loader."
   },
+  "musicbrainz_relationship_key": {
+    "consumer": "musicbrainz-sql-loader",
+    "introduced_in_contract_version": 1,
+    "kind": "replacement",
+    "key": {
+      "function": "musicbrainz.relationship_key",
+      "index": "musicbrainz.relationships_key",
+      "inputs": [
+        "source_mbid",
+        "target_mbid",
+        "source_entity_type",
+        "target_entity_type",
+        "relationship_type",
+        "begin_date",
+        "end_date",
+        "attributes"
+      ],
+      "replaces": "relationships_natural_key (UNIQUE NULLS NOT DISTINCT over the same eight columns)"
+    },
+    "loader_change": "ON CONFLICT (source_mbid, target_mbid, source_entity_type, target_entity_type, relationship_type, begin_date, end_date, attributes) becomes ON CONFLICT (musicbrainz.relationship_key(source_mbid, target_mbid, source_entity_type, target_entity_type, relationship_type, begin_date, end_date, attributes)); the INSERT column list and the DO UPDATE clause are unchanged. The old target no longer infers an arbiter and fails with 'there is no unique or exclusion constraint matching the ON CONFLICT specification'.",
+    "migration": "expand then contract inside one initializer run: the function and the unique index are created first, and the eight-column constraint is dropped only once the index exists and is valid. The table is empty on lux and MusicBrainz is not enabled, so no loader writes between the schema and the loader change; deploy the loader change before enabling MusicBrainz.",
+    "note": "Uniqueness is unchanged except that attributes is hashed as jsonb text: key order does not matter, but a number keeps its written scale, so 1 and 1.0 are two keys where jsonb equality called them one. A NULL value is one key and is distinct from an empty string and from jsonb null.",
+    "rollback": "CREATE the eight-column constraint again, then DROP INDEX musicbrainz.relationships_key, then revert the loader's ON CONFLICT target; the rows need no change."
+  },
   "owners": [
     "database-schema"
   ],

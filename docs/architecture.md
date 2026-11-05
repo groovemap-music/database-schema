@@ -437,6 +437,41 @@ this primary key. When only 1% of subjects are eligible a page filters more rows
 total cost stays linear. `tests/integration/test_activity_keyset_paging.py` holds the schema to this:
 an index range scan, no sort, and the same buffers per page at any cursor depth or table size.
 
+### MusicBrainz relationships: the hash key
+
+`musicbrainz.relationships` is keyed by `musicbrainz.relationship_key(source_mbid, target_mbid,
+source_entity_type, target_entity_type, relationship_type, begin_date, end_date, attributes)`, a
+SHA-256 over the same eight values the old `relationships_natural_key` constraint named, held in the
+unique index `relationships_key`. The constraint was `UNIQUE NULLS NOT DISTINCT` over those eight
+columns, including a `jsonb` one, and was the largest index on the table.
+
+- **Rule kept.** Two relationships that differ only in date range or attributes are still two rows. Each
+  field is length-prefixed, so a value moved across a field boundary is a different key. A `NULL` is
+  one value: two `NULL` dates are the same key, and `NULL` is not an empty string and not `jsonb`
+  `null`. `attributes` is hashed as `jsonb` text, so key order does not matter. One difference: a
+  number keeps its written scale, so `1` and `1.0` are two keys here where `jsonb` equality called them
+  one. MusicBrainz attributes are strings and arrays of strings, so none is known to hit it.
+- **Measured** on PostgreSQL 18, 200,000 rows in random order with the dates and attributes MusicBrainz
+  carries on a minority of rows: the key index is 111 bytes per row as the eight-column constraint and
+  80 as the hash key (28% less). With every column populated, as in the audit's 144 bytes, the saving is
+  larger; the hash key's size does not depend on the data.
+- **Loader change (breaking).** `musicbrainz-sql-loader`'s `ON CONFLICT (source_mbid, target_mbid,
+  source_entity_type, target_entity_type, relationship_type, begin_date, end_date, attributes)` must
+  become `ON CONFLICT (musicbrainz.relationship_key(source_mbid, target_mbid, source_entity_type,
+  target_entity_type, relationship_type, begin_date, end_date, attributes))`. The column list and the
+  `DO UPDATE` clause do not change. The old target no longer finds a constraint and fails with `there is
+  no unique or exclusion constraint matching the ON CONFLICT specification`. Paired bead:
+  `gm-musicbrainz-sql-loader-1twk`. Deploy the loader change before MusicBrainz is enabled; the table is
+  empty on lux and nothing writes to it today.
+- **Upgrade path.** One initializer run: create the function, build the unique index, then drop the
+  eight-column constraint (and the older five-column one, if present) only once the index exists and is
+  valid, so a database is never without a uniqueness rule. A populated table takes a write lock for the
+  index build; build it first with `CREATE UNIQUE INDEX CONCURRENTLY relationships_key ON
+  musicbrainz.relationships (musicbrainz.relationship_key(...))` and the initializer finds it. Applying
+  twice changes nothing, and a database with duplicate-free rows needs no cleaning.
+- **Rollback.** Add the eight-column constraint back, drop `relationships_key`, and revert the loader's
+  conflict target. The rows are untouched.
+
 ### Event idempotency across partitions
 
 A unique key on a partitioned table must include the partition key, so `activity.events`'
@@ -609,9 +644,9 @@ The executable PostgreSQL inventory is in
 
 The statement lists also carry the migrations required for an existing database: additive
 authentication and media columns, rarity-signal columns, Discogs cross-reference widening to
-`BIGINT`, and the widened `musicbrainz.relationships` natural key. The latter uses `UNIQUE NULLS
-NOT DISTINCT` across both entity identifiers and types, relationship type, dates, and
-attributes. These statements intentionally run with the table/index declarations because
+`BIGINT`, and the `musicbrainz.relationships` key, a SHA-256 over both entity identifiers and
+types, relationship type, dates, and attributes (see
+[MusicBrainz relationships: the hash key](#musicbrainz-relationships-the-hash-key)). These statements intentionally run with the table/index declarations because
 `CREATE TABLE IF NOT EXISTS` cannot update an existing table. Do not translate them into an
 out-of-band migration or remove retained provenance fields.
 

@@ -129,7 +129,7 @@ _LEGACY_STATEMENT_NAMES = [
     "musicbrainz.releases.media column",
     "musicbrainz.release_groups table",
     "musicbrainz.relationships table",
-    "musicbrainz.relationships widen natural key to include begin_date/end_date/attributes",
+    "musicbrainz.relationships retire the eight-column natural key",
     "musicbrainz.external_links table",
     "musicbrainz.artists.discogs_artist_id widen to BIGINT",
     "musicbrainz.labels.discogs_label_id widen to BIGINT",
@@ -155,6 +155,8 @@ _LEGACY_STATEMENT_NAMES = [
 _ADDED_STATEMENT_NAMES = frozenset(
     {
         "queue_metrics table retired",
+        "musicbrainz.relationship_key function",
+        "musicbrainz.relationships_key index",
         "service_health_metrics table retired",
         "public.idx_artists_name hash index migration",
         "public.idx_labels_name hash index migration",
