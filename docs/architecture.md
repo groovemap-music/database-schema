@@ -421,6 +421,22 @@ subject's data") stays answerable rather than invisible.
 Every table, function, and trigger above is additive within persistence contract v1 — see
 [the persistence compatibility contract](../contracts/persistence/).
 
+### Keyset paging over activity tables
+
+Readers page `activity.events` and `activity.impressions` with `ORDER BY occurred_at, <key> LIMIT n`
+and the cursor `(occurred_at, <key>) > ($1, $2)`. No extra index is needed: the primary key
+`(occurred_at, event_id)` (`(occurred_at, impression_id)` on impressions) is created on every
+partition and is exactly that order, so the planner merges the partitions' primary-key scans
+(`Merge Append` over `*_pkey`) and stops after `n` rows, with no sort. An index on the same columns
+would only add write cost. Measured on PostgreSQL 18 with the real schema, the audited page shape
+(15,000 of 20,000 subjects eligible, `model_training` snapshot check, 1,000-row pages):
+0.9 to 1.5 ms per page at 400k events and 1.7 to 2.0 ms at 1.2M, at the start, middle and end of the
+window. The 102 ms per page an earlier audit measured at 400k events was taken on a table without
+this primary key. When only 1% of subjects are eligible a page filters more rows to find its 1,000
+(66 ms for the first page at 1.2M events) but each row is still read once across the whole walk, so
+total cost stays linear. `tests/integration/test_activity_keyset_paging.py` holds the schema to this:
+an index range scan, no sort, and the same buffers per page at any cursor depth or table size.
+
 ### Event idempotency across partitions
 
 A unique key on a partitioned table must include the partition key, so `activity.events`'
