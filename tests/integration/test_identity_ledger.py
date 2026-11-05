@@ -1,15 +1,20 @@
-"""Real-engine proof of the precomputed Identity Ledger (epic gm-database-schema-k8e9).
+"""Real-engine proof of the precomputed Identity Ledger (epics gm-database-schema-k8e9 and xen5).
 
-Every test runs in its own fresh database, so the views start unpopulated and
-the fixture below is the only history they hold: the suite's shared database
-collects other tests' items and supersessions, and once refreshed a view never
-returns to unpopulated.
+Every test runs in its own fresh database, so the tables start empty and the
+fixture below is the only history they hold: the suite's shared database
+collects other tests' items and supersessions.
+
+Incremental maintenance is held to two independent recomputes: catalog-api's
+prototype statements, verbatim, and `identity_ledger_verify()`.  The randomized
+history at the end of this file is what the maintenance's reach is proved by,
+because a hand-written case only covers the dependencies its author thought of.
 """
 
 from __future__ import annotations
 
 import contextlib
-from datetime import UTC, datetime
+import random
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
@@ -20,7 +25,15 @@ from psycopg import sql
 from psycopg.types.json import Jsonb
 
 from groovemap_schema import initializer
-from groovemap_schema.postgres import IDENTITY_LEDGER_VIEWS
+from groovemap_schema.postgres import (
+    IDENTITY_LEDGER_REFRESH_GRANTS,
+    IDENTITY_LEDGER_ROLLBACK_STATEMENTS,
+    IDENTITY_LEDGER_VIEWS,
+    _ledger_density_select,
+    _ledger_edition_events_select,
+    _ledger_edition_parents_select,
+    _ledger_work_summary_select,
+)
 
 
 if TYPE_CHECKING:
@@ -173,14 +186,6 @@ async def _view_rows(connection: psycopg.AsyncConnection[Any], view: str, schema
     return set(await _rows(connection, query))
 
 
-async def _populated(connection: psycopg.AsyncConnection[Any]) -> dict[str, bool]:
-    rows = await _rows(
-        connection,
-        "SELECT relname, relispopulated FROM pg_class WHERE relkind = 'm' AND relnamespace = 'public'::regnamespace",
-    )
-    return dict(rows)
-
-
 async def _view_locks(connection: psycopg.AsyncConnection[Any], pid: int) -> set[tuple[str, str]]:
     """The (view, lock mode) pairs PID holds on the four views."""
     rows = await _rows(
@@ -253,22 +258,37 @@ async def _build_reference(connection: psycopg.AsyncConnection[Any]) -> None:
     await connection.execute("RESET search_path")
 
 
+async def _refresh_and_compare(connection: psycopg.AsyncConnection[Any], context: Any = None) -> None:
+    """Refresh, then require both recomputes to agree with all four tables, row for row."""
+    await _rows(connection, "SELECT identity_ledger_refresh()")
+    await _assert_equal_to_a_full_recompute(connection, context)
+
+
+async def _assert_equal_to_a_full_recompute(connection: psycopg.AsyncConnection[Any], context: Any = None) -> None:
+    for view in IDENTITY_LEDGER_VIEWS:
+        await connection.execute(sql.SQL("REFRESH MATERIALIZED VIEW {}").format(sql.Identifier(_REFERENCE_SCHEMA, view)))
+        assert await _view_rows(connection, view) == await _view_rows(connection, view, _REFERENCE_SCHEMA), (view, context)
+    assert await _rows(connection, "SELECT relation, missing, unexpected, pending_changes FROM identity_ledger_verify() ORDER BY relation") == [
+        (view, 0, 0, 0) for view in sorted(IDENTITY_LEDGER_VIEWS)
+    ], context
+
+
 @pytest.mark.asyncio
-async def test_the_views_are_unreadable_until_the_first_refresh() -> None:
-    """Acceptance 4: a view not yet refreshed raises the error catalog-api checks for."""
+async def test_the_tables_are_empty_and_unrefreshed_until_the_first_refresh() -> None:
+    """A schema apply runs no history inline; the state row, not emptiness, says "not refreshed yet"."""
     async with _ledger_database() as params:
         connection = await _connect(params)
         async with connection:
-            assert await _populated(connection) == dict.fromkeys(IDENTITY_LEDGER_VIEWS, False)
+            async with connection.cursor() as cursor:
+                await _seed(cursor, Fixture())
             for view in IDENTITY_LEDGER_VIEWS:
-                with pytest.raises(psycopg.errors.ObjectNotInPrerequisiteState, match=f'materialized view "{view}" has not been populated'):
-                    await _rows(connection, sql.SQL("SELECT * FROM {} LIMIT 1").format(sql.Identifier(view)))
+                assert await _rows(connection, sql.SQL("SELECT * FROM {} LIMIT 1").format(sql.Identifier(view))) == []
             assert await _refresh_state(connection) == []
 
 
 @pytest.mark.asyncio
-async def test_the_first_refresh_populates_every_view_equal_to_the_reference() -> None:
-    """Acceptance 2: one refresh populates all four, row for row as catalog-api defines them."""
+async def test_the_first_refresh_fills_every_table_equal_to_the_reference() -> None:
+    """Acceptance 2: one refresh fills all four, row for row as catalog-api defines them."""
     fixture = Fixture()
     async with _ledger_database() as params:
         connection = await _connect(params)
@@ -277,13 +297,12 @@ async def test_the_first_refresh_populates_every_view_equal_to_the_reference() -
             async with connection.cursor() as cursor:
                 await _seed(cursor, fixture)
 
-            # The first refresh builds each view plainly: CONCURRENTLY refuses an
-            # unpopulated view, so a plain build's ACCESS EXCLUSIVE is the price.
+            # The first refresh takes no lock a reader queues behind.
             async with refresher.transaction():
                 ((refreshed_at,),) = await _rows(refresher, "SELECT identity_ledger_refresh()")
-                exclusive = await _view_locks(connection, refresher.info.backend_pid)
-                assert {(view, "AccessExclusiveLock") for view in IDENTITY_LEDGER_VIEWS} <= exclusive
-            assert await _populated(connection) == dict.fromkeys(IDENTITY_LEDGER_VIEWS, True)
+                locks = await _view_locks(connection, refresher.info.backend_pid)
+                assert locks
+                assert not any(mode == "AccessExclusiveLock" for _view, mode in locks)
             ((state_at, duration, watermark),) = await _refresh_state(connection)
             assert (state_at, watermark) == (refreshed_at, None)
             assert duration.total_seconds() >= 0
@@ -306,18 +325,31 @@ async def test_the_first_refresh_populates_every_view_equal_to_the_reference() -
             # And catalog-api's reference definitions agree on every row.
             await _build_reference(connection)
             for view in IDENTITY_LEDGER_VIEWS:
-                reference = await _view_rows(connection, view, _REFERENCE_SCHEMA)
-                assert reference, view
-                assert await _view_rows(connection, view) == reference, view
+                assert await _view_rows(connection, view, _REFERENCE_SCHEMA), view
+            await _assert_equal_to_a_full_recompute(connection)
 
-            # Applying the schema again leaves the populated views as they are.
+            # Applying the schema again leaves the filled tables as they are.
             assert await initializer._apply_postgres_schema(params) is True
-            assert await _populated(connection) == dict.fromkeys(IDENTITY_LEDGER_VIEWS, True)
             assert await _view_rows(connection, "identity_ledger_work_summary") == _expected_work_summary(fixture)
 
 
 @pytest.mark.asyncio
-async def test_a_later_refresh_is_concurrent_and_never_blocks_a_reader() -> None:
+async def test_the_table_columns_keep_the_types_the_views_published() -> None:
+    """A reader sees the same columns and types the materialized views had, in the same order."""
+    async with _ledger_database() as params:
+        connection = await _connect(params)
+        async with connection:
+            await _build_reference(connection)
+            shape = """
+                SELECT attname, format_type(atttypid, atttypmod) FROM pg_attribute
+                WHERE attrelid = %s::regclass AND attnum > 0 AND NOT attisdropped ORDER BY attnum
+            """
+            for view in IDENTITY_LEDGER_VIEWS:
+                assert await _rows(connection, shape, (f"public.{view}",)) == await _rows(connection, shape, (f"{_REFERENCE_SCHEMA}.{view}",)), view
+
+
+@pytest.mark.asyncio
+async def test_a_later_refresh_never_blocks_a_reader() -> None:
     """Acceptance 3: a reader in another session neither blocks nor is blocked by the refresh."""
     fixture = Fixture()
     async with _ledger_database() as params:
@@ -341,9 +373,6 @@ async def test_a_later_refresh_is_concurrent_and_never_blocks_a_reader() -> None
                 (fixture.mb1, relinked),
             )
 
-            # The reader holds its ACCESS SHARE lock on the summary in an open
-            # transaction. A plain REFRESH would wait for it and hit the
-            # refresher's lock timeout; a concurrent one does not wait.
             await reader.execute("BEGIN")
             assert await _rows(reader, summary, (fixture.w1,)) == [(1, LOAD)]
             await refresher.execute("SET lock_timeout = '5s'")
@@ -352,11 +381,10 @@ async def test_a_later_refresh_is_concurrent_and_never_blocks_a_reader() -> None
             ((second_at,),) = await _rows(refresher, "SELECT identity_ledger_refresh(%s)", (Jsonb(watermark),))
             assert second_at > first_at
 
-            # Mid-refresh, before it commits: it holds EXCLUSIVE, never ACCESS
-            # EXCLUSIVE, so a new reader with a short lock timeout reads at once
-            # and sees the rows of the previous refresh.
+            # Mid-refresh, before it commits: no ACCESS EXCLUSIVE, so a new reader
+            # with a short lock timeout reads at once and sees the previous rows.
             locks = await _view_locks(writer, refresher.info.backend_pid)
-            assert {(view, "ExclusiveLock") for view in IDENTITY_LEDGER_VIEWS} <= locks
+            assert locks
             assert not any(mode == "AccessExclusiveLock" for _view, mode in locks)
             await late_reader.execute("SET lock_timeout = '1s'")
             assert await _rows(late_reader, summary, (fixture.w1,)) == [(1, LOAD)]
@@ -374,6 +402,7 @@ async def test_a_later_refresh_is_concurrent_and_never_blocks_a_reader() -> None
 @pytest.mark.asyncio
 async def test_refreshing_needs_the_owner_or_maintain_on_every_view() -> None:
     """Acceptance 5: catalog-api's login, the owner today, refreshes; another login needs the stated grant."""
+    fixture = Fixture()
     async with _ledger_database() as params:
         role, password = f"ledger_refresher_{uuid4().hex[:12]}", uuid4().hex
         owner = await _connect(params)
@@ -387,14 +416,23 @@ async def test_refreshing_needs_the_owner_or_maintain_on_every_view() -> None:
 
                     # The grant the design note states for a separate catalog-api login.
                     await owner.execute(
-                        sql.SQL("GRANT MAINTAIN ON {} TO {}").format(
-                            sql.SQL(", ").join(sql.Identifier(view) for view in IDENTITY_LEDGER_VIEWS), sql.Identifier(role)
+                        sql.SQL("GRANT SELECT, INSERT, UPDATE, DELETE ON {} TO {}").format(
+                            sql.SQL(", ").join(sql.Identifier(table) for table in IDENTITY_LEDGER_REFRESH_GRANTS), sql.Identifier(role)
                         )
                     )
-                    await owner.execute(sql.SQL("GRANT SELECT, INSERT, UPDATE ON identity_ledger_refresh_state TO {}").format(sql.Identifier(role)))
-                    # Both a first, plain refresh and a later, concurrent one.
+                    await owner.execute(
+                        sql.SQL("GRANT SELECT ON provider_aliases, catalog_items, catalog_item_supersessions, identity_link_events TO {}").format(
+                            sql.Identifier(role)
+                        )
+                    )
+                    await owner.execute(sql.SQL("GRANT USAGE ON SCHEMA graph, musicbrainz TO {}").format(sql.Identifier(role)))
+                    await owner.execute(sql.SQL("GRANT SELECT ON graph.derived_from, musicbrainz.releases TO {}").format(sql.Identifier(role)))
+                    # Both a first build and a later, per-item refresh.
                     await _rows(other, "SELECT identity_ledger_refresh()")
+                    async with owner.cursor() as cursor:
+                        await _seed(cursor, fixture)
                     await _rows(other, "SELECT identity_ledger_refresh()")
+                    assert await _view_rows(owner, "identity_ledger_work_summary") == _expected_work_summary(fixture)
 
                 # The owning login, which every service connects as today, needs no grant.
                 ((refreshed_at,),) = await _rows(owner, "SELECT identity_ledger_refresh()")
@@ -402,3 +440,454 @@ async def test_refreshing_needs_the_owner_or_maintain_on_every_view() -> None:
             finally:
                 await owner.execute(sql.SQL("DROP OWNED BY {}").format(sql.Identifier(role)))
                 await owner.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(role)))
+
+
+@pytest.mark.asyncio
+async def test_a_writer_that_cannot_write_the_log_directly_still_writes_its_source() -> None:
+    """Capture runs as the schema owner, so a role granted only a source keeps working."""
+    async with _ledger_database() as params:
+        role, password = f"ledger_writer_{uuid4().hex[:12]}", uuid4().hex
+        owner = await _connect(params)
+        async with owner:
+            await owner.execute(sql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(sql.Identifier(role), sql.Literal(password)))
+            try:
+                await owner.execute(sql.SQL("GRANT INSERT, SELECT ON catalog_items, provider_aliases TO {}").format(sql.Identifier(role)))
+                writer = await _connect(params, user=role, password=password)
+                async with writer:
+                    item = uuid4()
+                    await writer.execute("INSERT INTO catalog_items (id, kind) VALUES (%s, 'release')", (item,))
+                    await writer.execute(
+                        "INSERT INTO provider_aliases (provider, entity_kind, external_id, native_id) VALUES ('discogs', 'release', 'r1', %s)",
+                        (item,),
+                    )
+                assert await _rows(owner, "SELECT DISTINCT item_id FROM identity_ledger_changes") == [(item,)]
+            finally:
+                await owner.execute(sql.SQL("DROP OWNED BY {}").format(sql.Identifier(role)))
+                await owner.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(role)))
+
+
+@pytest.mark.asyncio
+async def test_a_transaction_that_commits_after_a_refresh_is_not_lost() -> None:
+    """What a timestamp watermark gets wrong: a write older than the refresh, committed after it."""
+    fixture = Fixture()
+    async with _ledger_database() as params:
+        writer = await _connect(params)
+        late = await _connect(params)
+        async with writer, late:
+            async with writer.cursor() as cursor:
+                await _seed(cursor, fixture)
+            await _build_reference(writer)
+            await _rows(writer, "SELECT identity_ledger_refresh()")
+
+            await late.execute("BEGIN")
+            await late.execute(
+                "INSERT INTO provider_aliases (provider, entity_kind, external_id, native_id, valid_from) "
+                "VALUES ('musicbrainz', 'release', %s, %s, %s)",
+                (str(uuid4()), fixture.b, _at(4, 1)),
+            )
+            await _rows(writer, "SELECT identity_ledger_refresh()")
+            await late.execute("COMMIT")
+
+            await _refresh_and_compare(writer)
+            assert (fixture.b, _at(4, 1), "linked_at_ingest", 1) in await _view_rows(writer, "identity_ledger_edition_events")
+
+
+@pytest.mark.asyncio
+async def test_a_refresh_with_no_change_writes_nothing_but_the_state_row() -> None:
+    """Cost scales with changes: with none, not one ledger row is touched."""
+    fixture = Fixture()
+    async with _ledger_database() as params:
+        connection = await _connect(params)
+        async with connection:
+            async with connection.cursor() as cursor:
+                await _seed(cursor, fixture)
+            await _rows(connection, "SELECT identity_ledger_refresh()")
+
+            ctids = sql.SQL(" UNION ALL ").join(
+                sql.SQL("SELECT {}, ctid::text, xmin::text FROM {}").format(sql.Literal(table), sql.Identifier(table))
+                for table in (*IDENTITY_LEDGER_VIEWS, "identity_ledger_item_mints", "identity_ledger_item_events")
+            )
+            before = await _rows(connection, ctids)
+            assert before
+            await _rows(connection, "SELECT identity_ledger_refresh()")
+            assert await _rows(connection, ctids) == before
+
+
+@pytest.mark.asyncio
+async def test_a_truncated_source_rebuilds_on_the_next_refresh() -> None:
+    """TRUNCATE names no rows, so it asks for a rebuild, and the deltas are not applied twice."""
+    fixture = Fixture()
+    async with _ledger_database() as params:
+        connection = await _connect(params)
+        async with connection:
+            async with connection.cursor() as cursor:
+                await _seed(cursor, fixture)
+            await _build_reference(connection)
+            await _rows(connection, "SELECT identity_ledger_refresh()")
+
+            # A delta waits in the log when the rebuild is asked for.
+            await connection.execute(
+                "INSERT INTO identity_link_events (provider, entity_kind, external_id, event, discogs_id_before, discogs_id_after, "
+                "event_at, dated_from, source_ref) VALUES ('musicbrainz', 'release', %s, 'link_changed', 2, 3, %s, 'groovemap_load', 'x')",
+                (fixture.mb1, _at(11, 2)),
+            )
+            await connection.execute("TRUNCATE graph.derived_from")
+            await _refresh_and_compare(connection)
+            assert await _rows(connection, "SELECT count(*) FROM identity_ledger_density_changes") == [(0,)]
+
+
+@pytest.mark.asyncio
+async def test_a_disabled_capture_trigger_stops_the_refresh() -> None:
+    """A source no longer followed fails loudly, rather than answering stale rows."""
+    async with _ledger_database() as params:
+        connection = await _connect(params)
+        async with connection:
+            await connection.execute("ALTER TABLE provider_aliases DISABLE TRIGGER identity_ledger_capture_insert")
+            with pytest.raises(psycopg.errors.ObjectNotInPrerequisiteState, match="capture triggers are incomplete"):
+                await _rows(connection, "SELECT identity_ledger_refresh()")
+            await connection.execute("ALTER TABLE provider_aliases ENABLE TRIGGER identity_ledger_capture_insert")
+            await _rows(connection, "SELECT identity_ledger_refresh()")
+
+
+@pytest.mark.asyncio
+async def test_verify_reports_a_tampered_table_and_a_pending_change() -> None:
+    """The verification path can fail: it finds rows wrong in either direction, and says when it is not settled."""
+    fixture = Fixture()
+    async with _ledger_database() as params:
+        connection = await _connect(params)
+        async with connection:
+            async with connection.cursor() as cursor:
+                await _seed(cursor, fixture)
+            await _rows(connection, "SELECT identity_ledger_refresh()")
+            verify = "SELECT relation, missing, unexpected, pending_changes FROM identity_ledger_verify() WHERE relation = 'identity_ledger_density'"
+            assert await _rows(connection, verify) == [("identity_ledger_density", 0, 0, 0)]
+
+            await connection.execute(
+                "UPDATE identity_ledger_density SET events = events + 1 WHERE (kind, month, type) = ('release', '2026-01', 'minted')"
+            )
+            assert await _rows(connection, verify) == [("identity_ledger_density", 1, 1, 0)]
+
+            await connection.execute("SELECT identity_ledger_request_rebuild()")
+            assert await _rows(connection, verify) == [("identity_ledger_density", 1, 1, 1)]
+            await _rows(connection, "SELECT identity_ledger_refresh()")
+            assert await _rows(connection, verify) == [("identity_ledger_density", 0, 0, 0)]
+
+
+async def _make_v063_views(connection: psycopg.AsyncConnection[Any]) -> None:
+    """Replace the tables with the materialized views v0.6.3 published, refreshed, with a state row."""
+    await connection.execute("DROP TABLE " + ", ".join(IDENTITY_LEDGER_VIEWS))
+    bodies = (
+        _ledger_edition_events_select(),
+        _ledger_edition_parents_select("SELECT DISTINCT edition_id FROM public.identity_ledger_edition_events"),
+        _ledger_work_summary_select("public.identity_ledger_edition_events", "public.identity_ledger_edition_parents"),
+        _ledger_density_select(),
+    )
+    for view, body in zip(IDENTITY_LEDGER_VIEWS, bodies, strict=True):
+        await connection.execute(f"CREATE MATERIALIZED VIEW public.{view} AS {body}".encode())
+    await connection.execute("INSERT INTO identity_ledger_refresh_state (refreshed_at, duration) VALUES (now(), '45 seconds')")
+
+
+@pytest.mark.asyncio
+async def test_upgrading_from_the_materialized_views_rebuilds_on_the_first_refresh() -> None:
+    """The upgrade on a database holding data: views go, the state row goes, the first refresh fills the tables."""
+    fixture = Fixture()
+    async with _ledger_database() as params:
+        connection = await _connect(params)
+        async with connection:
+            async with connection.cursor() as cursor:
+                await _seed(cursor, fixture)
+            await _build_reference(connection)
+            await _make_v063_views(connection)
+
+            # Writes that land before capture exists must be in the first build.
+            await connection.execute("DROP TRIGGER identity_ledger_capture_insert ON provider_aliases")
+            await connection.execute(
+                "INSERT INTO provider_aliases (provider, entity_kind, external_id, native_id, valid_from) "
+                "VALUES ('musicbrainz', 'release', %s, %s, %s)",
+                (str(uuid4()), fixture.b, _at(4, 1)),
+            )
+
+            assert await initializer._apply_postgres_schema(params) is True
+            relkinds = dict(
+                await _rows(connection, "SELECT relname, relkind::text FROM pg_class WHERE relname = ANY(%s)", (list(IDENTITY_LEDGER_VIEWS),))
+            )
+            assert relkinds == dict.fromkeys(IDENTITY_LEDGER_VIEWS, "r")
+            assert await _refresh_state(connection) == []
+            await _refresh_and_compare(connection)
+            assert await _refresh_state(connection) != []
+
+            # A second apply finds nothing to migrate.
+            assert await initializer._apply_postgres_schema(params) is True
+            await _assert_equal_to_a_full_recompute(connection)
+
+
+@pytest.mark.asyncio
+async def test_rolling_back_restores_the_materialized_views_equal_to_the_reference() -> None:
+    """The documented rollback: remove what the upgrade added, and v0.6.3's own statements apply again."""
+    fixture = Fixture()
+    async with _ledger_database() as params:
+        connection = await _connect(params)
+        async with connection:
+            async with connection.cursor() as cursor:
+                await _seed(cursor, fixture)
+            await _build_reference(connection)
+            await _rows(connection, "SELECT identity_ledger_refresh()")
+
+            for statement in IDENTITY_LEDGER_ROLLBACK_STATEMENTS:
+                await connection.execute(statement.encode())
+            assert await _rows(connection, "SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'identity\\_ledger\\_%'") == [(0,)]
+            assert await _rows(
+                connection, "SELECT count(*) FROM pg_proc WHERE proname LIKE 'identity\\_ledger\\_%' AND proname <> 'identity_ledger_refresh'"
+            ) == [(0,)]
+            assert await _refresh_state(connection) == []
+
+            # The source tables were never touched, and every statement of the old
+            # schema that names a ledger relation can run: nothing of the name remains.
+            await connection.execute(
+                "CREATE TABLE identity_ledger_edition_events_probe AS SELECT 1 AS probe; DROP TABLE identity_ledger_edition_events_probe"
+            )
+            bodies = (
+                _ledger_edition_events_select(),
+                _ledger_edition_parents_select("SELECT DISTINCT edition_id FROM public.identity_ledger_edition_events"),
+                _ledger_work_summary_select("public.identity_ledger_edition_events", "public.identity_ledger_edition_parents"),
+                _ledger_density_select(),
+            )
+            for view, body in zip(IDENTITY_LEDGER_VIEWS, bodies, strict=True):
+                await connection.execute(f"CREATE MATERIALIZED VIEW IF NOT EXISTS public.{view} AS {body}".encode())
+                await connection.execute(sql.SQL("REFRESH MATERIALIZED VIEW {}").format(sql.Identifier(_REFERENCE_SCHEMA, view)))
+                assert await _view_rows(connection, view) == await _view_rows(connection, view, _REFERENCE_SCHEMA), view
+
+
+class History:
+    """A deterministic random history of everything the sources admit, written as the writers would."""
+
+    KINDS = ("release", "master", "artist", "label")
+
+    def __init__(self, cursor: Any, seed: int) -> None:
+        self.cursor = cursor
+        self.random = random.Random(seed)  # noqa: S311 -- reproducible test data, not security
+        self.clock = _at(1, 1, 2024)
+        self.items: dict[str, list[UUID]] = {kind: [] for kind in self.KINDS}
+        self.instants: list[datetime] = [self.clock]
+
+    def tick(self) -> datetime:
+        """Return a later instant, sometimes one already used, so instants collide as a merge's do."""
+        if self.random.random() < 0.2:
+            return self.random.choice(self.instants)
+        self.clock += timedelta(days=self.random.randint(1, 45))
+        self.instants.append(self.clock)
+        return self.clock
+
+    async def one(self, query: str, parameters: Any = None) -> Any:
+        await self.cursor.execute(query, parameters)
+        row = await self.cursor.fetchone()
+        return row
+
+    async def mint(self) -> None:
+        kind = self.random.choice(self.KINDS)
+        item = uuid4()
+        at = self.tick()
+        order = self.random.random()
+        statements = [
+            ("INSERT INTO catalog_items (id, kind) VALUES (%s, %s)", (item, kind)),
+            (
+                "INSERT INTO provider_aliases (provider, entity_kind, external_id, native_id, valid_from) VALUES ('discogs', %s, %s, %s, %s)",
+                (kind, uuid4().hex, item, at),
+            ),
+        ]
+        # An alias written before its item, which no foreign key forbids.
+        for statement, parameters in statements if order < 0.9 else reversed(statements):
+            await self.cursor.execute(statement, parameters)
+        self.items[kind].append(item)
+
+    async def attach(self) -> None:
+        kind = self.random.choice(self.KINDS)
+        if not self.items[kind]:
+            return
+        item = self.random.choice(self.items[kind])
+        provider = self.random.choice(("discogs", "musicbrainz", "musicbrainz", "wikidata"))
+        # Reuse a link event's or release group's id now and then, so an alias arrives for a row already there.
+        known = await self.one(
+            "SELECT external_id FROM identity_link_events WHERE entity_kind = %s AND random() < 0.5 "
+            "AND NOT EXISTS (SELECT 1 FROM provider_aliases AS alias WHERE alias.provider = 'musicbrainz' AND alias.entity_kind = %s "
+            "AND alias.external_id = identity_link_events.external_id AND alias.valid_to IS NULL) LIMIT 1",
+            (kind, kind),
+        )
+        external = known[0] if known and provider == "musicbrainz" else str(uuid4())
+        # Sometimes earlier than the item's mint, which moves the mint.
+        at = self.tick() if self.random.random() < 0.85 else _at(1, 1, 2023) + timedelta(days=self.random.randint(0, 300))
+        await self.cursor.execute(
+            "INSERT INTO provider_aliases (provider, entity_kind, external_id, native_id, valid_from) VALUES (%s, %s, %s, %s, %s)",
+            (provider, kind, external, item, at),
+        )
+
+    async def close(self) -> None:
+        row = await self.one("SELECT id FROM provider_aliases WHERE valid_to IS NULL ORDER BY random() LIMIT 1")
+        if row:
+            await self.cursor.execute("UPDATE provider_aliases SET valid_to = %s WHERE id = %s", (self.tick(), row[0]))
+
+    async def remove(self) -> None:
+        row = await self.one("SELECT id FROM provider_aliases ORDER BY random() LIMIT 1")
+        if row:
+            await self.cursor.execute("DELETE FROM provider_aliases WHERE id = %s", (row[0],))
+
+    async def forget(self) -> None:
+        """Delete an unreferenced item, as the loaders' mint rollback does."""
+        row = await self.one(
+            "SELECT id, kind FROM catalog_items AS item WHERE NOT EXISTS (SELECT 1 FROM catalog_item_supersessions AS s "
+            "WHERE item.id IN (s.superseded_id, s.survivor_id)) ORDER BY random() LIMIT 1"
+        )
+        if row:
+            await self.cursor.execute("DELETE FROM catalog_items WHERE id = %s", (row[0],))
+            self.items[row[1]].remove(row[0])
+
+    async def supersede(self) -> None:
+        kind = self.random.choice(("release", "release", "master"))
+        if len(self.items[kind]) < 2:
+            return
+        superseded, survivor = self.random.sample(self.items[kind], 2)
+        if await self.one("SELECT 1 FROM catalog_item_supersessions WHERE superseded_id = %s AND valid_to IS NULL", (superseded,)):
+            return
+        at = self.tick()
+        cause = self.random.choice(("edition_promotion", "catalog_reattachment"))
+        await self.cursor.execute(
+            "INSERT INTO catalog_item_supersessions (superseded_id, survivor_id, cause, decision_ref, valid_from) VALUES (%s, %s, %s, %s, %s)",
+            (superseded, survivor, cause, uuid4(), at),
+        )
+        # A re-attachment moves an alias at the supersession's instant, which is no alias event.
+        moved = await self.one(
+            "SELECT id, provider, entity_kind, external_id FROM provider_aliases WHERE native_id = %s AND valid_to IS NULL LIMIT 1", (superseded,)
+        )
+        if moved and cause == "catalog_reattachment":
+            await self.cursor.execute("UPDATE provider_aliases SET valid_to = %s WHERE id = %s", (at, moved[0]))
+            await self.cursor.execute(
+                "INSERT INTO provider_aliases (provider, entity_kind, external_id, native_id, valid_from) VALUES (%s, %s, %s, %s, %s)",
+                (moved[1], moved[2], moved[3], survivor, at),
+            )
+
+    async def revert(self) -> None:
+        row = await self.one("SELECT id FROM catalog_item_supersessions WHERE valid_to IS NULL ORDER BY random() LIMIT 1")
+        if row:
+            await self.cursor.execute("UPDATE catalog_item_supersessions SET valid_to = %s WHERE id = %s", (self.tick(), row[0]))
+
+    async def erase_supersession(self) -> None:
+        row = await self.one(
+            "SELECT id FROM catalog_item_supersessions AS s WHERE NOT EXISTS (SELECT 1 FROM catalog_item_supersessions AS later WHERE later.via_id = s.id) "
+            "ORDER BY random() LIMIT 1"
+        )
+        if row:
+            await self.cursor.execute("DELETE FROM catalog_item_supersessions WHERE id = %s", (row[0],))
+
+    async def link(self) -> None:
+        kind = self.random.choice((*self.KINDS, "release", "release"))
+        held = await self.one(
+            "SELECT external_id FROM provider_aliases WHERE provider = 'musicbrainz' AND entity_kind = %s AND valid_to IS NULL ORDER BY random() LIMIT 1",
+            (kind,),
+        )
+        external = held[0] if held and self.random.random() < 0.8 else str(uuid4())
+        await self.cursor.execute(
+            "INSERT INTO identity_link_events (provider, entity_kind, external_id, event, discogs_id_before, discogs_id_after, event_at, dated_from, source_ref) "
+            "VALUES ('musicbrainz', %s, %s, 'link_added', NULL, 1, %s, %s, %s) ON CONFLICT DO NOTHING",
+            (kind, external, self.tick(), self.random.choice(("musicbrainz_fullexport", "groovemap_load")), uuid4().hex),
+        )
+
+    async def unlink(self) -> None:
+        row = await self.one("SELECT id FROM identity_link_events ORDER BY random() LIMIT 1")
+        if row:
+            await self.cursor.execute("DELETE FROM identity_link_events WHERE id = %s", (row[0],))
+
+    async def redate_link(self) -> None:
+        row = await self.one("SELECT id FROM identity_link_events ORDER BY random() LIMIT 1")
+        if row:
+            await self.cursor.execute("UPDATE identity_link_events SET event_at = %s WHERE id = %s", (self.tick(), row[0]))
+
+    async def derive(self) -> None:
+        release = await self.one(
+            "SELECT external_id FROM provider_aliases WHERE provider = 'discogs' AND entity_kind = 'release' ORDER BY random() LIMIT 1"
+        )
+        master = await self.one(
+            "SELECT external_id FROM provider_aliases WHERE provider = 'discogs' AND entity_kind = 'master' ORDER BY random() LIMIT 1"
+        )
+        if release and master:
+            await self.cursor.execute(
+                "INSERT INTO graph.derived_from (release_id, master_id) VALUES (%s, %s) ON CONFLICT DO NOTHING", (release[0], master[0])
+            )
+
+    async def underive(self) -> None:
+        row = await self.one("SELECT release_id, master_id FROM graph.derived_from ORDER BY random() LIMIT 1")
+        if row:
+            await self.cursor.execute("DELETE FROM graph.derived_from WHERE release_id = %s AND master_id = %s", row)
+
+    async def mb_release(self) -> None:
+        release = await self.one(
+            "SELECT external_id FROM provider_aliases WHERE provider = 'musicbrainz' AND entity_kind = 'release' AND external_id !~ '^[0-9a-f]{32}$' ORDER BY random() LIMIT 1"
+        )
+        group = await self.one(
+            "SELECT external_id FROM provider_aliases WHERE provider = 'musicbrainz' AND entity_kind = 'master' AND external_id !~ '^[0-9a-f]{32}$' ORDER BY random() LIMIT 1"
+        )
+        if release and group:
+            await self.cursor.execute(
+                "INSERT INTO musicbrainz.releases (mbid, name, release_group_mbid) VALUES (%s, 'x', %s) "
+                "ON CONFLICT (mbid) DO UPDATE SET release_group_mbid = EXCLUDED.release_group_mbid",
+                (release[0], group[0]),
+            )
+
+    async def mb_release_touch(self) -> None:
+        await self.cursor.execute(
+            "UPDATE musicbrainz.releases SET name = name || 'y' WHERE mbid IN (SELECT mbid FROM musicbrainz.releases ORDER BY random() LIMIT 1)"
+        )
+
+    async def mb_release_gone(self) -> None:
+        await self.cursor.execute("DELETE FROM musicbrainz.releases WHERE mbid IN (SELECT mbid FROM musicbrainz.releases ORDER BY random() LIMIT 1)")
+
+    async def rebuild(self) -> None:
+        await self.cursor.execute("SELECT identity_ledger_request_rebuild()")
+
+    async def step(self) -> None:
+        operations = [
+            (self.mint, 12),
+            (self.attach, 12),
+            (self.close, 5),
+            (self.remove, 2),
+            (self.forget, 2),
+            (self.supersede, 6),
+            (self.revert, 3),
+            (self.erase_supersession, 1),
+            (self.link, 6),
+            (self.unlink, 1),
+            (self.redate_link, 1),
+            (self.derive, 6),
+            (self.underive, 2),
+            (self.mb_release, 5),
+            (self.mb_release_touch, 1),
+            (self.mb_release_gone, 1),
+        ]
+        await self.random.choices([operation for operation, _weight in operations], [weight for _operation, weight in operations])[0]()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seed", range(6))
+async def test_any_history_refreshed_in_steps_equals_a_full_recompute(seed: int) -> None:
+    """The acceptance criterion: after every batch of changes, the tables equal both recomputes."""
+    async with _ledger_database() as params:
+        connection = await _connect(params)
+        async with connection:
+            await _build_reference(connection)
+            history = History(connection.cursor(), seed)
+            for _ in range(40):
+                await history.mint()
+            await _refresh_and_compare(connection, (seed, "first"))
+
+            for batch in range(25):
+                for _ in range(history.random.randint(1, 12)):
+                    await history.step()
+                if history.random.random() < 0.05:
+                    await history.rebuild()
+                await _refresh_and_compare(connection, (seed, batch))
+
+            # Maintained state is what a rebuild computes, so the stores never drift either.
+            stores = ["identity_ledger_item_mints", "identity_ledger_item_events"]
+            maintained = [set(await _rows(connection, sql.SQL("SELECT * FROM {}").format(sql.Identifier(table)))) for table in stores]
+            await history.rebuild()
+            await _refresh_and_compare(connection, (seed, "rebuilt"))
+            assert [set(await _rows(connection, sql.SQL("SELECT * FROM {}").format(sql.Identifier(table)))) for table in stores] == maintained

@@ -12,6 +12,7 @@ from groovemap_schema.postgres import (
     _FREE_TEXT_KEYS,
     _GRAPH_STATEMENTS,
     _IDENTITY_LEDGER_STATEMENTS,
+    _LEDGER_SOURCES,
     _MUSICBRAINZ_TABLES,
     _PATH_RELATIONS,
     _PATH_RELATIONSHIP_TYPES,
@@ -21,6 +22,7 @@ from groovemap_schema.postgres import (
     EXPLORE_DEFAULT_ROW_LIMIT,
     EXPLORE_MAX_HOPS,
     EXPLORE_MIN_HOPS,
+    IDENTITY_LEDGER_STORES,
     IDENTITY_LEDGER_VIEWS,
     PATH_DEFAULT_DEPTH,
     PATH_MAX_DEPTH,
@@ -195,8 +197,8 @@ purge_index = retention["index"].split(" ", 1)[0]
 assert retention["index"] == activity_statements[purge_index].removeprefix("CREATE INDEX IF NOT EXISTS ")
 
 # The precomputed Identity Ledger is read and refreshed by catalog-api. Pin the
-# refresh order, every view's columns, unique key and read indexes, the state
-# row, and the function's signature to the statements.
+# maintenance order, every table's columns, unique key and read indexes, the state
+# row, the sources, and the function's signature to the statements.
 ledger = contract["identity_ledger_precompute"]
 ledger_statements = dict(_IDENTITY_LEDGER_STATEMENTS)
 assert ledger["kind"] == "additive"
@@ -206,9 +208,8 @@ assert ledger["refresh"]["order"] == list(IDENTITY_LEDGER_VIEWS)
 assert list(ledger["views"]) == list(IDENTITY_LEDGER_VIEWS)
 contracted_indexes = set()
 for view, shape in ledger["views"].items():
-    view_statement = ledger_statements[f"{view} materialized view"]
-    assert f"CREATE MATERIALIZED VIEW IF NOT EXISTS public.{view} AS" in view_statement, view
-    assert view_statement.rstrip().endswith("WITH NO DATA"), view
+    view_statement = ledger_statements[f"{view} table"]
+    assert f"CREATE TABLE IF NOT EXISTS {view} (" in view_statement, view
     for column in shape["columns"]:
         assert re.search(rf"\b{column}\b", view_statement), (view, column)
     unique = shape["unique"]
@@ -220,7 +221,22 @@ for view, shape in ledger["views"].items():
         name = index.split(" ", 1)[0]
         assert index == ledger_statements[name].removeprefix("CREATE INDEX IF NOT EXISTS "), name
         contracted_indexes.add(name)
+for index in ledger["refresh"]["maintenance_indexes"]:
+    name = index.split(" ", 1)[0]
+    assert index == ledger_statements[name].removeprefix("CREATE INDEX IF NOT EXISTS "), name
+    contracted_indexes.add(name)
 assert contracted_indexes == {name for name in ledger_statements if name.startswith("idx_")}
+assert ledger["refresh"]["sources"] == [table for table, _function in _LEDGER_SOURCES]
+assert list(ledger["stores"]) == list(IDENTITY_LEDGER_STORES)
+for store in IDENTITY_LEDGER_STORES:
+    assert f"CREATE TABLE IF NOT EXISTS {store} (" in ledger_statements[f"{store} table"], store
+for table, _function in _LEDGER_SOURCES:
+    assert f"{table} identity ledger capture triggers" in ledger_statements, table
+verify_signature = ledger["refresh"]["verify"].split(" runs ", 1)[0]
+assert (
+    f"CREATE OR REPLACE FUNCTION {verify_signature.split(' RETURNS ')[0]}\nRETURNS {verify_signature.split(' RETURNS ')[1]}\n"
+    in ledger_statements["identity_ledger_verify function"]
+)
 refresh_state = ledger["refresh_state"]
 refresh_state_statement = ledger_statements["identity_ledger_refresh_state table"]
 assert refresh_state["relation"] == "public.identity_ledger_refresh_state"
