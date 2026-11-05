@@ -852,6 +852,66 @@ additive, media-neutral rarity signals alongside the retained `format_rarity`. E
 is additive within persistence contract v1 — see
 [the persistence compatibility contract](../contracts/persistence/).
 
+### Schema init and a running rarity job
+
+The rarity writer holds one transaction open for 1.4-1.8 hours on lux (gm-catalog-api-usmt).
+Schema init used to wait for it, and worse, make every rarity reader wait too:
+`CREATE INDEX IF NOT EXISTS` takes `SHARE` on the table before it finds the index exists, and
+`ALTER TABLE ... ADD COLUMN IF NOT EXISTS` takes `ACCESS EXCLUSIVE` before it finds the column.
+A queued `ALTER` blocks every later reader behind it; measured on PostgreSQL 18.6, a reader
+waited 2.96, 9.96 and 30.02 s for a 3, 10 and 30 s wait, against a 6.5 ms p50, and with no
+`lock_timeout` it would have waited for the whole transaction.
+
+Two changes, neither of which changes what the schema is:
+
+1. **A statement that would be a no-op is not sent.** Immediately before a
+   `CREATE [UNIQUE] INDEX IF NOT EXISTS` or a single-clause `ADD COLUMN IF NOT EXISTS`,
+   `create_postgres_schema` asks the catalog whether that one index or column exists now
+   (`to_regclass` and `pg_attribute`; no lock on any table) and skips the statement if it does. The
+   check is made per statement, never from a snapshot taken at the start, because the init itself
+   drops indexes (the hash-index and free-text-key migrations retire an index that a later
+   `CREATE INDEX IF NOT EXISTS` recreates), and a stale answer would skip that recreate. An
+   `ALTER TABLE` with a second clause or any other action is never skipped, a missing object is
+   always sent, and a probe that fails means "send it". A re-run against a finished schema takes no
+   lock on `insights.release_rarity` or any other table those statements name.
+2. **What is sent runs under a `lock_timeout`.** The session sets `lock_timeout` to 2000 ms
+   (`SCHEMA_INIT_LOCK_TIMEOUT_MS`), retries a statement that timed out up to 3 times
+   (`SCHEMA_INIT_LOCK_ATTEMPTS`) with a 1 s pause, and then **stops**: it logs the statement, says
+   how long it waited, counts that statement and every statement not yet applied as failed, and
+   returns. The timeout is reset before the connection goes back to the pool. Both limits are
+   keyword arguments of `create_postgres_schema`.
+
+The bound, stated: schema init waits on another transaction for at most
+`lock_timeout x attempts` plus the pauses (about 8 s by default) before it fails, and a reader
+queued behind one of its statements waits at most one `lock_timeout` (2 s), not the other
+transaction's lifetime. The reader stall is bounded, not zero, which is why the instruction below
+is to apply an upgrade that needs a lock when the job is not running.
+
+Measured on PostgreSQL 18 with a writer holding an open transaction on `insights.release_rarity`
+and a reader polling the table every 50 ms (`tests/integration/test_schema_init_under_long_transaction.py`):
+
+| | init | slowest reader |
+|---|---|---|
+| before: one no-op `ADD COLUMN IF NOT EXISTS` | still waiting after 3 s, no bound | 2.98 s (until the writer ended) |
+| after, schema complete | 0.27 s, 0 failures | 2 ms |
+| after, `label_ids` missing, 500 ms x 2 attempts | gave up in 1.28 s (bound about 1.2 s) | 494 ms |
+
+**What to do if schema init meets a running rarity job.**
+
+- *A re-run of an unchanged schema:* nothing. It skips the index and column statements, takes no
+  lock on the rarity tables, and finishes while the job runs.
+- *An upgrade that adds an index or column to `insights.release_rarity`* (for instance
+  `label_ids` and `artist_ids`) **now fails the deploy instead of waiting for the job**: the init stops with `Schema init stopped at '<statement>'` and a
+  non-zero failure count. Nothing was half-applied; each statement is idempotent. Wait for the job
+  to commit (`SELECT pid, now() - xact_start, state, left(query, 80) FROM pg_stat_activity WHERE
+  xact_start IS NOT NULL ORDER BY xact_start` shows it), then run the init again. Do not cancel the
+  job to make room for the init.
+- *Do not raise `lock_timeout` to 0 to "make it finish".* That is the hang this section removes.
+
+Statements outside these two shapes are unchanged: the trigger statements keep their own 30 s
+`lock_timeout`, and the DDL that is not an `IF NOT EXISTS` no-op waits for the lock it needs, now
+for at most the session timeout.
+
 ### Rarity tier browse and observation indexes
 
 Two indexes are added, both `CREATE INDEX IF NOT EXISTS`, additive, and safe to apply twice:

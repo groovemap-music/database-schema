@@ -46,6 +46,8 @@ from groovemap_schema.postgres import (
     _artist_embeddings_version_index_create_statement,
     _artist_embeddings_version_index_drop_statement,
     _connection_is_autocommit,
+    _noop_probe,
+    _schema_statements,
     _set_maintenance_work_mem_statement,
     _sql_string_literal,
     _valid_index_name,
@@ -62,6 +64,9 @@ from groovemap_schema.postgres import (
 )
 
 
+_PROBED_STATEMENTS = sum(1 for _name, statement in _schema_statements() if _noop_probe(statement) is not None)
+
+
 @pytest.fixture
 def mock_pool() -> MagicMock:
     """Mock AsyncPostgreSQLPool with async context manager support."""
@@ -75,6 +80,7 @@ def mock_pool() -> MagicMock:
     # extension and CREATEROLE probes both read a falsy first column, so
     # `_apply_vector_schema` skips its statements unless a test overrides this.
     mock_cursor.fetchone = AsyncMock(return_value=(False,))
+    mock_cursor.fetchall = AsyncMock(return_value=[])
     mock_conn.__aenter__ = AsyncMock(return_value=mock_conn)
     mock_conn.__aexit__ = AsyncMock(return_value=False)
     # cursor() is synchronous in psycopg (returns an async context manager, not a coroutine)
@@ -366,6 +372,10 @@ class TestCreatePostgresSchema:
             # extension gate also probes pg_available_extensions before
             # closing, since it is not yet installed.
             + 3
+            # set_config lock_timeout, RESET lock_timeout, and one lock-free probe before each
+            # index or column statement that could be skipped as a no-op
+            + 2
+            + _PROBED_STATEMENTS
         )
         assert cursor.execute.await_count == expected_calls
 
@@ -378,7 +388,8 @@ class TestCreatePostgresSchema:
         async def flaky(*args: Any, **kwargs: Any) -> None:  # noqa: ARG001
             nonlocal call_count
             call_count += 1
-            if call_count % 4 == 0:
+            bookkeeping = str(args[0]).lstrip().startswith(("SELECT set_config", "RESET", "SELECT EXISTS"))
+            if call_count % 4 == 0 and not bookkeeping:
                 raise Exception("Simulated PostgreSQL error")
 
         cursor.execute = AsyncMock(side_effect=flaky)
@@ -404,6 +415,10 @@ class TestCreatePostgresSchema:
             # extension gate also probes pg_available_extensions before
             # closing, since it is not yet installed.
             + 3
+            # set_config lock_timeout, RESET lock_timeout, and one lock-free probe before each
+            # index or column statement that could be skipped as a no-op
+            + 2
+            + _PROBED_STATEMENTS
         )
         assert cursor.execute.await_count == expected_calls
 
@@ -436,10 +451,19 @@ class TestCreatePostgresSchema:
             # no state to reapply and is trivially idempotent by never writing
             # anything.
             read_only = upper.strip().startswith("SELECT")
+            # Session settings around the apply: a lock timeout set and reset on the connection.
+            session_setting = upper.startswith(("SET LOCK_TIMEOUT", "RESET LOCK_TIMEOUT"))
             # A retirement is `DROP TABLE IF EXISTS`: the guard makes it a no-op
             # once the table is gone, which the DROP guard below also checks.
             retirement = upper.startswith("DROP TABLE IF EXISTS ")
-            exempt = ("ALTER COLUMN" in upper and "TYPE " in upper) or "CREATE OR REPLACE" in upper or guarded_block or read_only or retirement
+            exempt = (
+                ("ALTER COLUMN" in upper and "TYPE " in upper)
+                or "CREATE OR REPLACE" in upper
+                or guarded_block
+                or read_only
+                or retirement
+                or session_setting
+            )
             if not exempt:
                 assert "IF NOT EXISTS" in upper, f"Statement is not idempotent: {stmt[:80]}..."
             if guarded_block:
@@ -477,6 +501,10 @@ class TestCreatePostgresSchema:
             # extension gate also probes pg_available_extensions before
             # closing, since it is not yet installed.
             + 3
+            # set_config lock_timeout, RESET lock_timeout, and one lock-free probe before each
+            # index or column statement that could be skipped as a no-op
+            + 2
+            + _PROBED_STATEMENTS
         )
         assert cursor.execute.await_count == expected_calls
 
@@ -1413,3 +1441,24 @@ class TestVectorSchemaFullRun:
 
         assert not any(ARTIST_EMBEDDINGS_HNSW_INDEX_NAME in statement for statement in captured)
         assert not any("maintenance_work_mem" in statement for statement in captured)
+
+
+class TestNoopProbeScansEveryStatement:
+    """No statement may be skipped unless it only declares one index or column."""
+
+    def test_every_probed_statement_is_a_single_declaration(self) -> None:
+        import re
+
+        probed = [(name, statement) for name, statement in _schema_statements() if _noop_probe(statement) is not None]
+        assert probed, "nothing is probed, so nothing is skipped"
+        for name, statement in probed:
+            text = str(statement)
+            assert len(re.findall(r"\bADD\s+COLUMN\b|\bCREATE\b", text, re.IGNORECASE)) == 1, name
+            assert not re.search(r"\bDROP\b|\bRENAME\b|\bDO\s+\$", text, re.IGNORECASE), name
+            assert text.count(";") <= 1, name
+
+    def test_multi_clause_alter_is_never_probed(self) -> None:
+        assert _noop_probe("ALTER TABLE t ADD COLUMN IF NOT EXISTS a INT, ADD COLUMN IF NOT EXISTS b INT") is None
+        assert _noop_probe("ALTER TABLE t ADD COLUMN IF NOT EXISTS a INT, DROP COLUMN b") is None
+        assert _noop_probe("ALTER TABLE t ADD COLUMN IF NOT EXISTS a INT") is not None
+        assert _noop_probe("DO $x$ BEGIN CREATE INDEX IF NOT EXISTS i ON t (a); END $x$") is None

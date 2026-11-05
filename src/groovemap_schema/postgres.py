@@ -8,6 +8,7 @@ an object a decision has retired, always with DROP ... IF EXISTS.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from typing import TYPE_CHECKING, Any, cast
@@ -7026,6 +7027,146 @@ async def _execute_schema_statements(cursor: Any, statements: Iterable[tuple[str
     return success_count, failure_count
 
 
+# ── Schema init under a long transaction (gm-database-schema-anui) ──
+# `CREATE INDEX IF NOT EXISTS` takes SHARE on the table before it finds the index exists, and
+# `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` takes ACCESS EXCLUSIVE before it finds the column, so
+# a no-op init waited behind the rarity writer's one transaction (1.4-1.8 h on lux), and the queued
+# ALTER stalled every later reader of the table for the whole wait (measured 2.96 / 9.96 / 30.02 s
+# for 3 / 10 / 30 s waits). Two controls, neither of which changes what the schema is:
+#
+# 1. A statement whose object already exists is not sent. One catalog read of the existing
+#    indexes and columns (no relation lock) lets the init skip the two statement shapes above when
+#    they would be no-ops, so a re-run against a finished schema takes no lock on any table.
+# 2. The statements that remain run under a session `lock_timeout`. A statement that cannot get its
+#    lock in that time is retried after a pause, a bounded number of times, and then the init stops
+#    and reports it. A queued lock request blocks later readers only until it times out, so a
+#    reader stalls at most `lock_timeout` per attempt rather than for the other transaction's life.
+SCHEMA_INIT_LOCK_TIMEOUT_MS = 2000
+SCHEMA_INIT_LOCK_ATTEMPTS = 3
+SCHEMA_INIT_LOCK_RETRY_PAUSE_S = 1.0
+_LOCK_NOT_AVAILABLE_SQLSTATE = "55P03"
+
+_NOOP_INDEX_RE = re.compile(
+    r"^\s*CREATE\s+(?:UNIQUE\s+)?INDEX\s+IF\s+NOT\s+EXISTS\s+(?P<index>\w+)\s+ON\s+(?:ONLY\s+)?(?P<table>[\w.]+)",
+    re.IGNORECASE,
+)
+_NOOP_COLUMN_RE = re.compile(
+    r"^\s*ALTER\s+TABLE\s+(?:ONLY\s+)?(?P<table>[\w.]+)\s+ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+(?P<column>\w+)\b",
+    re.IGNORECASE,
+)
+# Anything after the column name that is not a plain column definition: a second clause, or any
+# other ALTER TABLE action. Such a statement is always sent, never skipped.
+_OTHER_ALTER_ACTION_RE = re.compile(
+    r"\b(?:ADD|DROP|ALTER|RENAME|SET|ENABLE|DISABLE|VALIDATE|OWNER|INHERIT|CLUSTER|ATTACH|DETACH|REPLICA)\b", re.IGNORECASE
+)
+_INDEX_EXISTS_QUERY = "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_class WHERE oid = pg_catalog.to_regclass(%s) AND relkind IN ('i', 'I'))"
+_COLUMN_EXISTS_QUERY = (
+    "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute WHERE attrelid = pg_catalog.to_regclass(%s) "
+    "AND attname = %s AND attnum > 0 AND NOT attisdropped)"
+)
+
+
+def _qualified(table: str) -> tuple[str, str]:
+    schema, _, name = table.rpartition(".")
+    return (schema or "public").lower(), name.lower()
+
+
+def _noop_probe(statement: Any) -> tuple[str, tuple[str, ...]] | None:
+    """Return the catalog probe that says whether a statement would be a no-op, or None.
+
+    Only a statement that does nothing but declare one index (CREATE INDEX IF NOT EXISTS) or add
+    one column (ADD COLUMN IF NOT EXISTS) has a probe. Anything else, including an ALTER TABLE with
+    a second clause, has none and is always sent.
+    """
+    if not isinstance(statement, str):
+        return None
+    if match := _NOOP_INDEX_RE.match(statement):
+        schema, _ = _qualified(match["table"])
+        return _INDEX_EXISTS_QUERY, (f"{schema}.{match['index'].lower()}",)
+    if (match := _NOOP_COLUMN_RE.match(statement)) and not _OTHER_ALTER_ACTION_RE.search(statement[match.end() :]):
+        schema, table = _qualified(match["table"])
+        return _COLUMN_EXISTS_QUERY, (f"{schema}.{table}", match["column"].lower())
+    return None
+
+
+async def _is_noop_statement(cursor: Any, statement: Any) -> bool:
+    """Return whether the statement would only re-declare an object that exists right now.
+
+    The probe runs immediately before the statement it guards, so a DROP earlier in the same init
+    (a hash-index or key migration that retires an index a later CREATE INDEX recreates) is seen.
+    It reads the catalog and takes no lock on any table. A probe that fails means "send it".
+    """
+    probe = _noop_probe(statement)
+    if probe is None:
+        return False
+    query, params = probe
+    try:
+        await cursor.execute(query, params)
+        row = await cursor.fetchone()
+    except Exception:
+        return False
+    return bool(row and row[0] is True)
+
+
+async def _execute_schema_statements_bounded(
+    cursor: Any,
+    statements: Iterable[tuple[str, Any]],
+    *,
+    lock_timeout_ms: int,
+    attempts: int,
+    retry_pause_s: float,
+) -> tuple[int, int]:
+    """Execute the statements under a lock timeout, skipping no-ops and stopping when blocked.
+
+    Returns success and failure counts. A statement that times out waiting for a lock is retried up
+    to `attempts` times; if it still cannot run, the init stops (every statement not yet applied
+    counts as a failure) because the rest would wait on the same transaction. Any other error is
+    logged and counted, and the init carries on, exactly as `_execute_schema_statements` does.
+    """
+    pending = list(statements)
+    success_count = 0
+    failure_count = 0
+    for position, (name, statement) in enumerate(pending):
+        if await _is_noop_statement(cursor, statement):
+            logger.info("✅ Schema: %s (already present, not re-sent)", name)
+            success_count += 1
+            continue
+        for attempt in range(1, attempts + 1):
+            try:
+                await cursor.execute(statement)
+            except Exception as error:
+                if getattr(error, "sqlstate", None) != _LOCK_NOT_AVAILABLE_SQLSTATE:
+                    logger.error("❌ Failed to create schema object '%s': %s", name, error)
+                    failure_count += 1
+                    break
+                if attempt < attempts:
+                    logger.warning(
+                        "⏳ Schema: %s could not get its lock within %d ms (attempt %d of %d); retrying",
+                        name,
+                        lock_timeout_ms,
+                        attempt,
+                        attempts,
+                    )
+                    await asyncio.sleep(retry_pause_s)
+                    continue
+                skipped = len(pending) - position - 1
+                logger.error(
+                    "❌ Schema init stopped at '%s': it waited %d x %d ms for a lock held by another transaction "
+                    "(typically the rarity job); %d later statement(s) were not applied. Re-run the init when "
+                    "that transaction has ended; see docs/architecture.md, 'Schema init and a running rarity job'.",
+                    name,
+                    attempts,
+                    lock_timeout_ms,
+                    skipped,
+                )
+                return success_count, failure_count + 1 + skipped
+            else:
+                logger.info("✅ Schema: %s", name)
+                success_count += 1
+                break
+    return success_count, failure_count
+
+
 # ── Precomputed similar-artist lists and the embedding-release pointer (ADR 0013, D serving mode) ──
 # gm-analytics-engine-8ts measured serving similar artists straight off the live HNSW index
 # against the maintainer's three thresholds and it failed all three: ANN churn 0.7243 (needs
@@ -8082,7 +8223,13 @@ async def _apply_preprovisioned_vector_schema(cursor: Any) -> int:
     return failures + grant_failures
 
 
-async def create_postgres_schema(pool: Any, *, preprovisioned: bool = False) -> int:
+async def create_postgres_schema(
+    pool: Any,
+    *,
+    preprovisioned: bool = False,
+    lock_timeout_ms: int = SCHEMA_INIT_LOCK_TIMEOUT_MS,
+    lock_attempts: int = SCHEMA_INIT_LOCK_ATTEMPTS,
+) -> int:
     """Create all PostgreSQL tables and indexes.
 
     With `preprovisioned=True` the operator owns the cluster-level objects: no
@@ -8100,9 +8247,13 @@ async def create_postgres_schema(pool: Any, *, preprovisioned: bool = False) -> 
 
     Args:
         pool: An AsyncPostgreSQLPool instance (from common.postgres_resilient).
+        preprovisioned: The operator owns cluster-level objects.
+        lock_timeout_ms: How long one statement may wait for a lock before it is retried.
+        lock_attempts: Attempts per statement before the init stops and reports it.
 
     Returns:
-        Number of failed schema statements (0 means all succeeded).
+        Number of failed schema statements (0 means all succeeded). The init never waits on
+        another transaction for longer than `lock_timeout_ms * lock_attempts` plus the pauses.
     """
     logger.info("🔧 Creating PostgreSQL schema (tables and indexes)...")
 
@@ -8114,11 +8265,28 @@ async def create_postgres_schema(pool: Any, *, preprovisioned: bool = False) -> 
             statements = list(_schema_statements())
             if preprovisioned:
                 statements = [item for item in statements if item[0] not in _PREPROVISIONED_EXTENSION_STATEMENT_NAMES]
-            success_count, failure_count = await _execute_schema_statements(cursor, statements)
-            if preprovisioned:
-                failure_count += await _apply_preprovisioned_vector_schema(cursor)
-            else:
-                failure_count += await _apply_vector_schema(cursor)
+            try:
+                await cursor.execute("SELECT set_config('lock_timeout', %s, false)", (f"{int(lock_timeout_ms)}ms",))
+            except Exception as error:
+                logger.warning("Schema: could not set lock_timeout (%s); statements may wait for locks", error)
+            try:
+                success_count, failure_count = await _execute_schema_statements_bounded(
+                    cursor,
+                    statements,
+                    lock_timeout_ms=lock_timeout_ms,
+                    attempts=lock_attempts,
+                    retry_pause_s=SCHEMA_INIT_LOCK_RETRY_PAUSE_S,
+                )
+                if preprovisioned:
+                    failure_count += await _apply_preprovisioned_vector_schema(cursor)
+                else:
+                    failure_count += await _apply_vector_schema(cursor)
+            finally:
+                # The connection goes back to the pool; the next borrower must not inherit the timeout.
+                try:
+                    await cursor.execute("RESET lock_timeout")
+                except Exception as error:
+                    logger.warning("Schema: could not reset lock_timeout (%s)", error)
 
     total = len(statements)
     logger.info(f"✅ PostgreSQL schema creation complete: {success_count} succeeded, {failure_count} failed (total: {total})")
