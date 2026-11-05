@@ -421,6 +421,38 @@ subject's data") stays answerable rather than invisible.
 Every table, function, and trigger above is additive within persistence contract v1 — see
 [the persistence compatibility contract](../contracts/persistence/).
 
+### Set-based `first_year` and the move-ledger indexes
+
+`graph.genre_stats` and `graph.style_stats` fill `first_year` in one pass (`_first_year_by_tag` in
+`postgres.py`): read each release's `year` once from `public.releases`, keep the positive decimal
+years, and `min()` them per tag through the tag edge, `LEFT JOIN`ed to the vertex so a tag with no
+dated release still gets `NULL`. The old form was a correlated subquery per tag over the
+`graph.release` view, which re-read a release's document once for each tag it carries and probed
+`provider_aliases` for a `gm_id` the counter never uses. The year test is unchanged: `^[0-9]+$` and
+`> 0`, so `0`, `0000`, empty, padded and text years behave as before; the integration test runs both
+bodies on the same malformed years and requires identical rows. On PostgreSQL 18 with 120,000
+releases carrying one to three genres and styles: genre 1,041 ms to 135 ms, style 2,738 ms to 80 ms
+(about 8 times and 34 times). The audit measured over 120 s against 33.7 s on lux at 3.97M releases;
+the lux acceptance (35 s or less, identical values) is not reproduced here.
+
+**Upgrade path.** Function and loader text only, no table change. The loader's `COUNTER_BODIES` in
+`discogs-sql-loader` (`tableinator/graph_counters.py`) holds the same two bodies and must take the
+same SQL; either side can deploy first because the two produce identical rows, and until the loader
+changes it keeps its correlated form. Rollback is restoring the previous text.
+
+`idx_catalog_item_moves_from_item_id` and `idx_catalog_item_moves_to_item_id` index the two foreign
+keys to `catalog_items`. `common.identity` deletes orphaned `catalog_items`, and each such delete
+checks both columns for a ledger row that still names the item; without an index the check scans the
+ledger once per deleted item. With 150,000 ledger rows, deleting 150 orphaned items took 2,356 ms
+without the indexes and 25 ms with them. Both are `CREATE INDEX IF NOT EXISTS` on a table that is
+small or empty, additive, and safe to apply twice; rollback is `DROP INDEX`.
+
+The other three keys the audit listed are deliberately not indexed. `users` rows are soft-erased and
+never deleted, which is why `artifacts.created_by` and `extraction_history.triggered_by` see no
+delete; no code path deletes `artifacts`, so `owned_copies.artifact_id` sees none either. Revisit if
+one of those starts to delete. `observations.owned_copy_id` is indexed under the rarity and
+observation index change.
+
 ### Event idempotency across partitions
 
 A unique key on a partitioned table must include the partition key, so `activity.events`'

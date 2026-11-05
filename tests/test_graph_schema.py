@@ -30,6 +30,7 @@ from groovemap_schema.postgres import (
     PATH_MAX_DEPTH,
     PATH_MIN_DEPTH,
     PATH_SEEN_RELATION,
+    _first_year_by_tag,
     _path_neighbour_branches,
     _role_category_branches,
     _schema_statements,
@@ -1116,9 +1117,16 @@ class TestBootstrapFill:
 
     def test_the_counter_bodies_read_the_edge_tables_and_no_document(self) -> None:
         statement = statement_for_function("bootstrap_fill")
-        counters = statement[min(statement.index(f"TRUNCATE graph.{relation};") for relation in COUNTER_TABLES) :]
+        counters = " ".join(statement[min(statement.index(f"TRUNCATE graph.{relation};") for relation in COUNTER_TABLES) :].split())
+        # `first_year` is the one document-backed counter: genre_stats and style_stats read each
+        # release's year once, straight from public.releases. Take those two reads out, and
+        # what is left must touch no document.
+        for edge, column in (("in_genre", "genre_name"), ("in_style", "style_name")):
+            read = " ".join(_first_year_by_tag(edge, column).split())
+            assert read in counters
+            counters = counters.replace(read, "")
+        assert counters.count("public.releases") == 0
         assert "jsonb" not in counters
-        assert "public.releases" not in counters
         assert "graph.by_artist" in counters
 
 
