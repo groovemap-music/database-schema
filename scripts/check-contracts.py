@@ -331,7 +331,12 @@ for edge, recorded in neo4j_only["relationships"].items():
     assert edge not in _PATH_RELATIONSHIP_TYPES.values(), edge
     assert recorded["in_shortest_path_types"] is False, edge
     assert not any(edge.lower() == name for name in declared_shapes), edge
-assert set(neo4j_only["message_fields"]) == {"ExtractionCompletion.stats_version", "MaintenanceCheckpoint.run_key"}
+# HAS_STYLE stays Neo4j-only for as long as the relation that would publish it is not declared: once
+# graph.label_style exists this record is stale and must move to the published relations.
+assert "label_style" not in declared_shapes, "graph.label_style is declared, so HAS_STYLE is no longer Neo4j-only"
+assert f"{GRAPH_SCHEMA}.label_style" in neo4j_only["relationships"]["HAS_STYLE"]["would_publish_as"]
+assert neo4j_only["node_properties"]["ExtractionCompletion.stats_version"]["reader"] == "catalog-api"
+assert set(neo4j_only["node_properties"]) == {"ExtractionCompletion.stats_version", "MaintenanceCheckpoint.run_key"}
 
 storage_only = {name for name, shape in declared_shapes.items() if shape == "table"}
 

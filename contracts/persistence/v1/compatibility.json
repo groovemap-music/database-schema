@@ -659,7 +659,7 @@
     "neo4j_only": {
       "availability": "unconditional",
       "kind": "additive",
-      "decision": "Recorded as Neo4j-only, not published relationally. No relational reader of any of these is known today, and publishing a roughly 5.0M-row relation with no reader and no writer would add load cost for nothing. Publishing them later is additive; would_publish_as names the shape a later bead would add.",
+      "decision": "Recorded as Neo4j-only, not published relationally. No relational reader of any of these is known today, and publishing a relation of about 5.0M rows (the distinct-pairs count from Postgres; lux has no HAS_STYLE edges yet) with no reader and no writer would add load cost for nothing. Publishing them later is additive; would_publish_as names the shape a later bead would add.",
       "artist_properties": {
         "label": "artist",
         "published": [
@@ -683,20 +683,23 @@
           ],
           "writer": "discogs-graph-enricher (post-import maintenance)",
           "cardinality": "one per label and style, no cap",
-          "observed_count": "about 5.0M on lux",
+          "observed_count": "about 5.0M distinct (label, style) pairs, counted from Postgres; lux has no HAS_STYLE edges yet",
           "in_shortest_path_types": false,
           "effect_on_path_surface": "None. HAS_STYLE is outside the relationship types graph.find_shortest_path walks, so that function, graph_path rels and edge_relations are unchanged.",
           "would_publish_as": "a loader-written graph.label_style table keyed (label_id, style_name) carrying release_count, derived from graph.on_label and graph.in_style"
         }
       },
-      "message_fields": {
+      "node_properties": {
         "ExtractionCompletion.stats_version": {
           "type": "integer",
-          "note": "A queue message field, not a persisted column of this schema."
+          "writer": "discogs-graph-enricher",
+          "reader": "catalog-api",
+          "note": "A persisted property of the Neo4j ExtractionCompletion node. It is not a column of this schema and is not published relationally."
         },
         "MaintenanceCheckpoint.run_key": {
           "format": "<version>@stats-<N>",
-          "note": "Neo4j-side checkpoint written by the enricher; it is not graph.extraction_latch, which keys on (loader, extraction) and is unchanged."
+          "writer": "discogs-graph-enricher",
+          "note": "A persisted property of the Neo4j MaintenanceCheckpoint node; it is not graph.extraction_latch, which keys on (loader, extraction) and is unchanged."
         }
       },
       "indexes_and_constraints": "None added or required."
