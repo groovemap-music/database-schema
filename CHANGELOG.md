@@ -2,6 +2,40 @@
 
 All notable changes to the GrooveMap database schema will be documented here.
 
+## v0.7.0 (2026-11-05)
+
+### Deploy order with catalog-api
+
+This release goes on Lux at the reset, on a fresh database. Documented orders for the changes it carries:
+
+1. `catalog-api` first: the release that drops the `relkind = 'm'` filter from its two Identity Ledger freshness statements and also requires the state row. The ledger tables were materialized views through v0.6.3 and are plain tables now.
+2. This schema, applied by the initializer. Every change is additive or guarded, and nothing else reads the new columns.
+3. `catalog-api`'s stream carrying `label_ids` and `artist_ids`, then `analytics-engine`'s `COPY` listing both columns, then one complete rarity run.
+4. The route that reads `label_ids` and `artist_ids` last. Before that run finishes, those lookups return empty groups.
+
+### Feat
+
+- **musicbrainz**: add a hash key beside the relationships natural key
+- **musicbrainz**: key relationships on a hash instead of the eight-column constraint
+- **postgres**: add label and artist ids to insights.release_rarity
+- **postgres**: maintain the Identity Ledger per item instead of refreshing views
+
+### Fix
+
+- **postgres**: decide whether a statement is a no-op right before sending it
+- **postgres**: set the schema init lock timeout with a bound parameter
+- **postgres**: bound schema init's lock waits and skip no-op index and column statements
+- **postgres**: order the rarity tier index release_id ascending, as the route does
+- **postgres**: write an edition's rows under the snapshot that resolved its members
+- **postgres**: guard the refresh's temporary table drops
+- **postgres**: spell the ledger's guarded blocks as the schema's idempotence check reads them
+
+### Perf
+
+- **musicbrainz**: retire the redundant relationships source_mbid index
+- **graph**: compute first_year set-based and index the move ledger's item keys
+- **postgres**: index the rarity tier keyset and observations.owned_copy_id
+
 ## v0.6.3 (2026-11-04)
 
 ### Fix
