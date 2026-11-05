@@ -272,7 +272,7 @@
     "kind": "additive",
     "populate": "every table is created empty, so applying the schema never runs the whole history inline; identity_ledger_refresh_state holds no row until the first refresh commits, and that row, not the tables' emptiness, answers 'refreshed yet?', because a catalog with no events is empty too; reapplying the schema never empties a table",
     "refresh": {
-      "freshness": "all four tables commit together in the refresh's one transaction, so they always agree with each other; a change committed after the refresh drained the log stays there for the next refresh, so nothing is lost; freshness is bounded by catalog-api's refresh trigger, since this repository never calls the function",
+      "freshness": "all four tables commit together in the refresh's one transaction; a change committed after the refresh drained the log can show in part, and stays in the log, so the next refresh is exact and nothing is lost; freshness is bounded by catalog-api's refresh trigger, since this repository never calls the function",
       "function": "public.identity_ledger_refresh(source_watermark jsonb DEFAULT NULL) RETURNS timestamptz",
       "locking": "the refresh writes rows under ordinary row locks, so readers never block and keep the previous rows until it commits, the first build included; it takes the advisory lock hashtext('groovemap:identity-ledger-refresh') that catalog-api already holds, so refreshes run one at a time",
       "order": [

@@ -381,8 +381,13 @@ every table, the log, and the state row as they were.
   commits, the first build and a rebuild included. It takes the advisory lock
   `hashtext('groovemap:identity-ledger-refresh')`, which `catalog-api` already holds around a
   refresh, so refreshes run one at a time.
-- **Freshness.** All four tables commit at one instant, so they always agree with each other. How
-  fresh they are depends on when `catalog-api` triggers the refresh. This repository declares the
+- **Freshness.** All four tables commit at one instant. A refresh runs `READ COMMITTED`, so a
+  change that commits while it runs can show in part: an item resolved before a supersession
+  committed stays under its old edition, while a later statement may already read that
+  supersession's own event. That is bounded to one refresh, because the change's log row
+  outlived the drain, so the next refresh recomputes both sides exactly, and `catalog-api`'s
+  watermark, read before each refresh, moves and asks for that refresh. How fresh the tables are
+  otherwise depends on when `catalog-api` triggers the refresh. This repository declares the
   refresh and never calls it.
 - **A missing trigger stops the refresh.** A source without its triggers would silently stop the
   ledger following it, so the refresh raises SQLSTATE `55000` if any capture trigger is missing or
@@ -422,7 +427,8 @@ equal both `catalog-api`'s prototype and `identity_ledger_verify()`.
 #### Upgrading from v0.6.3
 
 The upgrade is one ordinary schema apply, and is safe while the database holds data and while
-loaders write. Nothing in the ledger is source data: every row it removes is derived.
+loaders write short transactions. Nothing in the ledger is source data: every row it removes is
+derived. Check for a long transaction first, for the reason in step 2.
 
 1. **Deploy `catalog-api` before this schema upgrade.** This order is required. Its two freshness
    statements filter `relkind = 'm'`, so against tables they find nothing and it answers "not
@@ -430,11 +436,28 @@ loaders write. Nothing in the ledger is source data: every row it removes is der
    version to deploy drops that filter and also requires the state row to exist, which holds on
    both shapes, so it runs correctly against v0.6.3 first.
 2. **Apply the schema.** A guarded transaction drops the four views and deletes the state row, then
-   the tables and triggers are created. Each table's triggers go on in one transaction under a
-   30 s `lock_timeout`: `CREATE TRIGGER` takes `SHARE ROW EXCLUSIVE`, so it waits for running writes
-   and briefly holds new ones, and a long transaction fails that statement rather than queueing
-   every writer behind it. Running the apply again finishes the rest, and a table already covered
-   takes no lock. Until every trigger exists the refresh refuses to run.
+   the tables and triggers are created. Until every trigger exists the refresh refuses to run.
+
+   Only the trigger statements have a lock timeout. Each table's triggers go on in one transaction
+   under a 30 s `lock_timeout`: `CREATE TRIGGER` takes `SHARE ROW EXCLUSIVE`, so it waits for running
+   writes and briefly holds new ones, and a long transaction fails that statement. Running the
+   apply again finishes the rest, and a table already covered takes no lock in that statement.
+
+   Everything else in the apply waits with no timeout, on every apply, and this predates the
+   ledger. `CREATE INDEX IF NOT EXISTS` takes `SHARE` before it finds the index exists, so even a
+   no-op waits for every open writer of that table, and `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`
+   takes `ACCESS EXCLUSIVE` before it finds the column, so it also waits for readers. The index
+   statements reach `provider_aliases`, `catalog_item_supersessions`, `identity_link_events`,
+   `musicbrainz.releases`, and `graph.derived_from`, and the `ALTER TABLE` statements reach
+   `musicbrainz.releases`, all ahead of the trigger statements. A statement waiting for a lock
+   queues later writers of that table behind it, so one
+   long transaction there stalls the apply and that table's writers until it ends, and the 30 s
+   timeout does not help. The retirement's `DROP MATERIALIZED VIEW` likewise waits, with no timeout,
+   for a running `REFRESH`, and readers of that view queue behind it.
+
+   So before applying, confirm in `pg_stat_activity` that no transaction has been open for long on
+   those tables. If an apply stalls, cancel it, or end the long transaction: the apply is safe to
+   run again.
 3. **The first refresh rebuilds.** With no state row, the next refresh builds every table from
    the base tables, so a write made before capture started is in that build. It costs about one
    old refresh, plus index maintenance. `catalog-api`'s poll does this on its own, within one
@@ -454,17 +477,18 @@ items, the rest new MusicBrainz links with their link events, alias closures, an
 | --- | ---: | ---: |
 | v0.6.3, nothing changed | 3.6 s, 77 MB temp | 15.4 s, 339 MB temp |
 | v0.6.3, 1,000 changes | 3.7 s, 82 MB temp | 13.1 s, 340 MB temp |
-| Tables, nothing changed | 0.02 s, no temp | 0.03 s, no temp |
-| Tables, 100 changes | 0.06 s | 0.07 s |
-| Tables, 1,000 changes | 0.12 to 0.19 s | 0.19 to 0.21 s |
-| Tables, 10,000 changes | 0.9 s | 1.6 s |
-| Tables, 100,000 changes | 6.6 s | 6.8 s |
-| First build, after the upgrade | 3.3 s, 42 MB temp | 10.2 s, 147 MB temp |
+| Tables, nothing changed | 0.03 s, no temp | 0.05 s, no temp |
+| Tables, 100 changes | 0.10 s | 0.07 s |
+| Tables, 1,000 changes | 0.19 to 0.25 s | 0.21 to 0.22 s |
+| Tables, 10,000 changes | 1.1 s | 2.3 s |
+| Tables, 100,000 changes | 7.4 s | 9.9 s |
+| First build, after the upgrade | 3.5 s | 11.3 s |
 | `identity_ledger_verify()` | 3.1 s | 12.8 s |
 
-Tripling the catalog tripled the old refresh and left the new one level at each number of changes.
-Maintenance and a rebuild cost the same at about 11% of the catalog dirty, which sets the 10%
-threshold. `identity_ledger_verify()` reported `0, 0, 0` after each build and after the batches.
+Tripling the catalog tripled the old refresh. The new one stayed level up to 1,000 changes, and
+rose 1.3 to 2.2 times at 10,000 and 100,000, where the batch itself is a large share of the smaller
+catalog and sorts begin to spill. Maintenance and a rebuild cost about the same at 10% of the
+catalog dirty, which sets the threshold. `identity_ledger_verify()` reported `0, 0, 0` after each build and after the batches.
 These are synthetic rows without identifier aliases, so read them as a comparison, not as a
 forecast for lux. Lux's refresh was never timed on this build, because nothing has been applied there.
 
