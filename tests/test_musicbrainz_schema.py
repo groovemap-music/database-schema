@@ -53,7 +53,8 @@ def test_musicbrainz_indexes_defined():
     assert "idx_mb_artists_discogs_id" in index_names
     assert "idx_mb_labels_discogs_id" in index_names
     assert "idx_mb_releases_discogs_id" in index_names
-    assert "idx_mb_rels_source" in index_names
+    # idx_mb_rels_source is retired: relationships_natural_key leads with source_mbid.
+    assert "idx_mb_rels_source" not in index_names
     assert "idx_mb_links_mbid" in index_names
     assert "idx_mb_rels_updated_at" in index_names
     assert "idx_mb_links_updated_at" in index_names

@@ -142,7 +142,6 @@ _LEGACY_STATEMENT_NAMES = [
     "idx_mb_release_groups_discogs_id",
     "idx_mb_artists_name",
     "idx_mb_labels_name",
-    "idx_mb_rels_source",
     "idx_mb_rels_target",
     "idx_mb_rels_type",
     "idx_mb_links_mbid",
@@ -155,6 +154,7 @@ _LEGACY_STATEMENT_NAMES = [
 _ADDED_STATEMENT_NAMES = frozenset(
     {
         "queue_metrics table retired",
+        "idx_mb_rels_source retire",
         "service_health_metrics table retired",
         "public.idx_artists_name hash index migration",
         "public.idx_labels_name hash index migration",
