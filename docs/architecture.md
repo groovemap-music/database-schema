@@ -1466,20 +1466,27 @@ the rows that arrive afterwards loosen it again.
 - **Lock impact.** `CONCURRENTLY` takes `SHARE UPDATE EXCLUSIVE`: reads and writes continue, and
   only schema changes and vacuum on the table wait. In the measurement 255 writes ran during the
   rebuild, the slowest taking 94 ms, and the unique key still rejected a duplicate afterwards. Plain
-  `REINDEX INDEX` is shorter but blocks every write to the table for its duration (and any read the
-  planner sends through that index), so stop the loaders first if you choose it.
+  `REINDEX INDEX` blocks every write to the table and also virtually every read of it, not only
+  reads that would use the index: the planner takes a lock on every index of a table it reads, so a
+  sequential scan and a point read both wait behind the rebuild (both hit `lock_timeout` when
+  reproduced). Whoever runs the plain form must stop readers as well as the loaders, or use
+  `CONCURRENTLY`.
 - **Time and room.** 3.6 s for `credited_on_key` at 1.5M rows. At 51M and 96.5M rows expect
   minutes to tens of minutes, longer once the build outgrows `maintenance_work_mem`; raise it for
   the session, for example `SET maintenance_work_mem = '2GB'`. The new index is built beside the old
   one, so keep free disk for the whole of one new key (about 3 GB for `credited_on_key` and about
   7 GB for `track_credited_on_key` at full scale) and do the two one after the other.
 - **If it fails or is cancelled.** The old index stays in service. A leftover `INVALID` index named
-  `<index>_ccnew` can remain; find it with
-  `SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid AND indrelid::regclass::text LIKE 'graph.%credited_on'`
-  and `DROP INDEX CONCURRENTLY` it before retrying.
-- **Check it.** The same `pg_index` query shows both keys `indisvalid`, and the key is still
-  `indisunique`. Nothing else changes: the rows, the key definition and the `ON CONFLICT` target are
-  the same, so no loader change is needed.
+  `<index>_ccnew` (the new one, half built) or `<index>_ccold` (the old one, not yet dropped) can
+  remain. List them with
+  `SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid AND indrelid IN ('graph.credited_on'::regclass, 'graph.track_credited_on'::regclass)`
+  and `DROP INDEX CONCURRENTLY` each one before retrying. That query filters on `NOT indisvalid`, so
+  a healthy database returns zero rows.
+- **Check it.** After the rebuild the query above returns zero rows, and both keys are still
+  `indisunique` and `indisvalid` (`SELECT indexrelid::regclass, indisunique, indisvalid FROM pg_index
+  WHERE indexrelid IN ('graph.credited_on_key'::regclass, 'graph.track_credited_on_key'::regclass)`).
+  Nothing else changes: the rows, the key definition and the `ON CONFLICT` target are the same, so no
+  loader change is needed.
 
 `credited_on_role_category` (the generated-column index) was not smaller after the rebuild in the
 random-order measurement, so it is not part of this step. The `deployment` runbook should link here
