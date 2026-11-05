@@ -582,6 +582,17 @@ _USER_TABLES: list[tuple[str, str]] = [
         )
         """,
     ),
+    # common.identity deletes orphaned catalog_items, and each delete checks both
+    # item columns here for a ledger row that still names the item; without an
+    # index that check scans the whole ledger once per deleted item.
+    (
+        "idx_catalog_item_moves_from_item_id",
+        "CREATE INDEX IF NOT EXISTS idx_catalog_item_moves_from_item_id ON catalog_item_moves (from_item_id)",
+    ),
+    (
+        "idx_catalog_item_moves_to_item_id",
+        "CREATE INDEX IF NOT EXISTS idx_catalog_item_moves_to_item_id ON catalog_item_moves (to_item_id)",
+    ),
     (
         "idx_catalog_item_moves_user_id",
         "CREATE INDEX IF NOT EXISTS idx_catalog_item_moves_user_id ON catalog_item_moves (user_id)",
@@ -4495,6 +4506,26 @@ _BOOTSTRAP_COLUMNS: dict[str, tuple[str, ...]] = {
     "issued_on": ("release_id", "medium_id", "source", "qty"),
 }
 
+
+# The earliest positive year of any release carrying a tag, for every tag in one
+# pass. `genre_stats` and `style_stats` used to find it with a correlated
+# subquery per tag, which read each release's document once for every tag it
+# carries (the `graph.release` view also probes `provider_aliases` for a `gm_id`
+# nothing here reads). This reads each release document once, keeps the rows
+# whose year counts, and joins them to the tag edges. The year test is the one
+# the correlated form used: any positive decimal, because importer normalization
+# owns plausibility bounds. A tag with no dated release has no row here, so the
+# LEFT JOIN yields NULL, as the correlated form's empty `min()` did.
+def _first_year_by_tag(edge: str, tag_column: str) -> str:
+    return f"""    SELECT edge.{tag_column} AS name, min(btrim(release.year)::integer) AS first_year
+      FROM graph.{edge} AS edge
+      JOIN (SELECT releases.data_id::text AS release_id, releases.data ->> 'year' AS year
+              FROM public.releases AS releases) AS release ON release.release_id = edge.release_id
+     WHERE btrim(release.year) ~ '^[0-9]+$'
+       AND btrim(release.year)::numeric > 0
+     GROUP BY edge.{tag_column}"""  # noqa: S608
+
+
 # How `discogs-sql-loader` computes each counter relation on the
 # `extraction_complete` latch. These are sums over the edge tables and never
 # re-read a JSONB document, which is the property that makes the post-import
@@ -4502,7 +4533,7 @@ _BOOTSTRAP_COLUMNS: dict[str, tuple[str, ...]] = {
 # to implement rather than five readings of a prose table, and because the
 # parity harness fills the relations with them.
 _COUNTER_BOOTSTRAP: dict[str, str] = {
-    "genre_stats": """
+    "genre_stats": f"""
 SELECT genre.name AS name,
        (SELECT count(*) FROM graph.in_genre AS edge WHERE edge.genre_name = genre.name) AS release_count,
        (SELECT count(DISTINCT by_artist.artist_id)
@@ -4517,15 +4548,13 @@ SELECT genre.name AS name,
           FROM graph.in_genre AS in_genre
           JOIN graph.in_style AS in_style ON in_style.release_id = in_genre.release_id
          WHERE in_genre.genre_name = genre.name) AS style_count,
-       (SELECT min(btrim(release.year)::integer)
-          FROM graph.in_genre AS edge
-          JOIN graph.release AS release ON release.release_id = edge.release_id
-         WHERE edge.genre_name = genre.name
-           AND btrim(release.year) ~ '^[0-9]+$'
-           AND btrim(release.year)::numeric > 0) AS first_year
+       first_year.first_year AS first_year
 FROM graph.genre AS genre
-""",
-    "style_stats": """
+LEFT JOIN (
+{_first_year_by_tag("in_genre", "genre_name")}
+) AS first_year ON first_year.name = genre.name
+""",  # noqa: S608
+    "style_stats": f"""
 SELECT style.name AS name,
        (SELECT count(*) FROM graph.in_style AS edge WHERE edge.style_name = style.name) AS release_count,
        (SELECT count(DISTINCT by_artist.artist_id)
@@ -4540,14 +4569,12 @@ SELECT style.name AS name,
           FROM graph.in_style AS in_style
           JOIN graph.in_genre AS in_genre ON in_genre.release_id = in_style.release_id
          WHERE in_style.style_name = style.name) AS genre_count,
-       (SELECT min(btrim(release.year)::integer)
-          FROM graph.in_style AS edge
-          JOIN graph.release AS release ON release.release_id = edge.release_id
-         WHERE edge.style_name = style.name
-           AND btrim(release.year) ~ '^[0-9]+$'
-           AND btrim(release.year)::numeric > 0) AS first_year
+       first_year.first_year AS first_year
 FROM graph.style AS style
-""",
+LEFT JOIN (
+{_first_year_by_tag("in_style", "style_name")}
+) AS first_year ON first_year.name = style.name
+""",  # noqa: S608
     "label_stats": """
 SELECT label.label_id AS label_id,
        (SELECT count(DISTINCT on_label.release_id)

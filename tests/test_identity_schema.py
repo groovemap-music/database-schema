@@ -250,6 +250,8 @@ _ADDED_STATEMENT_NAMES = frozenset(
         "idx_catalog_item_supersessions_survivor_id",
         "idx_catalog_item_supersessions_via_id",
         "catalog_item_moves table",
+        "idx_catalog_item_moves_from_item_id",
+        "idx_catalog_item_moves_to_item_id",
         "idx_catalog_item_moves_user_id",
         "resolve_catalog_item function",
         "identity_link_events table",
