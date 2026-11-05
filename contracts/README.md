@@ -104,8 +104,9 @@ rows (`loader = 'musicbrainz'`) into the same relation when it adopts the patter
 `design_decision` in the contract. `purge_vetoed` records which entity types' stale-row purge
 that extraction vetoed, so a count of consecutive vetoes survives the restarts between dumps. It
 is additive, with an empty default: existing rows read as no veto recorded, and a loader that does
-not know the column keeps working. `column_writers` names who writes it, `discogs-sql-loader`
-today, and a `musicbrainz-sql-loader` writer is added here when it adopts the column.
+not know the column keeps working. `column_writers` names who writes it: `discogs-sql-loader` and
+`musicbrainz-sql-loader`, each to its own `loader` rows, one per extraction, keyed by the signal's
+version.
 Storage-only: `loader_extraction_latch` is a plain `public`
 table, not a `graph` schema relation, and is not a property-graph element.
 
