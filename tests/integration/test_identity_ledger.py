@@ -12,6 +12,7 @@ because a hand-written case only covers the dependencies its author thought of.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import random
 from datetime import UTC, datetime, timedelta
@@ -656,6 +657,157 @@ async def test_rolling_back_restores_the_materialized_views_equal_to_the_referen
                 await connection.execute(f"CREATE MATERIALIZED VIEW IF NOT EXISTS public.{view} AS {body}".encode())
                 await connection.execute(sql.SQL("REFRESH MATERIALIZED VIEW {}").format(sql.Identifier(_REFERENCE_SCHEMA, view)))
                 assert await _view_rows(connection, view) == await _view_rows(connection, view, _REFERENCE_SCHEMA), view
+
+
+async def _release_with_link(cursor: Any, at: datetime) -> UUID:
+    """Write a release item with one Discogs alias and a MusicBrainz link at AT, a `linked_at_ingest` event."""
+    item = uuid4()
+    await cursor.execute("INSERT INTO catalog_items (id, kind) VALUES (%s, 'release')", (item,))
+    await cursor.executemany(
+        "INSERT INTO provider_aliases (provider, entity_kind, external_id, native_id, valid_from) VALUES (%s, 'release', %s, %s, %s)",
+        [("discogs", uuid4().hex, item, MINT), ("musicbrainz", str(uuid4()), item, at)],
+    )
+    return item
+
+
+async def _supersede(cursor: Any, superseded: UUID, survivor: UUID, at: datetime) -> None:
+    await cursor.execute(
+        "INSERT INTO catalog_item_supersessions (superseded_id, survivor_id, cause, decision_ref, valid_from) "
+        "VALUES (%s, %s, 'edition_promotion', %s, %s)",
+        (superseded, survivor, uuid4(), at),
+    )
+
+
+@contextlib.asynccontextmanager
+async def _refresh_paused_after_members(params: dict[str, Any], observer: psycopg.AsyncConnection[Any]) -> AsyncIterator[asyncio.Task[Any]]:
+    """Yield with a refresh paused between resolving its editions' members and writing their rows.
+
+    `identity_ledger_maintain` builds `ledger_members`, then deletes the dirty editions' rows, and
+    the DELETE is the first thing it does to `identity_ledger_edition_events`.  So holding SHARE
+    on that table stops it exactly there, and whatever commits meanwhile is the concurrent
+    write of a READ COMMITTED refresh, every time rather than one run in hundreds.
+    """
+    gate = await _connect(params)
+    refresher = await _connect(params)
+    async with gate, refresher:
+        await gate.execute("BEGIN")
+        await gate.execute("LOCK TABLE identity_ledger_edition_events IN SHARE MODE")
+        refresh = asyncio.create_task(_rows(refresher, "SELECT identity_ledger_refresh()"))
+        try:
+            for _ in range(500):
+                waiting = await _rows(
+                    observer,
+                    "SELECT 1 FROM pg_locks WHERE pid = %s AND NOT granted AND relation = 'identity_ledger_edition_events'::regclass",
+                    (refresher.info.backend_pid,),
+                )
+                if waiting:
+                    break
+                assert not refresh.done(), "the refresh finished without reaching the gate"
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("the refresh never reached the gate")
+            yield refresh
+        finally:
+            await gate.execute("COMMIT")
+            await refresh
+
+
+@pytest.mark.asyncio
+async def test_a_supersession_opening_mid_refresh_stays_out_of_this_refresh_and_lands_in_the_next() -> None:
+    """X -> Z commits after X was resolved: X's rows must not land on Z, an edition this refresh is not writing."""
+    async with _ledger_database() as params:
+        connection = await _connect(params)
+        async with connection:
+            await _build_reference(connection)
+            shared = _at(3, 1)
+            async with connection.cursor() as cursor:
+                x, z = await _release_with_link(cursor, shared), await _release_with_link(cursor, shared)
+            await _refresh_and_compare(connection)
+
+            # Only X is dirty, so Z is not an edition this refresh deletes and rewrites.
+            await connection.execute(
+                "INSERT INTO provider_aliases (provider, entity_kind, external_id, native_id, valid_from) VALUES ('wikidata', 'release', 'Q1', %s, %s)",
+                (x, _at(4, 1)),
+            )
+            async with _refresh_paused_after_members(params, connection), connection.cursor() as cursor:
+                await _supersede(cursor, x, z, _at(5, 1))
+
+            # X's rows stay under X, as the snapshot that resolved it saw, and Z is untouched.
+            rows = await _view_rows(connection, "identity_ledger_edition_events")
+            assert (x, shared, "linked_at_ingest", 1) in rows
+            assert (z, shared, "linked_at_ingest", 1) in rows
+
+            # The supersession's log row outlived the drain, so the next refresh settles it.
+            await _refresh_and_compare(connection)
+            assert (z, shared, "linked_at_ingest", 2) in await _view_rows(connection, "identity_ledger_edition_events")
+
+
+@pytest.mark.asyncio
+async def test_a_supersession_closing_mid_refresh_stays_out_of_this_refresh_and_lands_in_the_next() -> None:
+    """X -> Y closes after X was resolved: X must not grow a partial edition of its own this refresh."""
+    async with _ledger_database() as params:
+        connection = await _connect(params)
+        async with connection:
+            await _build_reference(connection)
+            async with connection.cursor() as cursor:
+                x, y = await _release_with_link(cursor, _at(3, 1)), await _release_with_link(cursor, _at(3, 2))
+                await _supersede(cursor, x, y, _at(4, 1))
+            await _refresh_and_compare(connection)
+
+            # Only Y is dirty; X is a member of it, and is not an edition this refresh writes.
+            await connection.execute(
+                "INSERT INTO provider_aliases (provider, entity_kind, external_id, native_id, valid_from) VALUES ('wikidata', 'release', 'Q2', %s, %s)",
+                (y, _at(5, 1)),
+            )
+            async with _refresh_paused_after_members(params, connection):
+                await connection.execute("UPDATE catalog_item_supersessions SET valid_to = %s WHERE superseded_id = %s", (_at(6, 1), x))
+
+            editions = {row[0] for row in await _view_rows(connection, "identity_ledger_edition_events")}
+            assert editions == {y}
+
+            await _refresh_and_compare(connection)
+            assert {row[0] for row in await _view_rows(connection, "identity_ledger_edition_events")} == {x, y}
+
+
+@pytest.mark.asyncio
+async def test_refreshes_racing_writers_never_fail_and_settle_on_a_full_recompute() -> None:
+    """Supersessions opening and closing while refreshes run: no refresh fails, and the last one is exact."""
+    async with _ledger_database() as params:
+        connection = await _connect(params)
+        async with connection:
+            await _build_reference(connection)
+            shared = _at(3, 1)
+            async with connection.cursor() as cursor:
+                items = [await _release_with_link(cursor, shared) for _ in range(24)]
+            await _rows(connection, "SELECT identity_ledger_refresh()")
+            finished = asyncio.Event()
+
+            async def writer(seed: int) -> None:
+                chance = random.Random(seed)  # noqa: S311 -- reproducible test data, not security
+                own = await _connect(params)
+                async with own, own.cursor() as cursor:
+                    while not finished.is_set():
+                        superseded, survivor = chance.sample(items, 2)
+                        with contextlib.suppress(psycopg.errors.UniqueViolation):
+                            await _supersede(cursor, superseded, survivor, _at(chance.randint(4, 9), chance.randint(1, 28)))
+                        await cursor.execute(
+                            "UPDATE catalog_item_supersessions SET valid_to = %s WHERE superseded_id = %s AND valid_to IS NULL",
+                            (_at(10, chance.randint(1, 28)), chance.choice(items)),
+                        )
+                        await cursor.execute(
+                            "INSERT INTO provider_aliases (provider, entity_kind, external_id, native_id, valid_from) "
+                            "VALUES ('wikidata', 'release', %s, %s, %s)",
+                            (uuid4().hex, chance.choice(items), _at(chance.randint(4, 9), chance.randint(1, 28))),
+                        )
+
+            writers = [asyncio.create_task(writer(seed)) for seed in range(4)]
+            try:
+                for _ in range(120):
+                    await _rows(connection, "SELECT identity_ledger_refresh()")
+            finally:
+                finished.set()
+                await asyncio.gather(*writers)
+            await _refresh_and_compare(connection)
 
 
 class History:

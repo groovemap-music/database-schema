@@ -5629,8 +5629,9 @@ _GRAPH_STATEMENTS: list[tuple[str, str]] = _build_graph_statements()
 # holds no row until the first refresh commits, and that row, not the tables'
 # emptiness, answers "refreshed yet?": a catalog with no events is empty too.
 # Everything a refresh writes runs in the caller's one transaction, so readers
-# keep the previous rows until it commits, never block, and for the first time see
-# all four tables at one instant.
+# keep the previous rows until it commits and never block, and all four tables change
+# at one instant.  It runs READ COMMITTED, so a change committed while it runs can
+# show in part; that change's log row outlived the drain, so the next refresh is exact.
 #
 # Who may refresh.  The function is SECURITY INVOKER; its caller needs SELECT,
 # INSERT, UPDATE, DELETE on the tables named in `IDENTITY_LEDGER_REFRESH_GRANTS`.
@@ -5674,7 +5675,7 @@ _LEDGER_REPAIRS = "('reattached', 'promoted', 'reverted')"
 _LEDGER_LOCK_KEY = "groovemap:identity-ledger-refresh"
 
 # Past this share of the catalog dirty, a rebuild is cheaper than per-item maintenance:
-# they cost the same at about 11% (architecture notes, "Measured").
+# they cost about the same there (architecture notes, "Measured").
 _LEDGER_REBUILD_SHARE = 0.1
 
 # An RFC 4122 text form as PostgreSQL prints a uuid: the only text a release group's
@@ -6072,10 +6073,11 @@ ${name}$
 def _ledger_capture_triggers(table: str, function: str) -> tuple[str, str]:
     """Return the guarded statement creating TABLE's four capture triggers.
 
-    Guarded rather than `CREATE OR REPLACE TRIGGER` because a reapply must take no
-    lock on a table a load is writing, and with a lock timeout so that a long
-    transaction fails the statement, which a rerun repeats, instead of queueing
-    every writer behind it.  One transaction per table, so no table is half covered.
+    Guarded rather than `CREATE OR REPLACE TRIGGER` so this statement takes no lock on a
+    reapply, and with a lock timeout so that a long transaction fails it, which a rerun
+    repeats, instead of queueing every writer behind it.  The timeout is this statement's
+    alone: the apply's other statements on the same tables wait without one.  One
+    transaction per table, so no table is half covered.
     An update of `catalog_items` changes no event unless it changes an id or a kind,
     which moves history between kinds; nothing does, so it asks for a rebuild.
     """
@@ -6180,11 +6182,25 @@ def _ledger_edition_rows(*, scoped: bool) -> str:
     `_ledger_edition_events_select` over the stored item rows, so a rebuild reads
     the alias history once.  Each source is reached from the members of the dirty
     editions, by index, when scoped.
+
+    Scoped, a member's edition comes from `ledger_members`, never from resolving it
+    again here.  The refresh runs READ COMMITTED, so this statement sees a later
+    snapshot than the one that chose the members, and a supersession committed between
+    them would otherwise send a member to an edition this refresh neither deleted nor
+    is writing: a unique violation, or a partial row.  As it is, every key written is a
+    dirty edition, whose rows were just deleted.  That supersession's change is still in
+    the log, so the next refresh moves the member, whichever way it went.
     """
 
     def within(column: str) -> str:
         return f"JOIN pg_temp.ledger_members AS member ON member.item_id = {column}" if scoped else ""
 
+    edition = "resolved_member.edition_id" if scoped else "COALESCE(edition_open.survivor_id, side_event.item_id)"
+    resolve = (
+        "JOIN pg_temp.ledger_members AS resolved_member ON resolved_member.item_id = side_event.item_id"
+        if scoped
+        else _ledger_resolved("edition_open", "side_event.item_id")
+    )
     sides = "\n    UNION ALL".join(
         f"""
     SELECT supersession.{side} AS item_id, supersession.valid_from AS at,
@@ -6216,9 +6232,9 @@ WITH side_event AS (
     WHERE holder.provider = 'musicbrainz' AND holder.entity_kind = 'release' AND holder.valid_to IS NULL
     UNION ALL{sides}
 )
-SELECT COALESCE(edition_open.survivor_id, side_event.item_id), side_event.at, side_event.type, sum(side_event.events)::bigint
+SELECT {edition}, side_event.at, side_event.type, sum(side_event.events)::bigint
 FROM side_event
-{_ledger_resolved("edition_open", "side_event.item_id")}
+{resolve}
 GROUP BY 1, 2, 3
 """  # noqa: S608 -- composed of module constants only
 
@@ -6330,10 +6346,11 @@ BEGIN
     JOIN public.catalog_item_supersessions AS supersession ON supersession.superseded_id = dirty.item_id AND supersession.valid_to IS NULL;
     ANALYZE pg_temp.ledger_editions;
 
-    -- Every item that resolves to a dirty edition.
-    CREATE TEMP TABLE ledger_members (item_id uuid PRIMARY KEY) ON COMMIT DROP;
+    -- Every item that resolves to a dirty edition, with that edition: this one snapshot
+    -- decides where each item's rows go (see _ledger_edition_rows).
+    CREATE TEMP TABLE ledger_members (item_id uuid PRIMARY KEY, edition_id uuid NOT NULL) ON COMMIT DROP;
     INSERT INTO pg_temp.ledger_members
-    SELECT candidate.item_id
+    SELECT candidate.item_id, COALESCE(resolved.survivor_id, candidate.item_id)
     FROM (
         SELECT edition_id AS item_id FROM pg_temp.ledger_editions
         UNION
