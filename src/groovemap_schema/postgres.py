@@ -1872,6 +1872,28 @@ def _widen_to_bigint(table: str, column: str) -> str:
         """  # noqa: S608 — `table` and `column` are module constants, never input
 
 
+def _relationship_key_function() -> str:
+    """Return the IMMUTABLE function keying one MusicBrainz relationship on a single hash."""
+    parts = [
+        "source_mbid::text", "target_mbid::text", "source_entity_type", "target_entity_type",
+        "relationship_type", "begin_date", "end_date", "attributes::text",
+    ]  # fmt: skip
+    prefixed = " ||\n            ".join(f"COALESCE(pg_catalog.length({part})::text || ':' || {part}, '-')" for part in parts)
+    return f"""
+        CREATE OR REPLACE FUNCTION musicbrainz.relationship_key(
+            source_mbid uuid, target_mbid uuid, source_entity_type text, target_entity_type text,
+            relationship_type text, begin_date text, end_date text, attributes jsonb)
+        RETURNS bytea
+        LANGUAGE sql
+        IMMUTABLE
+        PARALLEL SAFE
+        AS $relationship_key$
+        SELECT pg_catalog.sha256(pg_catalog.convert_to(
+            {prefixed}, 'UTF8'))
+        $relationship_key$
+        """
+
+
 _MUSICBRAINZ_TABLES: list[tuple[str, str]] = [
     (
         "musicbrainz schema",
@@ -2030,6 +2052,32 @@ _MUSICBRAINZ_TABLES: list[tuple[str, str]] = [
             END IF;
         END
         $mb_rel_key$""",
+    ),
+    # A second, narrower key beside the eight-column constraint above: a SHA-256 over the same eight values,
+    # in a unique index (32 bytes of key per row against a constraint that carries a jsonb column). The
+    # constraint stays, so the loader's current `ON CONFLICT (<eight columns>)` keeps working and this
+    # change is additive. Dropping the constraint is a separate, later step, taken after
+    # `musicbrainz-sql-loader` moves its conflict target to the expression below
+    # (gm-musicbrainz-sql-loader-1twk) and before MusicBrainz is enabled; only then does the index per row
+    # fall. The function is one expression, so the planner inlines it into the index and into an
+    # `ON CONFLICT` target that repeats it. Every field is length-prefixed and a missing one is a distinct
+    # marker, so `('ab', 'c')` and `('a', 'bc')` are two keys, and a NULL date is neither an empty string
+    # nor another value (two NULL dates are the same key, the `NULLS NOT DISTINCT` rule). `attributes` is
+    # hashed as jsonb text, which is canonical for key order; a number keeps its written scale, so `1` and
+    # `1.0` are two hash keys where jsonb equality calls them one, and while the constraint stays it
+    # rejects the second.
+    (
+        "musicbrainz.relationship_key function",
+        _relationship_key_function(),
+    ),
+    (
+        "musicbrainz.relationships_key index",
+        """CREATE UNIQUE INDEX IF NOT EXISTS relationships_key ON musicbrainz.relationships (
+            musicbrainz.relationship_key(
+                source_mbid, target_mbid, source_entity_type, target_entity_type,
+                relationship_type, begin_date, end_date, attributes
+            )
+        )""",
     ),
     (
         "musicbrainz.external_links table",

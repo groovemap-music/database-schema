@@ -718,6 +718,41 @@ The `LATERAL` form is the faster on large groups and a few milliseconds slower o
 one that answers past the end. The shipped-ids column leaves out the Neo4j walk that produces the ids, which is
 where the 15.7 s for label 1818 went. Both costs grow with the group, since the total needs every member.
 
+### MusicBrainz relationships: the hash key
+
+`musicbrainz.relationships` keeps its eight-column `relationships_natural_key` constraint and gains a second
+unique index, `relationships_key`, over `musicbrainz.relationship_key(source_mbid, target_mbid,
+source_entity_type, target_entity_type, relationship_type, begin_date, end_date, attributes)`: a SHA-256 over the
+same eight values. The constraint carries a `jsonb` column and is the largest index on the table; the hash is 32
+bytes of key whatever the data. The change is additive, so `musicbrainz-sql-loader`'s current `ON CONFLICT (<eight
+columns>)` keeps working and a new `ON CONFLICT (musicbrainz.relationship_key(...))` works beside it.
+
+- **Rule kept.** Two relationships that differ only in date range or attributes are still two rows. Each field is
+  length-prefixed, so a value moved across a field boundary is a different key. A `NULL` is one value: two `NULL`
+  dates are the same key, and `NULL` is not an empty string and not `jsonb` `null`. `attributes` is hashed as
+  `jsonb` text, so key order does not matter. One difference: a number keeps its written scale, so `1` and `1.0`
+  are two hash keys where `jsonb` equality calls them one. While the constraint stays it rejects the second, so
+  the pair is an error and not two rows. MusicBrainz attributes are strings and arrays of strings, so none is
+  known to hit it.
+- **Measured** on PostgreSQL 18, 200,000 rows inserted in random order, with the dates and attributes MusicBrainz
+  carries on a minority of rows: the constraint's index is 143 bytes per row and the hash key's is 77. **While both
+  exist the table pays for both**, 220 bytes per row, so this step adds index cost; the saving (66 bytes per row
+  here, more where every column is populated, as in the audit's 144) arrives only when the constraint is dropped.
+- **Later step, not made here.** Drop `relationships_natural_key` after `gm-musicbrainz-sql-loader-1twk` moves the
+  writer, and before MusicBrainz is enabled. The loader change is `ON CONFLICT (source_mbid, target_mbid,
+  source_entity_type, target_entity_type, relationship_type, begin_date, end_date, attributes)` becoming `ON
+  CONFLICT (musicbrainz.relationship_key(source_mbid, target_mbid, source_entity_type, target_entity_type,
+  relationship_type, begin_date, end_date, attributes))`, with the column list and the `DO UPDATE` clause
+  unchanged. After the drop, the old target no longer finds a constraint and fails with `there is no unique or
+  exclusion constraint matching the ON CONFLICT specification`, so the drop is a breaking change and needs its
+  own contract step. The table is empty on lux and nothing writes to it today.
+- **Upgrade path.** Additive: the function and the unique index are created `IF NOT EXISTS`, and applying twice
+  changes nothing. A populated table takes a write lock for the index build; build it first with `CREATE UNIQUE
+  INDEX CONCURRENTLY relationships_key ON musicbrainz.relationships (musicbrainz.relationship_key(...))` and the
+  initializer finds it. A database with duplicate-free rows needs no cleaning.
+- **Rollback.** `DROP INDEX musicbrainz.relationships_key` and `DROP FUNCTION musicbrainz.relationship_key`;
+  nothing depends on them while the constraint stays.
+
 ### Event idempotency across partitions
 
 A unique key on a partitioned table must include the partition key, so `activity.events`'
@@ -939,9 +974,9 @@ The executable PostgreSQL inventory is in
 
 The statement lists also carry the migrations required for an existing database: additive
 authentication and media columns, rarity-signal columns, Discogs cross-reference widening to
-`BIGINT`, and the widened `musicbrainz.relationships` natural key. The latter uses `UNIQUE NULLS
-NOT DISTINCT` across both entity identifiers and types, relationship type, dates, and
-attributes. These statements intentionally run with the table/index declarations because
+`BIGINT`, the widened `musicbrainz.relationships` natural key (`UNIQUE NULLS NOT DISTINCT` across both entity
+identifiers and types, relationship type, dates, and attributes), and the hash key beside it (see
+[MusicBrainz relationships: the hash key](#musicbrainz-relationships-the-hash-key)). These statements intentionally run with the table/index declarations because
 `CREATE TABLE IF NOT EXISTS` cannot update an existing table. Do not translate them into an
 out-of-band migration or remove retained provenance fields.
 

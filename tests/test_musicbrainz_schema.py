@@ -188,3 +188,27 @@ class TestWideningGuard:
         for name, sql in self._guards().items():
             table, column = name.removeprefix("musicbrainz.").removesuffix(" widen to BIGINT").split(".")
             assert f"ALTER TABLE musicbrainz.{table} ALTER COLUMN {column} TYPE BIGINT" in sql
+
+
+def test_relationships_hash_key_sits_beside_the_natural_key_constraint():
+    # Additive: the eight-column constraint stays (the loader's current ON CONFLICT names it) and a
+    # hash key over the same eight values is added as a second unique index.
+    statements = dict(_MUSICBRAINZ_TABLES)
+    assert "CONSTRAINT relationships_natural_key UNIQUE NULLS NOT DISTINCT" in statements["musicbrainz.relationships table"]
+    function = statements["musicbrainz.relationship_key function"]
+    for column in (
+        "source_mbid",
+        "target_mbid",
+        "source_entity_type",
+        "target_entity_type",
+        "relationship_type",
+        "begin_date",
+        "end_date",
+        "attributes",
+    ):
+        assert column in function, column
+    index = statements["musicbrainz.relationships_key index"]
+    assert "CREATE UNIQUE INDEX IF NOT EXISTS relationships_key" in index
+    assert "musicbrainz.relationship_key(" in index
+    names = [name for name, _ in _MUSICBRAINZ_TABLES]
+    assert names.index("musicbrainz.relationship_key function") < names.index("musicbrainz.relationships_key index")

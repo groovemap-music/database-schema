@@ -161,6 +161,8 @@ _ADDED_STATEMENT_NAMES = frozenset(
     {
         "queue_metrics table retired",
         "idx_mb_rels_source retire",
+        "musicbrainz.relationship_key function",
+        "musicbrainz.relationships_key index",
         "service_health_metrics table retired",
         "public.idx_artists_name hash index migration",
         "public.idx_labels_name hash index migration",

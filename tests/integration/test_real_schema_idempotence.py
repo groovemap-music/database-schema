@@ -512,6 +512,16 @@ async def assert_expected_postgres_schema() -> None:
         )
     ]
 
+    # The hash key sits beside the constraint (gm-database-schema-ngw9): both exist, both unique and valid.
+    hash_key = await postgres_rows(
+        """
+        SELECT index_row.indisunique, index_row.indisvalid
+        FROM pg_index AS index_row
+        WHERE index_row.indexrelid = 'musicbrainz.relationships_key'::regclass
+        """
+    )
+    assert hash_key == [(True, True)]
+
     # The loader's startup probe declines the relation unless it carries a
     # primary key (or unique constraint) on exactly its key columns, since its
     # `ON CONFLICT (loader, version)` upsert depends on one existing. This is
