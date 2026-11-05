@@ -474,9 +474,14 @@ them. Do not switch the route over before that run has finished, or it reports e
 **Writer cost of the GIN indexes.** The writer clears the table and `COPY`s every row in one transaction, so both
 indexes are built entry by entry as rows arrive. Measured on PostgreSQL 18 with that statement shape and 200,000
 rows carrying two ids in each column: 2.9 s with the two indexes against 2.5 s without (about 16% more), and the
-indexes hold 5.3 MB (`label_ids`) and 10.1 MB (`artist_ids`) at that size. A full run at the real row count pays
-the same proportion. If that matters, drop the two indexes before the `COPY` and rebuild them after it; the
-statements are `IF NOT EXISTS`, so the initializer restores them.
+indexes hold 5.3 MB (`label_ids`) and 10.1 MB (`artist_ids`) at that size. That is one measurement at 200,000 rows
+with few distinct ids; the cost grows with the number of distinct ids, and a reviewer's single 2,000,000-row bulk
+load with far more distinct ids (by `INSERT`, not `COPY`) went from 16.0 s to 29.3 s, so re-read the cost at full
+size before relying on the 16%. If it matters, drop the two indexes and rebuild them around the load, and do it
+**outside** the writer's transaction: a `DROP INDEX` inside it holds `ACCESS EXCLUSIVE` on the table, so readers
+block for the whole `COPY`. Outside it, the label and artist lookups run without the index (a sequential scan of
+the table) until the rebuild finishes, so take the route out of use, or accept the slow lookups, for that window.
+The statements are `IF NOT EXISTS`, so the initializer restores them.
 
 Upgrade path: additive. `ADD COLUMN IF NOT EXISTS` of a nullable column with no default is a metadata-only change,
 and the GIN indexes are `CREATE INDEX IF NOT EXISTS` on a table that is empty on lux, so the change is instant and
