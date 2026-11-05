@@ -686,6 +686,55 @@ additive, media-neutral rarity signals alongside the retained `format_rarity`. E
 is additive within persistence contract v1 — see
 [the persistence compatibility contract](../contracts/persistence/).
 
+### Rarity tier browse and observation indexes
+
+Two indexes are added, both `CREATE INDEX IF NOT EXISTS`, additive, and safe to apply twice:
+
+- `idx_release_rarity_tier_score` on `insights.release_rarity (tier, rarity_score DESC, release_id)`
+  serves catalog-api's tier browse `WHERE tier = $1 ORDER BY rarity_score DESC, release_id` and its
+  keyset page
+  `tier = $1 AND rarity_score <= $2::real AND (rarity_score < $2::real OR release_id > $3)`. The plan
+  is one index range scan with no sort of any kind. `release_id` is ascending because the route
+  orders it that way; with a descending `release_id` in the index, a page inside a tie group must
+  sort the whole group, and the writer rounds scores to 0.1, so a group can hold tens of thousands of
+  rows (about 12 ms against 0.7 ms). The keyset form is not a row-wise `<`: that comparison runs every
+  column the same way, so it only matches an order where both columns descend, and with
+  `release_id` ascending it would repeat or skip rows at a score tie. The first score term seeks into
+  the index and the second is the exact boundary. The cursor score is bound as `real`, because
+  `rarity_score` is `REAL` and a `float8` cursor does not equal the stored value it was read from,
+  so the page boundary would repeat rows. The integration test runs the literal route statement and
+  walks a whole tier by keyset on data shaped like the writer's (scores rounded to 0.1, tier derived
+  from the score, one score holding most of the tier) and gets every row exactly once, in order.
+- `idx_observations_owned_copy_id` on `observations (owned_copy_id)` supports the `ON DELETE CASCADE`
+  from `owned_copies`, which otherwise scans every observation per deleted copy, and gives one copy's
+  observations a lookup path.
+
+Upgrade path: the initializer runs the same statements on a new and an existing database, so there is
+nothing to migrate. A plain `CREATE INDEX` blocks writes to its table while it builds. Both tables are
+empty on lux and the build is instant. On a populated database, build them first by hand with
+`CREATE INDEX CONCURRENTLY IF NOT EXISTS` and the same definition; the initializer then finds them and
+skips. Rollback is `DROP INDEX insights.idx_release_rarity_tier_score` and
+`DROP INDEX idx_observations_owned_copy_id`; no reader depends on them for correctness. The older
+`idx_release_rarity_tier` is now a prefix of the composite and is left in place: nothing has measured
+it as unused, and retiring it needs that evidence.
+
+Measured on PostgreSQL 18 with 300,000 `release_rarity` rows shaped like the writer's (scores rounded to
+0.1, tier derived from the score, 55% of rows on one score), median of 15 runs, 20-row pages, with no
+index, with a `release_id DESC` variant of the index, and with the shipped one:
+
+| Statement | No index | `release_id DESC` index | Shipped index |
+| --- | ---: | ---: | ---: |
+| route, `common` first page | 58.8 ms | 1.31 ms | 0.94 ms |
+| route, `ultra-rare` first page | 1.28 ms | 1.31 ms | 0.87 ms |
+| keyset, page inside the `common` tie group | 27.4 ms | 30.9 ms | 4.23 ms |
+| keyset, deep `ultra-rare` page | 1.80 ms | 1.42 ms | 0.89 ms |
+
+The `release_id DESC` variant is no better than no index inside a tie group, which is why the shipped
+index orders `release_id` ascending. A keyset page inside a large tie group still skips the tie rows
+at or before the cursor id, so it costs more than a first page (4.23 ms here). Deleting 50 owned
+copies with 100 observations each (200k observation rows): 731 ms to 29 ms. The 1,984 ms in the audit
+came from 4M synthetic rows; this measurement is smaller, so its absolute times are too.
+
 The executable PostgreSQL inventory is in
 [`src/groovemap_schema/postgres.py`](../src/groovemap_schema/postgres.py):
 

@@ -449,6 +449,13 @@ _USER_TABLES: list[tuple[str, str]] = [
         "idx_observations_artifact_kind",
         "CREATE INDEX IF NOT EXISTS idx_observations_artifact_kind ON observations (artifact_id, kind)",
     ),
+    # observations.owned_copy_id is a cascading foreign key: without an index a
+    # delete of an owned copy scans every observation, and a copy's own
+    # observations have no lookup path.
+    (
+        "idx_observations_owned_copy_id",
+        "CREATE INDEX IF NOT EXISTS idx_observations_owned_copy_id ON observations (owned_copy_id)",
+    ),
     # provider_aliases maps every external namespace — Discogs, MusicBrainz,
     # Wikidata, barcodes, catalogue numbers, ISRCs, matrix inscriptions — onto a
     # native id, with a validity interval so a provider merge or split is a new
@@ -1014,6 +1021,24 @@ _INSIGHTS_TABLES: list[tuple[str, str]] = [
     (
         "idx_release_rarity_gem",
         "CREATE INDEX IF NOT EXISTS idx_release_rarity_gem ON insights.release_rarity (hidden_gem_score DESC NULLS LAST)",
+    ),
+    # The tier browse catalog-api serves is WHERE tier = $1 ORDER BY rarity_score DESC,
+    # release_id (release_id ascending, as the route writes it). The index matches that
+    # order exactly: with release_id descending, a page inside a tie group has to sort
+    # the whole group, and the writer rounds scores to 0.1, so a tie group can hold tens
+    # of thousands of rows (about 12 ms against 0.7 ms for a 20-row read).
+    #
+    # The keyset page is not a row-wise `<`, which cannot express a descending score
+    # with an ascending id; it is
+    #   tier = $1 AND rarity_score <= $2::real AND (rarity_score < $2::real OR release_id > $3)
+    # where the first score term is the seek into the index and the second the exact
+    # boundary. The cursor score must be cast to real: rarity_score is REAL, and a
+    # float8 cursor does not equal the stored value it came from, so the page boundary
+    # would repeat rows. idx_release_rarity_tier (tier) is now a prefix of this index. It is
+    # left in place: no bead has measured it as unused, and retiring it needs that evidence.
+    (
+        "idx_release_rarity_tier_score",
+        "CREATE INDEX IF NOT EXISTS idx_release_rarity_tier_score ON insights.release_rarity (tier, rarity_score DESC, release_id)",
     ),
     (
         "insights.community_counts table",
