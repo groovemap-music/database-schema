@@ -1034,8 +1034,8 @@ _INSIGHTS_TABLES: list[tuple[str, str]] = [
     # where the first score term is the seek into the index and the second the exact
     # boundary. The cursor score must be cast to real: rarity_score is REAL, and a
     # float8 cursor does not equal the stored value it came from, so the page boundary
-    # would repeat rows. idx_release_rarity_tier is now a prefix of this index; it stays
-    # until the index audit (gm-database-schema-m6jp) decides on evidence.
+    # would repeat rows. idx_release_rarity_tier (tier) is now a prefix of this index. It is
+    # left in place: no bead has measured it as unused, and retiring it needs that evidence.
     (
         "idx_release_rarity_tier_score",
         "CREATE INDEX IF NOT EXISTS idx_release_rarity_tier_score ON insights.release_rarity (tier, rarity_score DESC, release_id)",

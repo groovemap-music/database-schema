@@ -549,8 +549,8 @@ empty on lux and the build is instant. On a populated database, build them first
 `CREATE INDEX CONCURRENTLY IF NOT EXISTS` and the same definition; the initializer then finds them and
 skips. Rollback is `DROP INDEX insights.idx_release_rarity_tier_score` and
 `DROP INDEX idx_observations_owned_copy_id`; no reader depends on them for correctness. The older
-`idx_release_rarity_tier` is now a prefix of the composite and is kept; whether to retire it is the
-index audit's decision, on usage evidence.
+`idx_release_rarity_tier` is now a prefix of the composite and is left in place: nothing has measured
+it as unused, and retiring it needs that evidence.
 
 Measured on PostgreSQL 18 with 300,000 `release_rarity` rows shaped like the writer's (scores rounded to
 0.1, tier derived from the score, 55% of rows on one score), median of 15 runs, 20-row pages, with no
