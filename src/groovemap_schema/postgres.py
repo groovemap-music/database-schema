@@ -6088,8 +6088,7 @@ def _ledger_capture_triggers(table: str, function: str) -> tuple[str, str]:
     )
     return (
         f"{table} identity ledger capture triggers",
-        f"""
-DO $capture$
+        f"""DO $capture$
 BEGIN
     IF (SELECT count(*) FROM pg_catalog.pg_trigger
         WHERE tgrelid = {_sql_literal(table)}::regclass AND tgname LIKE 'identity\\_ledger\\_capture\\_%') = {len(_LEDGER_CAPTURE_TRIGGERS)} THEN
@@ -6536,13 +6535,12 @@ def _ledger_retire_matviews() -> str:
     """
     drops = "\n".join(
         f"""    IF (SELECT relkind FROM pg_catalog.pg_class WHERE oid = to_regclass('public.{view}')) = 'm' THEN
-        DROP MATERIALIZED VIEW public.{view};
+        DROP MATERIALIZED VIEW IF EXISTS public.{view};
         retired := true;
     END IF;"""  # noqa: S608 -- composed of module constants only
         for view in reversed(IDENTITY_LEDGER_VIEWS)
     )
-    return f"""
-DO $retire$
+    return f"""DO $retire$
 DECLARE
     retired boolean := false;
 BEGIN

@@ -56,7 +56,7 @@ class TestIdentityLedgerStatements:
     def test_every_capture_is_statement_level_and_cannot_be_half_applied(self) -> None:
         for table, _function in _LEDGER_SOURCES:
             statement = _STATEMENTS[f"{table} identity ledger capture triggers"]
-            assert statement.lstrip().startswith("DO $capture$")
+            assert statement.startswith("DO $capture$")
             assert "SET LOCAL lock_timeout" in statement
             assert "FOR EACH ROW" not in statement
             assert statement.count("FOR EACH STATEMENT") == 4
@@ -92,7 +92,7 @@ class TestIdentityLedgerStatements:
         statement = _STATEMENTS["identity ledger materialized views retirement"]
         for view in IDENTITY_LEDGER_VIEWS:
             assert f"to_regclass('public.{view}')) = 'm'" in statement
-            assert f"DROP MATERIALIZED VIEW public.{view};" in statement
+            assert f"DROP MATERIALIZED VIEW IF EXISTS public.{view};" in statement
         assert "IF retired THEN\n        DELETE FROM public.identity_ledger_refresh_state;" in statement
 
     def test_the_rollback_removes_every_object_the_upgrade_added(self) -> None:
