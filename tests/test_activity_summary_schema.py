@@ -44,6 +44,10 @@ _NAMES_AFTER_ACTIVITY_SUMMARY = [
     "insights.release_rarity add media_families",
     "insights.release_rarity add family_signals",
     "insights.release_rarity add medium_rarity",
+    "insights.release_rarity add label_ids",
+    "insights.release_rarity add artist_ids",
+    "idx_release_rarity_label_ids",
+    "idx_release_rarity_artist_ids",
 ]
 
 

@@ -653,6 +653,71 @@ this primary key. When only 1% of subjects are eligible a page filters more rows
 total cost stays linear. `tests/integration/test_activity_keyset_paging.py` holds the schema to this:
 an index range scan, no sort, and the same buffers per page at any cursor depth or table size.
 
+### Rarity by label and by artist
+
+`insights.release_rarity` carries `label_ids BIGINT[]` and `artist_ids BIGINT[]`, the Discogs label and
+artist ids of the release, each with a GIN index. A label's or an artist's rarity page and its exact
+total are one statement, with the total as its own subquery and the page joined to it by `LATERAL`:
+
+```sql
+SELECT p.release_id, p.rarity_score, t.total
+FROM (SELECT count(*) AS total FROM insights.release_rarity WHERE label_ids @> ARRAY[$1]::bigint[]) AS t
+LEFT JOIN LATERAL (
+    SELECT release_id, rarity_score
+    FROM insights.release_rarity
+    WHERE label_ids @> ARRAY[$1]::bigint[]
+    ORDER BY rarity_score DESC, release_id
+    LIMIT $2 OFFSET $3
+) AS p ON true
+```
+
+It always returns at least one row. A page inside the group returns one row per release, each carrying the
+exact `total`. A page past the last one, and a label or artist no release has, return a single row whose
+`release_id` and `rarity_score` are `NULL` and whose `total` is still right (zero for an empty group); the caller
+drops the `NULL` row. The first form tried, `count(*) OVER ()` beside the page, returns no row at all past
+the last page and so no total there, which is why it is not the route's statement. The same lookup on
+`artist_ids` is identical with that column. There is no second count and no list of release ids to ship from
+Neo4j. The columns are nullable with no default: a release the writer found no label or artist for keeps
+`NULL` and does not match.
+
+**Order of rollout.** The rarity table is written by `analytics-engine` (`insights/computations.py`,
+`_RARITY_COPY_SQL`), which streams the scored releases from `catalog-api` and `COPY`s them in after clearing the
+table. Until it names the two columns they stay `NULL` and these queries return nothing, so the order is:
+this schema first; then `catalog-api`'s stream carrying the ids; then `analytics-engine`'s `COPY` listing
+`label_ids` and `artist_ids`; then one complete rarity run, which rewrites every row; then the route that reads
+them. Do not switch the route over before that run has finished, or it reports empty groups.
+
+**Writer cost of the GIN indexes.** The writer clears the table and `COPY`s every row in one transaction, so both
+indexes are built entry by entry as rows arrive. Measured on PostgreSQL 18 with that statement shape and 200,000
+rows carrying two ids in each column: 2.9 s with the two indexes against 2.5 s without (about 16% more), and the
+indexes hold 5.3 MB (`label_ids`) and 10.1 MB (`artist_ids`) at that size. That is one measurement at 200,000 rows
+with few distinct ids; the cost grows with the number of distinct ids, and a reviewer's single 2,000,000-row bulk
+load with far more distinct ids (by `INSERT`, not `COPY`) went from 16.0 s to 29.3 s, so re-read the cost at full
+size before relying on the 16%. If it matters, drop the two indexes and rebuild them around the load, and do it
+**outside** the writer's transaction: a `DROP INDEX` inside it holds `ACCESS EXCLUSIVE` on the table, so readers
+block for the whole `COPY`. Outside it, the label and artist lookups run without the index (a sequential scan of
+the table) until the rebuild finishes, so take the route out of use, or accept the slow lookups, for that window.
+The statements are `IF NOT EXISTS`, so the initializer restores them.
+
+Upgrade path: additive. `ADD COLUMN IF NOT EXISTS` of a nullable column with no default is a metadata-only change,
+and the GIN indexes are `CREATE INDEX IF NOT EXISTS` on a table that is empty on lux, so the change is instant and
+safe to apply twice. On a populated table the GIN builds take a write lock for their duration; build them first
+with `CREATE INDEX CONCURRENTLY` and the same definition and the initializer then skips them. Rollback is `DROP
+INDEX` for the two indexes and `ALTER TABLE ... DROP COLUMN` for the two columns; nothing else reads them.
+
+Measured on PostgreSQL 18 with 300,000 rows, median of 7 runs, 20-row pages. The page matches the member release
+ids shipped as `release_id = ANY(...)`, and the total is exact. For the statement above against the window form:
+
+| Group | `LATERAL` form | Window form | Shipped ids (ids already in hand) |
+| --- | ---: | ---: | ---: |
+| 50-release label | 9.0 ms | 4.6 ms | 1.1 ms |
+| 30,000-release artist | 18.5 ms | 25.2 ms | 50.2 ms |
+| 100,034-release label | 49.1 ms | 61.8 ms | 214.8 ms |
+
+The `LATERAL` form is the faster on large groups and a few milliseconds slower on a tiny one, and it is the only
+one that answers past the end. The shipped-ids column leaves out the Neo4j walk that produces the ids, which is
+where the 15.7 s for label 1818 went. Both costs grow with the group, since the total needs every member.
+
 ### Event idempotency across partitions
 
 A unique key on a partitioned table must include the partition key, so `activity.events`'
