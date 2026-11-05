@@ -367,7 +367,7 @@ class TestCreatePostgresSchema:
             # extension gate also probes pg_available_extensions before
             # closing, since it is not yet installed.
             + 3
-            # SET lock_timeout, the two catalog reads that find already-present objects, RESET lock_timeout
+            # set_config lock_timeout, the two catalog reads that find already-present objects, RESET lock_timeout
             + 4
         )
         assert cursor.execute.await_count == expected_calls
@@ -381,7 +381,7 @@ class TestCreatePostgresSchema:
         async def flaky(*args: Any, **kwargs: Any) -> None:  # noqa: ARG001
             nonlocal call_count
             call_count += 1
-            bookkeeping = str(args[0]).lstrip().startswith(("SET lock_timeout", "RESET", "SELECT n.nspname"))
+            bookkeeping = str(args[0]).lstrip().startswith(("SELECT set_config", "RESET", "SELECT n.nspname"))
             if call_count % 4 == 0 and not bookkeeping:
                 raise Exception("Simulated PostgreSQL error")
 
@@ -408,7 +408,7 @@ class TestCreatePostgresSchema:
             # extension gate also probes pg_available_extensions before
             # closing, since it is not yet installed.
             + 3
-            # SET lock_timeout, the two catalog reads that find already-present objects, RESET lock_timeout
+            # set_config lock_timeout, the two catalog reads that find already-present objects, RESET lock_timeout
             + 4
         )
         assert cursor.execute.await_count == expected_calls
@@ -492,7 +492,7 @@ class TestCreatePostgresSchema:
             # extension gate also probes pg_available_extensions before
             # closing, since it is not yet installed.
             + 3
-            # SET lock_timeout, the first catalog read (it fails, so the second is never sent), RESET lock_timeout
+            # set_config lock_timeout, the first catalog read (it fails, so the second is never sent), RESET lock_timeout
             + 3
         )
         assert cursor.execute.await_count == expected_calls

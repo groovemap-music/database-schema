@@ -8260,7 +8260,7 @@ async def create_postgres_schema(
             if preprovisioned:
                 statements = [item for item in statements if item[0] not in _PREPROVISIONED_EXTENSION_STATEMENT_NAMES]
             try:
-                await cursor.execute(f"SET lock_timeout = {int(lock_timeout_ms)}")
+                await cursor.execute("SELECT set_config('lock_timeout', %s, false)", (f"{int(lock_timeout_ms)}ms",))
             except Exception as error:
                 logger.warning("Schema: could not set lock_timeout (%s); statements may wait for locks", error)
             try:
