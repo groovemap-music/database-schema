@@ -75,6 +75,7 @@ def mock_pool() -> MagicMock:
     # extension and CREATEROLE probes both read a falsy first column, so
     # `_apply_vector_schema` skips its statements unless a test overrides this.
     mock_cursor.fetchone = AsyncMock(return_value=(False,))
+    mock_cursor.fetchall = AsyncMock(return_value=[])
     mock_conn.__aenter__ = AsyncMock(return_value=mock_conn)
     mock_conn.__aexit__ = AsyncMock(return_value=False)
     # cursor() is synchronous in psycopg (returns an async context manager, not a coroutine)
@@ -366,6 +367,8 @@ class TestCreatePostgresSchema:
             # extension gate also probes pg_available_extensions before
             # closing, since it is not yet installed.
             + 3
+            # SET lock_timeout, the two catalog reads that find already-present objects, RESET lock_timeout
+            + 4
         )
         assert cursor.execute.await_count == expected_calls
 
@@ -378,7 +381,8 @@ class TestCreatePostgresSchema:
         async def flaky(*args: Any, **kwargs: Any) -> None:  # noqa: ARG001
             nonlocal call_count
             call_count += 1
-            if call_count % 4 == 0:
+            bookkeeping = str(args[0]).lstrip().startswith(("SET lock_timeout", "RESET", "SELECT n.nspname"))
+            if call_count % 4 == 0 and not bookkeeping:
                 raise Exception("Simulated PostgreSQL error")
 
         cursor.execute = AsyncMock(side_effect=flaky)
@@ -404,6 +408,8 @@ class TestCreatePostgresSchema:
             # extension gate also probes pg_available_extensions before
             # closing, since it is not yet installed.
             + 3
+            # SET lock_timeout, the two catalog reads that find already-present objects, RESET lock_timeout
+            + 4
         )
         assert cursor.execute.await_count == expected_calls
 
@@ -436,10 +442,19 @@ class TestCreatePostgresSchema:
             # no state to reapply and is trivially idempotent by never writing
             # anything.
             read_only = upper.strip().startswith("SELECT")
+            # Session settings around the apply: a lock timeout set and reset on the connection.
+            session_setting = upper.startswith(("SET LOCK_TIMEOUT", "RESET LOCK_TIMEOUT"))
             # A retirement is `DROP TABLE IF EXISTS`: the guard makes it a no-op
             # once the table is gone, which the DROP guard below also checks.
             retirement = upper.startswith("DROP TABLE IF EXISTS ")
-            exempt = ("ALTER COLUMN" in upper and "TYPE " in upper) or "CREATE OR REPLACE" in upper or guarded_block or read_only or retirement
+            exempt = (
+                ("ALTER COLUMN" in upper and "TYPE " in upper)
+                or "CREATE OR REPLACE" in upper
+                or guarded_block
+                or read_only
+                or retirement
+                or session_setting
+            )
             if not exempt:
                 assert "IF NOT EXISTS" in upper, f"Statement is not idempotent: {stmt[:80]}..."
             if guarded_block:
@@ -476,6 +491,8 @@ class TestCreatePostgresSchema:
             # (CREATEROLE); with the shared fixture's default (False), the
             # extension gate also probes pg_available_extensions before
             # closing, since it is not yet installed.
+            + 3
+            # SET lock_timeout, the first catalog read (it fails, so the second is never sent), RESET lock_timeout
             + 3
         )
         assert cursor.execute.await_count == expected_calls
