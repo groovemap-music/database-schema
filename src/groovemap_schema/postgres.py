@@ -841,6 +841,14 @@ _USER_TABLES: list[tuple[str, str]] = [
         "loader_extraction_latch generation column",
         "ALTER TABLE loader_extraction_latch ADD COLUMN IF NOT EXISTS generation BIGINT",
     ),
+    # The entity types whose stale-row purge this extraction vetoed. A loader's own
+    # memory cannot hold this: dumps are a month apart, so a count of consecutive
+    # vetoes has to outlive every restart between them. A constant default adds the
+    # column without a table rewrite, and existing rows read as no veto recorded.
+    (
+        "loader_extraction_latch purge_vetoed column",
+        "ALTER TABLE loader_extraction_latch ADD COLUMN IF NOT EXISTS purge_vetoed TEXT[] NOT NULL DEFAULT '{}'",
+    ),
     (
         "idx_loader_extraction_latch_generation",
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_loader_extraction_latch_generation ON loader_extraction_latch (loader, generation) WHERE generation IS NOT NULL",

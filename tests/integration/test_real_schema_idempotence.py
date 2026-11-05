@@ -132,6 +132,7 @@ EXPECTED_COLUMNS = {
     ("public", "loader_extraction_latch", "created_at", "timestamp with time zone"),
     ("public", "loader_extraction_latch", "updated_at", "timestamp with time zone"),
     ("public", "loader_extraction_latch", "refreshed_at", "timestamp with time zone"),
+    ("public", "loader_extraction_latch", "purge_vetoed", "ARRAY"),
     ("public", "loader_extraction_latch", "generation", "bigint"),
     ("public", "loader_derived_refresh_cursor", "loader", "text"),
     ("public", "loader_derived_refresh_cursor", "generation", "bigint"),
@@ -851,6 +852,45 @@ async def test_extraction_history_source_is_added_to_a_table_that_predates_it() 
         rows = await postgres_rows("SELECT source FROM extraction_history WHERE id = %s", (run_id,))
         assert rows == [(None,)]
     assert len(await postgres_rows(_EXTRACTION_HISTORY_SOURCE_OBJECTS)) == 3
+
+
+@pytest.mark.asyncio
+async def test_purge_vetoed_is_added_to_a_latch_that_predates_it_and_old_loaders_keep_working() -> None:
+    """An upgrade keeps existing rows, rewrites nothing, and the current writer needs no change."""
+    await apply_schema()
+    version = f"upgrade-{uuid4().hex}"
+    connection = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params())
+    async with connection, connection.cursor() as cursor:
+        await cursor.execute("ALTER TABLE loader_extraction_latch DROP COLUMN purge_vetoed")
+        await cursor.execute("INSERT INTO loader_extraction_latch (loader, version, signals) VALUES ('discogs', %s, ARRAY['artists'])", (version,))
+        await connection.commit()
+    filenode = await postgres_rows("SELECT pg_relation_filenode('loader_extraction_latch')")
+
+    for _ in range(2):
+        await apply_schema()
+        rows = await postgres_rows("SELECT signals, purge_vetoed FROM loader_extraction_latch WHERE version = %s", (version,))
+        assert rows == [(["artists"], [])]
+    assert await postgres_rows("SELECT pg_relation_filenode('loader_extraction_latch')") == filenode
+
+    # The statement a loader that does not know the column runs: it lists its own columns.
+    connection = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params())
+    async with connection, connection.cursor() as cursor:
+        await cursor.execute(
+            """
+            INSERT INTO loader_extraction_latch AS latch (loader, version, signals) VALUES ('discogs', %s, ARRAY['labels'])
+            ON CONFLICT (loader, version) DO UPDATE SET signals = latch.signals || EXCLUDED.signals
+            """,
+            (version,),
+        )
+        await connection.commit()
+    assert await postgres_rows("SELECT signals, purge_vetoed FROM loader_extraction_latch WHERE version = %s", (version,)) == [
+        (["artists", "labels"], [])
+    ]
+
+    connection = await psycopg.AsyncConnection.connect(**initializer._postgres_connection_params())
+    async with connection, connection.cursor() as cursor:
+        await cursor.execute("DELETE FROM loader_extraction_latch WHERE version = %s", (version,))
+        await connection.commit()
 
 
 # ── The artist embeddings HNSW index and its build procedure (ADR 0013) ──────
