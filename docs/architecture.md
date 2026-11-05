@@ -1917,6 +1917,30 @@ removable; folding it onto the `release` vertex would make every release read pa
 the one relation in the edge model split across two owners, `discogs-sql-loader` and
 `catalog-api`, and the contract records it as such.
 
+### What Neo4j carries that the relational contract does not
+
+`discogs-graph-enricher` writes three Artist properties, one relationship type, and two message
+fields that this schema does not publish. The contract records them under
+`graph_schema.neo4j_only`, and `scripts/check-contracts.py` holds that record to the same
+standard as the counter parity claim: nothing is both published and Neo4j-only.
+
+**Decision: Neo4j-only.** No relational reader of any of them is known, and publishing the edge
+would add a relation of about 5.0 million rows (measured on lux) with no reader and no writer.
+Publishing later is additive; the table below names the shape each would take.
+
+| Neo4j | Carried as | If published later |
+|---|---|---|
+| `Artist.release_count`, `label_count`, `primary_genre` | node properties, written by the enricher | `graph.artist_stats` keyed on `artist_id`, joined into `graph.artist_vertex` beside `graph.artist_degree`, `discogs-sql-loader` as writer |
+| `(:Label)-[:HAS_STYLE {release_count}]->(:Style)` | one edge per label and style, no cap, derived from `ON` and `IS` by post-import maintenance | a loader-written `graph.label_style` keyed `(label_id, style_name)`, derived from `graph.on_label` and `graph.in_style` |
+| `ExtractionCompletion.stats_version` | integer queue-message field | none: not a stored column |
+| `MaintenanceCheckpoint.run_key` | now `<version>@stats-<N>` | none: a Neo4j-side checkpoint, distinct from `graph.extraction_latch` |
+
+`counter_properties.labels.artist.properties` stays `["degree"]` on purpose: the check proves
+every listed property is a column of `graph.artist_vertex`, and the three above are not.
+`HAS_STYLE` is outside the relationship types `graph.find_shortest_path` walks, so that function,
+the `graph_path` relations, and `edge_relations` (40) are unchanged. No index or constraint is
+added or needed.
+
 ### The MEMBER_OF union
 
 `graph.artist_member_of` is the one relation here derived from two others rather than projected
