@@ -12,6 +12,7 @@ Every assertion is made against the statement lists, never against a database.
 from groovemap_schema.postgres import (
     _ENTITY_TABLES,
     _GRAPH_STATEMENTS,
+    _IDENTITY_LEDGER_STATEMENTS,
     _MUSICBRAINZ_INDEXES,
     _MUSICBRAINZ_TABLES,
     _USER_TABLES,
@@ -112,6 +113,7 @@ _LEGACY_STATEMENT_NAMES = [
     "idx_release_rarity_score",
     "idx_release_rarity_tier",
     "idx_release_rarity_gem",
+    "idx_release_rarity_tier_score",
     "insights.community_counts table",
     "idx_community_counts_fetched",
     "insights.computation_log table",
@@ -188,6 +190,7 @@ _ADDED_STATEMENT_NAMES = frozenset(
         "observations table",
         "idx_observations_user_id",
         "idx_observations_artifact_kind",
+        "idx_observations_owned_copy_id",
         "provider_aliases table",
         "idx_provider_aliases_provider_entity_kind_external_id",
         "idx_provider_aliases_native_id",
@@ -449,19 +452,7 @@ _GRAPH_STATEMENT_NAMES = frozenset(
 # after the graph statements; tests/test_identity_ledger_schema.py covers it.
 _IDENTITY_LEDGER_STATEMENT_NAMES = frozenset(
     {
-        "identity_ledger_edition_events materialized view",
-        "idx_identity_ledger_edition_events_key",
-        "idx_identity_ledger_edition_events_at",
-        "idx_identity_ledger_edition_events_type_at",
-        "identity_ledger_edition_parents materialized view",
-        "idx_identity_ledger_edition_parents_key",
-        "identity_ledger_work_summary materialized view",
-        "idx_identity_ledger_work_summary_key",
-        "idx_identity_ledger_work_summary_page",
-        "identity_ledger_density materialized view",
-        "idx_identity_ledger_density_key",
-        "identity_ledger_refresh_state table",
-        "identity_ledger_refresh function",
+        *(name for name, _statement in _IDENTITY_LEDGER_STATEMENTS),
     }
 )
 

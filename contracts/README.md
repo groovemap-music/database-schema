@@ -121,15 +121,18 @@ The contract check pins its columns, the closed `provider`, `event`, and `dated_
 the `identity_link_events_link_matches_event` CHECK, the idempotence key, and its two indexes
 to the declaring statements. It stores no user data.
 
-`identity_ledger_precompute` records the four materialized views that precompute the
-Identity Ledger for `catalog-api`'s works list and density routes, together with
-`identity_ledger_refresh_state` and `identity_ledger_refresh(source_watermark jsonb)`.
-`catalog-api` is the only consumer: it reads the views and calls the refresh, and this
-repository never does either. The contract check pins the refresh order, each view's columns,
-unique key, and read indexes, the state row's columns, and the function's signature to the
-declaring statements. Every view stays unreadable until its first refresh. See
-[the architecture notes](../docs/architecture.md) for what each view holds and why readers
-never block.
+`identity_ledger_precompute` records the four tables that precompute the Identity Ledger for
+`catalog-api`'s works list and density routes, together with `identity_ledger_refresh_state`,
+`identity_ledger_refresh(source_watermark jsonb)`, and `identity_ledger_verify()`. `catalog-api`
+is the only consumer: it reads the tables and calls the refresh, and this repository never does
+either. They were materialized views through v0.6.3. Their names, columns, and indexes are
+unchanged, but `relkind` is now `'r'` and the state row, not `relispopulated`, says whether a
+refresh has happened, so `catalog-api` drops its `relkind = 'm'` filter before this revision
+applies. The contract check pins the maintenance order, each table's columns, unique key, and read
+indexes, the state row's columns, the six captured sources, the stores behind the tables, and both
+functions' signatures to the declaring statements. See
+[the architecture notes](../docs/architecture.md) for what each table holds, how to verify it
+against a full recompute, and the upgrade and rollback procedures.
 
 `activity_event_idempotency` records `activity.event_idempotency`, the non-partitioned
 `(subject_id, idempotency_key)` key that a `BEFORE INSERT` trigger on `activity.events` claims.

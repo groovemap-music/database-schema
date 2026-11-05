@@ -287,11 +287,11 @@ and `(event_at)`. No user data is stored.
 item's event history on each request: a window function over all of `provider_aliases` joined
 to `catalog_items`, and only then the filter. gm-catalog-api-278z measured the default works
 list at 71.5 s p95 at 50% scale, against a 2 s budget, and no index helps, because each
-statement aggregates the whole history before it filters. Four materialized views in `public`
-now hold what those statements compute, and `catalog-api` reads rows from them instead. They
-are declared in `_IDENTITY_LEDGER_STATEMENTS` in
+statement aggregates the whole history before it filters. Four tables in `public` now hold what
+those statements compute, and `catalog-api` reads rows from them instead. They are declared in
+`_IDENTITY_LEDGER_STATEMENTS` in
 [`src/groovemap_schema/postgres.py`](../src/groovemap_schema/postgres.py), after the graph
-statements, because they read `graph.derived_from` as well as `provider_aliases`,
+statements, because the refresh reads `graph.derived_from` as well as `provider_aliases`,
 `catalog_items`, `catalog_item_supersessions`, `identity_link_events`, and
 `musicbrainz.releases`. Their definitions are `catalog-api`'s route SQL with the filters lifted
 out, as its prototype composed them (`_view_statements` in `scripts/ledger_scale.py` at
@@ -315,61 +315,211 @@ An *edition* is a release-kind item resolved one hop through an open supersessio
   edition: the Discogs master its current Discogs release aliases name through
   `graph.derived_from`, and the release group its current MusicBrainz release aliases name
   through `musicbrainz.releases`, each through that master's current alias, resolved one hop.
-  An edition with two rows disagrees about its work. Unique on `(edition_id, work_id)`.
+  An edition with two rows disagrees about its work. Unique on `(edition_id, work_id)`, and
+  indexed on `(work_id)` for the refresh.
 - `identity_ledger_work_summary (work_id, event, evented_editions, repaired_editions,
   first_event, last_event)` — the works list's rows: one per work with `event = 'any'` over
   every event type, and one per work and event type. `repaired_editions` counts editions with a
-  `reattached`, `promoted`, or `reverted` event. The unfiltered row uses the `'any'` sentinel
-  rather than NULL because `REFRESH ... CONCURRENTLY` matches rows on a unique index, and NULLs
-  never compare equal. Unique on `(event, work_id)`, and indexed on
-  `(event, last_event DESC, work_id)` for the page.
+  `reattached`, `promoted`, or `reverted` event. Unique on `(event, work_id)`, and indexed on
+  `(event, last_event DESC, work_id)` for the page and on `(work_id)` for the refresh.
 - `identity_ledger_density (kind, month, type, dated_from, events)` — events per UTC month,
   type, and provenance for each of `release`, `master`, `artist`, and `label`. Unlike the
-  edition views it counts mints, counts a supersession once rather than per side, and counts a
+  edition tables it counts mints, counts a supersession once rather than per side, and counts a
   link change no current alias holds. Unique on `(kind, month, type, dated_from)`.
 
 `identity_ledger_refresh_state` is one row (`singleton BOOLEAN PRIMARY KEY DEFAULT true CHECK
 (singleton)`) holding `refreshed_at`, `duration`, and the caller's `source_watermark` (JSONB,
 nullable). Only the refresh writes it, and it is empty until the first refresh.
 
-`public.identity_ledger_refresh(source_watermark jsonb DEFAULT NULL) RETURNS timestamptz`
-refreshes the four views in dependency order: `edition_events`, then `edition_parents`, which
-reads it, then `work_summary`, which reads both, then `density`. It then upserts the state row, with
-`refreshed_at` set to the instant the refresh started, and returns `refreshed_at`. Everything
-runs in the caller's one transaction, so a failed refresh leaves every view and the state row
-as they were.
+#### Maintained per item
 
-- **Unreadable until the first refresh.** Every view is created `WITH NO DATA`, so applying the
-  schema to a loaded catalog never runs the whole history inline. Until the first refresh,
-  reading a view raises `materialized view "…" has not been populated` (SQLSTATE `55000`),
-  which `catalog-api` reports as "not refreshed yet". Applying the schema again never
-  repopulates or empties a view.
-- **Readers never block.** The function refreshes a view that is not yet populated
-  (`pg_class.relispopulated`) plainly, because `CONCURRENTLY` refuses one, and a populated view
-  `CONCURRENTLY`. A concurrent refresh holds an `EXCLUSIVE` lock, which conflicts with no
-  reader's `ACCESS SHARE`: readers keep the previous rows until it commits, and a reader's open
-  transaction does not hold the refresh up either. The first, plain build holds
-  `ACCESS EXCLUSIVE` instead, so a reader that arrives during it waits for the build rather
-  than erroring. `pg_class.relispopulated` answers "refreshed yet?" without taking a lock on
-  the view.
-- **Freshness.** Each `REFRESH` takes its own snapshot, so the four views can differ by writes
-  that commit between them, and `refreshed_at` is a lower bound on freshness rather than one
-  instant. How fresh the ledger is depends on when `catalog-api` triggers the refresh. This
-  repository declares the refresh and never calls it. The prototype measured about 179 s per
-  concurrent refresh at 50% scale and 130 s for the first build, and extrapolated about 6 to 7
-  minutes per refresh at full scale.
-- **Who may refresh.** `REFRESH` needs the view's owner or, on PostgreSQL 17 and later, the
-  `MAINTAIN` privilege. The function is `SECURITY INVOKER`. `catalog-api` refreshes as the
-  owner: every service connects as the one login that owns `public` (deployment's
-  `.env.example`, `POSTGRES_USERNAME`), and `EXECUTE` on a function defaults to `PUBLIC`, so no
-  grant is declared. A separate `catalog-api` login would need `GRANT MAINTAIN` on the four
-  views and `GRANT SELECT, INSERT, UPDATE ON identity_ledger_refresh_state`. `SELECT` is part
-  of that grant because the upsert's `ON CONFLICT DO UPDATE` reads the row. The integration
+These four relations were materialized views through v0.6.3. `REFRESH` recomputes all history
+whether or not anything changed (45 s on lux to produce 4 rows, estimated 3 to 6 minutes at full
+size) and `CONCURRENTLY` then diffs every row, so a materialized view cannot cost less than its
+history. gm-database-schema-xen5 replaced them with tables of the same names, columns, column
+types, and indexes, kept current per item.
+
+1. **Capture.** Statement-level `AFTER` triggers on the six sources append what changed to
+   `identity_ledger_changes`, in the writer's own transaction: an item, or a provider key for a
+   change that names no item (a `graph.derived_from` row, a `musicbrainz.releases` row, a link
+   event, a master alias that may be gone by the refresh). A change and its record commit or roll
+   back together, so a transaction that began before a refresh and commits after it is never
+   missed, which a timestamp watermark cannot promise, and a deletion is visible. The log has no
+   key on purpose: two loaders inserting the same keys in different orders would deadlock on one.
+   A statement that changes no row, such as `ON CONFLICT DO NOTHING` on a row already there,
+   writes nothing.
+2. **Density deltas.** Link and supersession events count in density whoever holds them, so the
+   triggers log their signed counts to `identity_ledger_density_changes`, and no per-event state
+   is kept. A refresh folds each delta in exactly once.
+3. **Per-item state.** Density's old counts cannot be read back from base tables after they
+   change, so `identity_ledger_item_mints` and `identity_ledger_item_events` keep each item's mint
+   and alias events as last computed. They are the price of this design: one row per item, and
+   no consumer reads them.
+4. **Refresh.** `public.identity_ledger_refresh(source_watermark jsonb DEFAULT NULL) RETURNS
+   timestamptz` drains the log first, so a change committed after the drain stays for the next
+   refresh and one committed before it is visible to everything after. The dirty unit is the
+   whole item, because `linked_at_ingest` reads the item's `discogs_at`, so a later Discogs alias
+   reclassifies an older MusicBrainz event. It then recomputes each dirty item's stored rows, the
+   edition that item resolves to, every edition a dirty master reaches backwards through
+   `graph.derived_from` and `musicbrainz.releases`, and every work those editions sat under
+   before or sit under now. With no change it writes only the state row, whose `refreshed_at` is
+   the instant the refresh started, and it returns `refreshed_at`.
+5. **Rebuild.** The first refresh, a `TRUNCATE` of a source, a change to an item's id or kind,
+   `public.identity_ledger_request_rebuild()`, and a refresh finding more than 10% of the catalog
+   dirty (and over 100,000 items) rebuild every table from the base tables instead. The deltas
+   are not idempotent, so a rebuild drains them in the one statement that counts link and
+   supersession events, which gives both one snapshot.
+
+Everything a refresh writes runs in the caller's one transaction, so a failed refresh leaves
+every table, the log, and the state row as they were.
+
+- **Not refreshed yet.** Every table is created empty, so applying the schema to a loaded catalog
+  never runs the whole history inline. The state row, not the tables' emptiness, answers
+  "refreshed yet?", because a catalog with no events is empty too. Applying the schema again never
+  empties a table.
+- **Readers never block.** A refresh writes rows, so readers keep the previous rows until it
+  commits, the first build and a rebuild included. It takes the advisory lock
+  `hashtext('groovemap:identity-ledger-refresh')`, which `catalog-api` already holds around a
+  refresh, so refreshes run one at a time.
+- **Freshness.** All four tables commit at one instant. A refresh runs `READ COMMITTED`, so a
+  change that commits while it runs can show in part: an item resolved before a supersession
+  committed stays under its old edition, while a later statement may already read that
+  supersession's own event. That is bounded to one refresh, because the change's log row
+  outlived the drain, so the next refresh recomputes both sides exactly, and `catalog-api`'s
+  watermark, read before each refresh, moves and asks for that refresh. How fresh the tables are
+  otherwise depends on when `catalog-api` triggers the refresh. This repository declares the
+  refresh and never calls it.
+- **A missing trigger stops the refresh.** A source without its triggers would silently stop the
+  ledger following it, so the refresh raises SQLSTATE `55000` if any capture trigger is missing or
+  disabled. `session_replication_role = replica` bypasses triggers without showing in the catalog;
+  no writer sets it, and a restore that does must call `identity_ledger_request_rebuild()`.
+- **Who may refresh.** The function is `SECURITY INVOKER`. `catalog-api` refreshes as the owner:
+  every service connects as the one login that owns `public` (deployment's `.env.example`,
+  `POSTGRES_USERNAME`), and `EXECUTE` on a function defaults to `PUBLIC`, so no grant is declared.
+  A separate `catalog-api` login would need `SELECT, INSERT, UPDATE, DELETE` on the tables in
+  `IDENTITY_LEDGER_REFRESH_GRANTS` and `SELECT` on the six sources. The capture functions are
+  `SECURITY DEFINER`, so a role that writes a source needs no grant on the log. The integration
   suite shows that this grant set is enough and that a role without it is refused.
-- **Changing a definition.** `CREATE MATERIALIZED VIEW IF NOT EXISTS` never redefines an
-  existing view, so a changed definition needs its own guarded drop-and-recreate migration in
-  reverse dependency order. That migration leaves the recreated views unpopulated until the
-  next refresh.
+
+#### Verifying against a full recompute
+
+`SELECT * FROM public.identity_ledger_verify()` runs the view bodies as they were, which remain
+the definition of correct, against the tables in one statement, and returns one row per table:
+
+| Column | Meaning |
+| --- | --- |
+| `relation` | The table compared |
+| `missing` | Rows the recompute has and the table lacks |
+| `unexpected` | Rows the table has and the recompute lacks |
+| `pending_changes` | Changes still waiting for a refresh |
+
+The ledger equals a full recompute when every row reads `0, 0, 0`. With `pending_changes` above
+0, a difference is only the work the next refresh still has to do, so refresh and ask again. One
+statement is one snapshot, so a concurrent refresh cannot show as a difference, and it writes
+nothing, so a read-only login can run it. It costs what one full recompute did, so it belongs
+outside load windows. If it reports a real difference, call
+`SELECT identity_ledger_request_rebuild()`, refresh, and treat the difference as a bug.
+
+The integration suite goes further: `test_any_history_refreshed_in_steps_equals_a_full_recompute`
+writes a random history of every kind of change, and after each batch requires all four tables to
+equal both `catalog-api`'s prototype and `identity_ledger_verify()`.
+
+#### Upgrading from v0.6.3
+
+The upgrade is one ordinary schema apply, and is safe while the database holds data and while
+loaders write short transactions. Nothing in the ledger is source data: every row it removes is
+derived. Check for a long transaction first, for the reason in step 2.
+
+1. **Deploy `catalog-api` before this schema upgrade.** This order is required. Its two freshness
+   statements filter `relkind = 'm'`, so against tables they find nothing and it answers "not
+   refreshed yet" on every ledger route until it is updated, however current the tables are. The
+   version to deploy drops that filter and also requires the state row to exist, which holds on
+   both shapes, so it runs correctly against v0.6.3 first.
+2. **Apply the schema.** A guarded transaction drops the four views and deletes the state row, then
+   the tables and triggers are created. Until every trigger exists the refresh refuses to run.
+
+   Only the trigger statements have a lock timeout. Each table's triggers go on in one transaction
+   under a 30 s `lock_timeout`: `CREATE TRIGGER` takes `SHARE ROW EXCLUSIVE`, so it waits for running
+   writes and briefly holds new ones, and a long transaction fails that statement. Running the
+   apply again finishes the rest, and a table already covered takes no lock in that statement.
+
+   Everything else in the apply waits with no timeout, on every apply, and this predates the
+   ledger. `CREATE INDEX IF NOT EXISTS` takes `SHARE` before it finds the index exists, so even a
+   no-op waits for every open writer of that table, and `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`
+   takes `ACCESS EXCLUSIVE` before it finds the column, so it also waits for readers. The index
+   statements reach `provider_aliases`, `catalog_item_supersessions`, `identity_link_events`,
+   `musicbrainz.releases`, and `graph.derived_from`, and the `ALTER TABLE` statements reach
+   `musicbrainz.releases`, all ahead of the trigger statements. A statement waiting for a lock
+   queues later writers of that table behind it, so one
+   long transaction there stalls the apply and that table's writers until it ends, and the 30 s
+   timeout does not help. The retirement's `DROP MATERIALIZED VIEW` likewise waits, with no timeout,
+   for a running `REFRESH`, and readers of that view queue behind it.
+
+   So before applying, confirm in `pg_stat_activity` that no transaction has been open for long on
+   those tables. If an apply stalls, cancel it, or end the long transaction: the apply is safe to
+   run again.
+3. **The first refresh rebuilds.** With no state row, the next refresh builds every table from
+   the base tables, so a write made before capture started is in that build. It costs about one
+   old refresh, plus index maintenance. `catalog-api`'s poll does this on its own, within one
+   interval. Readers see "not refreshed yet" until it commits.
+4. **Verify.** Run `identity_ledger_verify()` once outside a load, and expect `0, 0, 0`.
+
+The largest cost of this design is space and a small charge on every write: see "Measured" below.
+
+#### Measured
+
+`catalog-api`'s deterministic `scripts/ledger_scale/seed.sql` at two scales, on PostgreSQL 18 in a
+disposable container with default memory settings. Each database was loaded and timed on v0.6.3,
+then upgraded in place to the tables and timed again. Each change batch is the same mix: half new
+items, the rest new MusicBrainz links with their link events, alias closures, and supersessions.
+
+| Refresh | 449,000 items | 1.35M items |
+| --- | ---: | ---: |
+| v0.6.3, nothing changed | 3.6 s, 77 MB temp | 15.4 s, 339 MB temp |
+| v0.6.3, 1,000 changes | 3.7 s, 82 MB temp | 13.1 s, 340 MB temp |
+| Tables, nothing changed | 0.03 s, no temp | 0.05 s, no temp |
+| Tables, 100 changes | 0.10 s | 0.07 s |
+| Tables, 1,000 changes | 0.19 to 0.25 s | 0.21 to 0.22 s |
+| Tables, 10,000 changes | 1.1 s | 2.3 s |
+| Tables, 100,000 changes | 7.4 s | 9.9 s |
+| First build, after the upgrade | 3.5 s | 11.3 s |
+| `identity_ledger_verify()` | 3.1 s | 12.8 s |
+
+Tripling the catalog tripled the old refresh. The new one stayed level up to 1,000 changes, and
+rose 1.3 to 2.2 times at 10,000 and 100,000, where the batch itself is a large share of the smaller
+catalog and sorts begin to spill. Maintenance and a rebuild cost about the same at 10% of the
+catalog dirty, which sets the threshold. `identity_ledger_verify()` reported `0, 0, 0` after each build and after the batches.
+These are synthetic rows without identifier aliases, so read them as a comparison, not as a
+forecast for lux. Lux's refresh was never timed on this build, because nothing has been applied there.
+
+**Space.** `identity_ledger_item_mints` is the largest table: 129 MB at 1.35M items, about 96 bytes
+an item, so about 2 GB at lux's 20.5M items and 5 to 6 GB at an estimated 60M. Density's old refresh
+wrote 339 MB of temp per call at this scale for comparison. The log costs about 59 bytes a row and
+holds about two rows per changed item until a refresh drains it, so a load writing 100M rows
+without a refresh would hold about 6 GB; `catalog-api`'s staleness rule drains it every 6 hours.
+
+**Writers.** Capture on against off, in a server-side loop with no client round trip, which is the
+worst case for the ratio because a real statement also pays the network:
+
+| Statement | Off | On | Added |
+| --- | ---: | ---: | ---: |
+| One-row insert into `catalog_items` or `provider_aliases` | 63 µs | 87 µs | 24 µs |
+| `graph.derived_from` delete and insert, per statement | 127 µs | 218 µs | 91 µs |
+| `ON CONFLICT DO NOTHING` that changes nothing | 15 µs | 22 µs | 7 µs |
+
+#### Rolling back
+
+Both shapes hold derived rows only, so no history is at risk.
+
+1. Stop `catalog-api`'s refreshes (`IDENTITY_LEDGER_REFRESH_ENABLED=false`).
+2. Run `IDENTITY_LEDGER_ROLLBACK_STATEMENTS` from `groovemap_schema.postgres` in order. It removes
+   the triggers, functions, index, and tables, and empties the state row. `CREATE MATERIALIZED VIEW
+   IF NOT EXISTS` would otherwise find a table of that name and silently do nothing.
+3. Apply the previous release's schema, which recreates the views `WITH NO DATA`.
+4. Refresh once with the previous release's function, and restore the poll.
+
+The integration suite runs the rollback statements and requires the recreated views to match the
+reference.
 
 Every table and column above is additive within persistence contract v1 — see
 [the persistence compatibility contract](../contracts/persistence/).
@@ -571,6 +721,55 @@ additive, media-neutral rarity signals alongside the retained `format_rarity`. E
 is additive within persistence contract v1 — see
 [the persistence compatibility contract](../contracts/persistence/).
 
+### Rarity tier browse and observation indexes
+
+Two indexes are added, both `CREATE INDEX IF NOT EXISTS`, additive, and safe to apply twice:
+
+- `idx_release_rarity_tier_score` on `insights.release_rarity (tier, rarity_score DESC, release_id)`
+  serves catalog-api's tier browse `WHERE tier = $1 ORDER BY rarity_score DESC, release_id` and its
+  keyset page
+  `tier = $1 AND rarity_score <= $2::real AND (rarity_score < $2::real OR release_id > $3)`. The plan
+  is one index range scan with no sort of any kind. `release_id` is ascending because the route
+  orders it that way; with a descending `release_id` in the index, a page inside a tie group must
+  sort the whole group, and the writer rounds scores to 0.1, so a group can hold tens of thousands of
+  rows (about 12 ms against 0.7 ms). The keyset form is not a row-wise `<`: that comparison runs every
+  column the same way, so it only matches an order where both columns descend, and with
+  `release_id` ascending it would repeat or skip rows at a score tie. The first score term seeks into
+  the index and the second is the exact boundary. The cursor score is bound as `real`, because
+  `rarity_score` is `REAL` and a `float8` cursor does not equal the stored value it was read from,
+  so the page boundary would repeat rows. The integration test runs the literal route statement and
+  walks a whole tier by keyset on data shaped like the writer's (scores rounded to 0.1, tier derived
+  from the score, one score holding most of the tier) and gets every row exactly once, in order.
+- `idx_observations_owned_copy_id` on `observations (owned_copy_id)` supports the `ON DELETE CASCADE`
+  from `owned_copies`, which otherwise scans every observation per deleted copy, and gives one copy's
+  observations a lookup path.
+
+Upgrade path: the initializer runs the same statements on a new and an existing database, so there is
+nothing to migrate. A plain `CREATE INDEX` blocks writes to its table while it builds. Both tables are
+empty on lux and the build is instant. On a populated database, build them first by hand with
+`CREATE INDEX CONCURRENTLY IF NOT EXISTS` and the same definition; the initializer then finds them and
+skips. Rollback is `DROP INDEX insights.idx_release_rarity_tier_score` and
+`DROP INDEX idx_observations_owned_copy_id`; no reader depends on them for correctness. The older
+`idx_release_rarity_tier` is now a prefix of the composite and is left in place: nothing has measured
+it as unused, and retiring it needs that evidence.
+
+Measured on PostgreSQL 18 with 300,000 `release_rarity` rows shaped like the writer's (scores rounded to
+0.1, tier derived from the score, 55% of rows on one score), median of 15 runs, 20-row pages, with no
+index, with a `release_id DESC` variant of the index, and with the shipped one:
+
+| Statement | No index | `release_id DESC` index | Shipped index |
+| --- | ---: | ---: | ---: |
+| route, `common` first page | 58.8 ms | 1.31 ms | 0.94 ms |
+| route, `ultra-rare` first page | 1.28 ms | 1.31 ms | 0.87 ms |
+| keyset, page inside the `common` tie group | 27.4 ms | 30.9 ms | 4.23 ms |
+| keyset, deep `ultra-rare` page | 1.80 ms | 1.42 ms | 0.89 ms |
+
+The `release_id DESC` variant is no better than no index inside a tie group, which is why the shipped
+index orders `release_id` ascending. A keyset page inside a large tie group still skips the tie rows
+at or before the cursor id, so it costs more than a first page (4.23 ms here). Deleting 50 owned
+copies with 100 observations each (200k observation rows): 731 ms to 29 ms. The 1,984 ms in the audit
+came from 4M synthetic rows; this measurement is smaller, so its absolute times are too.
+
 The executable PostgreSQL inventory is in
 [`src/groovemap_schema/postgres.py`](../src/groovemap_schema/postgres.py):
 
@@ -590,7 +789,7 @@ The executable PostgreSQL inventory is in
 - native identity tables (see Identity above): `catalog_items`, `artifacts`, `owned_copies`,
   `collection_snapshots`, `observations`, `provider_aliases`, `catalog_item_supersessions`,
   `catalog_item_moves`, `identity_link_events`, and `identity_ledger_refresh_state`, plus the
-  four Identity Ledger materialized views (`identity_ledger_edition_events`,
+  four Identity Ledger tables (`identity_ledger_edition_events`,
   `identity_ledger_edition_parents`, `identity_ledger_work_summary`, and
   `identity_ledger_density`);
 - retired: `queue_metrics` and `service_health_metrics` are no longer created. The schema
@@ -1493,6 +1692,55 @@ one is.
 
 A schema init from v0.6.1 or v0.6.2 run against the one-hash keys is harmless: `IF NOT EXISTS`
 keeps the key, and it recreates the two person hash indexes, which the next v0.6.3 run drops.
+
+#### After the first load: rebuild the credit keys
+
+An index built while rows arrive in random order is left loosely packed, and one built over a
+loaded table is not. Once the initial Discogs SQL load has finished (the `extraction_complete`
+latch has fired and the loaders have drained), rebuild the two credit keys:
+
+```sql
+REINDEX INDEX CONCURRENTLY graph.credited_on_key;
+REINDEX INDEX CONCURRENTLY graph.track_credited_on_key;
+```
+
+Run each as its own statement on its own connection, in `autocommit`: `CONCURRENTLY` cannot run
+inside a transaction block. Do it once after the first full load, and again only after a reload that
+rewrote a large share of the rows. Doing it on a partly loaded or empty table gains nothing, since
+the rows that arrive afterwards loosen it again.
+
+- **What it saves.** The audit's estimate at 147.5M credit rows is 14.7 GB of key index falling to
+  9.6 GB (about 40%). Measured here on PostgreSQL 18, 1.5M `credited_on` rows loaded in random
+  order: `credited_on_key` 84.8 B per row to 65.5 B (about 23%). Expect the lux saving between the
+  two, and read it off `pg_relation_size` before and after.
+- **Lock impact.** `CONCURRENTLY` takes `SHARE UPDATE EXCLUSIVE`: reads and writes continue, and
+  only schema changes and vacuum on the table wait. In the measurement 255 writes ran during the
+  rebuild, the slowest taking 94 ms, and the unique key still rejected a duplicate afterwards. Plain
+  `REINDEX INDEX` blocks every write to the table and also virtually every read of it, not only
+  reads that would use the index: the planner takes a lock on every index of a table it reads, so a
+  sequential scan and a point read both wait behind the rebuild (both hit `lock_timeout` when
+  reproduced). Whoever runs the plain form must stop readers as well as the loaders, or use
+  `CONCURRENTLY`.
+- **Time and room.** 3.6 s for `credited_on_key` at 1.5M rows. At 51M and 96.5M rows expect
+  minutes to tens of minutes, longer once the build outgrows `maintenance_work_mem`; raise it for
+  the session, for example `SET maintenance_work_mem = '2GB'`. The new index is built beside the old
+  one, so keep free disk for the whole of one new key (about 3 GB for `credited_on_key` and about
+  7 GB for `track_credited_on_key` at full scale) and do the two one after the other.
+- **If it fails or is cancelled.** The old index stays in service. A leftover `INVALID` index named
+  `<index>_ccnew` (the new one, half built) or `<index>_ccold` (the old one, not yet dropped) can
+  remain. List them with
+  `SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid AND indrelid IN ('graph.credited_on'::regclass, 'graph.track_credited_on'::regclass)`
+  and `DROP INDEX CONCURRENTLY` each one before retrying. That query filters on `NOT indisvalid`, so
+  a healthy database returns zero rows.
+- **Check it.** After the rebuild the query above returns zero rows, and both keys are still
+  `indisunique` and `indisvalid` (`SELECT indexrelid::regclass, indisunique, indisvalid FROM pg_index
+  WHERE indexrelid IN ('graph.credited_on_key'::regclass, 'graph.track_credited_on_key'::regclass)`).
+  Nothing else changes: the rows, the key definition and the `ON CONFLICT` target are the same, so no
+  loader change is needed.
+
+`credited_on_role_category` (the generated-column index) was not smaller after the rebuild in the
+random-order measurement, so it is not part of this step. The `deployment` runbook should link here
+for the step rather than copy it.
 
 ### The counter, degree, and aggregate relations
 

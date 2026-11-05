@@ -25,7 +25,6 @@ from groovemap_schema.postgres import (
     _VERTEX_KIND_NAMES,
     ARTIST_EMBEDDINGS_HNSW_INDEX_NAME,
     EMBEDDING_PIPELINE_ROLE,
-    IDENTITY_LEDGER_VIEWS,
     MUSICBRAINZ_RELATIONSHIP_TYPES,
     VECTOR_EXTENSION,
     _widen_to_bigint,
@@ -57,7 +56,15 @@ EXPECTED_POSTGRES_TABLES = {
         "catalog_items",
         "collection_snapshots",
         "extraction_history",
+        "identity_ledger_changes",
+        "identity_ledger_density",
+        "identity_ledger_density_changes",
+        "identity_ledger_edition_events",
+        "identity_ledger_edition_parents",
+        "identity_ledger_item_events",
+        "identity_ledger_item_mints",
         "identity_ledger_refresh_state",
+        "identity_ledger_work_summary",
         "identity_link_events",
         "labels",
         "loader_extraction_latch",
@@ -379,9 +386,8 @@ async def assert_expected_postgres_schema() -> None:
     if await vector_extension_present():
         expected_tables["public"].add("artist_embeddings")
     assert actual_tables == expected_tables
-    # The precomputed Identity Ledger; tests/integration/test_identity_ledger.py proves its rows and refresh.
-    matview_rows = await postgres_rows("SELECT schemaname, matviewname FROM pg_matviews")
-    assert set(matview_rows) == {("public", view) for view in IDENTITY_LEDGER_VIEWS}
+    # The precomputed Identity Ledger is tables; tests/integration/test_identity_ledger.py proves its rows and refresh.
+    assert await postgres_rows("SELECT schemaname, matviewname FROM pg_matviews") == []
 
     column_rows = await postgres_rows(
         """
