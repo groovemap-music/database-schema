@@ -1443,6 +1443,48 @@ one is.
 A schema init from v0.6.1 or v0.6.2 run against the one-hash keys is harmless: `IF NOT EXISTS`
 keeps the key, and it recreates the two person hash indexes, which the next v0.6.3 run drops.
 
+#### After the first load: rebuild the credit keys
+
+An index built while rows arrive in random order is left loosely packed, and one built over a
+loaded table is not. Once the initial Discogs SQL load has finished (the `extraction_complete`
+latch has fired and the loaders have drained), rebuild the two credit keys:
+
+```sql
+REINDEX INDEX CONCURRENTLY graph.credited_on_key;
+REINDEX INDEX CONCURRENTLY graph.track_credited_on_key;
+```
+
+Run each as its own statement on its own connection, in `autocommit`: `CONCURRENTLY` cannot run
+inside a transaction block. Do it once after the first full load, and again only after a reload that
+rewrote a large share of the rows. Doing it on a partly loaded or empty table gains nothing, since
+the rows that arrive afterwards loosen it again.
+
+- **What it saves.** The audit's estimate at 147.5M credit rows is 14.7 GB of key index falling to
+  9.6 GB (about 40%). Measured here on PostgreSQL 18, 1.5M `credited_on` rows loaded in random
+  order: `credited_on_key` 84.8 B per row to 65.5 B (about 23%). Expect the lux saving between the
+  two, and read it off `pg_relation_size` before and after.
+- **Lock impact.** `CONCURRENTLY` takes `SHARE UPDATE EXCLUSIVE`: reads and writes continue, and
+  only schema changes and vacuum on the table wait. In the measurement 255 writes ran during the
+  rebuild, the slowest taking 94 ms, and the unique key still rejected a duplicate afterwards. Plain
+  `REINDEX INDEX` is shorter but blocks every write to the table for its duration (and any read the
+  planner sends through that index), so stop the loaders first if you choose it.
+- **Time and room.** 3.6 s for `credited_on_key` at 1.5M rows. At 51M and 96.5M rows expect
+  minutes to tens of minutes, longer once the build outgrows `maintenance_work_mem`; raise it for
+  the session, for example `SET maintenance_work_mem = '2GB'`. The new index is built beside the old
+  one, so keep free disk for the whole of one new key (about 3 GB for `credited_on_key` and about
+  7 GB for `track_credited_on_key` at full scale) and do the two one after the other.
+- **If it fails or is cancelled.** The old index stays in service. A leftover `INVALID` index named
+  `<index>_ccnew` can remain; find it with
+  `SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid AND indrelid::regclass::text LIKE 'graph.%credited_on'`
+  and `DROP INDEX CONCURRENTLY` it before retrying.
+- **Check it.** The same `pg_index` query shows both keys `indisvalid`, and the key is still
+  `indisunique`. Nothing else changes: the rows, the key definition and the `ON CONFLICT` target are
+  the same, so no loader change is needed.
+
+`credited_on_role_category` (the generated-column index) was not smaller after the rebuild in the
+random-order measurement, so it is not part of this step. The `deployment` runbook should link here
+for the step rather than copy it.
+
 ### The counter, degree, and aggregate relations
 
 `catalog-api` reads node properties that `graphinator`'s post-import pass writes and that no
