@@ -64,7 +64,7 @@ assert "ADD COLUMN IF NOT EXISTS generation BIGINT" in user_statements["loader_e
 latch = contract["extraction_latch"]
 assert "ADD COLUMN IF NOT EXISTS purge_vetoed TEXT[] NOT NULL DEFAULT '{}'" in user_statements["loader_extraction_latch purge_vetoed column"]
 assert "loader_extraction_latch.purge_vetoed" in latch["columns"]
-assert latch["column_writers"]["loader_extraction_latch.purge_vetoed"] == ["discogs-sql-loader"]
+assert latch["column_writers"]["loader_extraction_latch.purge_vetoed"] == ["discogs-sql-loader", "musicbrainz-sql-loader"]
 assert "PRIMARY KEY (loader, version)" in user_statements["loader_derived_refresh_job table"]
 assert "UNIQUE (loader, generation)" in user_statements["loader_derived_refresh_job table"]
 assert (

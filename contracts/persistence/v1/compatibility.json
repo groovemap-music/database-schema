@@ -151,7 +151,8 @@
     },
     "column_writers": {
       "loader_extraction_latch.purge_vetoed": [
-        "discogs-sql-loader"
+        "discogs-sql-loader",
+        "musicbrainz-sql-loader"
       ]
     },
     "consumers": [
