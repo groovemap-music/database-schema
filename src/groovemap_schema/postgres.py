@@ -2116,10 +2116,6 @@ _MUSICBRAINZ_INDEXES: list[tuple[str, str]] = [
         "CREATE INDEX IF NOT EXISTS idx_mb_labels_name ON musicbrainz.labels USING hash (name)",
     ),
     (
-        "idx_mb_rels_source",
-        "CREATE INDEX IF NOT EXISTS idx_mb_rels_source ON musicbrainz.relationships (source_mbid)",
-    ),
-    (
         "idx_mb_rels_target",
         "CREATE INDEX IF NOT EXISTS idx_mb_rels_target ON musicbrainz.relationships (target_mbid)",
     ),
@@ -6914,6 +6910,23 @@ def _retired_btree_index_statements() -> list[tuple[str, str]]:
     ]
 
 
+# idx_mb_rels_source (source_mbid) is retired: relationships_natural_key leads with
+# source_mbid, so it answers every lookup the narrower index did, and the narrower one
+# only cost an extra index write per row. Dropped where it exists, never recreated.
+_MUSICBRAINZ_RETIRED_INDEXES: list[tuple[str, str]] = [
+    (
+        "idx_mb_rels_source retire",
+        """DO $retire_mb_rels_source$
+        BEGIN
+            IF to_regclass('musicbrainz.idx_mb_rels_source') IS NOT NULL THEN
+                DROP INDEX IF EXISTS musicbrainz.idx_mb_rels_source;
+            END IF;
+        END
+        $retire_mb_rels_source$""",
+    ),
+]
+
+
 def _schema_statements() -> Iterator[tuple[str, Any]]:
     """Yield the complete PostgreSQL schema in compatibility-sensitive order."""
     yield from _entity_schema_statements()
@@ -6924,6 +6937,7 @@ def _schema_statements() -> Iterator[tuple[str, Any]]:
     yield from _ACTIVITY_STATEMENTS
     yield from _MUSICBRAINZ_TABLES
     yield from _MUSICBRAINZ_INDEXES
+    yield from _MUSICBRAINZ_RETIRED_INDEXES
     yield from _ARTIST_SIMILARITY_STATEMENTS
     yield from _GRAPH_STATEMENTS
     yield from _IDENTITY_LEDGER_STATEMENTS

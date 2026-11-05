@@ -30,6 +30,7 @@ from groovemap_schema.postgres import (
     _INSIGHTS_TABLES,
     _IS_SUPERUSER_QUERY,
     _MUSICBRAINZ_INDEXES,
+    _MUSICBRAINZ_RETIRED_INDEXES,
     _MUSICBRAINZ_TABLES,
     _PIPELINE_ROLE_STATEMENTS,
     _RESET_MAINTENANCE_WORK_MEM,
@@ -356,6 +357,7 @@ class TestCreatePostgresSchema:
             + len(_ACTIVITY_STATEMENTS)
             + len(_MUSICBRAINZ_TABLES)
             + len(_MUSICBRAINZ_INDEXES)
+            + len(_MUSICBRAINZ_RETIRED_INDEXES)
             + len(_ARTIST_SIMILARITY_STATEMENTS)
             + len(_GRAPH_STATEMENTS)
             + len(_IDENTITY_LEDGER_STATEMENTS)
@@ -393,6 +395,7 @@ class TestCreatePostgresSchema:
             + len(_ACTIVITY_STATEMENTS)
             + len(_MUSICBRAINZ_TABLES)
             + len(_MUSICBRAINZ_INDEXES)
+            + len(_MUSICBRAINZ_RETIRED_INDEXES)
             + len(_ARTIST_SIMILARITY_STATEMENTS)
             + len(_GRAPH_STATEMENTS)
             + len(_IDENTITY_LEDGER_STATEMENTS)
@@ -465,6 +468,7 @@ class TestCreatePostgresSchema:
             + len(_ACTIVITY_STATEMENTS)
             + len(_MUSICBRAINZ_TABLES)
             + len(_MUSICBRAINZ_INDEXES)
+            + len(_MUSICBRAINZ_RETIRED_INDEXES)
             + len(_ARTIST_SIMILARITY_STATEMENTS)
             + len(_GRAPH_STATEMENTS)
             + len(_IDENTITY_LEDGER_STATEMENTS)

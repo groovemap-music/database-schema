@@ -604,6 +604,39 @@ one of those starts to delete. `observations.owned_copy_id` is indexed under the
 observation index change.
 ||||||| 6489067
 
+### MusicBrainz relationships: index retirement
+
+`musicbrainz.relationships` carried eight indexes. `idx_mb_rels_source (source_mbid)` is retired: the
+natural key `relationships_natural_key` leads with `source_mbid`, so it answers every lookup the
+narrower index did, and the narrower one only added an index write per row. Measured on PostgreSQL 18
+with 300,000 rows, random UUID endpoints and the dates and attributes MusicBrainz carries on a
+minority of rows: index size per row 379 B to 347 B (the heap is 140 B), and a `source_mbid` lookup
+unchanged at about 0.6 ms (0.58 ms with the index, 0.62 ms without, same rows, now planned on the
+natural key).
+
+Upgrade path: the initializer drops the index where it exists (a guarded `DROP INDEX IF EXISTS`) and
+never recreates it, so applying twice changes nothing. A drop takes a brief lock on the table; the
+table is empty on lux. Rollback is `CREATE INDEX idx_mb_rels_source ON musicbrainz.relationships
+(source_mbid)`; nothing depends on it for correctness.
+
+Where the rest of the per-row cost sits, in bytes per row: `relationships_natural_key` 144,
+`idx_mb_rels_endpoint_source` 65, `idx_mb_rels_endpoint_target` 64, `idx_mb_rels_target` 39,
+`relationships_pkey` 23, `idx_mb_rels_type` 7, `idx_mb_rels_updated_at` 6. Left in place on evidence:
+
+- `idx_mb_rels_type` stays. The audit listed it as unread, but the `artist_member_of` fill filters
+  `relationship_type = 'MEMBER_OF'` through `graph.mb_rel_artist_artist`. It costs 7 B per row.
+- `idx_mb_rels_endpoint_source` and `_target` serve the sixteen `graph.mb_rel_*` views' endpoint-type
+  pair. They are the largest removable-looking cost after the key, but no reader's plan has been
+  measured on populated data, so they stay until one has.
+- `idx_mb_rels_target` serves a bare `target_mbid` lookup that no other index can.
+- `idx_mb_rels_updated_at` becomes a BRIN index only after the seen-in-extraction change (audit B3).
+
+The 8-column natural key with a `jsonb` column is the dominant cost, and narrowing it (for example a
+fixed-size hash of the eight values as the unique key) changes the `ON CONFLICT` target that
+`musicbrainz-sql-loader` names, so it is a breaking change for that writer and needs its own
+migration and rollback policy; it is not made here.
+||||||| 6489067
+
 ### Keyset paging over activity tables
 
 Readers page `activity.events` and `activity.impressions` with `ORDER BY occurred_at, <key> LIMIT n`
