@@ -449,6 +449,13 @@ _USER_TABLES: list[tuple[str, str]] = [
         "idx_observations_artifact_kind",
         "CREATE INDEX IF NOT EXISTS idx_observations_artifact_kind ON observations (artifact_id, kind)",
     ),
+    # observations.owned_copy_id is a cascading foreign key: without an index a
+    # delete of an owned copy scans every observation, and a copy's own
+    # observations have no lookup path.
+    (
+        "idx_observations_owned_copy_id",
+        "CREATE INDEX IF NOT EXISTS idx_observations_owned_copy_id ON observations (owned_copy_id)",
+    ),
     # provider_aliases maps every external namespace — Discogs, MusicBrainz,
     # Wikidata, barcodes, catalogue numbers, ISRCs, matrix inscriptions — onto a
     # native id, with a validity interval so a provider merge or split is a new
@@ -1014,6 +1021,19 @@ _INSIGHTS_TABLES: list[tuple[str, str]] = [
     (
         "idx_release_rarity_gem",
         "CREATE INDEX IF NOT EXISTS idx_release_rarity_gem ON insights.release_rarity (hidden_gem_score DESC NULLS LAST)",
+    ),
+    # The tier browse: WHERE tier = $1 ORDER BY rarity_score DESC, release_id DESC,
+    # then the keyset page WHERE tier = $1 AND (rarity_score, release_id) < ($2::real, $3)
+    # in that same order. Both sort columns descend because a row-wise `<` only
+    # expresses a keyset when every column runs the same way, and the cursor score
+    # must be cast to real: rarity_score is REAL, and a float8 cursor does not equal
+    # the stored value it came from, so the page boundary would repeat rows. One composite index serves the filter, the sort and the
+    # keyset seek, so a common-tier page reads one page of index and never sorts
+    # the tier. idx_release_rarity_tier is now a prefix of it; it stays until the
+    # index audit (gm-database-schema-m6jp) decides on evidence.
+    (
+        "idx_release_rarity_tier_score",
+        "CREATE INDEX IF NOT EXISTS idx_release_rarity_tier_score ON insights.release_rarity (tier, rarity_score DESC, release_id DESC)",
     ),
     (
         "insights.community_counts table",

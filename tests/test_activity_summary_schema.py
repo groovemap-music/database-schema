@@ -17,6 +17,7 @@ _NAMES_THROUGH_COMPUTATION_LOG = [
     "idx_release_rarity_score",
     "idx_release_rarity_tier",
     "idx_release_rarity_gem",
+    "idx_release_rarity_tier_score",
     "insights.community_counts table",
     "idx_community_counts_fetched",
     "insights.computation_log table",

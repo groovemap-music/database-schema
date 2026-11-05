@@ -520,6 +520,37 @@ additive, media-neutral rarity signals alongside the retained `format_rarity`. E
 is additive within persistence contract v1 — see
 [the persistence compatibility contract](../contracts/persistence/).
 
+### Rarity tier browse and observation indexes
+
+Two indexes are added, both `CREATE INDEX IF NOT EXISTS`, additive, and safe to apply twice:
+
+- `idx_release_rarity_tier_score` on `insights.release_rarity (tier, rarity_score DESC, release_id DESC)`
+  serves the tier browse `WHERE tier = $1 ORDER BY rarity_score DESC, release_id DESC` and its keyset
+  page `AND (rarity_score, release_id) < ($2::real, $3)`. The plan is one index range scan with no
+  sort, and a page costs the same however deep it is. Two rules keep the keyset complete: both sort
+  columns descend (a row-wise `<` cannot express mixed directions, and `release_id ASC` repeats or skips
+  rows at a score tie), and the cursor score is bound as `real`, because `rarity_score` is `REAL` and a
+  `float8` cursor does not equal the stored value it was read from, so the page boundary repeats rows.
+  The integration test walks a whole tier by keyset and gets every row exactly once.
+- `idx_observations_owned_copy_id` on `observations (owned_copy_id)` supports the `ON DELETE CASCADE`
+  from `owned_copies`, which otherwise scans every observation per deleted copy, and gives one copy's
+  observations a lookup path.
+
+Upgrade path: the initializer runs the same statements on a new and an existing database, so there is
+nothing to migrate. A plain `CREATE INDEX` blocks writes to its table while it builds. Both tables are
+empty on lux and the build is instant. On a populated database, build them first by hand with
+`CREATE INDEX CONCURRENTLY IF NOT EXISTS` and the same definition; the initializer then finds them and
+skips. Rollback is `DROP INDEX insights.idx_release_rarity_tier_score` and
+`DROP INDEX idx_observations_owned_copy_id`; no reader depends on them for correctness. The older
+`idx_release_rarity_tier` is now a prefix of the composite and is kept; whether to retire it is the
+index audit's decision, on usage evidence.
+
+Measured on PostgreSQL 18 with 300,000 `release_rarity` rows (70% common, 2% legendary), median of 15
+runs, page of 1,000, with and without the index: legendary first page 4.90 ms to 1.38 ms; common first
+page 1.61 ms to 1.37 ms; deep keyset page 1.87 ms to 1.12 ms. Deleting 50 owned copies with 100
+observations each (200k observation rows): 460 ms to 56 ms. The 1,984 ms in the audit came from 4M
+synthetic rows; this measurement is smaller, so its absolute times are too.
+
 The executable PostgreSQL inventory is in
 [`src/groovemap_schema/postgres.py`](../src/groovemap_schema/postgres.py):
 
