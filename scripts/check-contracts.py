@@ -311,6 +311,33 @@ for label, recorded in counters["labels"].items():
     for column in recorded["properties"]:
         assert f"AS {column}" in body, f"{label}.{column}"
 
+# Properties and edges Neo4j carries that the relational contract does not
+# publish. They are recorded rather than left unmentioned, and the record is
+# held to the same standard as the parity claim above: nothing may be listed as
+# both published and Neo4j-only, and no Neo4j-only relationship may be a type
+# the path function walks or a relation this schema declares.
+neo4j_only = graph["neo4j_only"]
+assert neo4j_only["kind"] == "additive"
+assert neo4j_only["availability"] == "unconditional"
+assert neo4j_only["decision"]
+artist_only = neo4j_only["artist_properties"]
+published = counters["labels"][artist_only["label"]]["properties"]
+assert artist_only["published"] == published, "artist counters published != recorded"
+assert not set(artist_only["neo4j_only"]) & set(published)
+artist_view = view_statements[f"{GRAPH_SCHEMA}.{artist_only['label']}_vertex"]
+for column in artist_only["neo4j_only"]:
+    assert f"AS {column}" not in artist_view, f"{column} is published, so it is not Neo4j-only"
+for edge, recorded in neo4j_only["relationships"].items():
+    assert edge not in _PATH_RELATIONSHIP_TYPES.values(), edge
+    assert recorded["in_shortest_path_types"] is False, edge
+    assert not any(edge.lower() == name for name in declared_shapes), edge
+# HAS_STYLE stays Neo4j-only for as long as the relation that would publish it is not declared: once
+# graph.label_style exists this record is stale and must move to the published relations.
+assert "label_style" not in declared_shapes, "graph.label_style is declared, so HAS_STYLE is no longer Neo4j-only"
+assert f"{GRAPH_SCHEMA}.label_style" in neo4j_only["relationships"]["HAS_STYLE"]["would_publish_as"]
+assert neo4j_only["node_properties"]["ExtractionCompletion.stats_version"]["reader"] == "catalog-api"
+assert set(neo4j_only["node_properties"]) == {"ExtractionCompletion.stats_version", "MaintenanceCheckpoint.run_key"}
+
 storage_only = {name for name, shape in declared_shapes.items() if shape == "table"}
 
 # The cross-provenance MEMBER_OF union. It is a table the path functions read
