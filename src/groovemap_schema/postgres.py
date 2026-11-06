@@ -2943,6 +2943,66 @@ def _credit_key_function() -> str:
         """
 
 
+# The padding `common.person_names.strip_person_name` removes from the two ends of a Person name, as
+# inclusive code point ranges: Unicode whitespace plus the separator (Zs, Zl, Zp), control (Cc) and
+# format (Cf) categories. It is a committed list, not computed from the interpreter at build time, so
+# the schema text does not change with the Python that renders it; `test_graph_schema.py` compares it
+# with the live rule, so a Unicode release that adds a character fails there instead of splitting the
+# stores. U+0000 is left out because a PostgreSQL text value cannot contain it.
+_PERSON_NAME_PADDING: tuple[tuple[int, int], ...] = (
+    (0x0001, 0x0020),
+    (0x007F, 0x00A0),
+    (0x00AD, 0x00AD),
+    (0x0600, 0x0605),
+    (0x061C, 0x061C),
+    (0x06DD, 0x06DD),
+    (0x070F, 0x070F),
+    (0x0890, 0x0891),
+    (0x08E2, 0x08E2),
+    (0x1680, 0x1680),
+    (0x180E, 0x180E),
+    (0x2000, 0x200F),
+    (0x2028, 0x202F),
+    (0x205F, 0x2064),
+    (0x2066, 0x206F),
+    (0x3000, 0x3000),
+    (0xFEFF, 0xFEFF),
+    (0xFFF9, 0xFFFB),
+    (0x110BD, 0x110BD),
+    (0x110CD, 0x110CD),
+    (0x13430, 0x1343F),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0001, 0xE0001),
+    (0xE0020, 0xE007F),
+)
+
+
+def _person_name_padding_class() -> str:
+    """Return the regular-expression bracket body matching `_PERSON_NAME_PADDING`."""
+    return "".join(f"\\U{low:08X}" if low == high else f"\\U{low:08X}-\\U{high:08X}" for low, high in _PERSON_NAME_PADDING)
+
+
+# `Person.name` keys a Neo4j node and `graph.person.name` keys the same person here, so the
+# padding rule must be the same in both stores. This is `common.person_names.strip_person_name` in
+# SQL: nothing but the two ends is touched, interior runs and marks stay, and a name that is all
+# padding becomes the empty string, which the credit sources then drop as they drop an empty name.
+def _strip_person_name_function() -> str:
+    """Return the IMMUTABLE function stripping the padding of a Person name at both ends."""
+    padding = _person_name_padding_class()
+    return f"""
+        CREATE OR REPLACE FUNCTION graph.strip_person_name(name text)
+        RETURNS text
+        LANGUAGE sql
+        IMMUTABLE
+        PARALLEL SAFE
+        RETURNS NULL ON NULL INPUT
+        AS $strip_person_name$
+        SELECT pg_catalog.regexp_replace(name, '^[{padding}]+|[{padding}]+$', '', 'g')
+        $strip_person_name$
+        """
+
+
 # The MusicBrainz relationship vocabulary, copied verbatim from
 # `musicbrainz-graph-enricher`'s `brainzgraphinator/_projections.py`. The two
 # stores disagree today and that disagreement is the gap this closes:
@@ -3014,17 +3074,20 @@ def _medium_label_function() -> str:
 
 
 # One row per `extraartists` credit that names both a person and a role — the two
-# the enricher requires before it MERGEs a `:Person` or a `[:CREDITED_ON]`. Names
-# are read verbatim, not normalized: `Person.name` is the Neo4j key, so folding it
-# here would key the vertex differently from the node it mirrors.
+# the enricher requires before it MERGEs a `:Person` or a `[:CREDITED_ON]`. A name is
+# stripped of its surrounding padding and nothing else (`graph.strip_person_name`, the
+# rule `common.person_names.strip_person_name` applies in both loaders): `Person.name`
+# is the Neo4j key, so folding or otherwise normalizing it here would key the vertex
+# differently from the node it mirrors, and leaving the padding would re-create the
+# padded rows the loaders no longer write. A name that is all padding is dropped.
 _CREDIT_SOURCE = f"""
     SELECT releases.data_id              AS release_id,
-           credit.value ->> 'name'       AS person_name,
+           graph.strip_person_name(credit.value ->> 'name') AS person_name,
            credit.value ->> 'role'       AS role,
            btrim(credit.value ->> 'id')  AS artist_id
     FROM public.releases AS releases
     CROSS JOIN LATERAL jsonb_array_elements({_jsonb_array("releases.data -> 'extraartists'")}) AS credit(value)
-    WHERE {_non_empty("credit.value ->> 'name'")}
+    WHERE {_non_empty("graph.strip_person_name(credit.value ->> 'name')")}
       AND {_non_empty("credit.value ->> 'role'")}
 """  # noqa: S608 -- composed of module constants only
 
@@ -3048,7 +3111,7 @@ _CREDIT_SOURCE = f"""
 # `NULL`; `track_position` still carries the dump's own string, kept as a
 # plain column so a consumer that wants it for display still can.
 #
-# Same rule as `_CREDIT_SOURCE`: names are read verbatim, and this is the
+# Same rule as `_CREDIT_SOURCE`: names are stripped of padding only, and this is the
 # release-level rule extended one level deeper, not a new one. `artist_id` is
 # carried through exactly as `_CREDIT_SOURCE` carries it — unused by
 # `track_credited_on`, which never stores it, and read instead by `same_as`'s
@@ -3059,21 +3122,21 @@ _TRACK_CREDIT_SOURCE = f"""
            track.ordinality                AS track_ordinal,
            0::bigint                       AS sub_track_ordinal,
            track.value ->> 'position'      AS track_position,
-           credit.value ->> 'name'         AS person_name,
+           graph.strip_person_name(credit.value ->> 'name') AS person_name,
            credit.value ->> 'role'         AS role,
            btrim(credit.value ->> 'id')    AS artist_id
     FROM public.releases AS releases
     CROSS JOIN LATERAL jsonb_array_elements({_xmltodict_array("releases.data -> 'tracklist'", "track")})
         WITH ORDINALITY AS track(value, ordinality)
     CROSS JOIN LATERAL jsonb_array_elements({_xmltodict_array("track.value -> 'extraartists'", "artist")}) AS credit(value)
-    WHERE {_non_empty("credit.value ->> 'name'")}
+    WHERE {_non_empty("graph.strip_person_name(credit.value ->> 'name')")}
       AND {_non_empty("credit.value ->> 'role'")}
     UNION ALL
     SELECT releases.data_id                    AS release_id,
            track.ordinality                    AS track_ordinal,
            sub_track.ordinality                AS sub_track_ordinal,
            sub_track.value ->> 'position'      AS track_position,
-           credit.value ->> 'name'             AS person_name,
+           graph.strip_person_name(credit.value ->> 'name') AS person_name,
            credit.value ->> 'role'             AS role,
            btrim(credit.value ->> 'id')        AS artist_id
     FROM public.releases AS releases
@@ -3082,7 +3145,7 @@ _TRACK_CREDIT_SOURCE = f"""
     CROSS JOIN LATERAL jsonb_array_elements({_xmltodict_array("track.value -> 'sub_tracks'", "track")})
         WITH ORDINALITY AS sub_track(value, ordinality)
     CROSS JOIN LATERAL jsonb_array_elements({_xmltodict_array("sub_track.value -> 'extraartists'", "artist")}) AS credit(value)
-    WHERE {_non_empty("credit.value ->> 'name'")}
+    WHERE {_non_empty("graph.strip_person_name(credit.value ->> 'name')")}
       AND {_non_empty("credit.value ->> 'role'")}
 """  # noqa: S608 -- composed of module constants only
 
@@ -5660,6 +5723,7 @@ def _build_graph_statements() -> list[tuple[str, str]]:
         ("graph.credit_role_category function", _credit_role_category_function()),
         ("graph.text_key function", _text_key_function()),
         ("graph.credit_key function", _credit_key_function()),
+        ("graph.strip_person_name function", _strip_person_name_function()),
         ("graph.medium_label function", _medium_label_function()),
         ("graph.mb_relationship_type function", _mb_relationship_type_function()),
         *_graph_relation_statements(),

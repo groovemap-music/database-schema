@@ -50,6 +50,8 @@ and so is every statement a writer runs, but a UNIQUE index over `graph.text_key
 target-less `ON CONFLICT DO NOTHING` the loaders already use. Consumers need no change; the vendored copy of this file is refreshed as
 usual.
 
+`graph.strip_person_name` is the SQL form of `common.person_names.strip_person_name`: it removes the surrounding Unicode whitespace, control and format padding of a Person name and nothing else. `graph.bootstrap_fill()` applies it to every credit name, release-level and track-level, so a fill keys `graph.person`, `graph.credited_on`, `graph.same_as` and `graph.track_credited_on` exactly as `discogs-sql-loader` and `discogs-graph-enricher` do. A name that is all padding is dropped, as an empty name is. `tests/test_graph_schema.py` compares the committed padding ranges with the live Python rule, and `tests/integration/test_person_name_strip.py` compares the two over every code point on a real PostgreSQL.
+
 The remaining four functions are the two loader-owned refreshes and the two procedural read
 functions. `graph_schema.member_of_union` and `graph_schema.vertex_degree` name
 `discogs-sql-loader` as the refresh owner for `graph.refresh_artist_member_of()` and

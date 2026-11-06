@@ -193,6 +193,7 @@ EXPECTED_FUNCTIONS = VOCABULARY_FUNCTIONS | {
     "explore_traversal",
     "text_key",
     "credit_key",
+    "strip_person_name",
 }
 
 MUSICBRAINZ_PAIRS = [
@@ -1831,3 +1832,41 @@ class TestMusicBrainzVerticesPublishGmItemId:
             ("mb_release_group", "discogs_master_id"),
         ):
             assert f"AS {column}" in statement_for(view), view
+
+
+class TestPersonNamePadding:
+    """The SQL rule is `common.person_names.strip_person_name`, and these fail if they ever differ."""
+
+    @staticmethod
+    def _live_ranges() -> list[tuple[int, int]]:
+        from common.person_names import _is_padding
+
+        ranges: list[list[int]] = []
+        for code_point in range(1, 0x110000):
+            if 0xD800 <= code_point <= 0xDFFF or not _is_padding(chr(code_point)):
+                continue
+            if ranges and ranges[-1][1] == code_point - 1:
+                ranges[-1][1] = code_point
+            else:
+                ranges.append([code_point, code_point])
+        return [(low, high) for low, high in ranges]
+
+    def test_the_committed_ranges_are_the_live_rules_padding(self) -> None:
+        from groovemap_schema.postgres import _PERSON_NAME_PADDING
+
+        assert list(_PERSON_NAME_PADDING) == self._live_ranges(), (
+            "the Python padding rule and graph.strip_person_name disagree: regenerate _PERSON_NAME_PADDING from common.person_names"
+        )
+
+    def test_the_function_is_created_before_any_relation_that_calls_it(self) -> None:
+        names = [name for name, _statement in _schema_statements()]
+        function = names.index("graph.strip_person_name function")
+        assert function < names.index("graph.person table"), "the vertex table is filled from views that call the function"
+        assert names.index("graph.credit_key function") < function < names.index("graph.medium_label function")
+
+    def test_every_credit_source_strips_the_name_and_filters_on_the_stripped_name(self) -> None:
+        from groovemap_schema.postgres import _CREDIT_SOURCE, _TRACK_CREDIT_SOURCE
+
+        for source in (_CREDIT_SOURCE, _TRACK_CREDIT_SOURCE):
+            assert "credit.value ->> 'name'" not in source.replace("graph.strip_person_name(credit.value ->> 'name')", "")
+            assert "NULLIF(graph.strip_person_name(credit.value ->> 'name'), '') IS NOT NULL" in source

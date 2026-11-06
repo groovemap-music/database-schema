@@ -304,6 +304,7 @@ _GRAPH_STATEMENT_NAMES = frozenset(
         "graph.credit_role_category function",
         "graph.text_key function",
         "graph.credit_key function",
+        "graph.strip_person_name function",
         "graph.medium_label function",
         "graph.mb_relationship_type function",
         "graph.genre view-to-table migration",

@@ -48,7 +48,7 @@
       "otel",
       "postgres"
     ],
-    "tested_commit": "6d0425f908e01a446b040e2993045e2afe30460e",
+    "tested_commit": "e5d5ad620b22db7f92143f6a6f7228ecadb8aecf",
     "tested_version": "0.1.0"
   },
   "catalog_item_supersession": {
@@ -603,6 +603,7 @@
       "graph.medium_label",
       "graph.refresh_artist_member_of",
       "graph.refresh_vertex_degree",
+      "graph.strip_person_name",
       "graph.text_key"
     ],
     "introduced_in_contract_version": 1,

@@ -75,4 +75,4 @@ POSTGRES_PASSWORD="${password}" \
 NEO4J_HOST="bolt://127.0.0.1:${neo4j_port}" \
 NEO4J_USERNAME=neo4j \
 NEO4J_PASSWORD="${password}" \
-    uv run pytest -m integration tests/integration
+    uv run pytest -m integration ${INTEGRATION_TESTS:-tests/integration} "$@"
