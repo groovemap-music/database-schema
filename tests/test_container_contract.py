@@ -12,7 +12,7 @@ import pytest
 
 ROOT = Path(__file__).parent.parent
 AUTOMATION_REVISION = "833cb464507678c38ab78bd4718ce697399463e9"
-PYTHON_LIBRARIES_REVISION = "6d0425f908e01a446b040e2993045e2afe30460e"
+PYTHON_LIBRARIES_REVISION = "e5d5ad620b22db7f92143f6a6f7228ecadb8aecf"
 PG19_BASE_IMAGE = "postgres:19beta3-alpine@sha256:b1692e50613a21e61c424859f943b9e193ae73e5a8c68abd5382dfb235bf15fc"
 PG19_LOCAL_IMAGE = "database-schema-postgres19-pgvector:local"
 
