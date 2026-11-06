@@ -180,7 +180,11 @@ a no-op once applied), and every row already stored stays valid. Consumers move 
 step leaves the daily analytics job working:
 
 1. **database-schema** (this change): the column accepts `NULL`. A writer that still supplies a number is unaffected.
-2. **analytics-engine**: `DataCompletenessItem.completeness_pct` becomes `float | None` and the job stores
-   `None` as `NULL`. It still receives numbers from the unchanged catalog-api, so nothing differs yet.
-3. **catalog-api**: the data-completeness computation returns `null` for artists and labels. This must come
-   last: analytics-engine has to accept `null` before anything sends it.
+2. **analytics-engine**, write and read together: `DataCompletenessItem.completeness_pct` becomes `float | None`
+   and the job stores `None` as `NULL`; the read path that serves the table (`float(r[6])` in
+   `insights.py`) must also pass `NULL` through, or the endpoint answers 500 as soon as one row is `NULL`. It
+   still receives numbers from the unchanged catalog-api, so nothing differs yet.
+3. **graph-explorer** (`gm-graph-explorer-jveg`): the insights panel (`insights.js`, `null.toFixed`) renders a
+   missing score instead of throwing, before any `null` can reach it.
+4. **catalog-api**, last: the data-completeness computation returns `null` for artists and labels. Everything
+   that reads the value has to accept `null` before anything sends it.
