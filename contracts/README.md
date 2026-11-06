@@ -172,3 +172,21 @@ consumes that package at the version and commit recorded in each compatibility c
 
 The former combined `catalog-ingestion` repository appears only in historical records. It is
 not an active producer or contract owner.
+
+## `insights.data_completeness.completeness_pct` is nullable
+
+`NULL` means the entity has no scorable field. Images left the score because Discogs dumps carry none,
+so artists and labels report `NULL` rather than a `0` that reads as a score. The column converges on
+existing databases (the `insights.data_completeness completeness_pct nullable` statement is guarded and
+a no-op once applied), and every row already stored stays valid. Consumers move in this order, and each
+step leaves the daily analytics job working:
+
+1. **database-schema** (this change): the column accepts `NULL`. A writer that still supplies a number is unaffected.
+2. **analytics-engine**, write and read together: `DataCompletenessItem.completeness_pct` becomes `float | None`
+   and the job stores `None` as `NULL`; the read path that serves the table (`float(r[6])` in
+   `insights.py`) must also pass `NULL` through, or the endpoint answers 500 as soon as one row is `NULL`. It
+   still receives numbers from the unchanged catalog-api, so nothing differs yet.
+3. **graph-explorer** (`gm-graph-explorer-jveg`): the insights panel (`insights.js`, `null.toFixed`) renders a
+   missing score instead of throwing, before any `null` can reach it.
+4. **catalog-api**, last: the data-completeness computation returns `null` for artists and labels. Everything
+   that reads the value has to accept `null` before anything sends it.

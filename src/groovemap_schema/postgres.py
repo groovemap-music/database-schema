@@ -1003,7 +1003,7 @@ _INSIGHTS_TABLES: list[tuple[str, str]] = [
             with_year       BIGINT NOT NULL DEFAULT 0,
             with_country    BIGINT NOT NULL DEFAULT 0,
             with_genre      BIGINT NOT NULL DEFAULT 0,
-            completeness_pct NUMERIC(5,2) NOT NULL DEFAULT 0,
+            completeness_pct NUMERIC(5,2) DEFAULT 0,
             computed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             PRIMARY KEY (entity_type)
         )
@@ -1277,6 +1277,26 @@ _INSIGHTS_TABLES: list[tuple[str, str]] = [
     (
         "idx_release_rarity_artist_ids",
         "CREATE INDEX IF NOT EXISTS idx_release_rarity_artist_ids ON insights.release_rarity USING gin (artist_ids)",
+    ),
+    # NULL means the entity has no scorable field (artists and labels once images left the score,
+    # because Discogs dumps carry none), which a stored 0 would misreport as a score. Existing
+    # databases converge here; the guard makes it a no-op, and lock-free, once the column is nullable.
+    # Expand phase: every row already written stays valid, and a writer that still supplies a
+    # number is unaffected. See contracts/README.md for the order consumers move in.
+    (
+        "insights.data_completeness completeness_pct nullable",
+        """DO $data_completeness_nullable$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'insights' AND table_name = 'data_completeness'
+                  AND column_name = 'completeness_pct' AND is_nullable = 'NO'
+            ) THEN
+                ALTER TABLE insights.data_completeness ALTER COLUMN completeness_pct DROP NOT NULL;
+            END IF;
+        END
+        $data_completeness_nullable$
+        """,
     ),
 ]
 
