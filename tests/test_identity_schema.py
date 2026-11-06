@@ -128,6 +128,7 @@ _LEGACY_STATEMENT_NAMES = [
     "insights.release_rarity add artist_ids",
     "idx_release_rarity_label_ids",
     "idx_release_rarity_artist_ids",
+    "insights.data_completeness completeness_pct nullable",
     "musicbrainz schema",
     "musicbrainz.artists table",
     "musicbrainz.labels table",

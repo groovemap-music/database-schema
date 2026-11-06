@@ -48,6 +48,7 @@ _NAMES_AFTER_ACTIVITY_SUMMARY = [
     "insights.release_rarity add artist_ids",
     "idx_release_rarity_label_ids",
     "idx_release_rarity_artist_ids",
+    "insights.data_completeness completeness_pct nullable",
 ]
 
 
