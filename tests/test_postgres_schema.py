@@ -373,6 +373,9 @@ class TestCreatePostgresSchema:
             # extension gate also probes pg_available_extensions before
             # closing, since it is not yet installed.
             + 3
+            # `_apply_pg_stat_statements`: the installed probe and the shared_preload_libraries
+            # probe, then a skip, since the fixture's first column is falsy (not preloaded)
+            + 2
             # set_config lock_timeout, RESET lock_timeout, and one lock-free probe before each
             # index or column statement that could be skipped as a no-op
             + 2
@@ -416,6 +419,9 @@ class TestCreatePostgresSchema:
             # extension gate also probes pg_available_extensions before
             # closing, since it is not yet installed.
             + 3
+            # `_apply_pg_stat_statements`: the installed probe and the shared_preload_libraries
+            # probe, then a skip, since the fixture's first column is falsy (not preloaded)
+            + 2
             # set_config lock_timeout, RESET lock_timeout, and one lock-free probe before each
             # index or column statement that could be skipped as a no-op
             + 2
@@ -502,6 +508,9 @@ class TestCreatePostgresSchema:
             # extension gate also probes pg_available_extensions before
             # closing, since it is not yet installed.
             + 3
+            # `_apply_pg_stat_statements`: the installed probe and the shared_preload_libraries
+            # probe, then a skip, since the fixture's first column is falsy (not preloaded)
+            + 2
             # set_config lock_timeout, RESET lock_timeout, and one lock-free probe before each
             # index or column statement that could be skipped as a no-op
             + 2

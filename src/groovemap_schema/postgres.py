@@ -8294,6 +8294,73 @@ async def _apply_vector_schema(cursor: Any) -> int:
     return failures
 
 
+PG_STAT_STATEMENTS_EXTENSION = "pg_stat_statements"
+_PG_STAT_STATEMENTS_STATEMENT = (
+    "pg_stat_statements extension",
+    f"CREATE EXTENSION IF NOT EXISTS {PG_STAT_STATEMENTS_EXTENSION}",
+)
+_SHARED_PRELOAD_LIBRARIES_QUERY = "SELECT current_setting('shared_preload_libraries')"
+
+
+async def _pg_stat_statements_preloaded(cursor: Any) -> bool:
+    """Return whether the server preloads pg_stat_statements via shared_preload_libraries.
+
+    Without the preload the extension's views fail at query time, so creating it
+    would leave a database that looks ready and then errors on first use.
+    """
+    try:
+        await cursor.execute(_SHARED_PRELOAD_LIBRARIES_QUERY)
+        row = await cursor.fetchone()
+    except Exception as error:
+        logger.error("❌ Could not read shared_preload_libraries: %s", error)
+        return False
+    if row is None or row[0] is None:
+        return False
+    libraries = [name.strip() for name in str(row[0]).split(",")]
+    return PG_STAT_STATEMENTS_EXTENSION in libraries
+
+
+async def _apply_pg_stat_statements(cursor: Any) -> int:
+    """Create pg_stat_statements in this database when the server can, skipping with a logged reason otherwise.
+
+    Three states, checked in cost order: already installed (nothing to do, so a rerun is a no-op),
+    not preloaded by the server (skipped, since the extension's views would error), or preloaded but
+    not installed and the connecting role is not a superuser (skipped, since the extension is not
+    trusted). A skip is a notice, never a failed schema statement, so the init still succeeds.
+    Returns the number of failed statements, as every other schema step does.
+    """
+    if await _extension_installed(cursor, PG_STAT_STATEMENTS_EXTENSION):
+        logger.info("✅ Schema: %s already installed", PG_STAT_STATEMENTS_EXTENSION)
+        return 0
+    if not await _pg_stat_statements_preloaded(cursor):
+        logger.info(
+            "⏭️  Skipped %s: the server does not preload it (add it to shared_preload_libraries to enable the query audit)",
+            PG_STAT_STATEMENTS_EXTENSION,
+        )
+        return 0
+    if not await _is_superuser(cursor):
+        logger.info(
+            "⏭️  Skipped %s: the connecting role is not a superuser and the extension is not trusted "
+            "(as a superuser, run: CREATE EXTENSION IF NOT EXISTS %s)",
+            PG_STAT_STATEMENTS_EXTENSION,
+            PG_STAT_STATEMENTS_EXTENSION,
+        )
+        return 0
+    _success, failures = await _execute_schema_statements(cursor, [_PG_STAT_STATEMENTS_STATEMENT])
+    return failures
+
+
+async def _extension_installed(cursor: Any, name: str) -> bool:
+    """Return whether the extension `name` is already installed on this database."""
+    try:
+        await cursor.execute(_VECTOR_EXTENSION_INSTALLED_QUERY, (name,))
+        row = await cursor.fetchone()
+    except Exception as error:
+        logger.error("❌ Could not read pg_extension: %s", error)
+        return False
+    return bool(row is not None and row[0])
+
+
 _ROLE_EXISTS_QUERY = "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = %s)"
 
 _PREPROVISIONED_EXTENSION_STATEMENT_NAMES = frozenset({_PG_TRGM_STATEMENT[0], _VECTOR_EXTENSION_STATEMENT[0]})
@@ -8396,6 +8463,7 @@ async def create_postgres_schema(
                     failure_count += await _apply_preprovisioned_vector_schema(cursor)
                 else:
                     failure_count += await _apply_vector_schema(cursor)
+                    failure_count += await _apply_pg_stat_statements(cursor)
             finally:
                 # The connection goes back to the pool; the next borrower must not inherit the timeout.
                 try:
