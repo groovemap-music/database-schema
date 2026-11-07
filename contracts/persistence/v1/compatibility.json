@@ -1096,7 +1096,7 @@
   "musicbrainz_relationship_key": {
     "consumer": "musicbrainz-sql-loader",
     "introduced_in_contract_version": 1,
-    "kind": "additive",
+    "kind": "retirement",
     "key": {
       "function": "musicbrainz.relationship_key",
       "index": "musicbrainz.relationships_key",
@@ -1110,18 +1110,45 @@
         "end_date",
         "attributes"
       ],
-      "beside": "relationships_natural_key (UNIQUE NULLS NOT DISTINCT over the same eight columns), which stays"
+      "conflict_target": "ON CONFLICT (musicbrainz.relationship_key(source_mbid, target_mbid, source_entity_type, target_entity_type, relationship_type, begin_date, end_date, attributes))"
     },
-    "later_step": {
-      "kind": "retirement",
-      "action": "drop the relationships_natural_key constraint, once the loader's conflict target is the expression",
-      "after": "gm-musicbrainz-sql-loader-1twk moves the writer: ON CONFLICT (source_mbid, target_mbid, source_entity_type, target_entity_type, relationship_type, begin_date, end_date, attributes) becomes ON CONFLICT (musicbrainz.relationship_key(source_mbid, target_mbid, source_entity_type, target_entity_type, relationship_type, begin_date, end_date, attributes)); the column list and the DO UPDATE clause do not change",
-      "before": "MusicBrainz is enabled",
-      "why": "the index per row only falls when the constraint goes; while both exist the table pays for both keys",
-      "tracked_in": "gm-database-schema-ngw9"
+    "retired": {
+      "constraint": "relationships_natural_key",
+      "relation": "musicbrainz.relationships",
+      "was": "UNIQUE NULLS NOT DISTINCT over the same eight columns",
+      "statement": "musicbrainz.relationships_natural_key retire",
+      "guard": "dropped only when relationships_key exists and is unique, valid and ready; otherwise the statement keeps the constraint and raises a notice",
+      "never_recreated": "neither the CREATE TABLE nor the five-column migration declares it, so applying the schema again does not bring it back",
+      "breaking_for": "an ON CONFLICT (<eight columns>) target, which then fails with: there is no unique or exclusion constraint matching the ON CONFLICT specification"
     },
-    "note": "Additive: the current loader keeps working, because the eight-column constraint still names its conflict target. The hash key is the same rule as the constraint except that attributes is hashed as jsonb text: key order does not matter, but a number keeps its written scale, so 1 and 1.0 are two hash keys where jsonb equality calls them one; while the constraint stays it rejects the second. A NULL value is one key and is distinct from an empty string and from jsonb null.",
-    "rollback": "DROP INDEX musicbrainz.relationships_key and DROP FUNCTION musicbrainz.relationship_key; nothing depends on them while the constraint stays."
+    "rollout_order": [
+      {
+        "phase": "expand",
+        "step": "database-schema adds musicbrainz.relationship_key and the unique index musicbrainz.relationships_key beside the constraint",
+        "shipped_in": "database-schema v0.8.0 or earlier",
+        "tracked_in": "gm-database-schema-ngw9"
+      },
+      {
+        "phase": "migrate",
+        "step": "musicbrainz-sql-loader moves its conflict target to the expression",
+        "requires": "musicbrainz-sql-loader v0.6.0 or later, deployed and running",
+        "tracked_in": "gm-musicbrainz-sql-loader-1twk"
+      },
+      {
+        "phase": "contract",
+        "step": "database-schema drops relationships_natural_key",
+        "requires": "no writer still names the eight columns as its conflict target",
+        "tracked_in": "gm-database-schema-00ke"
+      },
+      {
+        "phase": "enable",
+        "step": "MusicBrainz is enabled and the first load runs",
+        "requires": "the contract phase has been applied",
+        "tracked_in": "gm-database-schema-00ke"
+      }
+    ],
+    "note": "The hash key is the old constraint's rule except that attributes is hashed as jsonb text: key order does not matter, but a number keeps its written scale, so 1 and 1.0 are two keys where jsonb equality calls them one. With the constraint retired they are two rows. A NULL value is one key and is distinct from an empty string and from jsonb null. MusicBrainz attributes are strings and arrays of strings, so none is known to hit the scale case. No index leads with source_mbid after the drop: a source_mbid lookup is answered by idx_mb_rels_endpoint_source (source_entity_type, target_entity_type, source_mbid) through PostgreSQL 18's B-tree skip scan.",
+    "rollback": "Restore the constraint with ALTER TABLE musicbrainz.relationships ADD CONSTRAINT relationships_natural_key UNIQUE NULLS NOT DISTINCT (source_mbid, target_mbid, source_entity_type, target_entity_type, relationship_type, begin_date, end_date, attributes); it builds a unique index over the table, so it takes a write lock for the build and fails if the table holds two rows that the jsonb comparison calls equal (the 1 and 1.0 case). Applying the schema does not restore it. A writer that names the eight columns may run again only after that."
   },
   "owners": [
     "database-schema"
