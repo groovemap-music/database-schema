@@ -977,6 +977,12 @@ _INSIGHTS_TABLES: list[tuple[str, str]] = [
         )
         """,
     ),
+    # Placeholder labels (such as Not On Label) are stored after the real labels, which keep ranks 1..N;
+    # a constant default makes this a catalog-only change on a populated table, and old writers keep FALSE.
+    (
+        "insights.label_longevity is_placeholder column",
+        "ALTER TABLE insights.label_longevity ADD COLUMN IF NOT EXISTS is_placeholder BOOLEAN NOT NULL DEFAULT FALSE",
+    ),
     (
         "insights.monthly_anniversaries table",
         """

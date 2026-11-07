@@ -11,6 +11,7 @@ _NAMES_THROUGH_COMPUTATION_LOG = [
     "insights.artist_centrality table",
     "insights.genre_trends table",
     "insights.label_longevity table",
+    "insights.label_longevity is_placeholder column",
     "insights.monthly_anniversaries table",
     "insights.data_completeness table",
     "insights.release_rarity table",
