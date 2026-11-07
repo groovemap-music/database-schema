@@ -2,6 +2,16 @@
 
 All notable changes to the GrooveMap database schema will be documented here.
 
+## v0.10.0 (2026-11-07)
+
+### Release notes
+
+Adds `insights.label_longevity.is_placeholder` (boolean, default false), additive and safe for older writers. Deploy before analytics-engine v0.7.0, which writes it.
+
+### Feat
+
+- **schema**: add insights.label_longevity.is_placeholder
+
 ## v0.9.0 (2026-11-06)
 
 ### Release notes
