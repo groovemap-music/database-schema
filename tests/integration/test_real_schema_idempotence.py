@@ -484,36 +484,18 @@ async def assert_expected_postgres_schema() -> None:
         assert len(counted) == 1
         assert counted[0][0] >= 0
 
-    relationship_key = await postgres_rows(
+    # The eight-column constraint is retired (gm-database-schema-00ke): the hash key below is the only key.
+    retired_constraint = await postgres_rows(
         """
-        SELECT array_agg(attribute.attname ORDER BY key_column.ordinality)
+        SELECT count(*)
         FROM pg_constraint AS constraint_row
-        JOIN pg_class AS table_class ON table_class.oid = constraint_row.conrelid
-        JOIN pg_namespace AS namespace ON namespace.oid = table_class.relnamespace
-        CROSS JOIN LATERAL unnest(constraint_row.conkey) WITH ORDINALITY AS key_column(attnum, ordinality)
-        JOIN pg_attribute AS attribute
-          ON attribute.attrelid = table_class.oid AND attribute.attnum = key_column.attnum
-        WHERE namespace.nspname = 'musicbrainz'
-          AND table_class.relname = 'relationships'
+        WHERE constraint_row.conrelid = 'musicbrainz.relationships'::regclass
           AND constraint_row.conname = 'relationships_natural_key'
         """
     )
-    assert relationship_key == [
-        (
-            [
-                "source_mbid",
-                "target_mbid",
-                "source_entity_type",
-                "target_entity_type",
-                "relationship_type",
-                "begin_date",
-                "end_date",
-                "attributes",
-            ],
-        )
-    ]
+    assert retired_constraint == [(0,)]
 
-    # The hash key sits beside the constraint (gm-database-schema-ngw9): both exist, both unique and valid.
+    # The hash key is unique and valid (gm-database-schema-ngw9).
     hash_key = await postgres_rows(
         """
         SELECT index_row.indisunique, index_row.indisvalid

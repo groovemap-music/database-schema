@@ -1,17 +1,19 @@
-"""Real-engine proof for the MusicBrainz relationships hash key (gm-database-schema-ngw9).
+"""Real-engine proof for the MusicBrainz relationships hash key (gm-database-schema-ngw9, -00ke).
 
-`musicbrainz.relationships` keeps its eight-column `UNIQUE NULLS NOT DISTINCT` constraint, so the loader's
-current `ON CONFLICT (<eight columns>)` still works, and gains a second unique index over
-`musicbrainz.relationship_key(...)`, a SHA-256 over the same eight values. Dropping the constraint is a
-later step, after `musicbrainz-sql-loader` names the expression (gm-musicbrainz-sql-loader-1twk). These
-tests run both upsert targets on a real engine, hold the hash key to the constraint's rule (jsonb attribute
-order, NULL dates, field boundaries), measure the two keys' index per row, and add the hash index to a
-database that predates it. Each test gets its own database.
+`musicbrainz.relationships` is keyed by one unique index over `musicbrainz.relationship_key(...)`, a SHA-256
+over the eight values the retired `relationships_natural_key` constraint covered. `musicbrainz-sql-loader`
+v0.6.0 names the expression as its conflict target (gm-musicbrainz-sql-loader-1twk), and the schema drops
+the constraint (gm-database-schema-00ke). These tests run the loader's upsert on a real engine, hold the
+hash key to the constraint's rule (jsonb attribute order, NULL dates, field boundaries), measure index
+bytes per row with the constraint, with both keys and with the hash key alone, and upgrade databases that
+carry both keys, with a populated table, to prove the drop is safe and the constraint stays gone.
+Each test gets its own database.
 """
 
 from __future__ import annotations
 
 import json
+import time
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -153,63 +155,160 @@ _OLD_UPSERT = (
     "ON CONFLICT (source_mbid, target_mbid, source_entity_type, target_entity_type, relationship_type, begin_date, end_date, attributes) "
     "DO UPDATE SET ended = EXCLUDED.ended, updated_at = NOW() RETURNING (xmax = 0) AS inserted"
 )
+_CONSTRAINT = (
+    "ALTER TABLE musicbrainz.relationships ADD CONSTRAINT relationships_natural_key UNIQUE NULLS NOT DISTINCT "
+    "(source_mbid, target_mbid, source_entity_type, target_entity_type, relationship_type, begin_date, end_date, attributes)"
+)
+_CONSTRAINT_ROWS = "SELECT count(*) FROM pg_constraint WHERE conname = 'relationships_natural_key'"
+_SEED = """
+    INSERT INTO musicbrainz.relationships
+        (source_mbid, target_mbid, source_entity_type, target_entity_type, relationship_type, begin_date, end_date, attributes)
+    SELECT gen_random_uuid(), gen_random_uuid(), (ARRAY['artist', 'release', 'label'])[1 + g %% 3],
+           (ARRAY['artist', 'release', 'label'])[1 + (g / 3) %% 3], 'TYPE_' || (g %% 30),
+           CASE WHEN g %% 5 = 0 THEN (1960 + g %% 60)::text END, CASE WHEN g %% 11 = 0 THEN (1990 + g %% 30)::text END,
+           CASE WHEN g %% 4 = 0 THEN jsonb_build_object('instrument', ARRAY['guitar', 'vocals'], 'credited_as', 'name ' || g) END
+    FROM generate_series(1, %s) AS g
+"""
 
 
-async def test_the_loaders_current_conflict_target_still_works_beside_the_hash_key(connection: psycopg.AsyncConnection[Any]) -> None:
-    """The change is additive: the unchanged loader inserts once and updates on repeat."""
-    args = (A, "artist", B, "artist", "MEMBER_OF", Jsonb({"instrument": ["guitar"]}), "1990", None, False)
-    first = await (await connection.execute(_OLD_UPSERT, args)).fetchone()
-    second = await (await connection.execute(_OLD_UPSERT, args)).fetchone()
-    assert first == (True,)
-    assert second == (False,)
-    assert await _count(connection) == 1
-    # and the expression target finds the same row
-    assert await _upsert(connection, attributes={"instrument": ["guitar"]}, begin="1990") is False
-    assert await _count(connection) == 1
+async def _apply(conn: psycopg.AsyncConnection[Any]) -> None:
+    async with conn.cursor() as cursor:
+        _success, failures = await _execute_schema_statements(cursor, _schema_statements())
+    assert failures == 0
 
 
-async def test_the_hash_key_costs_less_index_per_row_than_the_constraint(connection: psycopg.AsyncConnection[Any]) -> None:
+async def _index_sizes(conn: psycopg.AsyncConnection[Any]) -> dict[str, int]:
+    rows = await (
+        await conn.execute(
+            "SELECT indexrelid::regclass::text, pg_relation_size(indexrelid) FROM pg_index WHERE indrelid = 'musicbrainz.relationships'::regclass"
+        )
+    ).fetchall()
+    return dict(rows)
+
+
+async def test_a_fresh_database_has_the_hash_key_and_no_natural_key_constraint(connection: psycopg.AsyncConnection[Any]) -> None:
+    assert await (await connection.execute(_CONSTRAINT_ROWS)).fetchone() == (0,)
+    index = await (
+        await connection.execute("SELECT indisunique, indisvalid FROM pg_index WHERE indexrelid = 'musicbrainz.relationships_key'::regclass")
+    ).fetchone()
+    assert index == (True, True)
+
+
+async def test_a_conflict_target_naming_the_eight_columns_fails_once_the_constraint_is_gone(connection: psycopg.AsyncConnection[Any]) -> None:
+    """The breaking part of the change, proved: a writer older than the hash target can no longer upsert."""
+    args = (A, "artist", B, "artist", "MEMBER_OF", None, "1990", None, False)
+    with pytest.raises(psycopg.errors.InvalidColumnReference, match="no unique or exclusion constraint matching the ON CONFLICT"):
+        await connection.execute(_OLD_UPSERT, args)
+    assert await _count(connection) == 0
+    assert await _upsert(connection, begin="1990") is True
+
+
+async def test_a_number_written_at_two_scales_is_two_relationships_now_that_the_constraint_is_gone(
+    connection: psycopg.AsyncConnection[Any],
+) -> None:
+    """`1` and `1.0` are two hash keys; while the constraint stood the second was an error."""
+    assert await _upsert(connection, attributes={"count": 1}) is True
+    assert await _upsert(connection, attributes={"count": 1.0}) is True
+    assert await _count(connection) == 2
+
+
+async def test_index_bytes_per_row_fall_below_the_figure_before_the_hash_key(connection: psycopg.AsyncConnection[Any]) -> None:
+    """Measure the table's index per row three ways on the same data: constraint alone, both keys, hash alone."""
     rows = 200_000
-    await connection.execute(
-        """
-        INSERT INTO musicbrainz.relationships
-            (source_mbid, target_mbid, source_entity_type, target_entity_type, relationship_type, begin_date, end_date, attributes)
-        SELECT gen_random_uuid(), gen_random_uuid(), (ARRAY['artist', 'release', 'label'])[1 + g %% 3],
-               (ARRAY['artist', 'release', 'label'])[1 + (g / 3) %% 3], 'TYPE_' || (g %% 30),
-               CASE WHEN g %% 5 = 0 THEN (1960 + g %% 60)::text END, CASE WHEN g %% 11 = 0 THEN (1990 + g %% 30)::text END,
-               CASE WHEN g %% 4 = 0 THEN jsonb_build_object('instrument', ARRAY['guitar', 'vocals'], 'credited_as', 'name ' || g) END
-        FROM generate_series(1, %s) AS g
-        """,
-        (rows,),
-    )
-    sizes = dict(
-        await (
-            await connection.execute(
-                "SELECT indexrelid::regclass::text, pg_relation_size(indexrelid) FROM pg_index WHERE indrelid = 'musicbrainz.relationships'::regclass"
-            )
-        ).fetchall()
-    )
-    old, new = sizes["musicbrainz.relationships_natural_key"] / rows, sizes["musicbrainz.relationships_key"] / rows
-    print(f"\nkey index bytes per row: {old:.0f} eight-column constraint, {new:.0f} hash key; both present now, so the table pays {old + new:.0f}")
-    print(f"saving once the constraint is dropped in the later step: {old - new:.0f} bytes per row")
-    assert new < old
+    per_row: dict[str, tuple[float, float]] = {}
+    for label, prepare in (
+        ("constraint only (before ngw9)", ("DROP INDEX musicbrainz.relationships_key", _CONSTRAINT)),
+        ("both keys (after ngw9)", (_CONSTRAINT,)),
+        ("hash key only (after 00ke)", ()),
+    ):
+        await connection.execute("TRUNCATE musicbrainz.relationships")
+        await connection.execute("DROP INDEX IF EXISTS musicbrainz.relationships_key")
+        await connection.execute("ALTER TABLE musicbrainz.relationships DROP CONSTRAINT IF EXISTS relationships_natural_key")
+        await _apply_key_index(connection)
+        for statement in prepare:
+            await connection.execute(statement)
+        await connection.execute(_SEED, (rows,))
+        sizes = await _index_sizes(connection)
+        keys = sum(size for name, size in sizes.items() if name.endswith(("relationships_natural_key", "relationships_key")))
+        per_row[label] = (keys / rows, sum(sizes.values()) / rows)
+    for label, (keys, total) in per_row.items():
+        print(f"\n{label}: key index {keys:.0f} B/row, all indexes {total:.0f} B/row", end="")
+    print()
+    before, both, after = per_row.values()
+    assert both[1] > before[1]
+    assert after[1] < before[1]
+    assert after[0] < before[0]
 
 
-async def test_a_database_that_predates_the_hash_key_gains_it_and_keeps_the_constraint(connection: psycopg.AsyncConnection[Any]) -> None:
+async def _apply_key_index(conn: psycopg.AsyncConnection[Any]) -> None:
+    """Recreate the hash index the way the schema declares it (a no-op where it is present)."""
+    statements = dict(_schema_statements())
+    await conn.execute(statements["musicbrainz.relationships_key index"])
+
+
+async def test_a_populated_database_with_both_keys_loses_the_constraint_and_keeps_every_row(connection: psycopg.AsyncConnection[Any]) -> None:
+    rows = 100_000
+    await connection.execute(_CONSTRAINT)
+    await connection.execute(_SEED, (rows,))
+    assert await (await connection.execute(_CONSTRAINT_ROWS)).fetchone() == (1,)
+    before = await (await connection.execute("SELECT count(*), sum(hashtext(id::text)) FROM musicbrainz.relationships")).fetchone()
+    for attempt in range(2):
+        started = time.perf_counter()
+        await _apply(connection)
+        elapsed = time.perf_counter() - started
+        print(f"\napply {attempt + 1} on {rows:,} rows with both keys: {elapsed:.2f} s")
+        assert await (await connection.execute(_CONSTRAINT_ROWS)).fetchone() == (0,)
+        index = await (
+            await connection.execute("SELECT indisunique, indisvalid FROM pg_index WHERE indexrelid = 'musicbrainz.relationships_key'::regclass")
+        ).fetchone()
+        assert index == (True, True)
+        assert await (await connection.execute("SELECT count(*), sum(hashtext(id::text)) FROM musicbrainz.relationships")).fetchone() == before
+    # a row that was already there is still found by the hash target, and a plain duplicate still violates the key
+    existing = await (
+        await connection.execute("SELECT source_mbid, target_mbid, source_entity_type, target_entity_type, relationship_type FROM musicbrainz.relationships LIMIT 1")
+    ).fetchone()
+    assert existing is not None
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        await connection.execute(
+            "INSERT INTO musicbrainz.relationships (source_mbid, target_mbid, source_entity_type, target_entity_type, relationship_type) "
+            "SELECT source_mbid, target_mbid, source_entity_type, target_entity_type, relationship_type FROM musicbrainz.relationships "
+            "WHERE begin_date IS NULL AND end_date IS NULL AND attributes IS NULL LIMIT 1"
+        )
+
+
+async def test_the_constraint_is_kept_when_the_hash_key_is_missing_or_not_valid(connection: psycopg.AsyncConnection[Any]) -> None:
+    """The drop never leaves the table with no key: it needs relationships_key unique, valid and ready."""
+    retire = dict(_schema_statements())["musicbrainz.relationships_natural_key retire"]
     await connection.execute("DROP INDEX musicbrainz.relationships_key")
+    await connection.execute(_CONSTRAINT)
+
+    await connection.execute(retire)
+    assert await (await connection.execute(_CONSTRAINT_ROWS)).fetchone() == (1,)  # no hash index at all
+
+    await _apply_key_index(connection)
+    await connection.execute("UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'musicbrainz.relationships_key'::regclass")
+    await connection.execute(retire)
+    assert await (await connection.execute(_CONSTRAINT_ROWS)).fetchone() == (1,)  # an invalid one
+
+    await connection.execute("UPDATE pg_index SET indisvalid = true WHERE indexrelid = 'musicbrainz.relationships_key'::regclass")
+    await connection.execute(retire)
+    assert await (await connection.execute(_CONSTRAINT_ROWS)).fetchone() == (0,)  # now it goes
+    await connection.execute(retire)  # and a second run finds nothing to do
+
+
+async def test_a_database_that_predates_the_hash_key_gains_it_and_loses_the_constraint(connection: psycopg.AsyncConnection[Any]) -> None:
+    await connection.execute("DROP INDEX musicbrainz.relationships_key")
+    await connection.execute(_CONSTRAINT)
     await connection.execute(
         "INSERT INTO musicbrainz.relationships (source_mbid, source_entity_type, target_mbid, target_entity_type, relationship_type, begin_date) "
         "SELECT gen_random_uuid(), 'artist', gen_random_uuid(), 'artist', 'MEMBER_OF', g::text FROM generate_series(1, 500) g"
     )
     for _ in range(2):
-        async with connection.cursor() as cursor:
-            _success, failures = await _execute_schema_statements(cursor, _schema_statements())
-        assert failures == 0
-        constraint = await (await connection.execute("SELECT count(*) FROM pg_constraint WHERE conname = 'relationships_natural_key'")).fetchone()
+        await _apply(connection)
+        assert await (await connection.execute(_CONSTRAINT_ROWS)).fetchone() == (0,)
         index = await (
             await connection.execute("SELECT indisunique, indisvalid FROM pg_index WHERE indexrelid = 'musicbrainz.relationships_key'::regclass")
         ).fetchone()
-        assert constraint == (1,)
         assert index == (True, True)
         assert await _count(connection) == 500
     with pytest.raises(psycopg.errors.UniqueViolation):

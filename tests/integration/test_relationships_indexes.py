@@ -1,11 +1,14 @@
 """Real-engine proof for the `musicbrainz.relationships` index retirement.
 
-`idx_mb_rels_source (source_mbid)` is a strict left prefix of `relationships_natural_key`, which
-leads with `source_mbid`, so the natural key answers every lookup the narrower index did. These
-tests measure what the index cost per row, show the same lookups return the same rows through the
-natural key, and prove an upgrade drops an existing index and a second apply changes nothing.
-`idx_mb_rels_type` stays: `graph.artist_member_of`'s fill filters `relationship_type = 'MEMBER_OF'`.
-Each test gets its own database.
+`idx_mb_rels_source (source_mbid)` was retired while `relationships_natural_key` led with
+`source_mbid`. That constraint is gone too (gm-database-schema-00ke), so no index leads with
+`source_mbid` any more, and the choice is not to bring the narrow index back: PostgreSQL 18's B-tree
+skip scan answers a `source_mbid` lookup from `idx_mb_rels_endpoint_source (source_entity_type,
+target_entity_type, source_mbid)`, whose leading columns have nine values between them. These tests
+measure what the narrow index would cost per row, show the same lookups return the same rows through
+the endpoint index at a comparable latency, and prove an upgrade drops an existing narrow index and a
+second apply changes nothing. `idx_mb_rels_type` stays: `graph.artist_member_of`'s fill filters
+`relationship_type = 'MEMBER_OF'`. Each test gets its own database.
 """
 
 from __future__ import annotations
@@ -98,7 +101,7 @@ async def test_the_source_index_is_not_created_on_a_fresh_database(connection: p
     assert SOURCE_INDEX not in await _index_bytes(connection)
 
 
-async def test_the_natural_key_answers_the_lookup_the_source_index_did(connection: psycopg.AsyncConnection[Any]) -> None:
+async def test_the_endpoint_index_answers_the_lookup_the_source_index_did(connection: psycopg.AsyncConnection[Any]) -> None:
     await _seed(connection)
     await connection.execute(_CREATE_SOURCE_INDEX)
     sources = [
@@ -126,8 +129,32 @@ async def test_the_natural_key_answers_the_lookup_the_source_index_did(connectio
         assert rows_before == rows_after
         assert rows_before
         assert SOURCE_INDEX in plan_before, plan_before
-        assert "relationships_natural_key" in plan_after, plan_after
+        assert "idx_mb_rels_endpoint_source" in plan_after, plan_after
+        assert "source_mbid = " in plan_after, plan_after
     assert median_after < 5 * median_before + 1
+
+
+async def test_no_index_leads_with_source_mbid_and_the_lookup_is_still_an_index_scan(connection: psycopg.AsyncConnection[Any]) -> None:
+    """The consequence of retiring the constraint, stated: the lookup rides the endpoint index's skip scan."""
+    leading = await (
+        await connection.execute(
+            """
+            SELECT indexrelid::regclass::text
+            FROM pg_index
+            WHERE indrelid = 'musicbrainz.relationships'::regclass
+              AND indkey[0] = (SELECT attnum FROM pg_attribute WHERE attrelid = indrelid AND attname = 'source_mbid')
+            """
+        )
+    ).fetchall()
+    assert leading == []
+    await _seed(connection)
+    source = (await (await connection.execute("SELECT source_mbid FROM musicbrainz.relationships ORDER BY id LIMIT 1 OFFSET 100")).fetchone() or (None,))[0]
+    rows, median_ms, plan = await _lookup(connection, source)
+    print(f"\nsource_mbid lookup through the endpoint index: {median_ms:.3f} ms median, {len(rows)} row(s)")
+    assert rows
+    assert "Seq Scan" not in plan, plan
+    assert "idx_mb_rels_endpoint_source" in plan, plan
+    assert median_ms < 50
 
 
 async def test_applying_the_schema_drops_an_existing_source_index_and_is_idempotent(connection: psycopg.AsyncConnection[Any]) -> None:
@@ -139,8 +166,9 @@ async def test_applying_the_schema_drops_an_existing_source_index_and_is_idempot
         assert failures == 0
         indexes = await _index_bytes(connection)
         assert SOURCE_INDEX not in indexes
+        assert "relationships_natural_key" not in indexes
         for kept in (
-            "relationships_natural_key",
+            "relationships_key",
             "idx_mb_rels_type",
             "idx_mb_rels_target",
             "idx_mb_rels_endpoint_source",

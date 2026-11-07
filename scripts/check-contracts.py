@@ -88,6 +88,42 @@ for relation in retired["relations"]:
 for index in retired["indexes_dropped_with_table"]:
     assert index not in user_statements, index
 
+# The MusicBrainz relationships hash key is the one key on the table: the eight-column constraint is
+# retired. Pin the key, the retirement, and the rollout order to the statements, so the constraint cannot
+# come back from a CREATE TABLE or a migration and the drop cannot run before the key it relies on.
+relationship_key = contract["musicbrainz_relationship_key"]
+musicbrainz_statements = dict(_MUSICBRAINZ_TABLES)
+musicbrainz_order = [name for name, _statement in _MUSICBRAINZ_TABLES]
+assert relationship_key["kind"] == "retirement"
+assert relationship_key["introduced_in_contract_version"] == contract["version"]
+assert relationship_key["consumer"] == "musicbrainz-sql-loader"
+key_inputs = ", ".join(relationship_key["key"]["inputs"])
+function_name = relationship_key["key"]["function"]
+index_name = relationship_key["key"]["index"]
+assert relationship_key["key"]["conflict_target"] == f"ON CONFLICT ({function_name}({key_inputs}))"
+assert f"CREATE OR REPLACE FUNCTION {function_name}(" in musicbrainz_statements[f"{function_name} function"]
+for column in relationship_key["key"]["inputs"]:
+    assert column in musicbrainz_statements[f"{function_name} function"], column
+key_index = musicbrainz_statements[f"{index_name} index"]
+assert key_index.startswith(f"CREATE UNIQUE INDEX IF NOT EXISTS {index_name.removeprefix('musicbrainz.')} ON musicbrainz.relationships")
+assert f"{function_name}(" in key_index and all(column in key_index for column in relationship_key["key"]["inputs"])
+retired_key = relationship_key["retired"]
+assert retired_key["relation"] == "musicbrainz.relationships"
+retire_statement = musicbrainz_statements[retired_key["statement"]]
+assert f"DROP CONSTRAINT {retired_key['constraint']}" in retire_statement
+assert "indisunique AND indisvalid AND indisready" in retire_statement
+# Never recreated: neither the table's own statement nor any migration declares the constraint.
+for name, statement in _MUSICBRAINZ_TABLES:
+    if name != retired_key["statement"]:
+        assert f"ADD CONSTRAINT {retired_key['constraint']}" not in statement, name
+        assert f"CONSTRAINT {retired_key['constraint']} UNIQUE" not in statement, name
+# The order: the key exists (function, then index) before the constraint it replaces is dropped.
+assert musicbrainz_order.index(f"{function_name} function") < musicbrainz_order.index(f"{index_name} index")
+assert musicbrainz_order.index(f"{index_name} index") < musicbrainz_order.index(retired_key["statement"])
+phases = [step["phase"] for step in relationship_key["rollout_order"]]
+assert phases == ["expand", "migrate", "contract", "enable"], phases
+assert "musicbrainz-sql-loader v0.6.0 or later" in relationship_key["rollout_order"][1]["requires"]
+
 # extraction_history.source is an additive nullable column: pin its type, the
 # NULL-tolerant CHECK, and the index to the statements that declare them.
 source = contract["extraction_history_source"]
