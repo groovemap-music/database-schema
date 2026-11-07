@@ -602,7 +602,6 @@ never deleted, which is why `artifacts.created_by` and `extraction_history.trigg
 delete; no code path deletes `artifacts`, so `owned_copies.artifact_id` sees none either. Revisit if
 one of those starts to delete. `observations.owned_copy_id` is indexed under the rarity and
 observation index change.
-||||||| 6489067
 
 ### MusicBrainz relationships: index retirement
 
@@ -645,7 +644,6 @@ Where the rest of the per-row cost sat when the natural key still stood, in byte
 The 8-column natural key with a `jsonb` column was the dominant cost. It is replaced by a fixed-size
 hash of the eight values as the one unique key, a breaking change for the writer that named the old
 `ON CONFLICT` target, with its own order and rollback (see "the hash key" below).
-||||||| 6489067
 
 ### Keyset paging over activity tables
 

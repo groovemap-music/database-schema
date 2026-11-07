@@ -240,7 +240,12 @@ require(
     "retired combined ingestion ownership must be explicitly historical",
 )
 
+# Git conflict markers: <<<<<<< and >>>>>>> open or close a conflict, and ||||||| opens the base section.
+# A bare ======= is not matched because it is also a Markdown setext heading underline.
+CONFLICT_MARKER = re.compile(r"^(<{7}|>{7}|\|{7})(\s|$)", re.MULTILINE)
+
 for markdown in (ROOT / "README.md", *sorted((ROOT / "docs").rglob("*.md")), *sorted((ROOT / "contracts").rglob("*.md"))):
+    require(CONFLICT_MARKER.search(markdown.read_text()) is None, f"merge-conflict marker in {markdown.relative_to(ROOT)}")
     for target in re.findall(r"(?<!!)\[[^]]+\]\(([^)]+)\)", markdown.read_text()):
         if target.startswith(("https://", "http://", "mailto:", "#")):
             continue
