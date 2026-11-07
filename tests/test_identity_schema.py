@@ -160,6 +160,7 @@ _LEGACY_STATEMENT_NAMES = [
 # before the legacy comparison will pass.
 _ADDED_STATEMENT_NAMES = frozenset(
     {
+        "insights.label_longevity is_placeholder column",
         "queue_metrics table retired",
         "idx_mb_rels_source retire",
         "musicbrainz.relationship_key function",
