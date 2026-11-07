@@ -2,6 +2,21 @@
 
 All notable changes to the GrooveMap database schema will be documented here.
 
+## v0.8.0 (2026-11-06)
+
+### Release notes
+
+Deploy this before discogs-sql-loader and musicbrainz-sql-loader: both write `loader_extraction_latch.purge_vetoed`, and check-images pairs the Discogs loader with this release. `data_completeness.completeness_pct` is nullable, and `bootstrap_fill` applies the Person name padding rule.
+
+### Feat
+
+- **insights**: make data_completeness.completeness_pct nullable
+- **postgres**: record vetoed purges durably on the extraction latch
+
+### Fix
+
+- **graph**: apply the Person name padding rule in bootstrap_fill
+
 ## v0.7.0 (2026-11-05)
 
 ### Deploy order with catalog-api
