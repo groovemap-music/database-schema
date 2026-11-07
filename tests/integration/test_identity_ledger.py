@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import random
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
@@ -53,6 +53,11 @@ _COLUMNS = {
     "identity_ledger_work_summary": "work_id, event, evented_editions, repaired_editions, first_event, last_event",
     "identity_ledger_density": "kind, month, type, dated_from, events",
 }
+
+# The per-day rollup postdates catalog-api's prototype, so it has no reference view or v0.6.3 body; it is
+# held to a direct GROUP BY over the events instead (test_the_day_rollup_answers_every_window_as_a_group_by_over_the_events).
+_DAY = "identity_ledger_work_summary_day"
+_REFERENCED_VIEWS = tuple(view for view in IDENTITY_LEDGER_VIEWS if view != _DAY)
 
 
 def _at(month: int, day: int, year: int = 2026) -> datetime:
@@ -266,7 +271,7 @@ async def _refresh_and_compare(connection: psycopg.AsyncConnection[Any], context
 
 
 async def _assert_equal_to_a_full_recompute(connection: psycopg.AsyncConnection[Any], context: Any = None) -> None:
-    for view in IDENTITY_LEDGER_VIEWS:
+    for view in _REFERENCED_VIEWS:
         await connection.execute(sql.SQL("REFRESH MATERIALIZED VIEW {}").format(sql.Identifier(_REFERENCE_SCHEMA, view)))
         assert await _view_rows(connection, view) == await _view_rows(connection, view, _REFERENCE_SCHEMA), (view, context)
     assert await _rows(connection, "SELECT relation, missing, unexpected, pending_changes FROM identity_ledger_verify() ORDER BY relation") == [
@@ -325,7 +330,7 @@ async def test_the_first_refresh_fills_every_table_equal_to_the_reference() -> N
 
             # And catalog-api's reference definitions agree on every row.
             await _build_reference(connection)
-            for view in IDENTITY_LEDGER_VIEWS:
+            for view in _REFERENCED_VIEWS:
                 assert await _view_rows(connection, view, _REFERENCE_SCHEMA), view
             await _assert_equal_to_a_full_recompute(connection)
 
@@ -345,7 +350,7 @@ async def test_the_table_columns_keep_the_types_the_views_published() -> None:
                 SELECT attname, format_type(atttypid, atttypmod) FROM pg_attribute
                 WHERE attrelid = %s::regclass AND attnum > 0 AND NOT attisdropped ORDER BY attnum
             """
-            for view in IDENTITY_LEDGER_VIEWS:
+            for view in _REFERENCED_VIEWS:
                 assert await _rows(connection, shape, (f"public.{view}",)) == await _rows(connection, shape, (f"{_REFERENCE_SCHEMA}.{view}",)), view
 
 
@@ -583,7 +588,7 @@ async def _make_v063_views(connection: psycopg.AsyncConnection[Any]) -> None:
         _ledger_work_summary_select("public.identity_ledger_edition_events", "public.identity_ledger_edition_parents"),
         _ledger_density_select(),
     )
-    for view, body in zip(IDENTITY_LEDGER_VIEWS, bodies, strict=True):
+    for view, body in zip(_REFERENCED_VIEWS, bodies, strict=True):
         await connection.execute(f"CREATE MATERIALIZED VIEW public.{view} AS {body}".encode())
     await connection.execute("INSERT INTO identity_ledger_refresh_state (refreshed_at, duration) VALUES (now(), '45 seconds')")
 
@@ -653,7 +658,7 @@ async def test_rolling_back_restores_the_materialized_views_equal_to_the_referen
                 _ledger_work_summary_select("public.identity_ledger_edition_events", "public.identity_ledger_edition_parents"),
                 _ledger_density_select(),
             )
-            for view, body in zip(IDENTITY_LEDGER_VIEWS, bodies, strict=True):
+            for view, body in zip(_REFERENCED_VIEWS, bodies, strict=True):
                 await connection.execute(f"CREATE MATERIALIZED VIEW IF NOT EXISTS public.{view} AS {body}".encode())
                 await connection.execute(sql.SQL("REFRESH MATERIALIZED VIEW {}").format(sql.Identifier(_REFERENCE_SCHEMA, view)))
                 assert await _view_rows(connection, view) == await _view_rows(connection, view, _REFERENCE_SCHEMA), view
@@ -1043,3 +1048,151 @@ async def test_any_history_refreshed_in_steps_equals_a_full_recompute(seed: int)
             await history.rebuild()
             await _refresh_and_compare(connection, (seed, "rebuilt"))
             assert [set(await _rows(connection, sql.SQL("SELECT * FROM {}").format(sql.Identifier(table)))) for table in stores] == maintained
+
+
+# ── The per-day rollup (gm-database-schema-9dcd) ─────────────────────────────
+
+_REPAIR_TYPES = ("reattached", "promoted", "reverted")
+
+# The route's window statement over the raw events: distinct editions per work, as the works list counts them.
+_WINDOW_DIRECT = """
+SELECT parent.work_id, count(DISTINCT event.edition_id),
+       count(DISTINCT event.edition_id) FILTER (WHERE event.type = ANY(%(repairs)s)), min(event.at), max(event.at)
+FROM identity_ledger_edition_events AS event
+JOIN identity_ledger_edition_parents AS parent ON parent.edition_id = event.edition_id
+WHERE (%(event)s::text = 'any' OR event.type = %(event)s::text)
+  AND event.at >= %(first)s::date::timestamp AT TIME ZONE 'UTC' AND event.at < (%(last)s::date + 1)::timestamp AT TIME ZONE 'UTC'
+GROUP BY parent.work_id
+"""
+
+# The window rule documented in docs/architecture.md: full UTC days [first, last], an edition counted at its first
+# day in the window (prev_day before FIRST), first_event and last_event over every row of the window's days.
+_WINDOW_ROLLUP = """
+SELECT work_id,
+       COALESCE(sum(editions) FILTER (WHERE prev_day < %(first)s::date), 0)::bigint,
+       min(first_event), max(last_event)
+FROM identity_ledger_work_summary_day
+WHERE event = %(event)s AND day BETWEEN %(first)s::date AND %(last)s::date
+GROUP BY work_id
+"""
+
+_WINDOW_REPAIRED = """
+SELECT work_id, COALESCE(sum(editions) FILTER (WHERE prev_day < %(first)s::date), 0)::bigint
+FROM identity_ledger_work_summary_day
+WHERE event = 'repaired' AND day BETWEEN %(first)s::date AND %(last)s::date
+GROUP BY work_id
+"""
+
+
+async def _seed_editions_across_days(cursor: Any) -> tuple[UUID, UUID, UUID]:
+    """Add a work with three editions: one with events on two days and in two filters, and two with one day each.
+
+    `many` is linked at ingest on March 20, then has an alias closed on March 22 and a second link on March 24: three
+    days, three types.  `once` is linked at ingest on March 22 only, and `late` on March 24 only.
+    """
+    work, many, once, late = uuid4(), uuid4(), uuid4(), uuid4()
+    master = uuid4().hex
+    await cursor.executemany(
+        "INSERT INTO catalog_items (id, kind) VALUES (%s, %s)", [(work, "master"), (many, "release"), (once, "release"), (late, "release")]
+    )
+    await cursor.execute(
+        "INSERT INTO provider_aliases (provider, entity_kind, external_id, native_id, valid_from) VALUES ('discogs', 'master', %s, %s, %s)",
+        (master, work, MINT),
+    )
+    aliases = []
+    derived = []
+    for item, name in ((many, "many"), (once, "once"), (late, "late")):
+        release = f"{name}-{uuid4().hex}"
+        aliases.append(("discogs", "release", release, item, MINT, None))
+        derived.append((release, master))
+    mb_many, mb_many_closed, mb_once, mb_late = (str(uuid4()) for _ in range(4))
+    aliases += [
+        ("musicbrainz", "release", mb_many, many, _at(3, 20), None),
+        ("musicbrainz", "release", mb_many_closed, many, _at(3, 20), _at(3, 22)),
+        ("musicbrainz", "release", mb_once, once, _at(3, 22), None),
+        ("musicbrainz", "release", mb_late, late, _at(3, 24), None),
+    ]
+    await cursor.executemany(
+        "INSERT INTO provider_aliases (provider, entity_kind, external_id, native_id, valid_from, valid_to) VALUES (%s, %s, %s, %s, %s, %s)", aliases
+    )
+    await cursor.executemany("INSERT INTO graph.derived_from (release_id, master_id) VALUES (%s, %s)", derived)
+    return work, many, once
+
+
+@pytest.mark.asyncio
+async def test_the_day_rollup_answers_every_window_as_a_group_by_over_the_events() -> None:
+    """Acceptance: the rollup, read by the window rule, equals a direct GROUP BY over the events.
+
+    Every window of full days over the fixture's days, for every event filter, with one edition that has events on
+    several days: a plain per-day sum would count it once per day.
+    """
+    fixture = Fixture()
+    async with _ledger_database() as params:
+        connection = await _connect(params)
+        async with connection:
+            async with connection.cursor() as cursor:
+                await _seed(cursor, fixture)
+                work, many, _once = await _seed_editions_across_days(cursor)
+            await _rows(connection, "SELECT identity_ledger_refresh()")
+
+            days = sorted({row[0] for row in await _rows(connection, "SELECT DISTINCT day FROM identity_ledger_work_summary_day")})
+            assert len(days) >= 6
+            events = [
+                row[0] for row in await _rows(connection, "SELECT DISTINCT event FROM identity_ledger_work_summary_day WHERE event <> 'repaired'")
+            ]
+            assert {"any", "linked_at_ingest", "alias_closed", "reattached"} <= set(events)
+
+            # `many` has events on March 20 and March 22; `once` starts on March 22; `late` on March 24.
+            chain = await _rows(
+                connection,
+                "SELECT day::text, prev_day::text, editions FROM identity_ledger_work_summary_day WHERE work_id = %s AND event = 'any' ORDER BY day, prev_day",
+                (work,),
+            )
+            assert chain == [
+                ("2026-03-20", "-infinity", 1),
+                ("2026-03-22", "-infinity", 1),
+                ("2026-03-22", "2026-03-20", 1),
+                ("2026-03-24", "-infinity", 1),
+            ]
+
+            candidates = sorted({day + timedelta(days=delta) for day in days for delta in (-1, 0, 1)})
+            checked = 0
+            for first in candidates:
+                for last in (day for day in candidates if day >= first):
+                    for event in events:
+                        keys = {"event": event, "first": first, "last": last, "repairs": list(_REPAIR_TYPES)}
+                        direct = {row[0]: row[1:] for row in await _rows(connection, _WINDOW_DIRECT, keys)}
+                        rolled = {row[0]: row for row in await _rows(connection, _WINDOW_ROLLUP, keys)}
+                        repaired = dict(await _rows(connection, _WINDOW_REPAIRED, keys))
+                        assert {w: (r[1], r[2], r[3]) for w, r in rolled.items()} == {w: (d[0], d[2], d[3]) for w, d in direct.items()}, keys
+                        for w, (evented, repaired_direct, _first, _last) in direct.items():
+                            if event == "any":
+                                assert repaired.get(w, 0) == repaired_direct, (keys, w)
+                            else:
+                                assert repaired_direct == (evented if event in _REPAIR_TYPES else 0), (keys, w)
+                        checked += 1
+            assert checked > 500
+
+            # A window over March 20 to 24 counts `many` once, though it has events on two days: the days sum to 4.
+            window = {"event": "any", "first": date(2026, 3, 20), "last": date(2026, 3, 24), "repairs": list(_REPAIR_TYPES)}
+            assert {row[0]: row[1] for row in await _rows(connection, _WINDOW_ROLLUP, window)}[work] == 3
+            assert await _rows(
+                connection, "SELECT sum(editions)::bigint FROM identity_ledger_work_summary_day WHERE work_id = %s AND event = 'any'", (work,)
+            ) == [(4,)]
+            # A window opening on March 22 counts `many` again, at its second day, because its first is outside.
+            later = {**window, "first": date(2026, 3, 22)}
+            assert {row[0]: row[1] for row in await _rows(connection, _WINDOW_ROLLUP, later)}[work] == 3
+
+            # The refresh keeps the rollup: a later event on `many` adds a day, and verify finds no difference.
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    "UPDATE provider_aliases SET valid_to = %s WHERE native_id = %s AND provider = 'musicbrainz' AND valid_to IS NULL",
+                    (_at(3, 26), many),
+                )
+            await _build_reference(connection)
+            await _refresh_and_compare(connection, "day rollup follows a later event")
+            assert await _rows(
+                connection,
+                "SELECT day::text, prev_day::text FROM identity_ledger_work_summary_day WHERE work_id = %s AND event = 'any' AND day = '2026-03-26'",
+                (work,),
+            ) == [("2026-03-26", "2026-03-22")]

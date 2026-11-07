@@ -5878,6 +5878,7 @@ IDENTITY_LEDGER_VIEWS = (
     "identity_ledger_edition_events",
     "identity_ledger_edition_parents",
     "identity_ledger_work_summary",
+    "identity_ledger_work_summary_day",
     "identity_ledger_density",
 )
 
@@ -6122,6 +6123,65 @@ GROUP BY work_id, type
 """  # noqa: S608 -- composed of module constants only
 
 
+def _ledger_work_summary_day_select(events: str, parents: str, works: str = "") -> str:
+    """Return the per-day rollup of the works list from EVENTS and PARENTS, limited by the join WORKS.
+
+    Rows are `(work_id, event, day, prev_day, editions, first_event, last_event)`.  `day` is the
+    UTC date of the events; `event` is `'any'` (every event type), an event type, or the pseudo
+    filter `'repaired'` (reattached, promoted, or reverted).  `editions` counts the editions of the
+    work that have an event of that filter on that day.
+
+    The works list counts *distinct* editions in a window, and an edition with events on two days
+    would be counted twice by adding the days.  So each row also carries `prev_day`: that edition's
+    previous day with an event of the same filter, or `-infinity` for its first.  An edition counts
+    once in a window of full days `[a, b]` at its first day in the window, which is the one row with
+    `day` in `[a, b]` and `prev_day < a`.  Then, per work and filter:
+
+        evented_editions  = sum(editions) over event = F, day in [a, b], prev_day < a   (F = 'any' or the event type)
+        repaired_editions = sum(editions) over event = 'repaired', same days and prev_day   (F = 'any'); F itself for a repair type; 0 otherwise
+        first_event, last_event = min(first_event), max(last_event) over every row with day in [a, b] (any prev_day)
+
+    `-infinity` rather than NULL keeps `(event, day, work_id, prev_day)` a unique key.
+    """
+    return f"""
+WITH by_type_day AS (
+    SELECT parent.work_id, event.edition_id, event.type, (event.at AT TIME ZONE 'UTC')::date AS day,
+           min(event.at) AS first_at, max(event.at) AS last_at
+    FROM {events} AS event
+    JOIN {parents} AS parent ON parent.edition_id = event.edition_id
+    {works}
+    GROUP BY parent.work_id, event.edition_id, event.type, (event.at AT TIME ZONE 'UTC')::date
+),
+by_edition_day AS (
+    SELECT work_id, edition_id, day, min(first_at) AS first_at, max(last_at) AS last_at
+    FROM by_type_day
+    GROUP BY work_id, edition_id, day
+),
+repair_day AS (
+    SELECT work_id, edition_id, day, min(first_at) AS first_at, max(last_at) AS last_at
+    FROM by_type_day
+    WHERE type IN {_LEDGER_REPAIRS}
+    GROUP BY work_id, edition_id, day
+),
+chained AS (
+    SELECT work_id, 'any'::text AS event, day,
+           COALESCE(lag(day) OVER (PARTITION BY work_id, edition_id ORDER BY day), '-infinity'::date) AS prev_day, first_at, last_at
+    FROM by_edition_day
+    UNION ALL
+    SELECT work_id, 'repaired', day,
+           COALESCE(lag(day) OVER (PARTITION BY work_id, edition_id ORDER BY day), '-infinity'::date), first_at, last_at
+    FROM repair_day
+    UNION ALL
+    SELECT work_id, type, day,
+           COALESCE(lag(day) OVER (PARTITION BY work_id, edition_id, type ORDER BY day), '-infinity'::date), first_at, last_at
+    FROM by_type_day
+)
+SELECT work_id, event, day, prev_day, count(*) AS editions, min(first_at) AS first_event, max(last_at) AS last_event
+FROM chained
+GROUP BY work_id, event, day, prev_day
+"""  # noqa: S608 -- composed of module constants only
+
+
 def _ledger_density_select() -> str:
     """Return the full recompute of `identity_ledger_density`: events per UTC month, type, and provenance, per kind.
 
@@ -6161,7 +6221,7 @@ def _ledger_verify_function() -> str:
     otherwise differences are the work the next refresh still has to do.  It
     costs what one full recompute does.
     """
-    events, parents, summary, density = IDENTITY_LEDGER_VIEWS
+    events, parents, summary, summary_day, density = IDENTITY_LEDGER_VIEWS
     compare = "\n    UNION ALL\n".join(
         f"""    SELECT {_sql_literal(view)}::text,
            (SELECT count(*) FROM (TABLE {recomputed} EXCEPT SELECT {columns} FROM public.{view}) AS missing),
@@ -6170,6 +6230,7 @@ def _ledger_verify_function() -> str:
             (events, "recomputed_events", "edition_id, at, type, events"),
             (parents, "recomputed_parents", "edition_id, work_id"),
             (summary, "recomputed_summary", "work_id, event, evented_editions, repaired_editions, first_event, last_event"),
+            (summary_day, "recomputed_summary_day", "work_id, event, day, prev_day, editions, first_event, last_event"),
             (density, "recomputed_density", "kind, month, type, dated_from, events"),
         )
     )
@@ -6182,6 +6243,7 @@ AS $identity_ledger_verify$
 WITH recomputed_events AS MATERIALIZED ({_ledger_edition_events_select()}),
 recomputed_parents AS MATERIALIZED ({_ledger_edition_parents_select("SELECT DISTINCT edition_id FROM recomputed_events")}),
 recomputed_summary AS MATERIALIZED ({_ledger_work_summary_select("recomputed_events", "recomputed_parents")}),
+recomputed_summary_day AS MATERIALIZED ({_ledger_work_summary_day_select("recomputed_events", "recomputed_parents")}),
 recomputed_density AS MATERIALIZED ({_ledger_density_select()}),
 pending AS (
     SELECT (SELECT count(*) FROM public.identity_ledger_changes)
@@ -6535,11 +6597,9 @@ def _ledger_maintain_function() -> str:
     those items and their editions and works hold, not what the catalog does.
     """
     columns = "kind, month, type, dated_from"
-    summary = _ledger_work_summary_select(
-        "public.identity_ledger_edition_events",
-        "public.identity_ledger_edition_parents",
-        "JOIN pg_temp.ledger_works AS dirty_work ON dirty_work.work_id = parent.work_id",
-    )
+    dirty_works = "JOIN pg_temp.ledger_works AS dirty_work ON dirty_work.work_id = parent.work_id"
+    summary = _ledger_work_summary_select("public.identity_ledger_edition_events", "public.identity_ledger_edition_parents", dirty_works)
+    summary_day = _ledger_work_summary_day_select("public.identity_ledger_edition_events", "public.identity_ledger_edition_parents", dirty_works)
     evented = """SELECT DISTINCT event.edition_id
     FROM public.identity_ledger_edition_events AS event
     JOIN pg_temp.ledger_parent_editions AS dirty ON dirty.edition_id = event.edition_id"""
@@ -6653,6 +6713,10 @@ BEGIN
     INSERT INTO public.identity_ledger_work_summary (work_id, event, evented_editions, repaired_editions, first_event, last_event)
     {summary};
 
+    DELETE FROM public.identity_ledger_work_summary_day AS stored USING pg_temp.ledger_works AS dirty WHERE stored.work_id = dirty.work_id;
+    INSERT INTO public.identity_ledger_work_summary_day (work_id, event, day, prev_day, editions, first_event, last_event)
+    {summary_day};
+
     DROP TABLE IF EXISTS pg_temp.ledger_density, pg_temp.ledger_editions, pg_temp.ledger_members, pg_temp.ledger_masters,
                pg_temp.ledger_parent_editions, pg_temp.ledger_works;
 END
@@ -6668,6 +6732,7 @@ def _ledger_rebuild_function() -> str:
     """
     parents = _ledger_edition_parents_select("SELECT DISTINCT edition_id FROM public.identity_ledger_edition_events")
     summary = _ledger_work_summary_select("public.identity_ledger_edition_events", "public.identity_ledger_edition_parents")
+    summary_day = _ledger_work_summary_day_select("public.identity_ledger_edition_events", "public.identity_ledger_edition_parents")
     tables = (*reversed(IDENTITY_LEDGER_VIEWS), "identity_ledger_item_events", "identity_ledger_item_mints")
     empty = "\n    ".join(f"DELETE FROM public.{table};" for table in tables)  # noqa: S608 -- composed of module constants only
     analyze = "\n    ".join(
@@ -6686,6 +6751,8 @@ BEGIN
     {parents};
     INSERT INTO public.identity_ledger_work_summary (work_id, event, evented_editions, repaired_editions, first_event, last_event)
     {summary};
+    INSERT INTO public.identity_ledger_work_summary_day (work_id, event, day, prev_day, editions, first_event, last_event)
+    {summary_day};
     {_ledger_density_rebuild()};
     {analyze}
 END
@@ -6886,6 +6953,31 @@ _IDENTITY_LEDGER_STATEMENTS: list[tuple[str, str]] = [
     (
         "idx_identity_ledger_work_summary_work",
         "CREATE INDEX IF NOT EXISTS idx_identity_ledger_work_summary_work ON public.identity_ledger_work_summary (work_id)",
+    ),
+    # The works list's per-day rollup (gm-database-schema-9dcd): a window of full UTC days reads
+    # rows with day in the window and prev_day before its first day, instead of grouping the events.
+    (
+        "identity_ledger_work_summary_day table",
+        """
+        CREATE TABLE IF NOT EXISTS identity_ledger_work_summary_day (
+            work_id     UUID NOT NULL,
+            event       TEXT NOT NULL,
+            day         DATE NOT NULL,
+            prev_day    DATE NOT NULL,
+            editions    BIGINT NOT NULL,
+            first_event TIMESTAMPTZ NOT NULL,
+            last_event  TIMESTAMPTZ NOT NULL
+        )
+        """,
+    ),
+    (
+        "idx_identity_ledger_work_summary_day_key",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_identity_ledger_work_summary_day_key ON public.identity_ledger_work_summary_day (event, day, work_id, prev_day)",
+    ),
+    # A refresh replaces a dirty work's rows.
+    (
+        "idx_identity_ledger_work_summary_day_work",
+        "CREATE INDEX IF NOT EXISTS idx_identity_ledger_work_summary_day_work ON public.identity_ledger_work_summary_day (work_id)",
     ),
     (
         "identity_ledger_density table",
