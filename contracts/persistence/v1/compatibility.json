@@ -274,7 +274,7 @@
     "consumers": [
       "catalog-api"
     ],
-    "design_decision": "catalog-api's Identity Ledger works list and density routes computed every release item's event history per request (71.5 s p95 for the default works list at 50% scale, against a 2 s budget), and no index helps because each statement aggregates the whole history before it filters. Four tables hold what those statements compute, maintained off the request path by one function. They were materialized views until gm-database-schema-xen5: REFRESH recomputes all history whether or not anything changed, and CONCURRENTLY diffs every row, so a materialized view cannot cost less than its history (45 s on lux to produce 4 rows). The definitions remain catalog-api's route SQL with the filters lifted out, as its prototype composed them (scripts/ledger_scale.py, _view_statements, catalog-api 6d744e2); identity_ledger_verify() and the integration suite pin the tables to them. They are declared after the graph statements because the capture triggers and the refresh reach graph.derived_from.",
+    "design_decision": "catalog-api's Identity Ledger works list and density routes computed every release item's event history per request (71.5 s p95 for the default works list at 50% scale, against a 2 s budget), and no index helps because each statement aggregates the whole history before it filters. Four tables hold what those statements compute, and a fifth rolls the works list up per UTC day (gm-database-schema-9dcd), all maintained off the request path by one function. They were materialized views until gm-database-schema-xen5: REFRESH recomputes all history whether or not anything changed, and CONCURRENTLY diffs every row, so a materialized view cannot cost less than its history (45 s on lux to produce 4 rows). The definitions remain catalog-api's route SQL with the filters lifted out, as its prototype composed them (scripts/ledger_scale.py, _view_statements, catalog-api 6d744e2); identity_ledger_verify() and the integration suite pin the tables to them. They are declared after the graph statements because the capture triggers and the refresh reach graph.derived_from.",
     "introduced_in_contract_version": 1,
     "kind": "additive",
     "populate": "every table is created empty, so applying the schema never runs the whole history inline; identity_ledger_refresh_state holds no row until the first refresh commits, and that row, not the tables' emptiness, answers 'refreshed yet?', because a catalog with no events is empty too; reapplying the schema never empties a table",
@@ -286,6 +286,7 @@
         "identity_ledger_edition_events",
         "identity_ledger_edition_parents",
         "identity_ledger_work_summary",
+        "identity_ledger_work_summary_day",
         "identity_ledger_density"
       ],
       "privilege": "SECURITY INVOKER: the caller needs SELECT, INSERT, UPDATE, DELETE on IDENTITY_LEDGER_REFRESH_GRANTS and SELECT on the six sources. catalog-api connects as the login that owns public, like every service (deployment .env.example), and EXECUTE defaults to PUBLIC, so no grant is declared. The capture functions are SECURITY DEFINER, so a writer of a source needs no grant on the log",
@@ -374,6 +375,30 @@
             "work_id"
           ],
           "index": "idx_identity_ledger_work_summary_key"
+        }
+      },
+      "identity_ledger_work_summary_day": {
+        "columns": [
+          "work_id",
+          "event",
+          "day",
+          "prev_day",
+          "editions",
+          "first_event",
+          "last_event"
+        ],
+        "indexes": [
+          "idx_identity_ledger_work_summary_day_work ON public.identity_ledger_work_summary_day (work_id)"
+        ],
+        "meaning": "the works list's rollup per UTC day, for windows of full days. One row per work, event filter ('any', an event type, or the pseudo filter 'repaired' for reattached, promoted or reverted), day and prev_day; editions counts the work's editions with an event of that filter on that day, and prev_day is that edition's previous day with an event of the same filter, '-infinity' for its first. WINDOW RULE for full UTC days [a, b]: evented_editions = sum(editions) over event = F, day in [a, b] and prev_day < a, which counts an edition once at its first day in the window; repaired_editions = the same over event = 'repaired' when F = 'any', editions itself when F is a repair type, and 0 otherwise; first_event and last_event = min(first_event) and max(last_event) over every row of event F with day in [a, b]. Summing editions over days without the prev_day condition counts an edition once per day it has events",
+        "unique": {
+          "columns": [
+            "event",
+            "day",
+            "work_id",
+            "prev_day"
+          ],
+          "index": "idx_identity_ledger_work_summary_day_key"
         }
       },
       "identity_ledger_density": {

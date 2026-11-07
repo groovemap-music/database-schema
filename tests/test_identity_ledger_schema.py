@@ -27,6 +27,7 @@ _UNIQUE_KEYS = {
     "identity_ledger_edition_events": ("idx_identity_ledger_edition_events_key", "(edition_id, at, type)"),
     "identity_ledger_edition_parents": ("idx_identity_ledger_edition_parents_key", "(edition_id, work_id)"),
     "identity_ledger_work_summary": ("idx_identity_ledger_work_summary_key", "(event, work_id)"),
+    "identity_ledger_work_summary_day": ("idx_identity_ledger_work_summary_day_key", "(event, day, work_id, prev_day)"),
     "identity_ledger_density": ("idx_identity_ledger_density_key", "(kind, month, type, dated_from)"),
 }
 
@@ -118,6 +119,27 @@ class TestIdentityLedgerStatements:
         statement = _STATEMENTS["identity_ledger_verify function"]
         assert "'any'::text AS event" in statement
         assert "('reattached', 'promoted', 'reverted')" in statement
+
+    def test_the_day_rollup_chains_each_edition_to_its_previous_day_so_a_window_counts_it_once(self) -> None:
+        statement = _STATEMENTS["identity_ledger_work_summary_day table"]
+        assert "prev_day    DATE NOT NULL" in statement  # -infinity for an edition's first day, never NULL
+        verify = _STATEMENTS["identity_ledger_verify function"]
+        assert "lag(day) OVER (PARTITION BY work_id, edition_id ORDER BY day)" in verify
+        assert "lag(day) OVER (PARTITION BY work_id, edition_id, type ORDER BY day)" in verify
+        assert "'-infinity'::date" in verify
+        assert "(event.at AT TIME ZONE 'UTC')::date" in verify
+        assert "'repaired'" in verify
+
+    def test_the_day_rollup_is_maintained_for_dirty_works_and_rebuilt_whole(self) -> None:
+        for name in ("identity_ledger_maintain function", "identity_ledger_rebuild function"):
+            assert (
+                "INSERT INTO public.identity_ledger_work_summary_day (work_id, event, day, prev_day, editions, first_event, last_event)"
+                in _STATEMENTS[name]
+            )
+        assert (
+            "DELETE FROM public.identity_ledger_work_summary_day AS stored USING pg_temp.ledger_works AS dirty"
+            in _STATEMENTS["identity_ledger_maintain function"]
+        )
 
     def test_verify_recomputes_every_kind_in_one_statement(self) -> None:
         statement = _STATEMENTS["identity_ledger_verify function"]

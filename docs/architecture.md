@@ -322,6 +322,32 @@ An *edition* is a release-kind item resolved one hop through an open supersessio
   every event type, and one per work and event type. `repaired_editions` counts editions with a
   `reattached`, `promoted`, or `reverted` event. Unique on `(event, work_id)`, and indexed on
   `(event, last_event DESC, work_id)` for the page and on `(work_id)` for the refresh.
+- `identity_ledger_work_summary_day (work_id, event, day, prev_day, editions, first_event,
+  last_event)` — the works list's rollup per UTC day, for windows of full days (what the route
+  groups from the events otherwise: 2.09M events joined to 2.44M parents, 2.5 s on lux). `event`
+  is `'any'`, an event type, or the pseudo filter `'repaired'` (reattached, promoted, or
+  reverted). `editions` counts the work's editions with an event of that filter on that day.
+  `prev_day` is that edition's previous day with an event of the same filter, `-infinity` for
+  its first, so the key `(event, day, work_id, prev_day)` has no NULL. Indexed on `(work_id)`
+  for the refresh.
+
+  **Window rule.** The works list counts *distinct* editions in a window, so adding the days
+  would count an edition once per day it has events. For full UTC days `[a, b]`, per work and
+  event filter `F`:
+
+  - `evented_editions` = `sum(editions)` over `event = F`, `day` in `[a, b]`, and
+    `prev_day < a`. An edition counts once, at its first day in the window.
+  - `repaired_editions` = the same sum over `event = 'repaired'` when `F` is `'any'`; `editions`
+    itself when `F` is a repair type; `0` otherwise.
+  - `first_event` and `last_event` = `min(first_event)` and `max(last_event)` over every row of
+    `event = F` with `day` in `[a, b]`, whatever `prev_day` is.
+
+  A window with partial edge days reads the full days from here and the edge days from
+  `identity_ledger_edition_events`, and must count an edition with events in both once.
+  The integration suite holds the rule to a direct `GROUP BY` over the events for every window
+  over the fixture's days and every filter, with an edition whose events fall on two days.
+  The refresh adds this table to the same transaction: it replaces the dirty works' rows, and a
+  rebuild recomputes all of it. Its added cost is measured in CI (see the 9dcd bead).
 - `identity_ledger_density (kind, month, type, dated_from, events)` — events per UTC month,
   type, and provenance for each of `release`, `master`, `artist`, and `label`. Unlike the
   edition tables it counts mints, counts a supersession once rather than per side, and counts a
