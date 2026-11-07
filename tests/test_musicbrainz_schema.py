@@ -208,7 +208,7 @@ def test_the_natural_key_is_retired_only_after_the_hash_key_exists():
     assert "musicbrainz.relationship_key(" in index
     retire = statements["musicbrainz.relationships_natural_key retire"]
     # guarded: the constraint goes only when the hash index is unique, valid and ready
-    assert "DROP CONSTRAINT relationships_natural_key" in retire
+    assert "DROP CONSTRAINT IF EXISTS relationships_natural_key" in retire
     assert "indisunique AND indisvalid AND indisready" in retire
     assert "relationships_key" in retire
     names = [name for name, _ in _MUSICBRAINZ_TABLES]

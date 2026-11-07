@@ -2118,7 +2118,7 @@ _MUSICBRAINZ_TABLES: list[tuple[str, str]] = [
                 RETURN;
             END IF;
 
-            ALTER TABLE musicbrainz.relationships DROP CONSTRAINT relationships_natural_key;
+            ALTER TABLE musicbrainz.relationships DROP CONSTRAINT IF EXISTS relationships_natural_key;
         END
         $retire_mb_rel_natural_key$""",
     ),

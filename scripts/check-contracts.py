@@ -110,7 +110,7 @@ assert f"{function_name}(" in key_index and all(column in key_index for column i
 retired_key = relationship_key["retired"]
 assert retired_key["relation"] == "musicbrainz.relationships"
 retire_statement = musicbrainz_statements[retired_key["statement"]]
-assert f"DROP CONSTRAINT {retired_key['constraint']}" in retire_statement
+assert f"DROP CONSTRAINT IF EXISTS {retired_key['constraint']}" in retire_statement
 assert "indisunique AND indisvalid AND indisready" in retire_statement
 # Never recreated: neither the table's own statement nor any migration declares the constraint.
 for name, statement in _MUSICBRAINZ_TABLES:
