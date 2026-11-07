@@ -2,6 +2,28 @@
 
 All notable changes to the GrooveMap database schema will be documented here.
 
+## v0.9.0 (2026-11-06)
+
+### Release notes
+
+Breaking: `relationships_natural_key` is dropped, and `relationships_key` (hash) is the only key. Apply this before MusicBrainz is enabled, and only with musicbrainz-sql-loader v0.6.0 or later as the writer: an older writer's upserts fail. The drop is guarded and instant on an empty table.
+
+### BREAKING CHANGE
+
+- an ON CONFLICT (source_mbid, target_mbid, source_entity_type,
+target_entity_type, relationship_type, begin_date, end_date, attributes)
+target on musicbrainz.relationships fails with "there is no unique or
+exclusion constraint matching the ON CONFLICT specification". Deploy
+musicbrainz-sql-loader v0.6.0 or later first.
+
+### Feat
+
+- **postgres**: retire the MusicBrainz relationships natural-key constraint
+
+### Fix
+
+- **postgres**: guard the natural-key drop with IF EXISTS
+
 ## v0.8.0 (2026-11-06)
 
 ### Release notes
