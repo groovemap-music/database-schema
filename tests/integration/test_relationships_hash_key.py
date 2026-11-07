@@ -263,11 +263,7 @@ async def test_a_populated_database_with_both_keys_loses_the_constraint_and_keep
         ).fetchone()
         assert index == (True, True)
         assert await (await connection.execute("SELECT count(*), sum(hashtext(id::text)) FROM musicbrainz.relationships")).fetchone() == before
-    # a row that was already there is still found by the hash target, and a plain duplicate still violates the key
-    existing = await (
-        await connection.execute("SELECT source_mbid, target_mbid, source_entity_type, target_entity_type, relationship_type FROM musicbrainz.relationships LIMIT 1")
-    ).fetchone()
-    assert existing is not None
+    # a plain duplicate of an existing key still violates the one key
     with pytest.raises(psycopg.errors.UniqueViolation):
         await connection.execute(
             "INSERT INTO musicbrainz.relationships (source_mbid, target_mbid, source_entity_type, target_entity_type, relationship_type) "

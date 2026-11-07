@@ -148,7 +148,9 @@ async def test_no_index_leads_with_source_mbid_and_the_lookup_is_still_an_index_
     ).fetchall()
     assert leading == []
     await _seed(connection)
-    source = (await (await connection.execute("SELECT source_mbid FROM musicbrainz.relationships ORDER BY id LIMIT 1 OFFSET 100")).fetchone() or (None,))[0]
+    source = (
+        await (await connection.execute("SELECT source_mbid FROM musicbrainz.relationships ORDER BY id LIMIT 1 OFFSET 100")).fetchone() or (None,)
+    )[0]
     rows, median_ms, plan = await _lookup(connection, source)
     print(f"\nsource_mbid lookup through the endpoint index: {median_ms:.3f} ms median, {len(rows)} row(s)")
     assert rows
