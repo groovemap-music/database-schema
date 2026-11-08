@@ -71,6 +71,7 @@ EXPECTED_POSTGRES_TABLES = {
         "loader_extraction_latch",
         "loader_derived_refresh_cursor",
         "loader_derived_refresh_job",
+        "master_search",
         "masters",
         "oauth_tokens",
         "observations",
