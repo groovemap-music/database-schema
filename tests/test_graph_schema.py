@@ -643,6 +643,14 @@ class TestEdgeViews:
         assert "role_category text GENERATED ALWAYS AS (graph.credit_role_category(role)) STORED" in statement
         assert any(statement.endswith("(role_category, release_id)") for statement in index_statements_for("credited_on"))
 
+    def test_credited_on_pins_its_release_id_distinct_estimate_as_a_row_fraction(self) -> None:
+        """A sampled `ANALYZE` under-counts clustered release ids 5x on lux, so the fraction is declared."""
+        statements = [sql for name, sql in _GRAPH_STATEMENTS if name == "graph.credited_on.release_id n_distinct"]
+        assert statements == ["ALTER TABLE graph.credited_on ALTER COLUMN release_id SET (n_distinct = -0.145)"]
+        table = next(index for index, (name, _) in enumerate(_GRAPH_STATEMENTS) if name == "graph.credited_on table")
+        pinned = next(index for index, (name, _) in enumerate(_GRAPH_STATEMENTS) if name == "graph.credited_on.release_id n_distinct")
+        assert table < pinned
+
     def test_source_stays_in_the_key_of_both_provider_written_edges(self) -> None:
         """Two providers write the same edge and must not collide, as ADR 0011 has it."""
         for relation in ("credited_to", "issued_on"):
