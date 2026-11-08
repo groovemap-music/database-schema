@@ -466,12 +466,15 @@ class TestCreatePostgresSchema:
             # A retirement is `DROP TABLE IF EXISTS`: the guard makes it a no-op
             # once the table is gone, which the DROP guard below also checks.
             retirement = upper.startswith("DROP TABLE IF EXISTS ")
+            # A column storage option: setting the same value again changes nothing.
+            statistics_option = "ALTER COLUMN" in upper and " SET (N_DISTINCT = " in upper
             exempt = (
                 ("ALTER COLUMN" in upper and "TYPE " in upper)
                 or "CREATE OR REPLACE" in upper
                 or guarded_block
                 or read_only
                 or retirement
+                or statistics_option
                 or session_setting
             )
             if not exempt:

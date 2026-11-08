@@ -3552,6 +3552,29 @@ def _table_index(relation: str, suffix: str, columns: str) -> tuple[str, str]:
     return (f"graph.{index} index", f"CREATE INDEX IF NOT EXISTS {index} ON graph.{relation} ({columns})")
 
 
+# `ANALYZE` estimates `n_distinct` for a column from a 30,000-row sample, and for
+# `graph.credited_on.release_id` it reads that sample as few releases: on lux
+# (2026-11-07, 71.8M rows) it stored 1.93M distinct values where `count(DISTINCT)`
+# finds 10.43M (9.71M under the four kept categories). Credits cluster on a release
+# (about 6.9 rows each), so most sampled releases show up once and the estimator
+# cannot see the many it missed. The planner then sized the `SELECT DISTINCT
+# release_id` the analytics embedding pipeline runs (`_CREDITED_RELEASE_IDS_SQL`)
+# at 1.93M groups, 5x short, and its HashAggregate spilled 1.04 GB to temp in 29.7 s.
+# A negative `n_distinct` is a fraction of the row count, so the declaration holds as
+# the table grows; 0.145 is lux's measured 10.43M / 71.81M. It is a catalog-only
+# change that the next `ANALYZE` applies: no table rewrite, only a SHARE UPDATE
+# EXCLUSIVE lock, and a no-op when repeated.
+_RELEASE_ID_DISTINCT_FRACTION = 0.145
+
+
+def _release_id_distinct_statement(relation: str) -> tuple[str, str]:
+    """Return the statement pinning RELATION's `release_id` distinct-value estimate."""
+    return (
+        f"graph.{relation}.release_id n_distinct",
+        f"ALTER TABLE graph.{relation} ALTER COLUMN release_id SET (n_distinct = -{_RELEASE_ID_DISTINCT_FRACTION})",
+    )
+
+
 def _trigram_index(relation: str, column: str) -> tuple[str, str]:
     """Return the extension-guarded GIN trigram index autocomplete reads."""
     index = f"{relation}_{column}_trgm"
@@ -4016,6 +4039,8 @@ def _edge_table_statements() -> list[tuple[str, str]]:
         if reverse is not None:
             statements.append(_table_index(relation, "reverse", reverse))
         statements.extend(_table_index(relation, suffix, index_columns) for suffix, index_columns in extras)
+        if relation == "credited_on":
+            statements.append(_release_id_distinct_statement(relation))
     return statements
 
 

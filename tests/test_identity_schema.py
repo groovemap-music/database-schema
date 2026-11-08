@@ -384,6 +384,7 @@ _GRAPH_STATEMENT_NAMES = frozenset(
         "graph.credited_on table",
         "graph.credited_on_key index",
         "graph.credited_on_role_category index",
+        "graph.credited_on.release_id n_distinct",
         "graph.same_as table",
         "graph.same_as_key index",
         "graph.same_as_person_name_hash index",
