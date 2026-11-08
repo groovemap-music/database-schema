@@ -23,6 +23,11 @@ from groovemap_schema.postgres import (
 _STATEMENTS = dict(_RELEASE_SEARCH_STATEMENTS)
 _TRIGGERS = _STATEMENTS["releases release_search capture triggers"]
 _BACKFILL = _STATEMENTS["release_search_backfill procedure"]
+_BACKFILL_STEPS = {
+    name: _STATEMENTS[f"{name} function"]
+    for name in ("release_search_backfill_pages", "release_search_backfill_find_missing", "release_search_backfill_add_missing")
+}
+_WRITING_STEPS = (_BACKFILL_STEPS["release_search_backfill_pages"], _BACKFILL_STEPS["release_search_backfill_add_missing"])
 _CAPTURE_FUNCTIONS = [name.removesuffix(" function") for name in _STATEMENTS if name.startswith("release_search_capture_")]
 
 
@@ -44,11 +49,11 @@ class TestTheVector:
         for name, alias in (
             ("release_search_capture_inserted function", "n"),
             ("release_search_capture_updated function", "NEW"),
-            ("release_search_backfill procedure", "r"),
+            ("release_search_backfill_pages function", "r"),
+            ("release_search_backfill_add_missing function", "r"),
             ("release_search_drift function", "r"),
         ):
             assert _release_title_tsvector(alias) in _STATEMENTS[name], name
-        assert _BACKFILL.count(_release_title_tsvector("r")) == 2
 
     def test_the_table_is_one_narrow_row_per_release_keyed_like_releases(self) -> None:
         table = _STATEMENTS["release_search table"]
@@ -107,18 +112,31 @@ class TestTheBackfill:
         assert "CREATE OR REPLACE PROCEDURE public.release_search_backfill(batch_pages integer DEFAULT 1000, first_page bigint DEFAULT 0)" in header
         assert "SECURITY DEFINER" not in header
         assert "\nSET " not in header
-        assert _BACKFILL.count("COMMIT;") >= 3
+        assert _BACKFILL.count("COMMIT;") == 3
+        assert _BACKFILL.rstrip().endswith("REVOKE ALL ON PROCEDURE public.release_search_backfill(integer, bigint) FROM PUBLIC")
+
+    def test_the_procedure_runs_no_sql_of_its_own_beyond_its_pinned_steps(self) -> None:
+        """Its search_path is the caller's, so a schema there could substitute `to_tsvector` or `->>`."""
+        body = _BACKFILL.split("AS $release_search_backfill$", 1)[1]
+        for fragment in ("to_tsvector", "->>", "INSERT", "DELETE", "SELECT", "CREATE", "DROP", "format("):
+            assert fragment not in body, fragment
+        for name, step in _BACKFILL_STEPS.items():
+            assert f"public.{name}(" in body, name
+            assert "SET search_path = pg_catalog, pg_temp" in step, name
+            assert "SECURITY DEFINER" not in step, name
+            assert re.search(rf"REVOKE ALL ON FUNCTION public\.{name}\([a-z, ]*\) FROM PUBLIC\s*$", step), name
 
     def test_every_batch_takes_the_lock_before_it_writes(self) -> None:
-        inserts = [match.start() for match in re.finditer(r"INSERT INTO public\.release_search", _BACKFILL)]
-        locks = [match.start() for match in re.finditer(r"PERFORM public\.release_search_backfill_lock\(\);", _BACKFILL)]
-        assert len(inserts) == len(locks) == 2
-        assert all(lock < insert for lock, insert in zip(locks, inserts, strict=True))
+        for step in _WRITING_STEPS:
+            assert step.index("PERFORM public.release_search_backfill_lock();") < step.index("INSERT INTO public.release_search")
+            assert step.count("ON CONFLICT (release_id) DO NOTHING") == 1
 
     def test_it_reads_in_heap_order_then_sweeps_what_moved(self) -> None:
-        assert "r.ctid >= pg_catalog.format('(%s,0)', page)::tid" in _BACKFILL
-        assert "NOT EXISTS (SELECT 1 FROM public.release_search AS s WHERE s.release_id = r.data_id)" in _BACKFILL
-        assert _BACKFILL.count("ON CONFLICT (release_id) DO NOTHING") == 2
+        assert "r.ctid >= format('(%s,0)', first_page)::tid" in _BACKFILL_STEPS["release_search_backfill_pages"]
+        assert (
+            "NOT EXISTS (SELECT 1 FROM public.release_search AS s WHERE s.release_id = r.data_id)"
+            in (_BACKFILL_STEPS["release_search_backfill_find_missing"])
+        )
 
     def test_the_lock_never_blocks_a_reader_and_waits_in_bounded_tries(self) -> None:
         lock = _STATEMENTS["release_search_backfill_lock function"]
@@ -144,7 +162,7 @@ class TestPlacementAndRollback:
     def test_the_rollback_removes_every_object_the_statements_create(self) -> None:
         script = "\n".join(RELEASE_SEARCH_ROLLBACK_STATEMENTS)
         created = re.findall(r"CREATE OR REPLACE (?:FUNCTION|PROCEDURE) (public\.\w+)\(", "\n".join(_STATEMENTS.values()))
-        assert len(created) == 7
+        assert len(created) == 10
         for name in created:
             assert re.search(rf"DROP (?:FUNCTION|PROCEDURE) IF EXISTS {re.escape(name)}\(", script), name
         for operation in _RELEASE_SEARCH_TRIGGERS:

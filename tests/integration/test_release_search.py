@@ -254,3 +254,31 @@ async def test_a_capture_function_attached_to_another_table_refuses_to_run(datab
         database,
         "SELECT count(*) FROM pg_proc WHERE proname LIKE 'release\\_search\\_capture\\_%' AND has_function_privilege('public', oid, 'EXECUTE')",
     ) == [(0,)]
+
+
+async def test_a_function_planted_on_the_callers_search_path_cannot_change_the_backfill(database: str) -> None:
+    """The procedure runs under the caller's search_path; its SQL runs in steps that pin theirs."""
+    await _without_triggers(database, {str(i): _document(i, _TITLES[i % len(_TITLES)]) for i in range(1, 101)})
+    await _rows(database, "CREATE SCHEMA planted")
+    await _rows(
+        database,
+        "CREATE FUNCTION planted.to_tsvector(text, text) RETURNS tsvector LANGUAGE sql AS $$ SELECT 'planted'::tsvector $$",
+    )
+    async with await psycopg.AsyncConnection.connect(**_params(database), autocommit=True) as connection:
+        await connection.execute("SET search_path = planted, public")
+        # The plant does win for unqualified SQL on this path, so the test below is not vacuous.
+        cursor = await connection.execute("SELECT to_tsvector('english', 'love')::text")
+        assert await cursor.fetchone() == ("'planted'",)
+        await connection.execute("CALL public.release_search_backfill(1)")
+    assert await _exact(database)
+    assert await _rows(database, "SELECT count(*) FROM release_search WHERE title_tsv = 'planted'::tsvector") == [(0,)]
+
+
+async def test_public_cannot_run_the_backfill_or_its_steps(database: str) -> None:
+    assert (
+        await _rows(
+            database,
+            "SELECT proname FROM pg_proc WHERE proname LIKE 'release\\_search\\_backfill%' AND has_function_privilege('public', oid, 'EXECUTE')",
+        )
+        == []
+    )

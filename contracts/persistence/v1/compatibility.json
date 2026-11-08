@@ -1179,7 +1179,7 @@
     "database-schema"
   ],
   "release_search": {
-    "backfill": "CALL public.release_search_backfill(batch_pages integer DEFAULT 1000, first_page bigint DEFAULT 0), run once by the operator outside a transaction block; the initializer never runs it. Each batch takes SHARE on public.release_search (never a lock on releases beyond a read's ACCESS SHARE), so readers never block and a load's trigger waits at most one batch; first_page resumes from its last progress notice; rerunning it is harmless",
+    "backfill": "CALL public.release_search_backfill(batch_pages integer DEFAULT 1000, first_page bigint DEFAULT 0), run once by the operator outside a transaction block; the initializer never runs it. Each batch takes SHARE on public.release_search (never a lock on releases beyond a read's ACCESS SHARE), so readers never block and a load's trigger waits at most one batch; first_page resumes from its last progress notice; rerunning it is harmless; its SQL runs in step functions with a pinned search_path, and PUBLIC has no EXECUTE on it or them",
     "columns": {
       "release_id": "VARCHAR PRIMARY KEY, equal to releases.data_id",
       "title_tsv": "TSVECTOR NOT NULL"

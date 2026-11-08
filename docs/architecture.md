@@ -1323,6 +1323,11 @@ changes a vector between the batch's read and its commit. Without it, the backfi
 against a concurrent load, and so did the load. A load during a backfill therefore waits up to one
 batch, about 0.35 s, per statement. Prefer a quiet window.
 
+A procedure that commits can't pin its `search_path`, so it runs no SQL of its own. It only calls
+three step functions that hold every statement and pin `search_path = pg_catalog, pg_temp`. A
+`to_tsvector` or `->>` planted in a schema on the caller's path therefore can't take the place of
+the real ones. PUBLIC has no EXECUTE on the procedure or its steps.
+
 Afterwards, `SELECT * FROM public.release_search_drift();` returns `(0, 0, 0)`: no release
 missing, no vector without a release, none stale. Its `stale` count recomputes every vector, so it
 reads every document once, as pass 1 does.

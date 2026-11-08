@@ -241,10 +241,13 @@ class Generator:
 def main(dsn: str, first: int, count: int, seed: int) -> None:
     generator = Generator(seed)
     with psycopg.connect(dsn) as connection, connection.cursor() as cursor:
+        # Parallel copies would otherwise race on CREATE TABLE IF NOT EXISTS.
+        cursor.execute("SELECT pg_advisory_xact_lock(hashtext('generate.py releases'))")
         cursor.execute(
             "CREATE TABLE IF NOT EXISTS releases (data_id VARCHAR PRIMARY KEY, hash VARCHAR NOT NULL, data JSONB NOT NULL, "
             "updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), gm_item_id UUID, media JSONB)"
         )
+        connection.commit()
         with cursor.copy("COPY releases (data_id, hash, data) FROM STDIN") as copy:
             for data_id in range(first, first + count):
                 text = json.dumps(generator.document(data_id), separators=(",", ":"))

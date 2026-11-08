@@ -7309,12 +7309,35 @@ BEGIN
         END;
     END LOOP;
 END
-$release_search_backfill_lock$
+$release_search_backfill_lock$;
+REVOKE ALL ON FUNCTION public.release_search_backfill_lock() FROM PUBLIC
 """
 
 
-def _release_search_backfill_procedure() -> str:
-    """Return the procedure that fills `release_search` for the releases already there.
+def _release_search_backfill_step(name: str, signature: str, returns: str, body: str) -> tuple[str, str]:
+    """Return one backfill step: a function holding all of a batch's SQL, with a pinned search_path.
+
+    The procedure cannot pin its own search_path (a procedure with a SET clause cannot COMMIT),
+    so it runs no SQL of its own beyond calling these. SECURITY INVOKER: the caller writes as
+    themselves. PUBLIC loses EXECUTE; only the schema owner runs a backfill.
+    """
+    return (
+        f"{name} function",
+        f"""
+CREATE OR REPLACE FUNCTION public.{name}({signature})
+RETURNS {returns}
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS ${name}$
+{body}
+${name}$;
+REVOKE ALL ON FUNCTION public.{name}({", ".join(argument.split()[1] for argument in signature.split(", ")) if signature else ""}) FROM PUBLIC
+""",
+    )
+
+
+def _release_search_backfill_statements() -> list[tuple[str, str]]:
+    """Return the procedure that fills `release_search` for the releases already there, and its steps.
 
     Two passes of short transactions, each holding `release_search_backfill_lock()`, so no
     snapshot is held for hours, the only lock on `releases` is the ACCESS SHARE of a read, and
@@ -7328,65 +7351,97 @@ def _release_search_backfill_procedure() -> str:
        refresh) fires no trigger and may have moved behind pass 1; one statement's snapshot
        sees every row exactly once, wherever it is.
 
-    SECURITY INVOKER and with no SET clause, which a procedure needs to COMMIT; it names every
-    object with its schema instead. Run it with CALL outside a transaction block.
+    The procedure is SECURITY INVOKER with no SET clause, which it needs to COMMIT. Every
+    statement that names a function or an operator runs in a step function with a pinned
+    search_path, so a schema on the caller's search_path cannot substitute its own `to_tsvector`
+    or `->>`. Run it with CALL outside a transaction block.
     """
     tsvector = _release_title_tsvector("r")
-    return f"""
+    pages = _release_search_backfill_step(
+        "release_search_backfill_pages",
+        "first_page bigint, page_count integer",
+        "void",
+        f"""BEGIN
+    PERFORM public.release_search_backfill_lock();
+    INSERT INTO public.release_search (release_id, title_tsv)
+    SELECT r.data_id, {tsvector}
+    FROM public.releases AS r
+    WHERE r.ctid >= format('(%s,0)', first_page)::tid
+      AND r.ctid < format('(%s,0)', first_page + page_count)::tid
+    ON CONFLICT (release_id) DO NOTHING;
+END""",  # noqa: S608 -- composed of module constants only
+    )
+    find_missing = _release_search_backfill_step(
+        "release_search_backfill_find_missing",
+        "",
+        "bigint",
+        """BEGIN
+    IF to_regclass('pg_temp.release_search_missing') IS NOT NULL THEN
+        DROP TABLE IF EXISTS pg_temp.release_search_missing;
+    END IF;
+    CREATE TEMPORARY TABLE release_search_missing AS
+    SELECT r.data_id FROM public.releases AS r
+    WHERE NOT EXISTS (SELECT 1 FROM public.release_search AS s WHERE s.release_id = r.data_id);
+    RETURN (SELECT count(*) FROM pg_temp.release_search_missing);
+END""",
+    )
+    add_missing = _release_search_backfill_step(
+        "release_search_backfill_add_missing",
+        "batch_rows integer",
+        "boolean",
+        f"""BEGIN
+    PERFORM public.release_search_backfill_lock();
+    WITH batch AS (
+        DELETE FROM pg_temp.release_search_missing
+        WHERE ctid IN (SELECT ctid FROM pg_temp.release_search_missing LIMIT batch_rows)
+        RETURNING data_id
+    )
+    INSERT INTO public.release_search (release_id, title_tsv)
+    SELECT r.data_id, {tsvector}
+    FROM public.releases AS r JOIN batch ON batch.data_id = r.data_id
+    ON CONFLICT (release_id) DO NOTHING;
+    IF EXISTS (SELECT 1 FROM pg_temp.release_search_missing) THEN
+        RETURN true;
+    END IF;
+    DROP TABLE IF EXISTS pg_temp.release_search_missing;
+    RETURN false;
+END""",  # noqa: S608 -- composed of module constants only
+    )
+    procedure = """
 CREATE OR REPLACE PROCEDURE public.release_search_backfill(batch_pages integer DEFAULT 1000, first_page bigint DEFAULT 0)
 LANGUAGE plpgsql
 AS $release_search_backfill$
 DECLARE
-    pages bigint := pg_catalog.pg_relation_size('public.releases') / pg_catalog.current_setting('block_size')::bigint;
+    pages bigint := pg_catalog.pg_relation_size('public.releases'::pg_catalog.regclass) / pg_catalog.current_setting('block_size')::bigint;
     page bigint := first_page;
     batches bigint := 0;
     missing bigint;
+    more boolean := true;
 BEGIN
     IF batch_pages IS NULL OR batch_pages < 1 THEN
         RAISE EXCEPTION 'batch_pages must be positive, not %', batch_pages;
     END IF;
     WHILE page < pages LOOP
-        PERFORM public.release_search_backfill_lock();
-        INSERT INTO public.release_search (release_id, title_tsv)
-        SELECT r.data_id, {tsvector}
-        FROM public.releases AS r
-        WHERE r.ctid >= pg_catalog.format('(%s,0)', page)::tid
-          AND r.ctid < pg_catalog.format('(%s,0)', page + batch_pages)::tid
-        ON CONFLICT (release_id) DO NOTHING;
+        PERFORM public.release_search_backfill_pages(page, batch_pages);
         page := page + batch_pages;
         COMMIT;
         batches := batches + 1;
-        IF batches % 100 = 0 THEN
+        IF pg_catalog.mod(batches, 100) = 0 THEN
             RAISE NOTICE 'release_search backfill: % of % heap pages read', page, pages;
         END IF;
     END LOOP;
-    IF pg_catalog.to_regclass('pg_temp.release_search_missing') IS NOT NULL THEN
-        DROP TABLE pg_temp.release_search_missing;
-    END IF;
-    CREATE TEMPORARY TABLE release_search_missing AS
-    SELECT r.data_id FROM public.releases AS r
-    WHERE NOT EXISTS (SELECT 1 FROM public.release_search AS s WHERE s.release_id = r.data_id);
-    SELECT count(*) INTO missing FROM pg_temp.release_search_missing;
+    missing := public.release_search_backfill_find_missing();
     COMMIT;
-    WHILE EXISTS (SELECT 1 FROM pg_temp.release_search_missing) LOOP
-        PERFORM public.release_search_backfill_lock();
-        WITH batch AS (
-            DELETE FROM pg_temp.release_search_missing
-            WHERE ctid IN (SELECT ctid FROM pg_temp.release_search_missing LIMIT 10000)
-            RETURNING data_id
-        )
-        INSERT INTO public.release_search (release_id, title_tsv)
-        SELECT r.data_id, {tsvector}
-        FROM public.releases AS r JOIN batch ON batch.data_id = r.data_id
-        ON CONFLICT (release_id) DO NOTHING;
+    WHILE more LOOP
+        more := public.release_search_backfill_add_missing(10000);
         COMMIT;
     END LOOP;
-    DROP TABLE IF EXISTS pg_temp.release_search_missing;
-    COMMIT;
     RAISE NOTICE 'release_search backfill: % heap pages read, % releases added after them', pages, missing;
 END
-$release_search_backfill$
-"""  # noqa: S608 -- composed of module constants only
+$release_search_backfill$;
+REVOKE ALL ON PROCEDURE public.release_search_backfill(integer, bigint) FROM PUBLIC
+"""
+    return [pages, find_missing, add_missing, ("release_search_backfill procedure", procedure)]
 
 
 def _release_search_drift_function() -> str:
@@ -7475,7 +7530,7 @@ _RELEASE_SEARCH_STATEMENTS: list[tuple[str, str]] = [
     ),
     _release_search_capture_function("release_search_capture_truncated", "    TRUNCATE public.release_search;"),
     ("release_search_backfill_lock function", _release_search_backfill_lock_function()),
-    ("release_search_backfill procedure", _release_search_backfill_procedure()),
+    *_release_search_backfill_statements(),
     ("release_search_drift function", _release_search_drift_function()),
     ("releases release_search capture triggers", _release_search_triggers()),
 ]
@@ -7487,6 +7542,9 @@ RELEASE_SEARCH_ROLLBACK_STATEMENTS: tuple[str, ...] = (
     *(f"DROP FUNCTION IF EXISTS public.release_search_capture_{event}()" for event in ("inserted", "updated", "deleted", "truncated")),
     "DROP FUNCTION IF EXISTS public.release_search_drift()",
     "DROP PROCEDURE IF EXISTS public.release_search_backfill(integer, bigint)",
+    "DROP FUNCTION IF EXISTS public.release_search_backfill_pages(bigint, integer)",
+    "DROP FUNCTION IF EXISTS public.release_search_backfill_find_missing()",
+    "DROP FUNCTION IF EXISTS public.release_search_backfill_add_missing(integer)",
     "DROP FUNCTION IF EXISTS public.release_search_backfill_lock()",
     "DROP TABLE IF EXISTS public.release_search",
 )
