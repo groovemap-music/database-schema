@@ -16,6 +16,7 @@ from groovemap_schema.postgres import (
     _MUSICBRAINZ_TABLES,
     _PATH_RELATIONS,
     _PATH_RELATIONSHIP_TYPES,
+    _RELEASE_SEARCH_STATEMENTS,
     _USER_TABLES,
     _VERTEX_KIND_NAMES,
     EXPLORE_DEFAULT_HOPS,
@@ -28,6 +29,9 @@ from groovemap_schema.postgres import (
     PATH_MAX_DEPTH,
     PATH_MIN_DEPTH,
     PATH_SEEN_RELATION,
+    RELEASE_SEARCH_INDEX,
+    RELEASE_SEARCH_TABLE,
+    RELEASE_TITLE_TSVECTOR,
     _entity_schema_statements,
 )
 
@@ -138,6 +142,33 @@ assert source["check"]["null_allowed"] is True
 assert f"c.conname = '{source['check']['constraint']}'" in user_statements["extraction_history.source check"]
 assert f"CHECK ({source['column']} IN ({allowed}))" in user_statements["extraction_history.source check"]
 assert source["index"] == user_statements["idx_extraction_history_source_created_at"].removeprefix("CREATE INDEX IF NOT EXISTS ")
+
+# catalog-api ranks release titles by public.release_search (gm-database-schema-fi4a): pin
+# its columns, index, vector, maintenance, and the procedures the operator calls.
+release_search = contract["release_search"]
+release_search_statements = dict(_RELEASE_SEARCH_STATEMENTS)
+assert release_search["kind"] == "additive"
+assert release_search["introduced_in_contract_version"] == contract["version"]
+assert release_search["consumers"] == ["catalog-api"]
+assert release_search["relation"] == RELEASE_SEARCH_TABLE
+release_search_table = " ".join(release_search_statements["release_search table"].split())
+for column, declaration in release_search["columns"].items():
+    column_type = declaration.split(",", 1)[0]
+    assert re.search(rf"\b{column}\s+{re.escape(column_type)}", release_search_table), column
+assert release_search["index"] == release_search_statements[RELEASE_SEARCH_INDEX].removeprefix("CREATE INDEX IF NOT EXISTS ")
+assert release_search["vector"].startswith(f"{RELEASE_TITLE_TSVECTOR} of the release's data")
+assert release_search["backfill"].startswith("CALL public.release_search_backfill(batch_pages integer DEFAULT 1000, first_page bigint DEFAULT 0)")
+assert (
+    "CREATE OR REPLACE PROCEDURE public.release_search_backfill(batch_pages integer DEFAULT 1000, first_page bigint DEFAULT 0)"
+    in (release_search_statements["release_search_backfill procedure"])
+)
+drift_signature = release_search["drift"].split(";", 1)[0]
+assert drift_signature == "public.release_search_drift() RETURNS TABLE (missing bigint, orphaned bigint, stale bigint)"
+assert (
+    "CREATE OR REPLACE FUNCTION public.release_search_drift()\nRETURNS TABLE (missing bigint, orphaned bigint, stale bigint)"
+    in (release_search_statements["release_search_drift function"])
+)
+assert "AFTER UPDATE OF data_id, data ON public.releases" in release_search_statements["releases release_search capture triggers"]
 
 # Catalog-item supersession (ADR 0009's 2026-09-25 amendment) is consumed by
 # catalog-api's merge steps, so every column, cause, key, and index the contract

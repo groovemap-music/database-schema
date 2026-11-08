@@ -15,6 +15,7 @@ from groovemap_schema.postgres import (
     _IDENTITY_LEDGER_STATEMENTS,
     _MUSICBRAINZ_INDEXES,
     _MUSICBRAINZ_TABLES,
+    _RELEASE_SEARCH_STATEMENTS,
     _USER_TABLES,
     _entity_schema_statements,
     _schema_statements,
@@ -466,6 +467,10 @@ _IDENTITY_LEDGER_STATEMENT_NAMES = frozenset(
         *(name for name, _statement in _IDENTITY_LEDGER_STATEMENTS),
     }
 )
+
+# The stored release title vector (gm-database-schema-fi4a), declared after the entity indexes;
+# tests/test_release_search_schema.py covers it.
+_RELEASE_SEARCH_STATEMENT_NAMES = frozenset(name for name, _statement in _RELEASE_SEARCH_STATEMENTS)
 
 
 def _user_tables() -> dict[str, str]:
@@ -1102,12 +1107,24 @@ class TestLegacyStatementsUnchanged:
 
     def test_legacy_names_are_intact_and_ordered(self) -> None:
         names = [name for name, _stmt in _schema_statements()]
-        added = _ADDED_STATEMENT_NAMES | _GRAPH_STATEMENT_NAMES | _ADDED_MUSICBRAINZ_INDEX_NAMES | _IDENTITY_LEDGER_STATEMENT_NAMES
+        added = (
+            _ADDED_STATEMENT_NAMES
+            | _GRAPH_STATEMENT_NAMES
+            | _ADDED_MUSICBRAINZ_INDEX_NAMES
+            | _IDENTITY_LEDGER_STATEMENT_NAMES
+            | _RELEASE_SEARCH_STATEMENT_NAMES
+        )
         surviving = [name for name in names if name not in added]
         assert surviving == _LEGACY_STATEMENT_NAMES
 
     def test_no_legacy_name_was_reused_for_a_new_statement(self) -> None:
-        added = _ADDED_STATEMENT_NAMES | _GRAPH_STATEMENT_NAMES | _ADDED_MUSICBRAINZ_INDEX_NAMES | _IDENTITY_LEDGER_STATEMENT_NAMES
+        added = (
+            _ADDED_STATEMENT_NAMES
+            | _GRAPH_STATEMENT_NAMES
+            | _ADDED_MUSICBRAINZ_INDEX_NAMES
+            | _IDENTITY_LEDGER_STATEMENT_NAMES
+            | _RELEASE_SEARCH_STATEMENT_NAMES
+        )
         assert not (added & set(_LEGACY_STATEMENT_NAMES))
 
     def test_declared_graph_names_match_the_schema(self) -> None:

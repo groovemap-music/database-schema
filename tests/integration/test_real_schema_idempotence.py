@@ -76,6 +76,7 @@ EXPECTED_POSTGRES_TABLES = {
         "observations",
         "owned_copies",
         "provider_aliases",
+        "release_search",
         "releases",
         "sync_history",
         "user_collections",
