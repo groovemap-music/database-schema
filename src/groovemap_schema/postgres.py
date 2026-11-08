@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 from common.credit_roles import ROLE_CATEGORIES
@@ -19,7 +20,7 @@ from psycopg import sql
 
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator
+    from collections.abc import Callable, Iterable, Iterator
     from datetime import date
 
 
@@ -7203,7 +7204,7 @@ _MUSICBRAINZ_RETIRED_INDEXES: list[tuple[str, str]] = [
 ]
 
 
-# ── Release title search vector (gm-database-schema-fi4a) ──
+# ── Title search side tables (gm-database-schema-fi4a, gm-database-schema-nu0c) ──
 # Ranking a common title term ("love": 497k of 19.6M releases on lux) had to compute
 # `to_tsvector` for every match, which detoasts the whole `releases.data` document per match
 # (about 4.7 buffers each, 54 GB of toast). `public.release_search` stores that vector, one
@@ -7212,47 +7213,94 @@ _MUSICBRAINZ_RETIRED_INDEXES: list[tuple[str, str]] = [
 # and filling a column rewrites every release row (19.6M new tuples, each inserted into every
 # index on `releases`), while the side table is created empty and filled without writing to
 # `releases` at all. See docs/architecture.md, "Release title search vector".
+# `public.master_search` is the same design for `masters` (gm-database-schema-nu0c), carrying
+# the master's year for the decade facet as well; see "Master title search vector".
 #
-# The vector is `RELEASE_TITLE_TSVECTOR` of the release's `data`, always. Triggers on
-# `releases` keep it current, so no loader changes:
+# Each side table is declared once, as a `_SearchSideTable`, and every statement below is
+# generated from that declaration, so the two tables share one implementation. A carried
+# column is always its expression over the entity row's `data`. Triggers on the entity table
+# keep it current, so no loader changes:
 #
 # - insert: one set-based upsert per statement over its transition table;
-# - update: per row, and only when the statement sets `data_id` or `data`. The loader's
-#   `updated_at` refresh of every unchanged record and its media and identity backfills set
-#   neither, so they pay nothing. A statement trigger cannot name columns and would
-#   recompute, and detoast, every one of those rows;
+# - update: per row, and only when the statement sets one of `watched` (`data_id` or `data`).
+#   The loader's `updated_at` refresh of every unchanged record and its media and identity
+#   backfills set neither, so they pay nothing. A statement trigger cannot name columns and
+#   would recompute, and detoast, every one of those rows;
 # - delete: one set-based delete per statement (the loader's stale-row purge);
 # - truncate: empties the side table.
 #
-# The capture functions are SECURITY DEFINER, so a role that may write `releases` needs no
-# grant on `release_search`. Existing releases are filled by `CALL
-# public.release_search_backfill()`, which the operator runs once; the initializer does not,
-# because on lux it reads every document once, about a quarter of an hour (see the
-# architecture notes).
-RELEASE_SEARCH_TABLE = "public.release_search"
-RELEASE_SEARCH_INDEX = "idx_release_search_title_tsv"
-RELEASE_TITLE_TSVECTOR = "to_tsvector('english', COALESCE(data->>'title', ''))"
-_RELEASE_SEARCH_TRIGGERS = ("insert", "update", "delete", "truncate")
+# The capture functions are SECURITY DEFINER, so a role that may write the entity table needs
+# no grant on its side table. Existing rows are filled by `CALL public.<side>_backfill()`, which
+# the operator runs once; the initializer does not, because on lux it reads every document
+# once, about a quarter of an hour for releases (see the architecture notes).
 
 
-def _release_title_tsvector(row: str) -> str:
-    """Return `RELEASE_TITLE_TSVECTOR` over the `data` of the row or alias ROW."""
+@dataclass(frozen=True)
+class _SearchSideTable:
+    """One title search side table: `public.<name>`, one row per row of `public.<source>`.
+
+    `columns` are (name, declaration, expression) for every column after the key. The first
+    is the TSVECTOR the GIN index covers. Each expression maps the alias of an entity row to
+    that column's value computed from the row, and is the only definition of the value: the
+    triggers, the backfill and the drift check all use it.
+    """
+
+    source: str
+    name: str
+    key: str
+    index: str
+    columns: tuple[tuple[str, str, Callable[[str], str]], ...]
+    watched: str = "data_id, data"
+
+    @property
+    def column_names(self) -> str:
+        return ", ".join(column for column, _declaration, _expression in self.columns)
+
+    def values(self, row: str) -> str:
+        """Return every carried column's expression over the entity row or alias ROW."""
+        return ", ".join(expression(row) for _column, _declaration, expression in self.columns)
+
+    def differs(self, stored: str, computed: str) -> str:
+        """Return the condition that the side row STORED differs from COMPUTED, a row or the values."""
+        if len(self.columns) == 1:
+            return f"{stored}.{self.columns[0][0]} IS DISTINCT FROM {computed}"
+        return f"({', '.join(f'{stored}.{column}' for column, _declaration, _expression in self.columns)}) IS DISTINCT FROM ({computed})"
+
+
+_SEARCH_TRIGGERS = ("insert", "update", "delete", "truncate")
+
+# The backfill's lock wait, and its pause before trying again. A batch waits at most this long
+# for a writer of the side table to commit, so a long transaction that wrote an entity row
+# never queues every later loader statement behind the backfill.
+SEARCH_BACKFILL_LOCK_TIMEOUT = "500ms"
+_SEARCH_BACKFILL_LOCK_PAUSE_S = 0.5
+
+
+def _title_tsvector(row: str) -> str:
+    """Return the title vector over the `data` of the row or alias ROW."""
     return f"to_tsvector('english', COALESCE({row}.data->>'title', ''))"
 
 
-_RELEASE_SEARCH_UPSERT = (
-    "ON CONFLICT (release_id) DO UPDATE SET title_tsv = EXCLUDED.title_tsv WHERE release_search.title_tsv IS DISTINCT FROM EXCLUDED.title_tsv"
-)
+def _search_upsert(table: _SearchSideTable) -> str:
+    """Return the ON CONFLICT clause of a capture upsert, which rewrites a row only when it changed."""
+    names = [column for column, _declaration, _expression in table.columns]
+    if len(names) == 1:
+        changed = f"{table.name}.{names[0]} IS DISTINCT FROM EXCLUDED.{names[0]}"
+    else:
+        changed = f"({', '.join(f'{table.name}.{name}' for name in names)}) IS DISTINCT FROM ({', '.join(f'EXCLUDED.{name}' for name in names)})"
+    assignments = ", ".join(f"{name} = EXCLUDED.{name}" for name in names)
+    return f"ON CONFLICT ({table.key}) DO UPDATE SET {assignments} WHERE {changed}"
 
 
-def _release_search_capture_function(name: str, body: str) -> tuple[str, str]:
-    """Return a SECURITY DEFINER capture function that acts only as a trigger on `public.releases`.
+def _search_capture_function(table: _SearchSideTable, event: str, body: str) -> tuple[str, str]:
+    """Return a SECURITY DEFINER capture function that acts only as a trigger on the entity table.
 
     A trigger function cannot be called, but any role that may create a table could attach it
-    to one and have it write, or truncate, `release_search` as its owner. So it refuses to run
+    to one and have it write, or truncate, the side table as its owner. So it refuses to run
     on any other table, and PUBLIC loses EXECUTE: creating a trigger needs EXECUTE, firing one
-    does not, so the loaders' writes to `releases` are unaffected.
+    does not, so the loaders' writes to the entity table are unaffected.
     """
+    name = f"{table.name}_capture_{event}"
     return (
         f"{name} function",
         f"""
@@ -7263,8 +7311,8 @@ SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
 AS ${name}$
 BEGIN
-    IF TG_TABLE_SCHEMA <> 'public' OR TG_TABLE_NAME <> 'releases' THEN
-        RAISE EXCEPTION '{name} fires only on public.releases, not on %.%', TG_TABLE_SCHEMA, TG_TABLE_NAME;
+    IF TG_TABLE_SCHEMA <> 'public' OR TG_TABLE_NAME <> '{table.source}' THEN
+        RAISE EXCEPTION '{name} fires only on public.{table.source}, not on %.%', TG_TABLE_SCHEMA, TG_TABLE_NAME;
     END IF;
 {body}
     RETURN NULL;
@@ -7275,46 +7323,69 @@ REVOKE ALL ON FUNCTION public.{name}() FROM PUBLIC
     )
 
 
-# The backfill's lock wait, and its pause before trying again. A batch waits at most this long
-# for a writer of `release_search` to commit, so a long transaction that wrote a release never
-# queues every later loader statement behind the backfill.
-RELEASE_SEARCH_BACKFILL_LOCK_TIMEOUT = "500ms"
-_RELEASE_SEARCH_BACKFILL_LOCK_PAUSE_S = 0.5
+def _search_capture_functions(table: _SearchSideTable) -> list[tuple[str, str]]:
+    """Return the four capture functions, inserted, updated, deleted and truncated."""
+    upsert = _search_upsert(table)
+    return [
+        _search_capture_function(
+            table,
+            "inserted",
+            f"""    INSERT INTO public.{table.name} ({table.key}, {table.column_names})
+    SELECT n.data_id, {table.values("n")} FROM new_rows AS n
+    {upsert};""",  # noqa: S608 -- composed of module constants only
+        ),
+        _search_capture_function(
+            table,
+            "updated",
+            f"""    IF NEW.data_id IS DISTINCT FROM OLD.data_id THEN
+        DELETE FROM public.{table.name} WHERE {table.key} = OLD.data_id;
+    END IF;
+    INSERT INTO public.{table.name} ({table.key}, {table.column_names})
+    VALUES (NEW.data_id, {table.values("NEW")})
+    {upsert};""",  # noqa: S608 -- composed of module constants only
+        ),
+        _search_capture_function(table, "deleted", f"    DELETE FROM public.{table.name} AS s USING old_rows AS o WHERE s.{table.key} = o.data_id;"),  # noqa: S608 -- module constants only
+        _search_capture_function(table, "truncated", f"    TRUNCATE public.{table.name};"),
+    ]
 
 
-def _release_search_backfill_lock_function() -> str:
+def _search_backfill_lock_function(table: _SearchSideTable) -> tuple[str, str]:
     """Return the function a backfill batch takes its lock with, waiting in bounded tries.
 
-    SHARE on `release_search` conflicts with the ROW EXCLUSIVE every capture trigger takes to
+    SHARE on the side table conflicts with the ROW EXCLUSIVE every capture trigger takes to
     write it, and with nothing a reader takes. Holding it, a batch never waits on a trigger's
     uncommitted row, which is what deadlocked an unlocked backfill against a concurrent load,
-    and no trigger can change a release's vector between the batch's read and its commit, so
-    the batch writes exactly what the triggers would. A trigger waits at most one batch.
+    and no trigger can change a row's values between the batch's read and its commit, so the
+    batch writes exactly what the triggers would. A trigger waits at most one batch.
     The lock is held to the end of the caller's transaction.
     """
-    return f"""
-CREATE OR REPLACE FUNCTION public.release_search_backfill_lock()
+    name = f"{table.name}_backfill_lock"
+    return (
+        f"{name} function",
+        f"""
+CREATE OR REPLACE FUNCTION public.{name}()
 RETURNS void
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
-SET lock_timeout = {_sql_literal(RELEASE_SEARCH_BACKFILL_LOCK_TIMEOUT)}
-AS $release_search_backfill_lock$
+SET lock_timeout = {_sql_literal(SEARCH_BACKFILL_LOCK_TIMEOUT)}
+AS ${name}$
 BEGIN
     LOOP
         BEGIN
-            LOCK TABLE public.release_search IN SHARE MODE;
+            LOCK TABLE public.{table.name} IN SHARE MODE;
             RETURN;
         EXCEPTION WHEN lock_not_available THEN
-            PERFORM pg_catalog.pg_sleep({_RELEASE_SEARCH_BACKFILL_LOCK_PAUSE_S});
+            PERFORM pg_catalog.pg_sleep({_SEARCH_BACKFILL_LOCK_PAUSE_S});
         END;
     END LOOP;
 END
-$release_search_backfill_lock$;
-REVOKE ALL ON FUNCTION public.release_search_backfill_lock() FROM PUBLIC
-"""
+${name}$;
+REVOKE ALL ON FUNCTION public.{name}() FROM PUBLIC
+""",
+    )
 
 
-def _release_search_backfill_step(name: str, signature: str, returns: str, body: str) -> tuple[str, str]:
+def _search_backfill_step(name: str, signature: str, returns: str, body: str) -> tuple[str, str]:
     """Return one backfill step: a function holding all of a batch's SQL, with a pinned search_path.
 
     The procedure cannot pin its own search_path (a procedure with a SET clause cannot COMMIT),
@@ -7336,17 +7407,17 @@ REVOKE ALL ON FUNCTION public.{name}({", ".join(argument.split()[1] for argument
     )
 
 
-def _release_search_backfill_statements() -> list[tuple[str, str]]:
-    """Return the procedure that fills `release_search` for the releases already there, and its steps.
+def _search_backfill_statements(table: _SearchSideTable) -> list[tuple[str, str]]:
+    """Return the procedure that fills the side table for the entity rows already there, and its steps.
 
-    Two passes of short transactions, each holding `release_search_backfill_lock()`, so no
-    snapshot is held for hours, the only lock on `releases` is the ACCESS SHARE of a read, and
-    a concurrent load is never lost or overwritten (a vector the triggers wrote is kept):
+    Two passes of short transactions, each holding `<side>_backfill_lock()`, so no snapshot is
+    held for hours, the only lock on the entity table is the ACCESS SHARE of a read, and a
+    concurrent load is never lost or overwritten (a row the triggers wrote is kept):
 
     1. Physical batches of `batch_pages` heap pages (a TID range scan), committed one by one.
        Reading in heap order reads the toast in the order it was written, which is what makes
        the pass fast. `first_page` resumes an interrupted run from its last progress notice.
-    2. The releases still missing, found by one read-only anti-join and added in batches. A row
+    2. The rows still missing, found by one read-only anti-join and added in batches. A row
        moved by an update that sets neither `data_id` nor `data` (the loader's `updated_at`
        refresh) fires no trigger and may have moved behind pass 1; one statement's snapshot
        sees every row exactly once, wherever it is.
@@ -7356,63 +7427,64 @@ def _release_search_backfill_statements() -> list[tuple[str, str]]:
     search_path, so a schema on the caller's search_path cannot substitute its own `to_tsvector`
     or `->>`. Run it with CALL outside a transaction block.
     """
-    tsvector = _release_title_tsvector("r")
-    pages = _release_search_backfill_step(
-        "release_search_backfill_pages",
+    side, source, key = table.name, table.source, table.key
+    missing = f"{side}_missing"
+    pages = _search_backfill_step(
+        f"{side}_backfill_pages",
         "first_page bigint, page_count integer",
         "void",
         f"""BEGIN
-    PERFORM public.release_search_backfill_lock();
-    INSERT INTO public.release_search (release_id, title_tsv)
-    SELECT r.data_id, {tsvector}
-    FROM public.releases AS r
+    PERFORM public.{side}_backfill_lock();
+    INSERT INTO public.{side} ({key}, {table.column_names})
+    SELECT r.data_id, {table.values("r")}
+    FROM public.{source} AS r
     WHERE r.ctid >= format('(%s,0)', first_page)::tid
       AND r.ctid < format('(%s,0)', first_page + page_count)::tid
-    ON CONFLICT (release_id) DO NOTHING;
+    ON CONFLICT ({key}) DO NOTHING;
 END""",  # noqa: S608 -- composed of module constants only
     )
-    find_missing = _release_search_backfill_step(
-        "release_search_backfill_find_missing",
+    find_missing = _search_backfill_step(
+        f"{side}_backfill_find_missing",
         "",
         "bigint",
-        """BEGIN
-    IF to_regclass('pg_temp.release_search_missing') IS NOT NULL THEN
-        DROP TABLE IF EXISTS pg_temp.release_search_missing;
+        f"""BEGIN
+    IF to_regclass('pg_temp.{missing}') IS NOT NULL THEN
+        DROP TABLE IF EXISTS pg_temp.{missing};
     END IF;
-    CREATE TEMPORARY TABLE release_search_missing AS
-    SELECT r.data_id FROM public.releases AS r
-    WHERE NOT EXISTS (SELECT 1 FROM public.release_search AS s WHERE s.release_id = r.data_id);
-    RETURN (SELECT count(*) FROM pg_temp.release_search_missing);
-END""",
+    CREATE TEMPORARY TABLE {missing} AS
+    SELECT r.data_id FROM public.{source} AS r
+    WHERE NOT EXISTS (SELECT 1 FROM public.{side} AS s WHERE s.{key} = r.data_id);
+    RETURN (SELECT count(*) FROM pg_temp.{missing});
+END""",  # noqa: S608 -- composed of module constants only
     )
-    add_missing = _release_search_backfill_step(
-        "release_search_backfill_add_missing",
+    add_missing = _search_backfill_step(
+        f"{side}_backfill_add_missing",
         "batch_rows integer",
         "boolean",
         f"""BEGIN
-    PERFORM public.release_search_backfill_lock();
+    PERFORM public.{side}_backfill_lock();
     WITH batch AS (
-        DELETE FROM pg_temp.release_search_missing
-        WHERE ctid IN (SELECT ctid FROM pg_temp.release_search_missing LIMIT batch_rows)
+        DELETE FROM pg_temp.{missing}
+        WHERE ctid IN (SELECT ctid FROM pg_temp.{missing} LIMIT batch_rows)
         RETURNING data_id
     )
-    INSERT INTO public.release_search (release_id, title_tsv)
-    SELECT r.data_id, {tsvector}
-    FROM public.releases AS r JOIN batch ON batch.data_id = r.data_id
-    ON CONFLICT (release_id) DO NOTHING;
-    IF EXISTS (SELECT 1 FROM pg_temp.release_search_missing) THEN
+    INSERT INTO public.{side} ({key}, {table.column_names})
+    SELECT r.data_id, {table.values("r")}
+    FROM public.{source} AS r JOIN batch ON batch.data_id = r.data_id
+    ON CONFLICT ({key}) DO NOTHING;
+    IF EXISTS (SELECT 1 FROM pg_temp.{missing}) THEN
         RETURN true;
     END IF;
-    DROP TABLE IF EXISTS pg_temp.release_search_missing;
+    DROP TABLE IF EXISTS pg_temp.{missing};
     RETURN false;
 END""",  # noqa: S608 -- composed of module constants only
     )
-    procedure = """
-CREATE OR REPLACE PROCEDURE public.release_search_backfill(batch_pages integer DEFAULT 1000, first_page bigint DEFAULT 0)
+    procedure = f"""
+CREATE OR REPLACE PROCEDURE public.{side}_backfill(batch_pages integer DEFAULT 1000, first_page bigint DEFAULT 0)
 LANGUAGE plpgsql
-AS $release_search_backfill$
+AS ${side}_backfill$
 DECLARE
-    pages bigint := pg_catalog.pg_relation_size('public.releases'::pg_catalog.regclass) / pg_catalog.current_setting('block_size')::bigint;
+    pages bigint := pg_catalog.pg_relation_size('public.{source}'::pg_catalog.regclass) / pg_catalog.current_setting('block_size')::bigint;
     page bigint := first_page;
     batches bigint := 0;
     missing bigint;
@@ -7422,132 +7494,152 @@ BEGIN
         RAISE EXCEPTION 'batch_pages must be positive, not %', batch_pages;
     END IF;
     WHILE page < pages LOOP
-        PERFORM public.release_search_backfill_pages(page, batch_pages);
+        PERFORM public.{side}_backfill_pages(page, batch_pages);
         page := page + batch_pages;
         COMMIT;
         batches := batches + 1;
         IF pg_catalog.mod(batches, 100) = 0 THEN
-            RAISE NOTICE 'release_search backfill: % of % heap pages read', page, pages;
+            RAISE NOTICE '{side} backfill: % of % heap pages read', page, pages;
         END IF;
     END LOOP;
-    missing := public.release_search_backfill_find_missing();
+    missing := public.{side}_backfill_find_missing();
     COMMIT;
     WHILE more LOOP
-        more := public.release_search_backfill_add_missing(10000);
+        more := public.{side}_backfill_add_missing(10000);
         COMMIT;
     END LOOP;
-    RAISE NOTICE 'release_search backfill: % heap pages read, % releases added after them', pages, missing;
+    RAISE NOTICE '{side} backfill: % heap pages read, % {source} added after them', pages, missing;
 END
-$release_search_backfill$;
-REVOKE ALL ON PROCEDURE public.release_search_backfill(integer, bigint) FROM PUBLIC
+${side}_backfill$;
+REVOKE ALL ON PROCEDURE public.{side}_backfill(integer, bigint) FROM PUBLIC
 """
-    return [pages, find_missing, add_missing, ("release_search_backfill procedure", procedure)]
+    return [pages, find_missing, add_missing, (f"{side}_backfill procedure", procedure)]
 
 
-def _release_search_drift_function() -> str:
-    """Return the function counting how far `release_search` is from `releases`.
+def _search_drift_function(table: _SearchSideTable) -> tuple[str, str]:
+    """Return the function counting how far the side table is from its entity table.
 
-    `missing` and `orphaned` read only keys. `stale` recomputes every vector, so it reads every
-    document: as long as the backfill's first pass, and run on purpose, after a backfill.
+    `missing` and `orphaned` read only keys. `stale` recomputes every row's values, so it reads
+    every document: as long as the backfill's first pass, and run on purpose, after a backfill.
     """
-    return f"""
-CREATE OR REPLACE FUNCTION public.release_search_drift()
+    side, source, key = table.name, table.source, table.key
+    return (
+        f"{side}_drift function",
+        f"""
+CREATE OR REPLACE FUNCTION public.{side}_drift()
 RETURNS TABLE (missing bigint, orphaned bigint, stale bigint)
 LANGUAGE sql
 STABLE
 SET search_path = pg_catalog, pg_temp
-AS $release_search_drift$
-SELECT (SELECT count(*) FROM public.releases AS r
-        WHERE NOT EXISTS (SELECT 1 FROM public.release_search AS s WHERE s.release_id = r.data_id)),
-       (SELECT count(*) FROM public.release_search AS s
-        WHERE NOT EXISTS (SELECT 1 FROM public.releases AS r WHERE r.data_id = s.release_id)),
-       (SELECT count(*) FROM public.releases AS r JOIN public.release_search AS s ON s.release_id = r.data_id
-        WHERE s.title_tsv IS DISTINCT FROM {_release_title_tsvector("r")})
-$release_search_drift$
-"""  # noqa: S608 -- composed of module constants only
+AS ${side}_drift$
+SELECT (SELECT count(*) FROM public.{source} AS r
+        WHERE NOT EXISTS (SELECT 1 FROM public.{side} AS s WHERE s.{key} = r.data_id)),
+       (SELECT count(*) FROM public.{side} AS s
+        WHERE NOT EXISTS (SELECT 1 FROM public.{source} AS r WHERE r.data_id = s.{key})),
+       (SELECT count(*) FROM public.{source} AS r JOIN public.{side} AS s ON s.{key} = r.data_id
+        WHERE {table.differs("s", table.values("r"))})
+${side}_drift$
+""",  # noqa: S608 -- composed of module constants only
+    )
 
 
-def _release_search_triggers() -> str:
-    """Return the guarded statement creating the four capture triggers on `releases`.
+def _search_triggers(table: _SearchSideTable) -> tuple[str, str]:
+    """Return the guarded statement creating the four capture triggers on the entity table.
 
-    Guarded, as the identity ledger's are, so a reapply takes no lock on `releases`. The first
-    apply takes SHARE ROW EXCLUSIVE on `releases` for the milliseconds the four CREATEs take:
+    Guarded, as the identity ledger's are, so a reapply takes no lock on the entity table. The
+    first apply takes SHARE ROW EXCLUSIVE on it for the milliseconds the four CREATEs take:
     readers are not blocked, writers wait. It runs under the initializer's lock timeout and
     retries rather than queueing every writer behind a long transaction.
     """
-    names = ", ".join(_sql_literal(f"release_search_capture_{operation}") for operation in _RELEASE_SEARCH_TRIGGERS)
-    drops = "\n".join(f"    DROP TRIGGER IF EXISTS release_search_capture_{operation} ON public.releases;" for operation in _RELEASE_SEARCH_TRIGGERS)
-    return f"""DO $release_search_triggers$
+    side, source = table.name, table.source
+    names = ", ".join(_sql_literal(f"{side}_capture_{operation}") for operation in _SEARCH_TRIGGERS)
+    drops = "\n".join(f"    DROP TRIGGER IF EXISTS {side}_capture_{operation} ON public.{source};" for operation in _SEARCH_TRIGGERS)
+    return (
+        f"{source} {side} capture triggers",
+        f"""DO ${side}_triggers$
 BEGIN
     IF (SELECT count(*) FROM pg_catalog.pg_trigger
-        WHERE tgrelid = 'public.releases'::regclass AND tgname IN ({names})) = {len(_RELEASE_SEARCH_TRIGGERS)} THEN
+        WHERE tgrelid = 'public.{source}'::regclass AND tgname IN ({names})) = {len(_SEARCH_TRIGGERS)} THEN
         RETURN;
     END IF;
 {drops}
-    CREATE TRIGGER release_search_capture_insert AFTER INSERT ON public.releases
-        REFERENCING NEW TABLE AS new_rows FOR EACH STATEMENT EXECUTE FUNCTION public.release_search_capture_inserted();
-    CREATE TRIGGER release_search_capture_update AFTER UPDATE OF data_id, data ON public.releases
-        FOR EACH ROW EXECUTE FUNCTION public.release_search_capture_updated();
-    CREATE TRIGGER release_search_capture_delete AFTER DELETE ON public.releases
-        REFERENCING OLD TABLE AS old_rows FOR EACH STATEMENT EXECUTE FUNCTION public.release_search_capture_deleted();
-    CREATE TRIGGER release_search_capture_truncate AFTER TRUNCATE ON public.releases
-        FOR EACH STATEMENT EXECUTE FUNCTION public.release_search_capture_truncated();
+    CREATE TRIGGER {side}_capture_insert AFTER INSERT ON public.{source}
+        REFERENCING NEW TABLE AS new_rows FOR EACH STATEMENT EXECUTE FUNCTION public.{side}_capture_inserted();
+    CREATE TRIGGER {side}_capture_update AFTER UPDATE OF {table.watched} ON public.{source}
+        FOR EACH ROW EXECUTE FUNCTION public.{side}_capture_updated();
+    CREATE TRIGGER {side}_capture_delete AFTER DELETE ON public.{source}
+        REFERENCING OLD TABLE AS old_rows FOR EACH STATEMENT EXECUTE FUNCTION public.{side}_capture_deleted();
+    CREATE TRIGGER {side}_capture_truncate AFTER TRUNCATE ON public.{source}
+        FOR EACH STATEMENT EXECUTE FUNCTION public.{side}_capture_truncated();
 END
-$release_search_triggers$
-"""  # noqa: S608 -- composed of module constants only
+${side}_triggers$
+""",  # noqa: S608 -- composed of module constants only
+    )
 
 
-_RELEASE_SEARCH_STATEMENTS: list[tuple[str, str]] = [
-    (
-        "release_search table",
-        """CREATE TABLE IF NOT EXISTS public.release_search (
-            release_id VARCHAR  PRIMARY KEY,
-            title_tsv  TSVECTOR NOT NULL
-        )""",
-    ),
-    (
-        RELEASE_SEARCH_INDEX,
-        f"CREATE INDEX IF NOT EXISTS {RELEASE_SEARCH_INDEX} ON public.release_search USING GIN (title_tsv)",
-    ),
-    _release_search_capture_function(
-        "release_search_capture_inserted",
-        f"""    INSERT INTO public.release_search (release_id, title_tsv)
-    SELECT n.data_id, {_release_title_tsvector("n")} FROM new_rows AS n
-    {_RELEASE_SEARCH_UPSERT};""",  # noqa: S608 -- composed of module constants only
-    ),
-    _release_search_capture_function(
-        "release_search_capture_updated",
-        f"""    IF NEW.data_id IS DISTINCT FROM OLD.data_id THEN
-        DELETE FROM public.release_search WHERE release_id = OLD.data_id;
-    END IF;
-    INSERT INTO public.release_search (release_id, title_tsv)
-    VALUES (NEW.data_id, {_release_title_tsvector("NEW")})
-    {_RELEASE_SEARCH_UPSERT};""",  # noqa: S608 -- composed of module constants only
-    ),
-    _release_search_capture_function(
-        "release_search_capture_deleted",
-        "    DELETE FROM public.release_search AS s USING old_rows AS o WHERE s.release_id = o.data_id;",
-    ),
-    _release_search_capture_function("release_search_capture_truncated", "    TRUNCATE public.release_search;"),
-    ("release_search_backfill_lock function", _release_search_backfill_lock_function()),
-    *_release_search_backfill_statements(),
-    ("release_search_drift function", _release_search_drift_function()),
-    ("releases release_search capture triggers", _release_search_triggers()),
-]
+def _search_statements(table: _SearchSideTable) -> list[tuple[str, str]]:
+    """Return every statement of one side table, in the order they must run.
 
-# Removes everything above, for the rollback in `docs/architecture.md`. Nothing here touches
-# `releases` rows; dropping the triggers takes the same brief lock creating them did.
-RELEASE_SEARCH_ROLLBACK_STATEMENTS: tuple[str, ...] = (
-    *(f"DROP TRIGGER IF EXISTS release_search_capture_{operation} ON public.releases" for operation in _RELEASE_SEARCH_TRIGGERS),
-    *(f"DROP FUNCTION IF EXISTS public.release_search_capture_{event}()" for event in ("inserted", "updated", "deleted", "truncated")),
-    "DROP FUNCTION IF EXISTS public.release_search_drift()",
-    "DROP PROCEDURE IF EXISTS public.release_search_backfill(integer, bigint)",
-    "DROP FUNCTION IF EXISTS public.release_search_backfill_pages(bigint, integer)",
-    "DROP FUNCTION IF EXISTS public.release_search_backfill_find_missing()",
-    "DROP FUNCTION IF EXISTS public.release_search_backfill_add_missing(integer)",
-    "DROP FUNCTION IF EXISTS public.release_search_backfill_lock()",
-    "DROP TABLE IF EXISTS public.release_search",
+    The table and its index first, then the functions, and the triggers that call them last.
+    """
+    width = max(len(name) for name in (table.key, *(column for column, _declaration, _expression in table.columns)))
+    columns = ",\n".join(
+        f"            {name:<{width}} {declaration}"
+        for name, declaration in ((table.key, "VARCHAR  PRIMARY KEY"), *((column, declaration) for column, declaration, _expression in table.columns))
+    )
+    vector = table.columns[0][0]
+    return [
+        (f"{table.name} table", f"CREATE TABLE IF NOT EXISTS public.{table.name} (\n{columns}\n        )"),
+        (table.index, f"CREATE INDEX IF NOT EXISTS {table.index} ON public.{table.name} USING GIN ({vector})"),
+        *_search_capture_functions(table),
+        _search_backfill_lock_function(table),
+        *_search_backfill_statements(table),
+        _search_drift_function(table),
+        _search_triggers(table),
+    ]
+
+
+def _search_rollback_statements(table: _SearchSideTable) -> tuple[str, ...]:
+    """Return the statements removing everything `_search_statements` creates, in order.
+
+    Nothing here touches an entity row; dropping the triggers takes the same brief lock
+    creating them did.
+    """
+    side, source = table.name, table.source
+    return (
+        *(f"DROP TRIGGER IF EXISTS {side}_capture_{operation} ON public.{source}" for operation in _SEARCH_TRIGGERS),
+        *(f"DROP FUNCTION IF EXISTS public.{side}_capture_{event}()" for event in ("inserted", "updated", "deleted", "truncated")),
+        f"DROP FUNCTION IF EXISTS public.{side}_drift()",
+        f"DROP PROCEDURE IF EXISTS public.{side}_backfill(integer, bigint)",
+        f"DROP FUNCTION IF EXISTS public.{side}_backfill_pages(bigint, integer)",
+        f"DROP FUNCTION IF EXISTS public.{side}_backfill_find_missing()",
+        f"DROP FUNCTION IF EXISTS public.{side}_backfill_add_missing(integer)",
+        f"DROP FUNCTION IF EXISTS public.{side}_backfill_lock()",
+        f"DROP TABLE IF EXISTS public.{side}",
+    )
+
+
+# ── Release title search vector (gm-database-schema-fi4a) ──
+# The vector is `RELEASE_TITLE_TSVECTOR` of the release's `data`, always: the expression
+# `idx_releases_fts` indexes, so ranks and their order are unchanged.
+RELEASE_SEARCH_TABLE = "public.release_search"
+RELEASE_SEARCH_INDEX = "idx_release_search_title_tsv"
+RELEASE_TITLE_TSVECTOR = "to_tsvector('english', COALESCE(data->>'title', ''))"
+_RELEASE_SEARCH_TRIGGERS = _SEARCH_TRIGGERS
+RELEASE_SEARCH_BACKFILL_LOCK_TIMEOUT = SEARCH_BACKFILL_LOCK_TIMEOUT
+_release_title_tsvector = _title_tsvector
+
+_RELEASE_SEARCH = _SearchSideTable(
+    source="releases",
+    name="release_search",
+    key="release_id",
+    index=RELEASE_SEARCH_INDEX,
+    columns=(("title_tsv", "TSVECTOR NOT NULL", _title_tsvector),),
 )
+_RELEASE_SEARCH_STATEMENTS: list[tuple[str, str]] = _search_statements(_RELEASE_SEARCH)
+
+# Removes everything above, for the rollback in `docs/architecture.md`.
+RELEASE_SEARCH_ROLLBACK_STATEMENTS: tuple[str, ...] = _search_rollback_statements(_RELEASE_SEARCH)
 
 
 def _schema_statements() -> Iterator[tuple[str, Any]]:
