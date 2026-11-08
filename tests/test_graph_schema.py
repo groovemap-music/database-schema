@@ -651,6 +651,14 @@ class TestEdgeViews:
         pinned = next(index for index, (name, _) in enumerate(_GRAPH_STATEMENTS) if name == "graph.credited_on.release_id n_distinct")
         assert table < pinned
 
+    def test_track_credited_on_pins_its_release_id_distinct_estimate_as_a_row_fraction(self) -> None:
+        """Lux stored 561k release ids against about 6.8M (0.074 a row), so the fraction is declared."""
+        name = "graph.track_credited_on.release_id n_distinct"
+        statements = [sql for stmt_name, sql in _GRAPH_STATEMENTS if stmt_name == name]
+        assert statements == ["ALTER TABLE graph.track_credited_on ALTER COLUMN release_id SET (n_distinct = -0.074)"]
+        names = [stmt_name for stmt_name, _ in _GRAPH_STATEMENTS]
+        assert names.index("graph.track_credited_on table") < names.index(name)
+
     def test_source_stays_in_the_key_of_both_provider_written_edges(self) -> None:
         """Two providers write the same edge and must not collide, as ADR 0011 has it."""
         for relation in ("credited_to", "issued_on"):
