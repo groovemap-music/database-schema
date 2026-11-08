@@ -348,6 +348,14 @@ An *edition* is a release-kind item resolved one hop through an open supersessio
   over the fixture's days and every filter, with an edition whose events fall on two days.
   The refresh adds this table to the same transaction: it replaces the dirty works' rows, and a
   rebuild recomputes all of it. Its added cost is measured in CI (see the 9dcd bead).
+
+  **Upgrading a populated ledger.** Maintenance rewrites only the works that changed, so schema
+  init requests one rebuild (`identity_ledger_request_rebuild()`'s own insert) when the ledger
+  has been refreshed and a derived table is missing, or when this rollup is empty beside a filled
+  `identity_ledger_work_summary` (what v0.11.0 left on an upgraded database). The next
+  `identity_ledger_refresh()` then recomputes all of it, which takes as long as a full rebuild
+  (a refresh averages about 354 s on lux). A fresh database and a rerun request nothing. A later
+  derived table is covered by the same guard once it is in `IDENTITY_LEDGER_VIEWS`.
 - `identity_ledger_density (kind, month, type, dated_from, events)` — events per UTC month,
   type, and provenance for each of `release`, `master`, `artist`, and `label`. Unlike the
   edition tables it counts mints, counts a supersession once rather than per side, and counts a

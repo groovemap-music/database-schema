@@ -1196,3 +1196,69 @@ async def test_the_day_rollup_answers_every_window_as_a_group_by_over_the_events
                 "SELECT day::text, prev_day::text FROM identity_ledger_work_summary_day WHERE work_id = %s AND event = 'any' AND day = '2026-03-26'",
                 (work,),
             ) == [("2026-03-26", "2026-03-22")]
+
+
+_DAY_ROWS = (
+    "SELECT work_id, event, day::text, prev_day::text, editions, first_event, last_event "  # noqa: S608 -- module constant
+    f"FROM {_DAY} ORDER BY 1, 2, 3, 4"
+)
+
+
+async def _rebuild_requests(connection: psycopg.AsyncConnection[Any]) -> int:
+    return (await _rows(connection, "SELECT count(*) FROM identity_ledger_changes WHERE rebuild"))[0][0]
+
+
+async def _day_rows(connection: psycopg.AsyncConnection[Any]) -> int:
+    return (await _rows(connection, f"SELECT count(*) FROM {_DAY}"))[0][0]  # noqa: S608 -- module constant
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_apply_and_a_rerun_request_no_rebuild_even_on_a_refreshed_ledger() -> None:
+    """The guard fires only when a refreshed ledger lacks a filled derived table."""
+    async with _ledger_database() as params:  # applied twice on an empty database
+        connection = await _connect(params)
+        async with connection:
+            assert await _rebuild_requests(connection) == 0
+            async with connection.cursor() as cursor:
+                await _seed(cursor, Fixture())
+            await _rows(connection, "SELECT identity_ledger_refresh()")
+            assert await _day_rows(connection) > 0
+            assert await initializer._apply_postgres_schema(params) is True
+            assert await _rebuild_requests(connection) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", ["table_missing", "table_empty"])
+async def test_upgrading_a_populated_ledger_without_the_day_rollup_fills_it_on_the_next_refresh(shape: str) -> None:
+    """The v0.10 shape (no table) and the v0.11.0 upgrade's result on lux (table created, empty).
+
+    The upgrade requests one rebuild, the next refresh fills the rollup equal to a direct recompute, and a
+    rerun requests nothing more.
+    """
+    async with _ledger_database() as params:
+        connection = await _connect(params)
+        async with connection:
+            async with connection.cursor() as cursor:
+                await _seed(cursor, Fixture())
+                await _seed_editions_across_days(cursor)
+            await _rows(connection, "SELECT identity_ledger_refresh()")
+            expected = await _rows(connection, _DAY_ROWS)
+            assert expected
+            if shape == "table_missing":
+                await connection.execute(f"DROP TABLE {_DAY}")
+            else:
+                await connection.execute(f"DELETE FROM {_DAY}")  # noqa: S608 -- module constant
+            assert await _rebuild_requests(connection) == 0
+
+            assert await initializer._apply_postgres_schema(params) is True
+            assert await _rebuild_requests(connection) == 1
+            assert await initializer._apply_postgres_schema(params) is True
+            assert await _rebuild_requests(connection) == 1  # a pending request is not asked for twice
+
+            await _rows(connection, "SELECT identity_ledger_refresh()")
+            assert await _rows(connection, _DAY_ROWS) == expected
+            assert await _rows(
+                connection, "SELECT relation, missing, unexpected, pending_changes FROM identity_ledger_verify() ORDER BY relation"
+            ) == [(view, 0, 0, 0) for view in sorted(IDENTITY_LEDGER_VIEWS)]
+            assert await initializer._apply_postgres_schema(params) is True
+            assert await _rebuild_requests(connection) == 0

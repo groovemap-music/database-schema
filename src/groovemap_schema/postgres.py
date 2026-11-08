@@ -5872,6 +5872,8 @@ _GRAPH_STATEMENTS: list[tuple[str, str]] = _build_graph_statements()
 #
 # Changing a definition.  Change `_ledger_*_select` and the maintenance together,
 # and let the guarded migration or `identity_ledger_request_rebuild()` rebuild.
+# A table added to `IDENTITY_LEDGER_VIEWS` is rebuilt on a populated ledger by
+# `_ledger_request_rebuild_for_new_tables`; an emptiness check for it is added there.
 
 # The relations catalog-api reads, in maintenance order: each reads only those before it.
 IDENTITY_LEDGER_VIEWS = (
@@ -6866,6 +6868,46 @@ $retire$
 """  # noqa: S608 -- composed of module constants only
 
 
+def _ledger_request_rebuild_for_new_tables() -> str:
+    """Return the guarded step that asks for a rebuild when a derived table is missing or never filled.
+
+    Maintenance rewrites only the works that changed, so a derived table created on a
+    ledger that already has rows would stay empty or partial until something forced a
+    full rebuild.  This runs before any table is created: a ledger that has been
+    refreshed (its state row exists) and lacks one of `IDENTITY_LEDGER_VIEWS` gets a
+    rebuild request, which the next `identity_ledger_refresh()` serves.  It also heals a
+    database an earlier release already upgraded without one (v0.11.0 left
+    `identity_ledger_work_summary_day` empty beside a filled `identity_ledger_work_summary`).
+    A fresh database has no state row, and a rerun finds every table, filled, or a request
+    already waiting, so neither adds one.  The retirement runs first and removes the state
+    row itself, so the two never both ask.
+    """
+    missing = " OR ".join(f"to_regclass('public.{table}') IS NULL" for table in IDENTITY_LEDGER_VIEWS)
+    # The emptiness check is dynamic: a static reference to a table that does not exist yet fails to parse.
+    return f"""DO $request$
+DECLARE
+    unfilled boolean := false;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM public.identity_ledger_refresh_state) OR to_regclass('public.identity_ledger_changes') IS NULL THEN
+        RETURN;
+    END IF;
+    IF EXISTS (SELECT 1 FROM public.identity_ledger_changes WHERE rebuild) THEN
+        RETURN;
+    END IF;
+    IF {missing} THEN
+        unfilled := true;
+    ELSE
+        EXECUTE 'SELECT EXISTS (SELECT 1 FROM public.identity_ledger_work_summary)'
+            ' AND NOT EXISTS (SELECT 1 FROM public.identity_ledger_work_summary_day)' INTO unfilled;
+    END IF;
+    IF unfilled THEN
+        INSERT INTO public.identity_ledger_changes (rebuild) VALUES (true);
+    END IF;
+END
+$request$
+"""  # noqa: S608 -- composed of module constants only
+
+
 # Declared after `_GRAPH_STATEMENTS` because the triggers and the refresh reach
 # `graph.derived_from` as well as the identity and MusicBrainz tables.  The
 # triggers precede the refresh function: until they all exist the refresh refuses
@@ -6884,6 +6926,7 @@ _IDENTITY_LEDGER_STATEMENTS: list[tuple[str, str]] = [
         """,
     ),
     ("identity ledger materialized views retirement", _ledger_retire_matviews()),
+    ("identity ledger rebuild request for new derived tables", _ledger_request_rebuild_for_new_tables()),
     (
         "identity_ledger_edition_events table",
         """

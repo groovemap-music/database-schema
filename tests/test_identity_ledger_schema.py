@@ -42,6 +42,20 @@ class TestIdentityLedgerStatements:
         retirement = names.index("identity ledger materialized views retirement")
         assert all(retirement < names.index(f"{view} table") for view in IDENTITY_LEDGER_VIEWS)
 
+    def test_the_rebuild_request_runs_after_the_retirement_and_before_any_table_is_created(self) -> None:
+        names = [name for name, _statement in _IDENTITY_LEDGER_STATEMENTS]
+        request = names.index("identity ledger rebuild request for new derived tables")
+        assert names.index("identity ledger materialized views retirement") < request
+        assert all(request < names.index(f"{view} table") for view in IDENTITY_LEDGER_VIEWS)
+
+    def test_the_rebuild_request_is_guarded_by_the_state_row_and_names_every_derived_table(self) -> None:
+        statement = _STATEMENTS["identity ledger rebuild request for new derived tables"]
+        assert "identity_ledger_refresh_state" in statement
+        assert "WHERE rebuild" in statement
+        assert "INSERT INTO public.identity_ledger_changes (rebuild) VALUES (true)" in statement
+        for view in IDENTITY_LEDGER_VIEWS:
+            assert f"to_regclass('public.{view}') IS NULL" in statement
+
     def test_they_run_after_the_graph_statements_they_read(self) -> None:
         names = [name for name, _statement in _schema_statements()]
         first = names.index("identity_ledger_refresh_state table")
