@@ -1311,7 +1311,8 @@ loaders' `TRUNCATE releases` fail.
 blocked; writers wait. It is held for the catalog change only, 4 to 9 ms on the populated sample,
 whatever the table's size. Like every init statement, it waits for an in-flight writer at most the
 initializer's 2 s lock timeout per attempt. A reapply finds all four triggers present and takes no
-lock. Nothing else in the change locks `releases` beyond a read's ACCESS SHARE.
+lock. Nothing else in the change locks `releases` beyond a read's ACCESS SHARE. (gm-database-schema-1sle added a fifth trigger and five more columns; see
+[Release search facet and filter attributes](#release-search-facet-and-filter-attributes).)
 
 **Backfill.** Run `CALL public.release_search_backfill();` once, outside a transaction block, as the
 schema owner. The initializer never runs it. It has two passes, each made of short committed
@@ -1400,6 +1401,12 @@ written. With two carried columns, a capture upsert writes only when the vector 
 changed, and the drift's `stale` count compares both. An upsert of an unchanged document
 rewrites nothing.
 
+Two engine changes from gm-database-schema-1sle hold here too (see [Release search facet and filter
+attributes](#release-search-facet-and-filter-attributes)). Every statement reads a master's document
+once rather than once per carried column, and the backfill's heap pass rewrites a row whose values
+differ rather than skipping it, so it also repairs stale rows. The measurements below were taken
+before both changes; neither adds work.
+
 **Locks.** Creating the four triggers takes SHARE ROW EXCLUSIVE on `masters`. Readers are not
 blocked; writers wait. On the populated 2.6M-row sample the whole statement took 8 to 25 ms
 (six runs, timed at the client, so the lock is held no longer than that). It runs under the initializer's 2 s lock timeout per attempt,
@@ -1452,6 +1459,114 @@ physical order. That sample is as arbitrary as today's. To roll back, first move
 back to `idx_masters_fts`, then run `MASTER_SEARCH_ROLLBACK_STATEMENTS` in order. They drop the
 masters triggers, the functions, the procedure and the table. No `masters` row is touched, and
 nothing of `release_search` is.
+
+## Release search facet and filter attributes
+
+The title vector made unfiltered ranking cheap, but the rest of catalog-api's search still read
+`releases` for every title match. The genre, decade and media facets, and every filtered release
+branch (year, genre, media, country), detoast `releases.data` once per match, and once more for
+each key they read. On lux, the genre facet for 'love' reads 49,018 buffers for its 10,000 matches
+(4.9 per match, 382 ms warm).
+
+`release_search` now carries those inputs as well, so a facet or filtered branch reads only the
+side table and its GIN index on `title_tsv`. Each column is exactly the expression catalog-api
+evaluates today. None is typed or cleaned, so a clause moved onto the side table answers the
+same for every row, odd values included, and no value can make a capture trigger, and with it a
+loader write, fail.
+
+| Column | Type | Value | catalog-api today | over `release_search` |
+| --- | --- | --- | --- | --- |
+| `genres` | JSONB | `data->'genres'` | `data->'genres' ?\| …`, `jsonb_array_elements_text(...)` | `genres` in their place |
+| `year` | TEXT | `data->>'year'` | `(data->>'year')::int`, `~ '^[0-9]{4}$'` | `year` in its place |
+| `country` | TEXT | `data->>'country'` | `data->>'country' = ANY(...)` | `country` in its place |
+| `media_families` | JSONB | `media->'families'` | `media->'families' ?\| …`, `jsonb_array_elements_text(...)` | `media_families` in its place |
+| `media_mediums` | JSONB | `jsonb_path_query_array(media, '$.items[*].medium[*]')` | `media IS NULL` | `media_mediums IS NULL` |
+| | | | `jsonb_path_exists(media, '$.items[*] ? (@.medium == $m)', ...)` | `media_mediums ? m` |
+
+`media_mediums` lists every value the path filter compares with `$m`: lax jsonpath unwraps one
+level of array on both sides, so `?` on the list matches exactly the releases the path filter
+matches. It is NULL exactly when `media` is, and `[]` for a block with no items. Year is TEXT, as
+`master_search.year` is (gm-database-schema-nu0c), so the two halves of the decade facet stay alike.
+An integration test compares every clause row by row, three-valued, over documents and media
+blocks of every shape (scalars, nulls, nested arrays, missing keys), and the facets value by value.
+
+**Keeping them current.** The insert, update and delete triggers write every column, from the
+same rows they always read. One more trigger covers the write that changes none of `data_id` or
+`data`: discogs-sql-loader's media backfill of hash-unchanged rows, an `UPDATE` that sets `media`
+alone. `release_search_capture_update_media` fires per row `AFTER UPDATE OF media` and only `WHEN
+(OLD.media IS DISTINCT FROM NEW.media)`. It rewrites the two media columns and reads nothing of
+`data`. It sorts after `release_search_capture_update`, so when one statement sets both, the update
+trigger has already written the media columns and this one finds nothing to change.
+
+**Each document read once.** Every `->` or `->>` over a toasted `data` detoasts the whole document
+again, so five carried values read each document four times. The triggers, the backfill and the
+drift check therefore read entity rows through `(SELECT data_id, data #> '{}' AS data, ... OFFSET
+0)`: `#> '{}'` hands back the detoasted document unchanged, and `OFFSET 0` keeps the planner from
+inlining it into every reference. On the sample below, a 1000-page backfill batch fell from
+150,384 buffers and 515 ms to 38,392 buffers and 263 ms. `master_search` gets the same.
+
+**Upgrade.** A database at v0.11.0 holds `release_search (release_id, title_tsv)`, filled, under four
+triggers. The init adds each column with `ALTER TABLE public.release_search ADD COLUMN IF NOT EXISTS
+<column> <type>`: nullable with no default, so a catalog change under ACCESS EXCLUSIVE on
+`release_search` alone, never `releases`. The initializer skips each once its column exists, so a
+reapply takes no lock. The trigger statement finds four of its five triggers and recreates all five
+in one transaction, under SHARE ROW EXCLUSIVE on `releases` (readers not blocked). The new columns
+are NULL until the backfill runs.
+
+The backfill's heap pass now upserts, rewriting a side row only when one of its values differs,
+instead of skipping rows that exist. So `CALL public.release_search_backfill();` fills the new
+columns on a populated table, and repairs any stale row. It still cannot overwrite a newer trigger
+write: each batch reads after taking its SHARE lock, so it sees the entity row of every committed
+trigger write, and a trigger still to run waits for the batch and writes after it.
+
+Rollout: apply the schema, run the backfill, check `release_search_drift()` is `(0, 0, 0)` (its
+`stale` count now compares every column), then move catalog-api's facets and filtered branches onto
+the side table. Until then catalog-api reads `releases` as today. To roll back the columns alone,
+move catalog-api back first. The columns can stay: nothing else reads them. The full rollback is
+`RELEASE_SEARCH_ROLLBACK_STATEMENTS`, which now also drops the media trigger and its function.
+
+**Measured.** On PostgreSQL 18, against a 500k-row Discogs-shaped sample with media blocks: heap and
+toast 1.8 GB, 9.5 rows per heap page (lux: 9.2), 'love' in 12,704 titles, 'rock' in 2,309,
+'paradise' in 1,136. All warm. Lux's 'love' has 497k matches, so its capped facets read 10,000.
+
+| Statement, 'love' | `releases` today | `release_search` | Fewer buffers |
+| --- | --- | --- | --- |
+| Genre facet (first 10,000 matches) | 47,948 buffers, 178 ms | 5,487, 21 ms | 8.7× |
+| Decade facet, releases half | 93,380, 248 ms | 6,239, 14 ms | 15× |
+| Media facet | 8,962, 24 ms | 5,484, 11 ms | 1.6× |
+| Filtered results branch (year, genre, media, country) | 45,630, 121 ms | 7,936, 13 ms | 5.7× |
+| Filtered count branch | 43,471, 113 ms | 6,969, 9 ms | 6.2× |
+| Genre facet over all 12,704 matches, no cap | not run (would read every document) | 7,025, 15 ms | |
+
+'rock' and 'paradise' fall by the same factors (genre facet 11,300 to 2,085 and 5,604 to 1,080;
+decade 19,231 to 2,085 and 9,336 to 1,080). The media facet falls least because `media` is stored
+inline, not toasted. The filtered results, both counts, and the uncapped genre, media and decade
+facets were identical over both tables for all three terms.
+
+| Upgrade step, on the populated sample | Took |
+| --- | --- |
+| Each `ADD COLUMN` (ACCESS EXCLUSIVE on `release_search` only) | 0.8 to 1.1 ms; the first, 38 ms |
+| Recreating the five triggers (SHARE ROW EXCLUSIVE on `releases`) | 3.8 ms (6.2 ms on a 1M-row run) |
+| The backfill, filling five columns on 500k rows | 14.7 s, 0.28 s per 1000-page batch |
+| A fresh v0.11.0 fill of the same rows, for comparison | 13.5 s |
+| `release_search_drift()` afterwards | 13.7 s, `(0, 0, 0)` |
+
+At 0.28 s per batch, lux's 2.08M heap pages make about 2,079 batches, about 10 minutes warm. Expect
+more cold: fi4a's cold fill ran 1.5 times its warm one. A writer of `release_search` waits at most
+one batch per statement. Every existing row gets a new version, so the side table grows by about
+its own size (114 MB here, after a v0.11.0 table of 81 MB; lux's is 1.6 GB today). A plain VACUUM
+makes the old versions reusable. With concurrent loader-shaped writes (changed documents, changed
+genres and country, a media backfill, `updated_at` refreshes, deletes, inserts) during the
+backfill, no statement failed and drift afterwards was `(0, 0, 0)`. A round of those writes took
+p50 1.42 s and at most 1.75 s, against 0.27 s without the backfill.
+
+The triggers' cost per 1000-row loader statement, against the same statement with user triggers
+disabled: a changed-document upsert +45 ms (fi4a's title vector alone: +28 ms), an insert +29 ms, a
+media backfill that changes the block +24 ms. A media backfill that rewrites the same block, and an
+`updated_at` refresh, cost nothing measurable.
+
+The scripts are in
+[`docs/audits/2026-11-08-release-search-facets`](audits/2026-11-08-release-search-facets/README.md).
 
 ## Graph schema
 

@@ -37,6 +37,9 @@
   - [Master title search vector, 2026-11-08](audits/2026-11-08-master-title-search-vector/README.md)
     — the scripts behind the masters side table's buffers-per-match, lock and backfill measurements
     (results in [architecture](architecture.md#master-title-search-vector)).
+  - [Release search facet and filter attributes, 2026-11-08](audits/2026-11-08-release-search-facets/README.md)
+    — the scripts behind the facet and filtered-branch buffers, the upgrade's locks and its backfill
+    (results in [architecture](architecture.md#release-search-facet-and-filter-attributes)).
 - [Design decisions](design/) — dated decision records.
   - [MusicBrainz relational migration decision](design/gm-database-schema-dgmd-musicbrainz-relational-migration.md)
     and its [research receipt index](design/evidence/gm-database-schema-a704-schema-research-receipts.md).

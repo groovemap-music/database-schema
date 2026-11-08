@@ -7295,16 +7295,19 @@ _MUSICBRAINZ_RETIRED_INDEXES: list[tuple[str, str]] = [
 #
 # Each side table is declared once, as a `_SearchSideTable`, and every statement below is
 # generated from that declaration, so the two tables share one implementation. A carried
-# column is always its expression over the entity row's `data`. Triggers on the entity table
-# keep it current, so no loader changes:
+# column is always its expression over the entity row (its `data`, or for release_search's
+# media columns its `media`). Triggers on the entity table keep it current, so no loader changes:
 #
 # - insert: one set-based upsert per statement over its transition table;
 # - update: per row, and only when the statement sets one of `watched` (`data_id` or `data`).
 #   The loader's `updated_at` refresh of every unchanged record and its media and identity
-#   backfills set neither, so they pay nothing. A statement trigger cannot name columns and
-#   would recompute, and detoast, every one of those rows;
+#   backfills set neither, so they pay nothing here. A statement trigger cannot name columns
+#   and would recompute, and detoast, every one of those rows;
 # - delete: one set-based delete per statement (the loader's stale-row purge);
-# - truncate: empties the side table.
+# - truncate: empties the side table;
+# - a `partial` update: per row, when a statement changes one other entity column (the
+#   loader's `media` backfill), rewriting only the carried columns computed from it, so it
+#   never detoasts `data`.
 #
 # The capture functions are SECURITY DEFINER, so a role that may write the entity table needs
 # no grant on its side table. Existing rows are filled by `CALL public.<side>_backfill()`, which
@@ -7320,6 +7323,17 @@ class _SearchSideTable:
     is the TSVECTOR the GIN index covers. Each expression maps the alias of an entity row to
     that column's value computed from the row, and is the only definition of the value: the
     triggers, the backfill and the drift check all use it.
+
+    `reads` names the entity columns other than `data_id` and `data` the expressions read.
+
+    `added` names the carried columns a deployed table may predate. Each gets an `ALTER TABLE
+    ... ADD COLUMN IF NOT EXISTS`, which the initializer skips, taking no lock, once the column
+    exists, and which must therefore declare a nullable column. The backfill fills them.
+
+    `partial` is (entity column, carried columns): a fifth row trigger, fired only when an
+    UPDATE changes that entity column, rewrites just those carried columns, which must be
+    computed from that entity column alone. The update trigger on `watched` still rewrites
+    every carried column.
     """
 
     source: str
@@ -7328,10 +7342,34 @@ class _SearchSideTable:
     index: str
     columns: tuple[tuple[str, str, Callable[[str], str]], ...]
     watched: str = "data_id, data"
+    reads: tuple[str, ...] = ()
+    added: tuple[str, ...] = ()
+    partial: tuple[tuple[str, tuple[str, ...]], ...] = ()
+
+    @property
+    def triggers(self) -> tuple[str, ...]:
+        """Return every capture trigger's operation: the four, then one `update_<column>` per partial."""
+        return (*_SEARCH_TRIGGERS, *(f"update_{column}" for column, _carried in self.partial))
 
     @property
     def column_names(self) -> str:
         return ", ".join(column for column, _declaration, _expression in self.columns)
+
+    def rows(self, select: str, *, alias: str) -> str:
+        """Return a FROM item, ALIAS, of the rows SELECT reads, each row's `data` detoasted once.
+
+        SELECT is the FROM and WHERE of a query over entity rows, or `NULL` to read a trigger's
+        `NEW`. Every `->` or `->>` over a toasted `data` detoasts the whole document again, so
+        carried columns that read several of its keys would read each document once per key
+        (four times for release_search, a quarter of its backfill). `data #> '{}'` hands back
+        the detoasted document unchanged, and OFFSET 0 keeps the planner from inlining it into
+        every reference.
+        """
+        if select == "NULL":
+            columns = ", ".join(("NEW.data_id AS data_id", "NEW.data #> '{}' AS data", *(f"NEW.{column} AS {column}" for column in self.reads)))
+            return f"(SELECT {columns} OFFSET 0) AS {alias}"
+        columns = ", ".join(("data_id", "data #> '{}' AS data", *self.reads))
+        return f"(SELECT {columns} {select} OFFSET 0) AS {alias}"
 
     def values(self, row: str) -> str:
         """Return every carried column's expression over the entity row or alias ROW."""
@@ -7408,7 +7446,7 @@ def _search_capture_functions(table: _SearchSideTable) -> list[tuple[str, str]]:
             table,
             "inserted",
             f"""    INSERT INTO public.{table.name} ({table.key}, {table.column_names})
-    SELECT n.data_id, {table.values("n")} FROM new_rows AS n
+    SELECT n.data_id, {table.values("n")} FROM {table.rows("FROM new_rows", alias="n")}
     {upsert};""",  # noqa: S608 -- composed of module constants only
         ),
         _search_capture_function(
@@ -7418,12 +7456,33 @@ def _search_capture_functions(table: _SearchSideTable) -> list[tuple[str, str]]:
         DELETE FROM public.{table.name} WHERE {table.key} = OLD.data_id;
     END IF;
     INSERT INTO public.{table.name} ({table.key}, {table.column_names})
-    VALUES (NEW.data_id, {table.values("NEW")})
+    SELECT n.data_id, {table.values("n")} FROM {table.rows("NULL", alias="n")}
     {upsert};""",  # noqa: S608 -- composed of module constants only
         ),
         _search_capture_function(table, "deleted", f"    DELETE FROM public.{table.name} AS s USING old_rows AS o WHERE s.{table.key} = o.data_id;"),  # noqa: S608 -- module constants only
         _search_capture_function(table, "truncated", f"    TRUNCATE public.{table.name};"),
+        *(_search_partial_capture_function(table, column, carried) for column, carried in table.partial),
     ]
+
+
+def _search_partial_capture_function(table: _SearchSideTable, column: str, carried: tuple[str, ...]) -> tuple[str, str]:
+    """Return the capture function rewriting only CARRIED, the columns computed from entity COLUMN.
+
+    It reads NEW's COLUMN and nothing else of the row, so an UPDATE that changes only that
+    column never detoasts `data`. A release with no side row yet (before the backfill reaches
+    it) is left for the backfill; the update trigger on `watched` rewrites these columns too.
+    """
+    expressions = {name: expression for name, _declaration, expression in table.columns}
+    assignments = ", ".join(f"{name} = {expressions[name]('NEW')}" for name in carried)
+    stored = ", ".join(f"s.{name}" for name in carried)
+    computed = ", ".join(expressions[name]("NEW") for name in carried)
+    changed = f"s.{carried[0]} IS DISTINCT FROM {computed}" if len(carried) == 1 else f"({stored}) IS DISTINCT FROM ({computed})"
+    return _search_capture_function(
+        table,
+        f"{column}_updated",
+        f"""    UPDATE public.{table.name} AS s SET {assignments}
+    WHERE s.{table.key} = NEW.data_id AND {changed};""",  # noqa: S608 -- composed of module constants only
+    )
 
 
 def _search_backfill_lock_function(table: _SearchSideTable) -> tuple[str, str]:
@@ -7489,11 +7548,16 @@ def _search_backfill_statements(table: _SearchSideTable) -> list[tuple[str, str]
 
     Two passes of short transactions, each holding `<side>_backfill_lock()`, so no snapshot is
     held for hours, the only lock on the entity table is the ACCESS SHARE of a read, and a
-    concurrent load is never lost or overwritten (a row the triggers wrote is kept):
+    concurrent load is never lost or overwritten:
 
     1. Physical batches of `batch_pages` heap pages (a TID range scan), committed one by one.
        Reading in heap order reads the toast in the order it was written, which is what makes
        the pass fast. `first_page` resumes an interrupted run from its last progress notice.
+       It upserts, rewriting a side row only when one of its values differs from the entity
+       row's, so it also fills columns added to a populated table (`added`) and repairs stale
+       rows. That cannot overwrite a newer trigger write: the batch reads after taking its
+       lock, so it sees every committed trigger write's entity row, and a trigger still to run
+       waits for the batch and writes after it.
     2. The rows still missing, found by one read-only anti-join and added in batches. A row
        moved by an update that sets neither `data_id` nor `data` (the loader's `updated_at`
        refresh) fires no trigger and may have moved behind pass 1; one statement's snapshot
@@ -7514,10 +7578,8 @@ def _search_backfill_statements(table: _SearchSideTable) -> list[tuple[str, str]
     PERFORM public.{side}_backfill_lock();
     INSERT INTO public.{side} ({key}, {table.column_names})
     SELECT r.data_id, {table.values("r")}
-    FROM public.{source} AS r
-    WHERE r.ctid >= format('(%s,0)', first_page)::tid
-      AND r.ctid < format('(%s,0)', first_page + page_count)::tid
-    ON CONFLICT ({key}) DO NOTHING;
+    FROM {table.rows(f"FROM public.{source} WHERE ctid >= format('(%s,0)', first_page)::tid AND ctid < format('(%s,0)', first_page + page_count)::tid", alias="r")}
+    {_search_upsert(table)};
 END""",  # noqa: S608 -- composed of module constants only
     )
     find_missing = _search_backfill_step(
@@ -7547,7 +7609,7 @@ END""",  # noqa: S608 -- composed of module constants only
     )
     INSERT INTO public.{side} ({key}, {table.column_names})
     SELECT r.data_id, {table.values("r")}
-    FROM public.{source} AS r JOIN batch ON batch.data_id = r.data_id
+    FROM {table.rows(f"FROM public.{source} WHERE data_id IN (SELECT data_id FROM batch)", alias="r")}
     ON CONFLICT ({key}) DO NOTHING;
     IF EXISTS (SELECT 1 FROM pg_temp.{missing}) THEN
         RETURN true;
@@ -7613,7 +7675,7 @@ SELECT (SELECT count(*) FROM public.{source} AS r
         WHERE NOT EXISTS (SELECT 1 FROM public.{side} AS s WHERE s.{key} = r.data_id)),
        (SELECT count(*) FROM public.{side} AS s
         WHERE NOT EXISTS (SELECT 1 FROM public.{source} AS r WHERE r.data_id = s.{key})),
-       (SELECT count(*) FROM public.{source} AS r JOIN public.{side} AS s ON s.{key} = r.data_id
+       (SELECT count(*) FROM {table.rows(f"FROM public.{source}", alias="r")} JOIN public.{side} AS s ON s.{key} = r.data_id
         WHERE {table.differs("s", table.values("r"))})
 ${side}_drift$
 """,  # noqa: S608 -- composed of module constants only
@@ -7621,22 +7683,31 @@ ${side}_drift$
 
 
 def _search_triggers(table: _SearchSideTable) -> tuple[str, str]:
-    """Return the guarded statement creating the four capture triggers on the entity table.
+    """Return the guarded statement creating the capture triggers on the entity table.
 
     Guarded, as the identity ledger's are, so a reapply takes no lock on the entity table. The
-    first apply takes SHARE ROW EXCLUSIVE on it for the milliseconds the four CREATEs take:
+    first apply, and the first after a partial trigger is declared, drops and recreates them all
+    under SHARE ROW EXCLUSIVE on it, for the milliseconds the CREATEs take:
     readers are not blocked, writers wait. It runs under the initializer's lock timeout and
     retries rather than queueing every writer behind a long transaction.
     """
     side, source = table.name, table.source
-    names = ", ".join(_sql_literal(f"{side}_capture_{operation}") for operation in _SEARCH_TRIGGERS)
-    drops = "\n".join(f"    DROP TRIGGER IF EXISTS {side}_capture_{operation} ON public.{source};" for operation in _SEARCH_TRIGGERS)
+    names = ", ".join(_sql_literal(f"{side}_capture_{operation}") for operation in table.triggers)
+    drops = "\n".join(f"    DROP TRIGGER IF EXISTS {side}_capture_{operation} ON public.{source};" for operation in table.triggers)
+    # Named update_<column>, so it sorts, and fires, after the update trigger: when one statement
+    # sets both, the update trigger has already written these columns and this one writes nothing.
+    partials = "".join(
+        f"""
+    CREATE TRIGGER {side}_capture_update_{column} AFTER UPDATE OF {column} ON public.{source}
+        FOR EACH ROW WHEN (OLD.{column} IS DISTINCT FROM NEW.{column}) EXECUTE FUNCTION public.{side}_capture_{column}_updated();"""
+        for column, _carried in table.partial
+    )
     return (
         f"{source} {side} capture triggers",
         f"""DO ${side}_triggers$
 BEGIN
     IF (SELECT count(*) FROM pg_catalog.pg_trigger
-        WHERE tgrelid = 'public.{source}'::regclass AND tgname IN ({names})) = {len(_SEARCH_TRIGGERS)} THEN
+        WHERE tgrelid = 'public.{source}'::regclass AND tgname IN ({names})) = {len(table.triggers)} THEN
         RETURN;
     END IF;
 {drops}
@@ -7647,7 +7718,7 @@ BEGIN
     CREATE TRIGGER {side}_capture_delete AFTER DELETE ON public.{source}
         REFERENCING OLD TABLE AS old_rows FOR EACH STATEMENT EXECUTE FUNCTION public.{side}_capture_deleted();
     CREATE TRIGGER {side}_capture_truncate AFTER TRUNCATE ON public.{source}
-        FOR EACH STATEMENT EXECUTE FUNCTION public.{side}_capture_truncated();
+        FOR EACH STATEMENT EXECUTE FUNCTION public.{side}_capture_truncated();{partials}
 END
 ${side}_triggers$
 """,  # noqa: S608 -- composed of module constants only
@@ -7665,8 +7736,13 @@ def _search_statements(table: _SearchSideTable) -> list[tuple[str, str]]:
         for name, declaration in ((table.key, "VARCHAR  PRIMARY KEY"), *((column, declaration) for column, declaration, _expression in table.columns))
     )
     vector = table.columns[0][0]
+    declarations = {name: declaration for name, declaration, _expression in table.columns}
     return [
         (f"{table.name} table", f"CREATE TABLE IF NOT EXISTS public.{table.name} (\n{columns}\n        )"),
+        *(
+            (f"{table.name}.{column} column", f"ALTER TABLE public.{table.name} ADD COLUMN IF NOT EXISTS {column} {declarations[column]}")
+            for column in table.added
+        ),
         (table.index, f"CREATE INDEX IF NOT EXISTS {table.index} ON public.{table.name} USING GIN ({vector})"),
         *_search_capture_functions(table),
         _search_backfill_lock_function(table),
@@ -7683,9 +7759,10 @@ def _search_rollback_statements(table: _SearchSideTable) -> tuple[str, ...]:
     creating them did.
     """
     side, source = table.name, table.source
+    events = ("inserted", "updated", "deleted", "truncated", *(f"{column}_updated" for column, _carried in table.partial))
     return (
-        *(f"DROP TRIGGER IF EXISTS {side}_capture_{operation} ON public.{source}" for operation in _SEARCH_TRIGGERS),
-        *(f"DROP FUNCTION IF EXISTS public.{side}_capture_{event}()" for event in ("inserted", "updated", "deleted", "truncated")),
+        *(f"DROP TRIGGER IF EXISTS {side}_capture_{operation} ON public.{source}" for operation in table.triggers),
+        *(f"DROP FUNCTION IF EXISTS public.{side}_capture_{event}()" for event in events),
         f"DROP FUNCTION IF EXISTS public.{side}_drift()",
         f"DROP PROCEDURE IF EXISTS public.{side}_backfill(integer, bigint)",
         f"DROP FUNCTION IF EXISTS public.{side}_backfill_pages(bigint, integer)",
@@ -7706,12 +7783,47 @@ _RELEASE_SEARCH_TRIGGERS = _SEARCH_TRIGGERS
 RELEASE_SEARCH_BACKFILL_LOCK_TIMEOUT = SEARCH_BACKFILL_LOCK_TIMEOUT
 _release_title_tsvector = _title_tsvector
 
+
+# ── Release search facet and filter attributes (gm-database-schema-1sle) ──
+# catalog-api's genre, decade and media facets, and every filtered release branch (year, genre,
+# media, country), read these from `releases` for every title match, detoasting `data` each
+# time. release_search carries each one as exactly the expression catalog-api evaluates, not a
+# typed or cleaned version of it: so a filter or facet moved onto release_search returns what it
+# returns today for every row, odd values included, and no value can make a capture trigger, and
+# with it a loader write, fail. catalog-api's clauses map one to one:
+#
+# | today, over releases                                   | over release_search          |
+# | ------------------------------------------------------ | ---------------------------- |
+# | data->'genres'  (?|, jsonb_array_elements_text)        | genres                       |
+# | data->>'year'   (::int, ~ '^[0-9]{4}$')                | year                         |
+# | data->>'country' (= ANY)                               | country                      |
+# | media->'families' (?|, jsonb_array_elements_text)      | media_families               |
+# | media IS NULL                                          | media_mediums IS NULL        |
+# | jsonb_path_exists(media, '$.items[*] ? (@.medium == $m)') | media_mediums ? m         |
+#
+# `media_mediums` lists every value an item's `medium` is compared as, in the same lax jsonpath
+# (one level of array unwrapped), so `?` on it matches exactly the releases the path filter
+# matches; it is NULL exactly when `media` is, and `[]` for a block with no items.
+RELEASE_SEARCH_ATTRIBUTES: tuple[tuple[str, str, Callable[[str], str]], ...] = (
+    ("genres", "JSONB", lambda row: f"{row}.data->'genres'"),
+    ("year", "TEXT", lambda row: f"{row}.data->>'year'"),
+    ("country", "TEXT", lambda row: f"{row}.data->>'country'"),
+    ("media_families", "JSONB", lambda row: f"{row}.media->'families'"),
+    ("media_mediums", "JSONB", lambda row: f"jsonb_path_query_array({row}.media, '$.items[*].medium[*]')"),
+)
+_RELEASE_MEDIA_ATTRIBUTES = ("media_families", "media_mediums")
+
 _RELEASE_SEARCH = _SearchSideTable(
     source="releases",
     name="release_search",
     key="release_id",
     index=RELEASE_SEARCH_INDEX,
-    columns=(("title_tsv", "TSVECTOR NOT NULL", _title_tsvector),),
+    columns=(("title_tsv", "TSVECTOR NOT NULL", _title_tsvector), *RELEASE_SEARCH_ATTRIBUTES),
+    reads=("media",),
+    # v0.11.0 created release_search with title_tsv alone.
+    added=tuple(column for column, _declaration, _expression in RELEASE_SEARCH_ATTRIBUTES),
+    # discogs-sql-loader backfills `media` on unchanged rows with an UPDATE that sets nothing else.
+    partial=(("media", _RELEASE_MEDIA_ATTRIBUTES),),
 )
 _RELEASE_SEARCH_STATEMENTS: list[tuple[str, str]] = _search_statements(_RELEASE_SEARCH)
 

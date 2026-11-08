@@ -34,6 +34,7 @@ from groovemap_schema.postgres import (
     PATH_MAX_DEPTH,
     PATH_MIN_DEPTH,
     PATH_SEEN_RELATION,
+    RELEASE_SEARCH_ATTRIBUTES,
     RELEASE_SEARCH_INDEX,
     RELEASE_SEARCH_TABLE,
     RELEASE_TITLE_TSVECTOR,
@@ -174,6 +175,23 @@ assert (
     in (release_search_statements["release_search_drift function"])
 )
 assert "AFTER UPDATE OF data_id, data ON public.releases" in release_search_statements["releases release_search capture triggers"]
+# catalog-api's facet and filter inputs (gm-database-schema-1sle): each column is the expression
+# the contract names, added to a v0.11.0 table by a skippable nullable ADD COLUMN, and a media-only
+# update is captured without reading the document.
+for column, declaration, expression in RELEASE_SEARCH_ATTRIBUTES:
+    contracted = release_search["columns"][column]
+    assert contracted.startswith(f"{declaration}, "), column
+    assert expression("r").removeprefix("r.") in contracted.replace("(media,", "(r.media,").removeprefix(f"{declaration}, "), column
+    assert (
+        release_search_statements[f"release_search.{column} column"]
+        == f"ALTER TABLE {RELEASE_SEARCH_TABLE} ADD COLUMN IF NOT EXISTS {column} {declaration}"
+    ), column
+assert set(release_search["columns"]) == {"release_id", "title_tsv", *(column for column, _declaration, _expression in RELEASE_SEARCH_ATTRIBUTES)}
+assert "release_search_capture_update_media" in release_search["maintenance"]
+assert (
+    "CREATE TRIGGER release_search_capture_update_media AFTER UPDATE OF media ON public.releases\n"
+    "        FOR EACH ROW WHEN (OLD.media IS DISTINCT FROM NEW.media)"
+) in release_search_statements["releases release_search capture triggers"]
 
 # catalog-api ranks and decade-facets masters by public.master_search (gm-database-schema-nu0c):
 # pin its columns, index, values, maintenance, and the procedures the operator calls.
