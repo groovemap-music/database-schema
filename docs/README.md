@@ -31,6 +31,9 @@
 - [Audits](audits/) — dated measurements of the shipped schema.
   - [Index, view and function audit, 2026-11-04](audits/2026-11-04-index-view-function-audit.md)
     — every index with size, scans and verdict, the load-time savings, and the follow-up beads.
+  - [Release title search vector, 2026-11-07](audits/2026-11-07-release-title-search-vector/README.md)
+    — the scripts behind the side table's buffers-per-match, lock and backfill measurements
+    (results in [architecture](architecture.md#release-title-search-vector)).
 - [Design decisions](design/) — dated decision records.
   - [MusicBrainz relational migration decision](design/gm-database-schema-dgmd-musicbrainz-relational-migration.md)
     and its [research receipt index](design/evidence/gm-database-schema-a704-schema-research-receipts.md).

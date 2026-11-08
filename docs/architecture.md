@@ -1258,6 +1258,111 @@ constraint and the `release_country` index.
 Every index and constraint above is additive within persistence contract v1 — see
 [the persistence compatibility contract](../contracts/persistence/).
 
+## Release title search vector
+
+catalog-api's search ranks every release whose title matches, because exact top results need a
+rank for each. Ranking by `ts_rank(to_tsvector('english', COALESCE(data->>'title', '')), q)`
+recomputes the vector from the document, which detoasts the whole `releases.data` per match: on
+lux, 'love' matches 497k of 19.6M releases and costs 16.6 s first and 4.1 s repeated, 2.33M of
+the route's 2.4M buffers (about 4.7 per match; the table carries 54 GB of toast).
+
+`public.release_search (release_id VARCHAR PRIMARY KEY, title_tsv TSVECTOR NOT NULL)` stores
+that vector, one row of about 86 bytes per release, under the GIN index
+`idx_release_search_title_tsv`. A ranking reads the side table and joins `releases` only for the
+rows that survive its LIMIT. `title_tsv` is exactly `RELEASE_TITLE_TSVECTOR`,
+`to_tsvector('english', COALESCE(data->>'title', ''))`, the expression `idx_releases_fts`
+indexes, so ranks and their order are unchanged. `idx_releases_fts` stays until catalog-api no
+longer reads it.
+
+**Why a side table.** `ADD COLUMN ... GENERATED ALWAYS AS (...) STORED` rewrites all 19.6M rows
+under ACCESS EXCLUSIVE, for hours. A nullable column filled in batches avoids the long lock, but
+it still writes a new version of every release into every index on `releases`. It also leaves the
+ranking reading the wide `releases` heap: on the sample below, today's plan visits 0.85 heap pages
+per match, against 0.38 for the side table. The side table is created empty and filled without writing a
+single `releases` row.
+
+**Keeping it current.** Triggers on `releases` maintain it, so no loader changes:
+
+| Trigger | Fires | Does |
+| --- | --- | --- |
+| `release_search_capture_insert` | after each INSERT statement | upserts the inserted rows' vectors from the transition table |
+| `release_search_capture_update` | after each row UPDATE that sets `data_id` or `data` | upserts the new vector, drops the old id's on a rename |
+| `release_search_capture_delete` | after each DELETE statement | deletes the deleted rows' vectors |
+| `release_search_capture_truncate` | after TRUNCATE | empties the table |
+
+The update trigger is per row because only a row trigger can name columns. The loaders refresh
+`updated_at` on every unchanged record, and backfill `media` and `gm_item_id`, without setting
+`data`. A statement trigger would recompute, and detoast, every one of those rows. An upsert writes
+only when the vector changed. The capture functions are SECURITY DEFINER, so a role that writes
+`releases` needs no grant on `release_search`. Each one refuses to run on any table but
+`public.releases`, and PUBLIC has no EXECUTE on them, so no role can attach one to a table of its
+own and write or truncate `release_search` as the owner. There is no foreign key: it would make the
+loaders' `TRUNCATE releases` fail.
+
+**Locks.** Creating the four triggers takes SHARE ROW EXCLUSIVE on `releases`. Readers are not
+blocked; writers wait. It is held for the catalog change only, 4 to 9 ms on the populated sample,
+whatever the table's size. Like every init statement, it waits for an in-flight writer at most the
+initializer's 2 s lock timeout per attempt. A reapply finds all four triggers present and takes no
+lock. Nothing else in the change locks `releases` beyond a read's ACCESS SHARE.
+
+**Backfill.** Run `CALL public.release_search_backfill();` once, outside a transaction block, as the
+schema owner. The initializer never runs it. It has two passes, each made of short committed
+transactions:
+
+1. Batches of `batch_pages` heap pages (default 1000) read by TID range, so the toast is read in
+   the order it was written. Every 100 batches it reports progress; after an interruption,
+   `CALL public.release_search_backfill(1000, <last page reported>)` resumes.
+2. One read-only anti-join finds the releases still missing, and they are added in batches. An
+   update that sets neither `data_id` nor `data` fires no trigger, yet it can move a row behind
+   pass 1; a single snapshot sees every row once, wherever it is.
+
+Each batch first takes SHARE on `release_search` through `release_search_backfill_lock()`. It
+waits at most 500 ms per try and retries. That lock conflicts with the triggers' writes and with
+nothing a reader takes. So a batch never waits on a trigger's uncommitted row, and no trigger
+changes a vector between the batch's read and its commit. Without it, the backfill deadlocked
+against a concurrent load, and so did the load. A load during a backfill therefore waits up to one
+batch, about 0.35 s, per statement. Prefer a quiet window.
+
+A procedure that commits can't pin its `search_path`, so it runs no SQL of its own. It only calls
+three step functions that hold every statement and pin `search_path = pg_catalog, pg_temp`. A
+`to_tsvector` or `->>` planted in a schema on the caller's path therefore can't take the place of
+the real ones. PUBLIC has no EXECUTE on the procedure or its steps.
+
+Afterwards, `SELECT * FROM public.release_search_drift();` returns `(0, 0, 0)`: no release
+missing, no vector without a release, none stale. Its `stale` count recomputes every vector, so it
+reads every document once, as pass 1 does.
+
+**Measured.** On PostgreSQL 18.6, against a 2M-row Discogs-shaped sample: heap 1.25 GB, toast
+4.79 GB (2.5 KB per row; lux has 2.75 KB), and 'love' in 51,144 titles. This is catalog-api's
+release branch with its cap of 40:
+
+| | Before (`idx_releases_fts`) | After (`release_search`) |
+| --- | --- | --- |
+| 'love': ranked-branch buffers | 194,535 (3.80 per match) | 19,327 (0.38 per match), 10.1× fewer |
+| 'love': cold / warm | 9.92 s / 0.54 to 1.46 s | 0.74 s / 45 ms |
+| 'rock' (9,020 matches): statement buffers, warm | 36,574, 196 ms | 8,083, 30 ms |
+| a 66-match term: statement buffers, warm | 1,091, 5.1 ms | 874, 3.0 ms |
+
+The backfill took 65 s for 2M rows with a warm OS cache and 97 s with every cache dropped, which
+extrapolates to 11 to 16 minutes for lux's 19.6M. Pass 2 took 5 s, about a minute at lux scale.
+At lux scale the side table holds about 1.6 GB of heap, 0.3 GB of GIN and 0.7 GB of primary key.
+
+The triggers add to a 1000-row loader statement about 28 ms for a changed-document upsert (156 to
+184 ms), 12 ms for an insert, and 12 ms for the stale-row purge. An `updated_at` refresh shows no
+measurable change.
+
+A backfill with loader-shaped writes running alongside it lost and kept nothing it should not.
+Those writes were upserts with changed titles, `updated_at` refreshes, deletes and inserts. Drift
+afterwards was `(0, 0, 0)`, and no statement failed. The writers' statements took p50 243 ms and at
+most 773 ms during it, against 17 ms and 202 ms without it. The scripts, and how to rerun them,
+are in [`docs/audits/2026-11-07-release-title-search-vector`](audits/2026-11-07-release-title-search-vector/README.md).
+
+**Rollout and rollback.** The change is additive: apply the schema, run the backfill, check the
+drift, then switch catalog-api's search statements to `release_search`. To roll back, first move
+catalog-api back to `idx_releases_fts`, then run `RELEASE_SEARCH_ROLLBACK_STATEMENTS` from
+`groovemap_schema.postgres` in order. They drop the triggers (with the same brief lock creating
+them took), then the functions, the procedure and the table. No `releases` row is touched.
+
 ## Graph schema
 
 The `graph` schema re-presents the catalog as relational vertex and edge projections matching

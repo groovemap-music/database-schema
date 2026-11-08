@@ -1178,6 +1178,26 @@
   "owners": [
     "database-schema"
   ],
+  "release_search": {
+    "backfill": "CALL public.release_search_backfill(batch_pages integer DEFAULT 1000, first_page bigint DEFAULT 0), run once by the operator outside a transaction block; the initializer never runs it. Each batch takes SHARE on public.release_search (never a lock on releases beyond a read's ACCESS SHARE), so readers never block and a load's trigger waits at most one batch; first_page resumes from its last progress notice; rerunning it is harmless; its SQL runs in step functions with a pinned search_path, and PUBLIC has no EXECUTE on it or them",
+    "columns": {
+      "release_id": "VARCHAR PRIMARY KEY, equal to releases.data_id",
+      "title_tsv": "TSVECTOR NOT NULL"
+    },
+    "consumers": [
+      "catalog-api"
+    ],
+    "consumer_rollout": "expand phase: catalog-api ranks by title_tsv only after release_search_drift() reports no missing rows on that database; until then it keeps ranking by idx_releases_fts, which this change leaves in place",
+    "design_decision": "Ranking a common title term computed to_tsvector for every match, detoasting the whole releases.data document per match (lux: 'love' 497k matches, about 4.7 buffers each, 16.6 s first run). A side table holds the vector so a ranking reads a row of about 86 bytes per match and reads releases only for the rows that survive its LIMIT. A side table rather than a column on releases: a stored generated column rewrites the table under ACCESS EXCLUSIVE, and a nullable column filled in batches writes a new version of all 19.6M rows into every index on releases, while the side table is created empty and filled without writing to releases (gm-database-schema-fi4a)",
+    "drift": "public.release_search_drift() RETURNS TABLE (missing bigint, orphaned bigint, stale bigint); missing and orphaned read keys only, stale recomputes every vector and so reads every document",
+    "index": "idx_release_search_title_tsv ON public.release_search USING GIN (title_tsv)",
+    "introduced_in_contract_version": 1,
+    "kind": "additive",
+    "maintenance": "triggers on public.releases keep it current, so no loader changes: an insert or delete is captured once per statement, an update only when it sets data_id or data (so the loaders' updated_at refresh and media and identity backfills pay nothing), and a truncate empties it; the capture functions are SECURITY DEFINER, so a role that writes releases needs no grant on release_search; each refuses to run on any table but public.releases, and PUBLIC has no EXECUTE on them",
+    "relation": "public.release_search",
+    "rollback": "the statements in RELEASE_SEARCH_ROLLBACK_STATEMENTS, in order; they touch no releases row",
+    "vector": "to_tsvector('english', COALESCE(data->>'title', '')) of the release's data, the expression idx_releases_fts indexes, for every release and no other row"
+  },
   "retired_relations": {
     "consumer_rollout": "contract phase of expand, migrate consumers, then contract: catalog-api stopped writing and reading both tables (gm-catalog-api-gz4r) and operations-console reads queue and service-health history from VictoriaMetrics, so the drop lands only after a catalog-api release containing that removal is deployed",
     "data": "historical rows are not migrated; VictoriaMetrics holds the same series at finer resolution for its retention window (ADR 0018)",
