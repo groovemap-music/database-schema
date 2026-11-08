@@ -22,7 +22,13 @@ import pytest_asyncio
 from psycopg import sql
 
 from groovemap_schema import initializer, postgres
-from groovemap_schema.postgres import _execute_schema_statements, _schema_statements, create_postgres_schema
+from groovemap_schema.postgres import (
+    _apply_pg_stat_statements,
+    _apply_vector_schema,
+    _execute_schema_statements,
+    _schema_statements,
+    create_postgres_schema,
+)
 
 
 if TYPE_CHECKING:
@@ -304,6 +310,11 @@ async def test_a_recreate_after_a_drop_in_the_same_init_is_not_skipped() -> None
         async with await psycopg.AsyncConnection.connect(**_params(plain), autocommit=True) as conn:
             async with conn.cursor() as cursor:
                 _success, failures = await _execute_schema_statements(cursor, _schema_statements())
+                # `create_postgres_schema` also applies the pgvector and pg_stat_statements schema
+                # whenever the server has them (ADR 0013), so the unguarded baseline must too, or
+                # the fingerprints differ on a pgvector image for a reason unrelated to the skip.
+                failures += await _apply_vector_schema(cursor)
+                failures += await _apply_pg_stat_statements(cursor)
             assert failures == 0
         assert await create_postgres_schema(_Pool(guarded)) == 0
 
