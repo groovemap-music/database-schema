@@ -1108,6 +1108,28 @@
     },
     "views": 37
   },
+  "master_search": {
+    "backfill": "CALL public.master_search_backfill(batch_pages integer DEFAULT 1000, first_page bigint DEFAULT 0), run once by the operator outside a transaction block; the initializer never runs it. Each batch takes SHARE on public.master_search (never a lock on masters beyond a read's ACCESS SHARE), so readers never block and a load's trigger waits at most one batch; first_page resumes from its last progress notice; rerunning it is harmless; its SQL runs in step functions with a pinned search_path, and PUBLIC has no EXECUTE on it or them",
+    "columns": {
+      "master_id": "VARCHAR PRIMARY KEY, equal to masters.data_id",
+      "title_tsv": "TSVECTOR NOT NULL",
+      "year": "TEXT, NULL when the document has no year"
+    },
+    "consumers": [
+      "catalog-api"
+    ],
+    "consumer_rollout": "expand phase: catalog-api ranks, year-filters and decade-facets masters by master_search only after master_search_drift() reports no missing rows on that database; until then it keeps reading masters.data through idx_masters_fts, which this change leaves in place",
+    "design_decision": "Master search and the masters half of the decade facet computed to_tsvector over masters.data for every match and read each match's heap row of whole documents (lux: 2.6M masters, 2.4 GB of heap at about nine a page; 'love' 71,692 matches, 69,224 buffers for the ranked branch, 0.97 per match). A side table built by the same generator as release_search holds the vector and the year, so a ranking or a facet reads a narrow row per match and reads masters only for the rows that survive its LIMIT; on a lux-shaped 2.6M-row sample 'love' falls from 1.05 to 0.38 buffers per match (2.8x) and from 6.6 s to 0.18 s cold, with the same 40 results in the same order; a side table rather than columns on masters for the reasons release_search gives (gm-database-schema-nu0c)",
+    "drift": "public.master_search_drift() RETURNS TABLE (missing bigint, orphaned bigint, stale bigint); missing and orphaned read keys only, stale recomputes every vector and year together and so reads every document",
+    "index": "idx_master_search_title_tsv ON public.master_search USING GIN (title_tsv)",
+    "introduced_in_contract_version": 1,
+    "kind": "additive",
+    "maintenance": "triggers on public.masters keep it current, so no loader changes: an insert or delete is captured once per statement, an update only when it sets data_id or data (so the loaders' updated_at refresh and identity backfill pay nothing), and a truncate empties it; a capture writes a row only when its vector or year changed; the capture functions are SECURITY DEFINER, so a role that writes masters needs no grant on master_search; each refuses to run on any table but public.masters, and PUBLIC has no EXECUTE on them",
+    "relation": "public.master_search",
+    "rollback": "the statements in MASTER_SEARCH_ROLLBACK_STATEMENTS, in order; they touch no masters row and nothing of release_search",
+    "vector": "to_tsvector('english', COALESCE(data->>'title', '')) of the master's data, the expression idx_masters_fts indexes, for every master and no other row",
+    "year": "data->>'year' of the master's data verbatim, as text: catalog-api's (year)::int filter and its '^[0-9]{4}$' decade test apply to it unchanged, and no document value can make a capture fail"
+  },
   "musicbrainz_delete_reconciliation": {
     "columns": {
       "musicbrainz.external_links.updated_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",

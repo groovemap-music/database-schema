@@ -7642,12 +7642,46 @@ _RELEASE_SEARCH_STATEMENTS: list[tuple[str, str]] = _search_statements(_RELEASE_
 RELEASE_SEARCH_ROLLBACK_STATEMENTS: tuple[str, ...] = _search_rollback_statements(_RELEASE_SEARCH)
 
 
+# ── Master title search vector (gm-database-schema-nu0c) ──
+# catalog-api's master search branch and the masters half of its decade facet match with
+# `MASTER_TITLE_TSVECTOR` over `masters.data` (2.6M rows on lux, 2.4 GB of heap at about nine
+# documents a page), so each match reads a heap page of whole documents. `public.master_search`
+# stores the vector and the master's year, so a ranking or a facet reads one narrow row per
+# match and `masters` only for the rows that survive its LIMIT. `year` is `MASTER_YEAR`
+# verbatim, text as catalog-api reads it today: its `year::int` filter and `~ '^[0-9]{4}$'`
+# decade test apply to the stored value unchanged, and no document value can make a trigger
+# fail. See docs/architecture.md, "Master title search vector".
+MASTER_SEARCH_TABLE = "public.master_search"
+MASTER_SEARCH_INDEX = "idx_master_search_title_tsv"
+MASTER_TITLE_TSVECTOR = "to_tsvector('english', COALESCE(data->>'title', ''))"
+MASTER_YEAR = "data->>'year'"
+
+
+def _master_year(row: str) -> str:
+    """Return `MASTER_YEAR` over the `data` of the row or alias ROW."""
+    return f"{row}.data->>'year'"
+
+
+_MASTER_SEARCH = _SearchSideTable(
+    source="masters",
+    name="master_search",
+    key="master_id",
+    index=MASTER_SEARCH_INDEX,
+    columns=(("title_tsv", "TSVECTOR NOT NULL", _title_tsvector), ("year", "TEXT", _master_year)),
+)
+_MASTER_SEARCH_STATEMENTS: list[tuple[str, str]] = _search_statements(_MASTER_SEARCH)
+
+# Removes everything above, for the rollback in `docs/architecture.md`.
+MASTER_SEARCH_ROLLBACK_STATEMENTS: tuple[str, ...] = _search_rollback_statements(_MASTER_SEARCH)
+
+
 def _schema_statements() -> Iterator[tuple[str, Any]]:
     """Yield the complete PostgreSQL schema in compatibility-sensitive order."""
     yield from _entity_schema_statements()
     yield from _retired_btree_index_statements()
     yield from _SPECIFIC_INDEXES
     yield from _RELEASE_SEARCH_STATEMENTS
+    yield from _MASTER_SEARCH_STATEMENTS
     yield from _USER_TABLES
     yield from _INSIGHTS_TABLES
     yield from _ACTIVITY_STATEMENTS

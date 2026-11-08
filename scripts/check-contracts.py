@@ -13,6 +13,7 @@ from groovemap_schema.postgres import (
     _GRAPH_STATEMENTS,
     _IDENTITY_LEDGER_STATEMENTS,
     _LEDGER_SOURCES,
+    _MASTER_SEARCH_STATEMENTS,
     _MUSICBRAINZ_TABLES,
     _PATH_RELATIONS,
     _PATH_RELATIONSHIP_TYPES,
@@ -25,6 +26,10 @@ from groovemap_schema.postgres import (
     EXPLORE_MIN_HOPS,
     IDENTITY_LEDGER_STORES,
     IDENTITY_LEDGER_VIEWS,
+    MASTER_SEARCH_INDEX,
+    MASTER_SEARCH_TABLE,
+    MASTER_TITLE_TSVECTOR,
+    MASTER_YEAR,
     PATH_DEFAULT_DEPTH,
     PATH_MAX_DEPTH,
     PATH_MIN_DEPTH,
@@ -169,6 +174,34 @@ assert (
     in (release_search_statements["release_search_drift function"])
 )
 assert "AFTER UPDATE OF data_id, data ON public.releases" in release_search_statements["releases release_search capture triggers"]
+
+# catalog-api ranks and decade-facets masters by public.master_search (gm-database-schema-nu0c):
+# pin its columns, index, values, maintenance, and the procedures the operator calls.
+master_search = contract["master_search"]
+master_search_statements = dict(_MASTER_SEARCH_STATEMENTS)
+assert master_search["kind"] == "additive"
+assert master_search["introduced_in_contract_version"] == contract["version"]
+assert master_search["consumers"] == ["catalog-api"]
+assert master_search["relation"] == MASTER_SEARCH_TABLE
+master_search_table = " ".join(master_search_statements["master_search table"].split())
+for column, declaration in master_search["columns"].items():
+    column_type = declaration.split(",", 1)[0]
+    assert re.search(rf"\b{column}\s+{re.escape(column_type)}", master_search_table), column
+assert "year TEXT )" in master_search_table  # nullable
+assert master_search["index"] == master_search_statements[MASTER_SEARCH_INDEX].removeprefix("CREATE INDEX IF NOT EXISTS ")
+assert master_search["vector"].startswith(f"{MASTER_TITLE_TSVECTOR} of the master's data")
+assert master_search["year"].startswith(f"{MASTER_YEAR} of the master's data verbatim")
+assert master_search["backfill"].startswith("CALL public.master_search_backfill(batch_pages integer DEFAULT 1000, first_page bigint DEFAULT 0)")
+assert (
+    "CREATE OR REPLACE PROCEDURE public.master_search_backfill(batch_pages integer DEFAULT 1000, first_page bigint DEFAULT 0)"
+    in (master_search_statements["master_search_backfill procedure"])
+)
+assert master_search["drift"].split(";", 1)[0] == "public.master_search_drift() RETURNS TABLE (missing bigint, orphaned bigint, stale bigint)"
+assert (
+    "CREATE OR REPLACE FUNCTION public.master_search_drift()\nRETURNS TABLE (missing bigint, orphaned bigint, stale bigint)"
+    in (master_search_statements["master_search_drift function"])
+)
+assert "AFTER UPDATE OF data_id, data ON public.masters" in master_search_statements["masters master_search capture triggers"]
 
 # Catalog-item supersession (ADR 0009's 2026-09-25 amendment) is consumed by
 # catalog-api's merge steps, so every column, cause, key, and index the contract

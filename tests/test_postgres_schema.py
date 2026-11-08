@@ -29,6 +29,7 @@ from groovemap_schema.postgres import (
     _IDENTITY_LEDGER_STATEMENTS,
     _INSIGHTS_TABLES,
     _IS_SUPERUSER_QUERY,
+    _MASTER_SEARCH_STATEMENTS,
     _MUSICBRAINZ_INDEXES,
     _MUSICBRAINZ_RETIRED_INDEXES,
     _MUSICBRAINZ_TABLES,
@@ -361,6 +362,7 @@ class TestCreatePostgresSchema:
             + len(_RETIRED_BTREE_INDEXES)
             + len(_SPECIFIC_INDEXES)
             + len(_RELEASE_SEARCH_STATEMENTS)
+            + len(_MASTER_SEARCH_STATEMENTS)
             + len(_USER_TABLES)
             + len(_INSIGHTS_TABLES)
             + len(_ACTIVITY_STATEMENTS)
@@ -408,6 +410,7 @@ class TestCreatePostgresSchema:
             + len(_RETIRED_BTREE_INDEXES)
             + len(_SPECIFIC_INDEXES)
             + len(_RELEASE_SEARCH_STATEMENTS)
+            + len(_MASTER_SEARCH_STATEMENTS)
             + len(_USER_TABLES)
             + len(_INSIGHTS_TABLES)
             + len(_ACTIVITY_STATEMENTS)
@@ -498,6 +501,7 @@ class TestCreatePostgresSchema:
             + len(_RETIRED_BTREE_INDEXES)
             + len(_SPECIFIC_INDEXES)
             + len(_RELEASE_SEARCH_STATEMENTS)
+            + len(_MASTER_SEARCH_STATEMENTS)
             + len(_USER_TABLES)
             + len(_INSIGHTS_TABLES)
             + len(_ACTIVITY_STATEMENTS)

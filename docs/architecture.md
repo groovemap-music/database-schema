@@ -1363,6 +1363,88 @@ catalog-api back to `idx_releases_fts`, then run `RELEASE_SEARCH_ROLLBACK_STATEM
 `groovemap_schema.postgres` in order. They drop the triggers (with the same brief lock creating
 them took), then the functions, the procedure and the table. No `releases` row is touched.
 
+## Master title search vector
+
+catalog-api's master search branch, its year-filtered form and the masters half of the decade
+facet all match with `to_tsvector('english', COALESCE(data->>'title', ''))` over `masters.data`.
+Every match then reads the master's heap row, a page of about nine whole documents. On lux,
+'love' matches 71,692 of 2.6M masters, and the ranked branch reads 69,224 buffers for them (0.97
+per match): 118 ms warm and 0.78 s cold. Masters are rarely toasted (188 MB of toast against 2.4
+GB of heap), so the cost is the wide heap rather than detoasting.
+
+`public.master_search (master_id VARCHAR PRIMARY KEY, title_tsv TSVECTOR NOT NULL, year TEXT)`
+holds one narrow row per master, under the GIN index `idx_master_search_title_tsv`.
+`title_tsv` is exactly `MASTER_TITLE_TSVECTOR`, the expression `idx_masters_fts` indexes, so
+ranks and their order are unchanged. `year` is `MASTER_YEAR`, `data->>'year'` verbatim, as
+text. catalog-api's `(year)::int` filter and its `'^[0-9]{4}$'` decade test therefore apply to
+it unchanged, and no document value can make a capture fail, as a cast in a trigger could. It is
+NULL only where the document has no year (6.9% of lux's masters). `idx_masters_fts` stays until
+catalog-api no longer reads it.
+
+**One implementation for both tables.** `release_search` and `master_search` are each declared
+once in `groovemap_schema.postgres` as a `_SearchSideTable`: the entity table, the side table,
+its key, its index and the carried columns with their expressions. Every statement in
+[Release title search vector](#release-title-search-vector) is generated from that declaration:
+the four capture triggers and their SECURITY DEFINER functions, the guarded trigger creation,
+the backfill lock, steps and procedure, the drift check and the rollback. So everything said
+there about triggers, locks, the backfill, `search_path` and privileges holds for `masters` as
+written. With two carried columns, a capture upsert writes only when the vector or the year
+changed, and the drift's `stale` count compares both. An upsert of an unchanged document
+rewrites nothing.
+
+**Locks.** Creating the four triggers takes SHARE ROW EXCLUSIVE on `masters`. Readers are not
+blocked; writers wait. On the populated 2.6M-row sample the whole statement took 8 to 25 ms
+(six runs, timed at the client, so the lock is held no longer than that). It runs under the initializer's 2 s lock timeout per attempt,
+and a reapply finds the triggers present and takes no lock on `masters`. Nothing else locks
+`masters` beyond a read's ACCESS SHARE.
+
+**Backfill.** Run `CALL public.master_search_backfill();` once, outside a transaction block, as
+the schema owner, then check that `SELECT * FROM public.master_search_drift();` returns `(0, 0,
+0)`. It works as `release_search_backfill()` does. On the
+2.6M-row sample, about lux's size, it took 53 s with every cache dropped and 48 s warm, so expect
+about a minute on lux. The drift check took 7 s (19 s without parallel workers). The side
+table holds 228 MB of heap (91 bytes a row), 41 MB of GIN and 92 MB of primary key.
+
+**Measured.** On PostgreSQL 18.6, against a 2.6M-row masters sample shaped like lux's
+(`generate.py`): 2.5 GB of heap, stored documents p50 816 / p90 1640 / p99 2347 bytes against
+lux's 771 / 1559 / 2438, and 'love' in 71,189 titles against lux's 71,692. Today's 'love' ranked
+branch reads 74,702 buffers on the sample, against 69,224 on lux. These are catalog-api's
+statements in `before.sql` and `after.sql`: the master branch with its cap of 40, the same branch
+with `year_min = 1990`, and the decade facet's masters half.
+
+| | Before (`idx_masters_fts`) | After (`master_search`) |
+| --- | --- | --- |
+| 'love' (71,189 matches): ranked-branch buffers | 74,702 (1.05 per match) | 26,987 (0.38 per match), 2.8× fewer |
+| 'love': ranked, cold / warm | 6.64 s / 186 ms | 0.18 s / 48 ms |
+| 'love': year-filtered branch buffers, warm | 89,877, 149 ms | 26,950, 40 ms (3.3× fewer) |
+| 'love': decade facet masters half, cold / warm | 10,097 reads, 203 ms / 12,365 buffers, 36 ms | 4,249 reads, 37 ms / 4,066 buffers, 17 ms (3.0× fewer) |
+| 'rock' (19,494 matches): ranked, cold / warm buffers | 1.41 s / 22,264 | 0.22 s / 14,492 (1.5× fewer) |
+| 'dub' (2,818 matches): ranked, warm buffers | 3,398, 17 ms | 2,854, 8.5 ms (1.2× fewer) |
+
+The ranked and year-filtered branches return the same 40 masters in the same order before and
+after, for each term. The factor is smaller than release_search's 10×: masters are rarely toasted,
+so a match cost about one heap page, not five. A common term now reads most of the side table's
+29k pages, and a rare term still reads about one page per match. The larger gain is cold: those
+pages are 228 MB of narrow rows instead of matches scattered over 2.5 GB of documents, and they
+stay cached.
+
+The triggers add to a 1000-row loader statement, warm, about 8 ms for an insert (75 to 83 ms),
+16 ms for a changed-document upsert (63 to 79 ms), 14 ms for an unchanged one, which fires the
+update trigger but rewrites no row, and 3.5 ms for the stale-row purge. An `updated_at` refresh
+shows no measurable change. A backfill with `churn.sql` rounds running alongside it took 61 s and
+ended with drift `(0, 0, 0)` and no failed statement. The writers' statements took p50 109 ms and
+at most 864 ms during it, against 20 ms and 322 ms without it. The scripts are in
+[`docs/audits/2026-11-08-master-title-search-vector`](audits/2026-11-08-master-title-search-vector/README.md).
+
+**Rollout and rollback.** The change is additive: apply the schema, run the backfill, check the
+drift, then switch catalog-api's master statements to `master_search` (gm-catalog-api-2jka).
+For a term with more than 10,000 matches, the decade facet's masters half then counts a
+different 10,000 masters: its LIMIT has no ORDER BY, and the side table is in a different
+physical order. That sample is as arbitrary as today's. To roll back, first move catalog-api
+back to `idx_masters_fts`, then run `MASTER_SEARCH_ROLLBACK_STATEMENTS` in order. They drop the
+masters triggers, the functions, the procedure and the table. No `masters` row is touched, and
+nothing of `release_search` is.
+
 ## Graph schema
 
 The `graph` schema re-presents the catalog as relational vertex and edge projections matching
