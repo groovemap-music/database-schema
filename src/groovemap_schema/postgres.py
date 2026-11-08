@@ -3564,14 +3564,23 @@ def _table_index(relation: str, suffix: str, columns: str) -> tuple[str, str]:
 # the table grows; 0.145 is lux's measured 10.43M / 71.81M. It is a catalog-only
 # change that the next `ANALYZE` applies: no table rewrite, only a SHARE UPDATE
 # EXCLUSIVE lock, and a no-op when repeated.
-_RELEASE_ID_DISTINCT_FRACTION = 0.145
+#
+# `graph.track_credited_on.release_id` clusters the same way, harder: lux
+# (2026-11-08, 91.3M rows) stored 561,395 distinct values, and `count(DISTINCT)`
+# times out at 120 s, so the real count is taken from five index-range slices of
+# `release_id` (first character 2, 3, 4, 5 and 7; 4.4M to 17.2M rows each). They
+# agree on 0.0724 to 0.0759 distinct per row (about 6.8M in all, 12x the stored
+# figure), so the declared 0.074 is that ratio. The planner's consumers there are
+# the release-keyed walks over `track_credited_on_key`.
+_RELEASE_ID_DISTINCT_FRACTIONS = {"credited_on": 0.145, "track_credited_on": 0.074}
 
 
 def _release_id_distinct_statement(relation: str) -> tuple[str, str]:
     """Return the statement pinning RELATION's `release_id` distinct-value estimate."""
+    fraction = _RELEASE_ID_DISTINCT_FRACTIONS[relation]
     return (
         f"graph.{relation}.release_id n_distinct",
-        f"ALTER TABLE graph.{relation} ALTER COLUMN release_id SET (n_distinct = -{_RELEASE_ID_DISTINCT_FRACTION})",
+        f"ALTER TABLE graph.{relation} ALTER COLUMN release_id SET (n_distinct = -{fraction})",
     )
 
 
@@ -4039,7 +4048,7 @@ def _edge_table_statements() -> list[tuple[str, str]]:
         if reverse is not None:
             statements.append(_table_index(relation, "reverse", reverse))
         statements.extend(_table_index(relation, suffix, index_columns) for suffix, index_columns in extras)
-        if relation == "credited_on":
+        if relation in _RELEASE_ID_DISTINCT_FRACTIONS:
             statements.append(_release_id_distinct_statement(relation))
     return statements
 
