@@ -2,6 +2,22 @@
 
 All notable changes to the GrooveMap database schema will be documented here.
 
+## v0.11.0 (2026-11-07)
+
+### Release notes
+
+Adds `public.release_search` (`title_tsv`, with GIN index `idx_release_search_title_tsv`), kept current by triggers on `public.releases`. Schema-init creates it under a SHARE ROW EXCLUSIVE lock held for a few milliseconds. After schema-init, run `CALL public.release_search_backfill();` once as the schema owner, outside a transaction, in a quiet window; then `SELECT * FROM public.release_search_drift();` must return `(0,0,0)` before catalog-api reads `release_search`. Also adds the per-day per-work identity ledger rollup table, and creates `pg_stat_statements` only when the server preloads it and the role is a superuser; otherwise it logs a skip. All changes are additive.
+
+### Feat
+
+- **postgres**: store the release title search vector in a side table
+- **schema**: create pg_stat_statements in groovemap when the server preloads it
+- **postgres**: add a per-day per-work rollup of the identity ledger events
+
+### Fix
+
+- **postgres**: run the release search backfill's SQL with a pinned search_path
+
 ## v0.10.0 (2026-11-07)
 
 ### Release notes
