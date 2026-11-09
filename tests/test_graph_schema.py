@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import re
+from pathlib import Path
 from typing import ClassVar
 
 from common.credit_roles import ROLE_CATEGORIES, categorize_role
@@ -1216,6 +1218,18 @@ class TestMemberOfUnion:
         assert statement.count("RETURN NEXT;") == 1
         assert statement.count("RAISE NOTICE") == 1
 
+    def test_the_refresh_serializes_on_a_transaction_scoped_advisory_lock(self) -> None:
+        """Two loaders own this refresh; the lock is taken before the TRUNCATE."""
+        statement = statement_for_function("refresh_artist_member_of")
+        lock = "pg_advisory_xact_lock(hashtextextended('graph.refresh_artist_member_of', 0))"
+        assert statement.index(lock) < statement.index("TRUNCATE graph.artist_member_of;")
+
+    def test_the_contract_names_both_loaders_as_refresh_owners(self) -> None:
+        union = json.loads(CONTRACT.read_text())["graph_schema"]["member_of_union"]
+        assert union["refresh_owners"] == ["discogs-sql-loader", "musicbrainz-sql-loader"]
+        assert union["refresh_order"] == ["graph.refresh_artist_member_of", "graph.refresh_vertex_degree"]
+        assert union["refresh_lock"]["kind"] == "pg_advisory_xact_lock"
+
     def test_the_refresh_and_the_fill_share_one_body(self) -> None:
         """Two texts could disagree about what a membership is; there is one."""
         body = " ".join(_DERIVED_EDGE_BOOTSTRAP["artist_member_of"].split())
@@ -1333,6 +1347,16 @@ class TestVertexDegree:
         assert f"FROM (VALUES {values}) AS vertex(kind)" in statement
         assert statement.count("RETURN NEXT;") == 1
         assert statement.count("RAISE NOTICE") == 1
+
+    def test_the_refresh_serializes_on_a_transaction_scoped_advisory_lock(self) -> None:
+        statement = statement_for_function("refresh_vertex_degree")
+        lock = "pg_advisory_xact_lock(hashtextextended('graph.refresh_vertex_degree', 0))"
+        assert statement.index(lock) < statement.index("TRUNCATE graph.vertex_degree;")
+
+    def test_the_contract_names_both_loaders_as_refresh_owners(self) -> None:
+        degree = json.loads(CONTRACT.read_text())["graph_schema"]["vertex_degree"]
+        assert degree["refresh_owners"] == ["discogs-sql-loader", "musicbrainz-sql-loader"]
+        assert degree["refresh_lock"]["kind"] == "pg_advisory_xact_lock"
 
     def test_the_refresh_and_the_fill_share_one_body(self) -> None:
         """Two texts could disagree about what a degree counts; there is one."""
@@ -1636,6 +1660,9 @@ def truncated_relations() -> set[str]:
     """Return every relation `graph.bootstrap_fill` empties before refilling it."""
     statement = statement_for_function("bootstrap_fill")
     return set(re.findall(r"TRUNCATE graph\.([a-z_]+);", statement))
+
+
+CONTRACT = Path(__file__).resolve().parents[1] / "contracts" / "persistence" / "v1" / "compatibility.json"
 
 
 def statement_for_function(function: str) -> str:
