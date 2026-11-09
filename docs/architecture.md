@@ -2606,6 +2606,334 @@ the rows that arrive afterwards loosen it again.
 random-order measurement, so it is not part of this step. The `deployment` runbook should link here
 for the step rather than copy it.
 
+### The `graph.issued_on` key order
+
+`graph.issued_on` is keyed `(release_id, source, medium_id)`. It was `(release_id, medium_id, source)`, and on lux
+(PostgreSQL 18.6, 21.6M rows, 2026-11-09) that put `source` behind a column with 38 distinct values. `WHERE release_id = $1
+AND source = $2` could not be a prefix lookup of that key: it was a skip-scan over every medium, and PostgreSQL costed it
+above the same skip-scan on the smaller `issued_on_reverse (medium_id, release_id)`, so the planner chose the latter:
+74 index searches, 333 buffers, 13.9 ms cold for one release. This is the per-release delete of
+`musicbrainz-sql-loader` (`brainztableinator/_persistence.py`, source `musicbrainz`, 1,898,183 calls at a 3.08 ms mean
+on lux); `discogs-sql-loader`'s `release_id = ANY($1) AND source = $2` delete, at 0.39 ms, is the other caller.
+With both equality columns leading, the lookup is one search of a few buffers on the key itself. The key columns are
+the same set, so every `ON CONFLICT (release_id, medium_id, source)` target still infers it. `credited_to` is not
+affected: only `discogs` writes it on lux, and its key ends in `source` behind free-text members.
+
+Upgrade path, in this order (it is a deployment step for the release carrying this change):
+
+1. Before the upgrade, with the loaders still running, build the new key. This must run **outside a
+   transaction** (autocommit; `CREATE INDEX CONCURRENTLY` refuses inside one, and so does a schema-init run wrapped in
+   one), and needs about **1.6 GB of temporary disk** for the new index, which exists beside the old 1.5 GB key until
+   step 3:
+
+   ```sql
+   CREATE UNIQUE INDEX CONCURRENTLY issued_on_pkey_new ON graph.issued_on (release_id, source, medium_id);
+   ```
+
+   Check it finished: `SELECT indisvalid FROM pg_index WHERE indexrelid = 'graph.issued_on_pkey_new'::regclass` must
+   be `t`. A failed build leaves an INVALID index; the initializer drops and rebuilds that one rather than using it.
+2. **Stop the loaders**, then run schema-init. Stop them even though the swap is short: it takes ACCESS EXCLUSIVE
+   on `graph.issued_on`, and skipping step 1 turns it into a plain `CREATE UNIQUE INDEX`, a write-blocking build of the
+   whole 21.6M-row table.
+3. The initializer swaps the key with one `ALTER TABLE ... DROP CONSTRAINT issued_on_pkey, ADD CONSTRAINT issued_on_pkey
+   PRIMARY KEY USING INDEX issued_on_pkey_new`, a catalog change (254 ms on a 24M-row local table, most of it removing
+   the old key's file). Restart the loaders. A second run is a no-op.
+
+Rollback is the same swap with the columns in the old order. `tests/integration/test_issued_on_key_order.py` runs the
+blocking path, the pre-built path, the INVALID-leftover path and the rerun against a real PostgreSQL 18, and both
+loaders' write shapes.
+
+### Keys over free text
+
+PostgreSQL refuses a btree entry over 2704 bytes after compression, and it refuses the row, not
+the index. A Discogs credit whose name compressed to 2888 bytes stopped the first SQL load on
+`person_pkey` on 2026-11-04 (gm-database-schema-brim). Discogs bounds neither a credit's name
+nor its role, so the release could not be stored at all, and the edge tables keyed on the same
+text would have failed next. Truncating would have merged two people, so the whole value stays
+in its column and the key no longer stores it.
+
+**`graph.text_key(value)` is SHA-256 of the value's UTF-8 bytes**, 32 bytes whatever the input.
+A collision would make `ON CONFLICT DO NOTHING` drop a real credit in silence, which rules out
+a 32- or 64-bit hash, and SHA-256 is why that outcome is not a case to handle. Equality is byte
+equality, the same as the deterministic collation the btree keys compared under.
+
+**`graph.credit_key(person_name, role)` is `text_key` over the name's length, a colon, the name,
+and the role.** The two credit relations key on it, so a credit costs one hash rather than two.
+The length is what keeps `('ab', 'c')` and `('a', 'bc')` apart: without it the two would share a
+key, and `ON CONFLICT DO NOTHING` would drop the second in silence. The function is one
+expression, so the planner inlines it.
+
+| Relation | Unique key (`<relation>_key`) | Hash index (`<relation>_<column>_hash`) |
+| --- | --- | --- |
+| `graph.person` | `text_key(name)` | `name` |
+| `graph.company` | `text_key(company_id)` | `company_id` |
+| `graph.credited_on` | `release_id, credit_key(person_name, role)` | none |
+| `graph.same_as` | `artist_id, text_key(person_name)` | `person_name` |
+| `graph.track_credited_on` | `release_id, track_ordinal, sub_track_ordinal, credit_key(person_name, role)` | none |
+| `graph.credited_to` | `release_id, text_key(company_id), role, source` | `company_id` |
+
+The natural keys are unchanged: the same rows are the same row and two rows that differed still
+do. A primary key cannot hold an expression, so these six relations have a unique index instead.
+Each unique index leads with the relation's fixed-size column, so it also serves that direction
+and the old `_reverse` index retires into it. Where a consumer walks the other direction, that is
+a hash index on the column itself, because `ON same_as.person_name = credited_on.person_name`
+names the column. A hash index stores a 32-bit hash per entry and answers that unchanged; a btree
+over `text_key` would serve only a query rewritten to hash its parameter.
+
+The two credit relations have no such index, because no repository reads them by person. It would
+cost more than a wasted write: a hash insert walks the bucket's overflow chain, so one value
+repeated a million times cost 906 µs an insert against a btree's 6.7 µs, and `Traditional` heads
+for about 386,000 track credits. `same_as` keeps its index, because the embedding pipeline's join
+reads it.
+
+`credited_on_role_category` moves from `(role_category, person_name)` to
+`(role_category, release_id)` for the same reason. The trigram index on `graph.person.name` needs
+no change: `pg_trgm` stores three-byte trigrams, not the value.
+
+**Writers change nothing.** Every loader statement names its columns and uses a target-less
+`ON CONFLICT DO NOTHING`, which fires on any unique index, so `discogs-sql-loader`'s
+`VERTEX_COLUMNS` and `EDGE_COLUMNS` and its `_BOOTSTRAP_COLUMNS` mirror stay exact. An
+`ON CONFLICT (name)` with a target would no longer infer an index, and none exists.
+
+**A generated key column was the other candidate, and the measurement ruled it out.** Both were
+loaded with 4,965,111 credited rows and 661,775 Zipf-distributed names on PostgreSQL 18, against
+the old shape:
+
+| `graph.credited_on` shape | Heap | Indexes | Total | Load |
+| --- | --- | --- | --- | --- |
+| v0.6.0, btree primary key | 380 MB | 789 MB | 1169 MB | 137 s |
+| Stored generated `bytea` key columns | 696 MB | 1361 MB | 2057 MB | 255 s |
+| **Expression unique index, as shipped** | 380 MB | 929 MB | 1309 MB | 205 s |
+
+A stored column also has to be added by rewriting the table under `ACCESS EXCLUSIVE`, on a
+relation that reaches 147M rows across the two credit tables, to hold a value nothing reads.
+
+**One hash and no person index cut the credit relations by about a third.** v0.6.3 against v0.6.2,
+per million rows on PostgreSQL 18, five interleaved pairs on each relation, on a laptop other
+containers were using:
+
+| Relation | Key | All indexes | WAL | Load, median | Paired gain |
+| --- | --- | --- | --- | --- | --- |
+| `credited_on`, v0.6.2 | 168 MB | 256 MB | 609 MB | 47.4 s | |
+| `credited_on`, v0.6.3 | 93 MB | 146 MB | 412 MB | 35.7 s | 7.8 s, faster in 4 of 5 |
+| `track_credited_on`, v0.6.2 | 194 MB | 315 MB | 674 MB | 46.9 s | |
+| `track_credited_on`, v0.6.3 | 140 MB | 227 MB | 489 MB | 34.7 s | 9.6 s, faster in 5 of 5 |
+
+At 51.0M and 96.5M rows that takes all the indexes on the two relations from 42.4 GB to 28.7 GB,
+and removes about 27 GB of WAL from a full load. The keys and person indexes alone go from 31.5 GB
+to 17.8 GB, or 10.5 GB once rebuilt, because a key built over loaded rows is packed: 56 MB and
+82 MB per million rows. Index sizes and WAL were the same on every run.
+
+**The query plans keep their shape.** On the same data, against the v0.6.0 shape:
+
+| Query | v0.6.0 | Now |
+| --- | --- | --- |
+| Credits of one person | Index Only Scan | Seq Scan: no index leads with the person |
+| Credits on one release | Index Scan on `_reverse` | Index Scan on `_key` |
+| `same_as` by person | Index Only Scan | Index Scan on the hash index |
+| Person to artist credit join | Nested Loop over indexes | Nested Loop over indexes |
+| `analytics-engine` credited-artist edges | Seq Scan, Memoize, 6.8 s | Seq Scan, Memoize, 5.2 s |
+| Releases of a credit category | Seq Scan, 1.6 s | Seq Scan, 1.5 s |
+
+The one real cost is a person-led read of a credit relation, which is now a sequential scan.
+Nothing reads `graph.credited_on` that way today, since the person queries run on Neo4j. If they
+move here, add `(graph.text_key(person_name), release_id)` and have that query hash its parameter.
+
+#### What the audit found
+
+Every btree index in the schema with a text member was read from `pg_index` on a real engine.
+"Fixed" means the value may now be any length.
+
+| Column | Finding |
+| --- | --- |
+| `graph.person.name`; `person_name` and `role` on `graph.credited_on` and `graph.track_credited_on`; `graph.same_as.person_name` | **Fixed**, above. Free text with no bound. |
+| `graph.company.company_id`, `graph.credited_to.company_id` | **Fixed**, above. A numeric Discogs id, or `name:` plus the folded free-text name when the source has no id. |
+| `idx_artists_name`, `idx_labels_name`, `idx_masters_title`, `idx_releases_title`, `idx_mb_artists_name`, `idx_mb_labels_name` | **Fixed**: hash indexes now. The 2026-11-01 masters dump tops out at 352 bytes of title and 242 of artist name, which suggests a field limit, but that dump is one of four and the failing credit shows Discogs text can pass the limit. No query in the organisation orders or ranges on these, so the hash index keeps everything they serve. |
+| `graph.credited_to.role` | Safe: Discogs' `entity_type_name`, a closed list `common.company_role_vocabulary` maps. |
+| `genre`, `style`, and every `genre_name`, `style_name`, and `insights.*` genre or style column | Safe: Discogs' closed vocabularies. The same dump holds 16 genres of at most 26 bytes and 756 styles of at most 27. |
+| `graph.media_family.name`, `graph.medium.medium_id`, `graph.issued_on.medium_id` | Safe: rendered from the media taxonomy, a closed list. |
+| Every `*_id`, `graph.vertex_degree.key`, `data_id` | Safe: numeric ids, or the closed vocabularies above for a genre or style vertex. |
+| `role_category`, `source`, `relationship_type`, `kind`, `status` | Safe: closed vocabularies or literals this schema or its writers state. |
+| `idx_releases_country`, `idx_masters_year`, `idx_releases_year` | Safe: a closed country list and a date fragment. |
+| `public.provider_aliases.external_id` | **Measured, and left a btree**: the longest real value is 758 bytes. See [the two keys that stay btrees](#the-two-keys-that-stay-btrees). |
+| `musicbrainz.external_links.url` | **Measured, and left a btree**: MusicBrainz's own unique index bounds it, and the largest real URL stores at 2,252 bytes. Same section. |
+| `Person.name` in Neo4j | Not this limit. The `person_name` constraint's RANGE index took 8,160 bytes and refused 12,000 on the integration image, against values Neo4j does not compress. |
+
+#### The two keys that stay btrees
+
+gm-database-schema-bmxc measured the two keys the audit left open, across every value in the public
+dumps, and left both as they are. Every real value fits its key, and moving them means a strict
+release order across three repositories for a value no dump contains. Neither key changed, so no
+writer changes and a database needs no upgrade.
+
+| Key | Source | Values | Largest real value | Largest the key accepts |
+| --- | --- | --- | --- | --- |
+| `external_id`, `matrix` | Discogs 2026-11-01, 19,575,942 releases | 14,654,067 | 758 bytes | 2,677 bytes |
+| `external_id`, `catalog_number` | same | 19,402,462 | 138 bytes | about 2,670 bytes |
+| `external_id`, `barcode` | same | 6,707,375 | 241 bytes | about 2,670 bytes |
+| `external_id`, MusicBrainz barcode and catalogue number | `VARCHAR(255)` upstream | not measured | 1,020 bytes at most, by schema | about 2,670 bytes |
+| `url` | MusicBrainz 20261104-002222, `url` table | 22,939,582 | 3,046 bytes raw, 2,252 stored | 2,621 bytes |
+
+Values are sized after the normalization `common.identifiers` applies. "Largest the key accepts" is
+incompressible text on PostgreSQL 18 through the writers' own statements, found by bisection: a
+`matrix` alias of kind `release`, and a `release-group` link with a 40-byte `service_name`. A longer
+provider or service name takes that many bytes off, which is the "about" above. The 500 longest URLs
+and the 433 matrix values of 200 bytes or more then went through the same statements into the real
+schema, and none was refused. The MusicBrainz table is a superset of what the loader sees, because
+it also holds URLs no entity links to.
+
+**`external_id` is a measurement, not a bound.** Only 10 of the 14.65M matrix values pass 512 bytes.
+Discogs does not cap the field: among the types that mint no alias, one value reaches 3,629 bytes,
+which is 19 once its padding collapses, and another holds 1,837 bytes of real text.
+The credit list that stopped the first load compressed from 4,159 characters to 2,888 bytes, so
+matrix text at that ratio needs about 3,900 characters to reach this key's limit, five times the
+longest in the catalogue.
+
+**`url` is bounded upstream, with a small gap.** MusicBrainz declares `CREATE UNIQUE INDEX
+url_idx_url ON url (url)`, the same btree limit, so a URL it holds fits a one-column key. That index
+refuses an incompressible 3,000-byte URL on PostgreSQL 18, which is why one cannot arrive here, and
+it is how the 3,046-byte URL exists: that one compresses to 2,252. This key is four columns wide, so
+it takes 2,621 incompressible bytes against the 2,692 the one-column index takes. Only a URL storing
+between those two sizes could be held upstream and refused here, and the largest of 22.9M stores 369
+bytes short of that.
+
+Reopen either key if an `index row size` error names `idx_provider_aliases_provider_entity_kind_external_id`
+or `external_links_mbid_entity_type_service_name_url_key`, if an `external_id` passes 2,000 bytes, or
+if a stored URL passes 2,500. These two read-only queries answer that:
+
+```sql
+SELECT provider, max(octet_length(external_id)) FROM provider_aliases GROUP BY provider;
+SELECT max(pg_column_size(url)) FROM musicbrainz.external_links;
+```
+
+Moving a key is not the swap above, because both are named by `ON CONFLICT` targets and a named
+target fails outright once its index is gone. Each of these was run against PostgreSQL 18:
+
+- **`provider_aliases`** has two such writers, `common.identity` and `catalog-api`'s `api/reattach.py`.
+  Both are `DO NOTHING`, so they can go target-less first, which works on either shape. Every
+  deployed writer must be moved before the schema step. That step adds a unique index on
+  `(provider, entity_kind, graph.text_key(external_id)) WHERE valid_to IS NULL` and a hash index on
+  `external_id`, and drops the old key. `catalog-api`'s `api/projection.py` pages with
+  `external_id > %s ORDER BY external_id`, which a hash index cannot serve, so it also needs
+  `(entity_kind, external_id) WHERE provider = 'discogs' AND valid_to IS NULL`, whose values are
+  numeric.
+- **`external_links`** cannot go target-less, because `DO UPDATE` requires a target. The order is
+  three steps: add the unique index over `graph.text_key(url)` beside the old key, move
+  `musicbrainz-sql-loader` to `ON CONFLICT (mbid, entity_type, service_name, graph.text_key(url))`,
+  then drop the old key.
+
+After either move, rolling back to an older writer needs the old index, which cannot be rebuilt once
+a long value is stored.
+
+#### Upgrading an existing database
+
+Schema init does it: run the new image once with the loaders stopped. Stop the writers because
+`CREATE INDEX` takes a lock that blocks them and the key swap takes `ACCESS EXCLUSIVE`. The swap
+is one guarded transaction per relation, so it builds the new indexes, drops the primary key and
+its old indexes, and commits or leaves the old key whole. It keys on the primary key's presence,
+so a fresh database and a converged one skip it. The heap is not rewritten. The six name and
+title indexes are dropped and rebuilt as hash indexes by the same run.
+
+A database on v0.6.0 takes that swap straight to the one-hash credit keys. A database that already
+has the two-hash keys, which is v0.6.1 or v0.6.2, needs a second step, because `CREATE UNIQUE INDEX
+IF NOT EXISTS` keeps an index of the same name whatever it holds. One guarded transaction per credit
+relation builds the new key, drops the old one, renames the new one into place, and drops the
+person hash index. It keys on the old key's definition, so any other database skips it, and an
+interrupted run leaves the old key whole for the next run to finish. On 1M rows it took 1.6 s on
+`credited_on` and 1.8 s on `track_credited_on`, which suggests about 4 minutes at 147M rows; allow
+longer once a build outgrows memory. Every pair unique under two hashes is unique under one, so no
+row needs cleaning.
+
+Every row already in the table satisfied the stricter old key, so a partly loaded database
+migrates without cleaning anything, and the loader resumes where it stopped: a batch refused by
+the old key rolled back whole and is still on the queue. On 2M `credited_on` rows the swap and
+the category index took 14 s at the default `maintenance_work_mem`, so expect minutes on a
+partial load and tens of minutes on the full 147M rows.
+
+Rolling back is a code rollback. The new shape serves the old loaders unchanged, so an older
+service image keeps working. An older schema init does not restore the primary keys, because
+`CREATE TABLE IF NOT EXISTS` skips an existing table, and it does recreate the btree `_reverse`
+indexes, which fails once a long value is stored. Pin schema init to this version or later once
+one is.
+
+A schema init from v0.6.1 or v0.6.2 run against the one-hash keys is harmless: `IF NOT EXISTS`
+keeps the key, and it recreates the two person hash indexes, which the next v0.6.3 run drops.
+
+#### After the first load: rebuild the credit keys
+
+An index built while rows arrive in random order is left loosely packed, and one built over a
+loaded table is not. Once the initial Discogs SQL load has finished (the `extraction_complete`
+latch has fired and the loaders have drained), rebuild the two credit keys:
+
+```sql
+REINDEX INDEX CONCURRENTLY graph.credited_on_key;
+REINDEX INDEX CONCURRENTLY graph.track_credited_on_key;
+```
+
+Run each as its own statement on its own connection, in `autocommit`: `CONCURRENTLY` cannot run
+inside a transaction block. Do it once after the first full load, and again only after a reload that
+rewrote a large share of the rows. Doing it on a partly loaded or empty table gains nothing, since
+the rows that arrive afterwards loosen it again.
+
+- **What it saves.** The audit's estimate at 147.5M credit rows is 14.7 GB of key index falling to
+  9.6 GB (about 40%). Measured here on PostgreSQL 18, 1.5M `credited_on` rows loaded in random
+  order: `credited_on_key` 84.8 B per row to 65.5 B (about 23%). Expect the lux saving between the
+  two, and read it off `pg_relation_size` before and after.
+- **Lock impact.** `CONCURRENTLY` takes `SHARE UPDATE EXCLUSIVE`: reads and writes continue, and
+  only schema changes and vacuum on the table wait. In the measurement 255 writes ran during the
+  rebuild, the slowest taking 94 ms, and the unique key still rejected a duplicate afterwards. Plain
+  `REINDEX INDEX` blocks every write to the table and also virtually every read of it, not only
+  reads that would use the index: the planner takes a lock on every index of a table it reads, so a
+  sequential scan and a point read both wait behind the rebuild (both hit `lock_timeout` when
+  reproduced). Whoever runs the plain form must stop readers as well as the loaders, or use
+  `CONCURRENTLY`.
+- **Time and room.** 3.6 s for `credited_on_key` at 1.5M rows. At 51M and 96.5M rows expect
+  minutes to tens of minutes, longer once the build outgrows `maintenance_work_mem`; raise it for
+  the session, for example `SET maintenance_work_mem = '2GB'`. The new index is built beside the old
+  one, so keep free disk for the whole of one new key (about 3 GB for `credited_on_key` and about
+  7 GB for `track_credited_on_key` at full scale) and do the two one after the other.
+- **If it fails or is cancelled.** The old index stays in service. A leftover `INVALID` index named
+  `<index>_ccnew` (the new one, half built) or `<index>_ccold` (the old one, not yet dropped) can
+  remain. List them with
+  `SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid AND indrelid IN ('graph.credited_on'::regclass, 'graph.track_credited_on'::regclass)`
+  and `DROP INDEX CONCURRENTLY` each one before retrying. That query filters on `NOT indisvalid`, so
+  a healthy database returns zero rows.
+- **Check it.** After the rebuild the query above returns zero rows, and both keys are still
+  `indisunique` and `indisvalid` (`SELECT indexrelid::regclass, indisunique, indisvalid FROM pg_index
+  WHERE indexrelid IN ('graph.credited_on_key'::regclass, 'graph.track_credited_on_key'::regclass)`).
+  Nothing else changes: the rows, the key definition and the `ON CONFLICT` target are the same, so no
+  loader change is needed.
+
+`credited_on_role_category` (the generated-column index) was not smaller after the rebuild in the
+random-order measurement, so it is not part of this step. The `deployment` runbook should link here
+for the step rather than copy it.
+
+### The `graph.issued_on` key order
+
+`graph.issued_on` is keyed `(release_id, source, medium_id)`. It was `(release_id, medium_id, source)`, and on lux
+(PostgreSQL 18.6, 21.6M rows, 2026-11-09) that put `source` behind a column with 38 distinct values. `WHERE release_id = $1
+AND source = $2` could not be a prefix lookup of that key: it was a skip-scan over every medium, and PostgreSQL costed it
+above the same skip-scan on the smaller `issued_on_reverse (medium_id, release_id)`, so the planner chose the latter:
+74 index searches, 333 buffers, 13.9 ms cold for one release. This is the per-release delete of
+`musicbrainz-sql-loader` (`brainztableinator/_persistence.py`, source `musicbrainz`, 1,898,183 calls at a 3.08 ms mean
+on lux); `discogs-sql-loader`'s `release_id = ANY($1) AND source = $2` delete, at 0.39 ms, is the other caller.
+With both equality columns leading, the lookup is one search of a few buffers on the key itself. The key columns are
+the same set, so every `ON CONFLICT (release_id, medium_id, source)` target still infers it. `credited_to` is not
+affected: only `discogs` writes it on lux, and its key ends in `source` behind free-text members.
+
+Upgrade path. To keep the loaders running, build the new key first, then run the schema initializer:
+
+```sql
+CREATE UNIQUE INDEX CONCURRENTLY issued_on_pkey_new ON graph.issued_on (release_id, source, medium_id);
+```
+
+The initializer then swaps it in with one `ALTER TABLE ... DROP CONSTRAINT issued_on_pkey, ADD CONSTRAINT issued_on_pkey
+PRIMARY KEY USING INDEX issued_on_pkey_new`, a catalog change: 254 ms under ACCESS EXCLUSIVE on a 24M-row local table
+(the old 1.5 GB key file's removal is most of it). With no pre-built index the initializer builds it itself under a
+write-blocking lock, so stop the loaders first. An INVALID index from a failed concurrent build is dropped and rebuilt.
+A second run is a no-op. Rollback is the same swap in the other column order. Needs about 1.6 GB of free disk for the
+new index until the old one drops.
+
 ### The counter, degree, and aggregate relations
 
 `catalog-api` reads node properties that `graphinator`'s post-import pass writes and that no
