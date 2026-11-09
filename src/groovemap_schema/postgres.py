@@ -4025,6 +4025,9 @@ _EDGE_TABLES: list[tuple[str, str, str | None, tuple[tuple[str, str], ...]]] = [
     # property — precisely so `discogs-sql-loader` writing `source='discogs'`
     # and `musicbrainz-sql-loader` writing `source='musicbrainz'` do not
     # collide, and so each one's source-scoped prune reaches only its own rows.
+    # The key leads `(release_id, source)`, not `(release_id, medium_id, source)`: the per-release
+    # `DELETE ... WHERE release_id = $1 AND source = $2` must be one prefix search. See
+    # `_ISSUED_ON_KEY_MIGRATION`.
     (
         "issued_on",
         """
@@ -4032,12 +4035,58 @@ _EDGE_TABLES: list[tuple[str, str, str | None, tuple[tuple[str, str], ...]]] = [
     medium_id  text NOT NULL,
     source     text NOT NULL,
     qty        bigint NOT NULL DEFAULT 1,
-    PRIMARY KEY (release_id, medium_id, source)
+    PRIMARY KEY (release_id, source, medium_id)
 """,
         "medium_id, release_id",
         (("source", "source"),),
     ),
 ]
+
+
+# `graph.issued_on` was keyed `(release_id, medium_id, source)`. `medium_id` has 38 distinct values, so
+# `WHERE release_id = $1 AND source = $2` could not be a prefix lookup on that key: `source` sits behind
+# `medium_id`, so the scan must skip-scan every medium (an array of 38 values per release; 74 index
+# searches and 333 buffers, 13.9 ms cold on lux 2026-11-09). PostgreSQL 18 costs that skip-scan on the
+# primary key above the smaller `issued_on_reverse (medium_id, release_id)` skip-scan, so the planner picked
+# the latter. Leading the key with both equality columns makes the same lookup one search of a few
+# buffers on the key itself, and cannot be mis-costed. The set of key columns is unchanged, so every
+# `ON CONFLICT (release_id, medium_id, source)` target still infers it and no loader changes.
+#
+# An existing table swaps its key without a table or index rebuild under lock when the new unique index
+# was built first, so the operator runs, with the loaders still running:
+#
+#     CREATE UNIQUE INDEX CONCURRENTLY issued_on_pkey_new ON graph.issued_on (release_id, source, medium_id);
+#
+# then the schema initializer. The swap is one `ALTER TABLE` that drops the old constraint and adds the
+# new one `USING INDEX`: a catalog change under a short ACCESS EXCLUSIVE lock. With no pre-built index
+# the migration builds it itself, a plain `CREATE UNIQUE INDEX` that blocks writes for the build, so
+# the loaders should be stopped then. An INVALID index left by a failed concurrent build is dropped and
+# rebuilt, never swapped in. Applying it twice changes nothing; a fresh table is created with the new key.
+_ISSUED_ON_KEY_MIGRATION = """DO $rekey_issued_on$
+DECLARE
+    primary_key name;
+    key_columns text;
+BEGIN
+    SELECT constraint_row.conname, pg_get_indexdef(constraint_row.conindid) INTO primary_key, key_columns
+    FROM pg_constraint AS constraint_row
+    WHERE constraint_row.conrelid = to_regclass('graph.issued_on')
+      AND constraint_row.contype = 'p';
+    IF NOT FOUND OR key_columns LIKE '%(release_id, source, medium_id)' THEN
+        RETURN;
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM pg_index
+        WHERE indexrelid = to_regclass('graph.issued_on_pkey_new') AND NOT (indisvalid AND indisready)
+    ) THEN
+        DROP INDEX graph.issued_on_pkey_new;
+    END IF;
+    CREATE UNIQUE INDEX IF NOT EXISTS issued_on_pkey_new ON graph.issued_on (release_id, source, medium_id);
+    EXECUTE format(
+        'ALTER TABLE graph.issued_on DROP CONSTRAINT %I, ADD CONSTRAINT %I PRIMARY KEY USING INDEX issued_on_pkey_new',
+        primary_key, primary_key
+    );
+END
+$rekey_issued_on$"""
 
 
 def _edge_table_statements() -> list[tuple[str, str]]:
@@ -4046,6 +4095,8 @@ def _edge_table_statements() -> list[tuple[str, str]]:
     for relation, columns, reverse, extras in _EDGE_TABLES:
         statements.append(_table(relation, columns))
         statements.extend(_free_text_key_statements(relation))
+        if relation == "issued_on":
+            statements.append(("graph.issued_on key-order migration", _ISSUED_ON_KEY_MIGRATION))
         if reverse is not None:
             statements.append(_table_index(relation, "reverse", reverse))
         statements.extend(_table_index(relation, suffix, index_columns) for suffix, index_columns in extras)

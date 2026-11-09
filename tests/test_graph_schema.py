@@ -168,7 +168,7 @@ EDGE_KEYS = {
     ),
     "track_by_artist": (("release_id", "track_ordinal", "sub_track_ordinal", "artist_id"), "release_id", "artist_id"),
     "credited_to": (("release_id", "company_id", "role", "source"), "release_id", "company_id"),
-    "issued_on": (("release_id", "medium_id", "source"), "release_id", "medium_id"),
+    "issued_on": (("release_id", "source", "medium_id"), "release_id", "medium_id"),
     "in_family": (("medium_id", "family_name"), "medium_id", "family_name"),
     "artist_genre": (("artist_id", "genre_name"), "artist_id", "genre_name"),
     "label_genre": (("label_id", "genre_name"), "label_id", "genre_name"),
@@ -338,7 +338,7 @@ class TestGraphSchemaStatement:
             if "DROP" not in statement.upper():
                 continue
             assert name.endswith(" migration"), f"{name} contains a DROP"
-            if name.endswith((" free-text key migration", " two-hash key migration")):
+            if name.endswith((" free-text key migration", " two-hash key migration", " key-order migration")):
                 continue  # `test_a_free_text_key_migration_...` and its sibling hold these to their own guards.
             relation = name.removeprefix("graph.").rsplit(" ", 2)[0]
             assert f"DROP VIEW graph.{relation} CASCADE;" in statement, name
@@ -350,6 +350,7 @@ class TestGraphSchemaStatement:
         expected |= {f"graph.{relation} key-type migration" for relation, _column in _TEXT_KEY_RETYPES}
         expected |= {f"graph.{relation} free-text key migration" for relation in _FREE_TEXT_KEYS}
         expected |= {f"graph.{relation} two-hash key migration" for relation in _COMBINED_KEY_RELATIONS}
+        expected.add("graph.issued_on key-order migration")
         assert set(migrations) == expected
         assert len(migrations) == len(expected)
 
@@ -361,7 +362,7 @@ class TestGraphSchemaStatement:
 
     def test_every_migration_precedes_the_relation_it_frees(self) -> None:
         names = [name for name, _statement in _GRAPH_STATEMENTS]
-        last_migration = max(index for index, name in enumerate(names) if name.endswith(" migration"))
+        last_migration = max(index for index, name in enumerate(names) if name.endswith(" migration") and "key-order" not in name)
         for relation in MATERIALIZED_VERTICES:
             assert names.index(f"graph.{relation} table") > last_migration
 
@@ -665,7 +666,7 @@ class TestEdgeViews:
             statement = ddl_for(relation)
             assert "source        text NOT NULL" in statement or "source     text NOT NULL" in statement, relation
             key = _FREE_TEXT_KEYS[relation][0] + ")" if relation in _FREE_TEXT_KEYS else statement
-            assert ", source)" in key, relation
+            assert "source" in key, relation
             assert any(candidate.endswith("(source)") for candidate in index_statements_for(relation)), relation
 
     def test_reference_edges_skip_elements_without_a_usable_id(self) -> None:
@@ -1813,6 +1814,25 @@ class TestMediaViews:
         assert "'discogs'::text" in statement
         assert "'musicbrainz'::text" in statement
         assert "AS source" in statement
+
+    def test_the_issued_on_key_leads_with_both_per_release_equality_columns(self) -> None:
+        """`DELETE ... WHERE release_id = $1 AND source = $2` must be one prefix search of the key.
+
+        With `medium_id` (38 values) between them it was a 74-search skip-scan, which the planner
+        then costed above the smaller `issued_on_reverse` skip-scan (gm-database-schema-ly5r).
+        """
+        assert "PRIMARY KEY (release_id, source, medium_id)" in ddl_for("issued_on")
+
+    def test_the_issued_on_key_swap_is_online_guarded_and_idempotent(self) -> None:
+        statement = GRAPH_STATEMENTS["graph.issued_on key-order migration"]
+        # Skips a fresh table (no key found) and one already in the new order.
+        assert "IF NOT FOUND OR key_columns LIKE '%(release_id, source, medium_id)' THEN" in statement
+        # A failed CREATE UNIQUE INDEX CONCURRENTLY leaves an INVALID index; it is rebuilt, never swapped in.
+        assert "NOT (indisvalid AND indisready)" in statement
+        # One catalog-only ALTER: drop the old key and attach the pre-built index in the same lock.
+        assert "DROP CONSTRAINT %I, ADD CONSTRAINT %I PRIMARY KEY USING INDEX issued_on_pkey_new" in statement
+        names = [name for name, _statement in _GRAPH_STATEMENTS]
+        assert names.index("graph.issued_on table") < names.index("graph.issued_on key-order migration")
 
     def test_an_unusable_quantity_defaults_to_one(self) -> None:
         statement = statement_for("issued_on")

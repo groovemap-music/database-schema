@@ -2606,6 +2606,32 @@ the rows that arrive afterwards loosen it again.
 random-order measurement, so it is not part of this step. The `deployment` runbook should link here
 for the step rather than copy it.
 
+### The `graph.issued_on` key order
+
+`graph.issued_on` is keyed `(release_id, source, medium_id)`. It was `(release_id, medium_id, source)`, and on lux
+(PostgreSQL 18.6, 21.6M rows, 2026-11-09) that put `source` behind a column with 38 distinct values. `WHERE release_id = $1
+AND source = $2` could not be a prefix lookup of that key: it was a skip-scan over every medium, and PostgreSQL costed it
+above the same skip-scan on the smaller `issued_on_reverse (medium_id, release_id)`, so the planner chose the latter:
+74 index searches, 333 buffers, 13.9 ms cold for one release. This is the per-release delete of
+`musicbrainz-sql-loader` (`brainztableinator/_persistence.py`, source `musicbrainz`, 1,898,183 calls at a 3.08 ms mean
+on lux); `discogs-sql-loader`'s `release_id = ANY($1) AND source = $2` delete, at 0.39 ms, is the other caller.
+With both equality columns leading, the lookup is one search of a few buffers on the key itself. The key columns are
+the same set, so every `ON CONFLICT (release_id, medium_id, source)` target still infers it. `credited_to` is not
+affected: only `discogs` writes it on lux, and its key ends in `source` behind free-text members.
+
+Upgrade path. To keep the loaders running, build the new key first, then run the schema initializer:
+
+```sql
+CREATE UNIQUE INDEX CONCURRENTLY issued_on_pkey_new ON graph.issued_on (release_id, source, medium_id);
+```
+
+The initializer then swaps it in with one `ALTER TABLE ... DROP CONSTRAINT issued_on_pkey, ADD CONSTRAINT issued_on_pkey
+PRIMARY KEY USING INDEX issued_on_pkey_new`, a catalog change: 254 ms under ACCESS EXCLUSIVE on a 24M-row local table
+(the old 1.5 GB key file's removal is most of it). With no pre-built index the initializer builds it itself under a
+write-blocking lock, so stop the loaders first. An INVALID index from a failed concurrent build is dropped and rebuilt.
+A second run is a no-op. Rollback is the same swap in the other column order. Needs about 1.6 GB of free disk for the
+new index until the old one drops.
+
 ### The counter, degree, and aggregate relations
 
 `catalog-api` reads node properties that `graphinator`'s post-import pass writes and that no

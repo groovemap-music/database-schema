@@ -401,6 +401,7 @@ _GRAPH_STATEMENT_NAMES = frozenset(
         "graph.credited_to_company_id_hash index",
         "graph.credited_to_source index",
         "graph.issued_on table",
+        "graph.issued_on key-order migration",
         "graph.issued_on_reverse index",
         "graph.issued_on_source index",
         "graph.artist_member_of table",
