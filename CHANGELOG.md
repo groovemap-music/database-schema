@@ -2,6 +2,27 @@
 
 All notable changes to the GrooveMap database schema will be documented here.
 
+## v0.12.0 (2026-11-08)
+
+### Release notes
+
+Schema-init adds five columns to `public.release_search` (`genres`, `year`, `country`, `media_families`, `media_mediums`); each `ADD COLUMN` takes milliseconds. It recreates the capture triggers on `public.releases` (a few milliseconds of SHARE ROW EXCLUSIVE lock) and adds `public.master_search`, with capture triggers on `public.masters` (lock held for 25 ms or less). It pins `n_distinct` on `graph.credited_on.release_id` (-0.145) and `graph.track_credited_on.release_id` (-0.074); this is catalog-only. On a populated identity ledger whose `work_summary_day` is empty or missing, it requests one ledger rebuild. After schema-init, as the schema owner and outside a transaction, run `ANALYZE graph.credited_on;`, `ANALYZE graph.track_credited_on;`, `SELECT identity_ledger_refresh();` (a full rebuild, about 6 minutes), `CALL public.master_search_backfill();` (about 1 minute), then `SELECT * FROM public.master_search_drift();` must return `(0,0,0)`. Then run `CALL public.release_search_backfill();` (about 10 minutes; it rewrites every `release_search` row, so run `VACUUM public.release_search;` afterwards), then `SELECT * FROM public.release_search_drift();` must return `(0,0,0)`. If a drift check hits `/dev/shm` limits, run `SET max_parallel_workers_per_gather = 0;` first. catalog-api reads the new columns and `master_search` only after both drift checks pass. All changes are additive.
+
+### Feat
+
+- **postgres**: carry search facet and filter attributes in release_search
+- **postgres**: store the master title vector and year in a side table
+
+### Fix
+
+- **postgres**: pin graph.track_credited_on release_id n_distinct as a row fraction
+- **postgres**: request a ledger rebuild when an upgrade leaves a derived table missing or unfilled
+- **postgres**: pin graph.credited_on release_id n_distinct as a row fraction
+
+### Refactor
+
+- **postgres**: generate the release search side table from a declaration
+
 ## v0.11.0 (2026-11-07)
 
 ### Release notes
