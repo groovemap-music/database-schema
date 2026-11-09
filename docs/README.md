@@ -6,7 +6,8 @@
   [integration tiers](architecture.md#integration-tiers), and the
   [graph schema](architecture.md#graph-schema) with its non-authoritative
   [bootstrap fill](architecture.md#the-bootstrap-fill) and its conditional
-  [SQL/PGQ removal and recovery](sql-pgq-removal.md).
+  [SQL/PGQ removal and recovery](sql-pgq-removal.md), and the
+  [reload seen lists](architecture.md#reload-seen-lists) both SQL loaders share for stale-row purges.
 - [Runtime configuration](runtime-configuration.md) — database endpoints, credentials,
   secret files, TLS, logging, image behavior, and the metrics and spans the initializer emits.
 - [Persistence compatibility contract](../contracts/persistence/) — schema evolution policy
@@ -40,6 +41,9 @@
   - [Release search facet and filter attributes, 2026-11-08](audits/2026-11-08-release-search-facets/README.md)
     — the scripts behind the facet and filtered-branch buffers, the upgrade's locks and its backfill
     (results in [architecture](architecture.md#release-search-facet-and-filter-attributes)).
+  - [Reload seen lists, 2026-11-08](audits/2026-11-08-reload-seen-list/README.md) — the scripts
+    behind the touch-against-append WAL and time, the MusicBrainz no-op upserts, and the purge's
+    anti-join at scale (the shared design is in [architecture](architecture.md#reload-seen-lists)).
 - [Design decisions](design/) — dated decision records.
   - [MusicBrainz relational migration decision](design/gm-database-schema-dgmd-musicbrainz-relational-migration.md)
     and its [research receipt index](design/evidence/gm-database-schema-a704-schema-research-receipts.md).
