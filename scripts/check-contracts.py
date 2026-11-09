@@ -18,6 +18,7 @@ from groovemap_schema.postgres import (
     _PATH_RELATIONS,
     _PATH_RELATIONSHIP_TYPES,
     _RELEASE_SEARCH_STATEMENTS,
+    _SEEN_LIST_STATEMENTS,
     _USER_TABLES,
     _VERTEX_KIND_NAMES,
     EXPLORE_DEFAULT_HOPS,
@@ -38,7 +39,15 @@ from groovemap_schema.postgres import (
     RELEASE_SEARCH_INDEX,
     RELEASE_SEARCH_TABLE,
     RELEASE_TITLE_TSVECTOR,
+    SEEN_LIST_CLOCK_MARGIN,
+    SEEN_LIST_HASH_KEY,
+    SEEN_LIST_NOT_INTACT_SQLSTATE,
+    SEEN_LIST_REGISTRY,
+    SEEN_LIST_ROLLBACK_STATEMENTS,
+    SEEN_LIST_SCHEMA,
+    SEEN_LISTS,
     _entity_schema_statements,
+    _schema_statements,
 )
 
 
@@ -220,6 +229,61 @@ assert (
     in (master_search_statements["master_search_drift function"])
 )
 assert "AFTER UPDATE OF data_id, data ON public.masters" in master_search_statements["masters master_search capture triggers"]
+
+# Both SQL loaders record what a reload saw in the loader_seen lists (gm-database-schema-uw6d):
+# pin every list, its key, its storage, the crash-reset registry, and the functions they call.
+seen_lists = contract["reload_seen_lists"]
+seen_statements = dict(_SEEN_LIST_STATEMENTS)
+assert seen_lists["kind"] == "additive"
+assert seen_lists["introduced_in_contract_version"] == contract["version"]
+assert seen_lists["consumers"] == ["discogs-sql-loader", "musicbrainz-sql-loader"]
+assert seen_lists["schema"] == SEEN_LIST_SCHEMA
+assert seen_statements[f"{SEEN_LIST_SCHEMA} schema"] == f"CREATE SCHEMA IF NOT EXISTS {SEEN_LIST_SCHEMA}"
+assert set(seen_lists["lists"]) == {seen.relation for seen in SEEN_LISTS}
+for seen in SEEN_LISTS:
+    entry = seen_lists["lists"][seen.relation]
+    table = " ".join(seen_statements[f"{seen.relation} table"].split())
+    assert entry["reconciles"] == seen.entity, seen.relation
+    assert entry["seen_key"].startswith(f"{seen.key_type} NOT NULL"), seen.relation
+    assert f"CREATE UNLOGGED TABLE {seen.relation} ( seen_at TIMESTAMPTZ NOT NULL DEFAULT now(), seen_key {seen.key_type} NOT NULL )" in table
+    assert "WITH (autovacuum_vacuum_insert_threshold = -1)" in table
+    assert "PRIMARY KEY" not in table and "UNIQUE" not in table, seen.relation
+    assert not any(f" ON {seen.relation}" in statement for _name, statement in _SEEN_LIST_STATEMENTS), seen.relation  # index-free
+    assert f"IF pg_catalog.to_regclass('{seen.relation}') IS NULL THEN" in table  # never recreated or emptied by a reapply
+    if seen.loader == "musicbrainz":
+        assert entry["seen_key"].endswith(seen.key.replace("e.", "")), seen.relation
+        assert seen.key.startswith(f"{SEEN_LIST_HASH_KEY}(")
+    for function in (f"{seen.name}_stale", f"{seen.name}_shadow"):
+        assert (
+            f"CREATE OR REPLACE FUNCTION {SEEN_LIST_SCHEMA}.{function}(p_started_at timestamptz"
+            in seen_statements[f"{SEEN_LIST_SCHEMA}.{function} function"]
+        )
+    stale = seen_statements[f"{SEEN_LIST_SCHEMA}.{seen.name}_stale function"]
+    assert f"RETURNS TABLE ({seen.row_id} {seen.row_id_type})" in stale
+    assert f"ERRCODE = '{SEEN_LIST_NOT_INTACT_SQLSTATE}'" in stale
+    assert "stale.updated_at < p_started_at" in stale and "s.seen_at >= p_started_at" in stale
+registry = seen_lists["registry"]
+assert registry["relation"] == SEEN_LIST_REGISTRY
+registry_table = " ".join(seen_statements[f"{SEEN_LIST_REGISTRY} table"].split())
+assert registry_table.startswith(f"CREATE UNLOGGED TABLE IF NOT EXISTS {SEEN_LIST_REGISTRY} (")
+for column, declaration in registry["columns"].items():
+    assert f"{column} {declaration}" in registry_table, column
+assert f"PRIMARY KEY ({', '.join(registry['primary_key'])})" in registry_table
+assert f"opened_at <= started_at - {SEEN_LIST_CLOCK_MARGIN}" in registry["intact"]
+assert f"p_started_at - interval '{SEEN_LIST_CLOCK_MARGIN}'" in seen_statements[f"{SEEN_LIST_SCHEMA}.intact function"]
+for signature in seen_lists["functions"]:
+    name = signature.split("(", 1)[0]
+    if "<list>" in name:
+        continue
+    assert f"{name} function" in seen_statements, name
+    assert f"CREATE OR REPLACE FUNCTION {signature.split(' RETURNS ', 1)[0]}" in seen_statements[f"{name} function"], signature
+assert SEEN_LIST_ROLLBACK_STATEMENTS[0] == f"DROP SCHEMA IF EXISTS {SEEN_LIST_SCHEMA} CASCADE"
+phases = [step["phase"] for step in seen_lists["consumer_rollout"]]
+assert phases == ["expand", "shadow", "switch", "contract"], phases
+# The lists follow the MusicBrainz tables whose key function they hash, and the registry precedes them.
+order = [name for name, _statement in _schema_statements()]
+assert order.index("musicbrainz.relationship_key function") < order.index(f"{SEEN_LIST_REGISTRY} table")
+assert order.index(f"{SEEN_LIST_REGISTRY} table") < min(order.index(f"{seen.relation} table") for seen in SEEN_LISTS)
 
 # Catalog-item supersession (ADR 0009's 2026-09-25 amendment) is consumed by
 # catalog-api's merge steps, so every column, cause, key, and index the contract

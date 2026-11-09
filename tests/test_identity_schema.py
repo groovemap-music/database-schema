@@ -17,6 +17,7 @@ from groovemap_schema.postgres import (
     _MUSICBRAINZ_INDEXES,
     _MUSICBRAINZ_TABLES,
     _RELEASE_SEARCH_STATEMENTS,
+    _SEEN_LIST_STATEMENTS,
     _USER_TABLES,
     _entity_schema_statements,
     _schema_statements,
@@ -478,6 +479,10 @@ _RELEASE_SEARCH_STATEMENT_NAMES = frozenset(name for name, _statement in _RELEAS
 # The stored master title vector and year (gm-database-schema-nu0c), declared after release_search;
 # tests/test_master_search_schema.py covers it.
 _MASTER_SEARCH_STATEMENT_NAMES = frozenset(name for name, _statement in _MASTER_SEARCH_STATEMENTS)
+
+# The reload seen lists (gm-database-schema-uw6d), declared after the MusicBrainz indexes;
+# tests/test_reload_seen_schema.py covers them.
+_SEEN_LIST_STATEMENT_NAMES = frozenset(name for name, _statement in _SEEN_LIST_STATEMENTS)
 
 
 def _user_tables() -> dict[str, str]:
@@ -1121,6 +1126,7 @@ class TestLegacyStatementsUnchanged:
             | _IDENTITY_LEDGER_STATEMENT_NAMES
             | _RELEASE_SEARCH_STATEMENT_NAMES
             | _MASTER_SEARCH_STATEMENT_NAMES
+            | _SEEN_LIST_STATEMENT_NAMES
         )
         surviving = [name for name in names if name not in added]
         assert surviving == _LEGACY_STATEMENT_NAMES
@@ -1133,6 +1139,7 @@ class TestLegacyStatementsUnchanged:
             | _IDENTITY_LEDGER_STATEMENT_NAMES
             | _RELEASE_SEARCH_STATEMENT_NAMES
             | _MASTER_SEARCH_STATEMENT_NAMES
+            | _SEEN_LIST_STATEMENT_NAMES
         )
         assert not (added & set(_LEGACY_STATEMENT_NAMES))
 

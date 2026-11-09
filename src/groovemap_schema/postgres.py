@@ -7864,6 +7864,339 @@ _MASTER_SEARCH_STATEMENTS: list[tuple[str, str]] = _search_statements(_MASTER_SE
 MASTER_SEARCH_ROLLBACK_STATEMENTS: tuple[str, ...] = _search_rollback_statements(_MASTER_SEARCH)
 
 
+# ── Reload seen lists (gm-database-schema-uw6d) ──
+# A reload used to prove a row was still upstream by rewriting it: discogs-sql-loader's hash gate
+# found the row unchanged and still ran `UPDATE ... SET updated_at = NOW()`, and
+# musicbrainz-sql-loader's upserts rewrite every conflict, because the stale-row purge deletes
+# what `updated_at` says the extraction did not reach. A seen list records the same fact without
+# the rewrite: the loader appends the row's key to a narrow, unlogged, index-free table in the
+# transaction that would have touched the row, and the purge deletes a row only when it is older
+# than the extraction AND absent from the list. One list per reconciled table and loader, so a
+# purge and the TRUNCATE that restarts its list reach that table alone.
+#
+# An unlogged table is emptied by crash recovery, and an emptied list would read as "nothing was
+# seen". `loader_seen.lists` is the guard: it is unlogged too, so the same recovery empties it,
+# and a list is intact for an extraction only while its row there says the list was started
+# before the extraction (less `SEEN_LIST_CLOCK_MARGIN`). `loader_seen.start` is the one way to
+# empty a list, and it stamps the row in the same transaction. See docs/architecture.md, "Reload
+# seen lists".
+SEEN_LIST_SCHEMA = "loader_seen"
+SEEN_LIST_REGISTRY = "loader_seen.lists"
+
+# How far before an extraction's `started_at` a list must have been started to count as intact.
+# `started_at` is the extractor's clock and `opened_at` the database's; a list started just after
+# an extraction began, by a clock that runs behind the extractor's, would otherwise pass while
+# missing that extraction's first batches. Lists restart when the previous extraction settles,
+# weeks before the next, so the margin costs nothing.
+SEEN_LIST_CLOCK_MARGIN = "15 minutes"
+
+# The sqlstate `loader_seen.*_stale` raises for a list that is not intact: object not in
+# prerequisite state. A loader that reaches it has skipped its own guard; the purge must not run.
+SEEN_LIST_NOT_INTACT_SQLSTATE = "55000"
+
+
+@dataclass(frozen=True)
+class _SeenList:
+    """One seen list: the reconciled table, its key, and what the purge returns."""
+
+    loader: str
+    data_type: str
+    entity: str
+    key_type: str
+    # The key of entity row `e`, exactly as the loader computes it for the list.
+    key: str
+    # The column of `e` the stale set returns, so the purge can delete by it.
+    row_id: str
+    row_id_type: str
+
+    @property
+    def name(self) -> str:
+        return f"{self.loader}_{self.data_type}"
+
+    @property
+    def relation(self) -> str:
+        return f"{SEEN_LIST_SCHEMA}.{self.name}"
+
+
+# A MusicBrainz list keeps 8 bytes of the row's 32-byte key: the purge's anti-join over 30M
+# relationships then hashes and spills a quarter of the bytes. Two keys can share 8 bytes (about
+# 2.4e-5 per 30M-row extraction), and that only ever makes an unseen row look seen: it survives
+# one more month, and no live row can be deleted by it.
+SEEN_LIST_HASH_KEY = f"{SEEN_LIST_SCHEMA}.hash_key"
+_MB_RELATIONSHIP_KEY = (
+    f"{SEEN_LIST_HASH_KEY}(musicbrainz.relationship_key(e.source_mbid, e.target_mbid, e.source_entity_type, e.target_entity_type, "
+    "e.relationship_type, e.begin_date, e.end_date, e.attributes))"
+)
+_MB_EXTERNAL_LINK_KEY = f"{SEEN_LIST_HASH_KEY}(musicbrainz.external_link_key(e.mbid, e.entity_type, e.service_name, e.url))"
+
+SEEN_LISTS: tuple[_SeenList, ...] = (
+    *(_SeenList("discogs", table, f"public.{table}", "TEXT", "e.data_id", "data_id", "text") for table in _ENTITY_TABLES),
+    _SeenList("musicbrainz", "relationships", "musicbrainz.relationships", "BIGINT", _MB_RELATIONSHIP_KEY, "id", "bigint"),
+    _SeenList("musicbrainz", "external_links", "musicbrainz.external_links", "BIGINT", _MB_EXTERNAL_LINK_KEY, "id", "bigint"),
+)
+
+
+def _external_link_key_function() -> str:
+    """Return the IMMUTABLE function keying one MusicBrainz external link on a single hash.
+
+    The relationship key's encoding, over the link's unique key: each part length-prefixed, so
+    no two different links can concatenate to the same text.
+    """
+    parts = ["mbid::text", "entity_type", "service_name", "url"]
+    prefixed = " ||\n            ".join(f"COALESCE(pg_catalog.length({part})::text || ':' || {part}, '-')" for part in parts)
+    return f"""
+        CREATE OR REPLACE FUNCTION musicbrainz.external_link_key(mbid uuid, entity_type text, service_name text, url text)
+        RETURNS bytea
+        LANGUAGE sql
+        IMMUTABLE
+        PARALLEL SAFE
+        AS $external_link_key$
+        SELECT pg_catalog.sha256(pg_catalog.convert_to(
+            {prefixed}, 'UTF8'))
+        $external_link_key$
+        """
+
+
+_SEEN_LIST_HASH_KEY_FUNCTION = f"""
+CREATE OR REPLACE FUNCTION {SEEN_LIST_HASH_KEY}(key bytea)
+RETURNS bigint
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+STRICT
+AS $hash_key$
+SELECT ('x' || pg_catalog.encode(pg_catalog.substr(key, 1, 8), 'hex'))::bit(64)::bigint
+$hash_key$"""
+
+
+def _seen_list_table(seen: _SeenList) -> tuple[str, str]:
+    """Return the statement creating one list, started, if it does not exist.
+
+    Created and registered together, and only when missing: a reapply must neither empty a list
+    a load is filling nor restamp one a crash has emptied. Insert-triggered autovacuum is off,
+    because the list is append-only and emptied by TRUNCATE; it would only reread it. Analyze
+    stays on, for the purge's plan.
+    """
+    return (
+        f"{seen.relation} table",
+        f"""DO $seen_list$
+BEGIN
+    IF pg_catalog.to_regclass('{seen.relation}') IS NULL THEN
+        CREATE UNLOGGED TABLE {seen.relation} (
+            seen_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+            seen_key {seen.key_type} NOT NULL
+        ) WITH (autovacuum_vacuum_insert_threshold = -1);
+        INSERT INTO {SEEN_LIST_REGISTRY} (loader, data_type) VALUES ('{seen.loader}', '{seen.data_type}')
+        ON CONFLICT (loader, data_type) DO UPDATE SET opened_at = EXCLUDED.opened_at;
+    END IF;
+END
+$seen_list$""",  # noqa: S608 -- composed of module constants only
+    )
+
+
+def _seen_list_branches(statement: Callable[[_SeenList], str], indent: str = "        ") -> str:
+    """Return one CASE branch per list, keyed 'loader.data_type', running STATEMENT for it."""
+    return "\n".join(f"{indent}WHEN '{seen.loader}.{seen.data_type}' THEN\n{indent}    {statement(seen)}" for seen in SEEN_LISTS)
+
+
+_UNKNOWN_SEEN_LIST = (
+    "ELSE RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = pg_catalog.format('no seen list for loader %L, data type %L', p_loader, p_data_type);"
+)
+
+
+def _seen_list_start_function() -> str:
+    """Return `loader_seen.start`, which empties one list and stamps when it started."""
+    branches = _seen_list_branches(lambda seen: f"TRUNCATE {seen.relation};")
+    return f"""
+CREATE OR REPLACE FUNCTION {SEEN_LIST_SCHEMA}.start(p_loader text, p_data_type text)
+RETURNS timestamptz
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $start$
+BEGIN
+    CASE p_loader || '.' || p_data_type
+{branches}
+        {_UNKNOWN_SEEN_LIST}
+    END CASE;
+    INSERT INTO {SEEN_LIST_REGISTRY} (loader, data_type, opened_at) VALUES (p_loader, p_data_type, now())
+    ON CONFLICT (loader, data_type) DO UPDATE SET opened_at = EXCLUDED.opened_at;
+    RETURN now();
+END
+$start$"""  # noqa: S608 -- composed of module constants only
+
+
+def _seen_list_intact_function() -> str:
+    """Return `loader_seen.intact`: whether a list holds every key appended since STARTED_AT.
+
+    One primary-key read: no scan of the list.
+    """
+    return f"""
+CREATE OR REPLACE FUNCTION {SEEN_LIST_SCHEMA}.intact(p_loader text, p_data_type text, p_started_at timestamptz)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SET search_path = pg_catalog, pg_temp
+AS $intact$
+SELECT COALESCE(
+    (SELECT l.opened_at <= p_started_at - interval '{SEEN_LIST_CLOCK_MARGIN}'
+     FROM {SEEN_LIST_REGISTRY} AS l WHERE l.loader = p_loader AND l.data_type = p_data_type),
+    false)
+$intact$"""  # noqa: S608 -- composed of module constants only
+
+
+def _seen_keys_count(seen: _SeenList) -> str:
+    """Return the statement counting SEEN's distinct keys since `p_started_at` into `seen_keys`."""
+    since = f"SELECT DISTINCT s.seen_key FROM {seen.relation} AS s WHERE s.seen_at >= p_started_at"  # noqa: S608 -- module constants only
+    return f"SELECT count(*) INTO seen_keys FROM ({since}) AS d;"  # noqa: S608 -- module constants only
+
+
+def _seen_list_status_function() -> str:
+    """Return `loader_seen.status`: when a list started, whether it is intact, and its distinct keys.
+
+    The count is of distinct keys appended at or after STARTED_AT, so a redelivered batch, or a
+    relationship seen from both of its endpoints, counts once.
+    """
+    branches = _seen_list_branches(_seen_keys_count)
+    return f"""
+CREATE OR REPLACE FUNCTION {SEEN_LIST_SCHEMA}.status(p_loader text, p_data_type text, p_started_at timestamptz)
+RETURNS TABLE (opened_at timestamptz, intact boolean, seen_keys bigint)
+LANGUAGE plpgsql
+STABLE
+SET search_path = pg_catalog, pg_temp
+AS $status$
+BEGIN
+    CASE p_loader || '.' || p_data_type
+{branches}
+        {_UNKNOWN_SEEN_LIST}
+    END CASE;
+    opened_at := (SELECT l.opened_at FROM {SEEN_LIST_REGISTRY} AS l WHERE l.loader = p_loader AND l.data_type = p_data_type);
+    intact := {SEEN_LIST_SCHEMA}.intact(p_loader, p_data_type, p_started_at);
+    RETURN NEXT;
+END
+$status$"""  # noqa: S608 -- composed of module constants only
+
+
+def _seen(seen: _SeenList) -> str:
+    """Return the predicate: entity row `e` has a key in SEEN's list since `p_started_at`."""
+    return f"EXISTS (SELECT 1 FROM {seen.relation} AS s WHERE s.seen_key = {seen.key} AND s.seen_at >= p_started_at)"  # noqa: S608 -- module constants only
+
+
+def _seen_list_stale_function(seen: _SeenList) -> tuple[str, str]:
+    """Return `loader_seen.<list>_stale`: the rows the purge deletes once the touch is gone.
+
+    Older than the extraction AND not seen by it. The age test keeps the old purge's meaning for
+    rows the extraction wrote (inserted or changed, so `updated_at` moved): they survive even if
+    a path forgot to append them. Refuses a list that is not intact, so a loader that skipped
+    `loader_seen.intact` still cannot purge from an emptied list.
+
+    The anti-join reads only the row id, so for Discogs it can run as an index-only scan of the
+    primary key (864 MB for lux's releases, not its 16 GB heap: a reload that no longer touches
+    unchanged rows leaves their pages all-visible). Only the few candidates it leaves are read
+    from the heap for the age test.
+    """
+    name = f"{seen.name}_stale"
+    unseen = f"SELECT e.{seen.row_id} FROM {seen.entity} AS e WHERE NOT {_seen(seen)}"  # noqa: S608 -- module constants only
+    return (
+        f"{SEEN_LIST_SCHEMA}.{name} function",
+        f"""
+CREATE OR REPLACE FUNCTION {SEEN_LIST_SCHEMA}.{name}(p_started_at timestamptz)
+RETURNS TABLE ({seen.row_id} {seen.row_id_type})
+LANGUAGE plpgsql
+STABLE
+SET search_path = pg_catalog, pg_temp
+AS ${name}$
+BEGIN
+    IF NOT {SEEN_LIST_SCHEMA}.intact('{seen.loader}', '{seen.data_type}', p_started_at) THEN
+        RAISE EXCEPTION USING ERRCODE = '{SEEN_LIST_NOT_INTACT_SQLSTATE}',
+            MESSAGE = pg_catalog.format('{seen.relation} is not intact for an extraction started at %s: purge nothing', p_started_at);
+    END IF;
+    RETURN QUERY
+    SELECT stale.{seen.row_id}::{seen.row_id_type} FROM {seen.entity} AS stale
+    WHERE stale.{seen.row_id} IN ({unseen}) AND stale.updated_at < p_started_at;
+END
+${name}$""",  # noqa: S608 -- composed of module constants only
+    )
+
+
+def _seen_list_shadow_function(seen: _SeenList) -> tuple[str, str]:
+    """Return `loader_seen.<list>_shadow`: the two purge sets of a shadow reload, compared.
+
+    During shadow mode the loader still touches every unchanged row, so `updated_at` says what the
+    old purge deletes. What the seen purge would delete once the touch is gone is every row not in
+    the list: an unchanged row's `updated_at` then predates the extraction. The two must be equal.
+    `refreshed_not_seen` counts rows the extraction refreshed that the list lacks: after the
+    switch they would be deleted while live, so any one of them blocks the switch.
+    `seen_not_refreshed` counts rows in the list that were not refreshed, which the old purge
+    deletes and the new one keeps. Samples are of at most P_SAMPLE ids each.
+    """
+    name = f"{seen.name}_shadow"
+    seen_since = f"SELECT DISTINCT s.seen_key FROM {seen.relation} AS s WHERE s.seen_at >= p_started_at"  # noqa: S608
+    return (
+        f"{SEEN_LIST_SCHEMA}.{name} function",
+        f"""
+CREATE OR REPLACE FUNCTION {SEEN_LIST_SCHEMA}.{name}(p_started_at timestamptz, p_sample integer DEFAULT 20)
+RETURNS TABLE (
+    intact boolean, total_rows bigint, touch_purge bigint, seen_purge bigint,
+    refreshed_not_seen bigint, seen_not_refreshed bigint,
+    refreshed_not_seen_sample {seen.row_id_type}[], seen_not_refreshed_sample {seen.row_id_type}[]
+)
+LANGUAGE plpgsql
+STABLE
+SET search_path = pg_catalog, pg_temp
+AS ${name}$
+BEGIN
+    intact := {SEEN_LIST_SCHEMA}.intact('{seen.loader}', '{seen.data_type}', p_started_at);
+    SELECT count(*),
+           count(*) FILTER (WHERE e.updated_at < p_started_at),
+           count(*) FILTER (WHERE d.seen_key IS NULL),
+           count(*) FILTER (WHERE e.updated_at >= p_started_at AND d.seen_key IS NULL),
+           count(*) FILTER (WHERE e.updated_at < p_started_at AND d.seen_key IS NOT NULL)
+    INTO total_rows, touch_purge, seen_purge, refreshed_not_seen, seen_not_refreshed
+    FROM {seen.entity} AS e LEFT JOIN ({seen_since}) AS d ON d.seen_key = {seen.key};
+    refreshed_not_seen_sample := ARRAY(
+        SELECT e.{seen.row_id}::{seen.row_id_type} FROM {seen.entity} AS e
+        WHERE refreshed_not_seen > 0 AND e.updated_at >= p_started_at AND NOT {_seen(seen)}
+        ORDER BY e.{seen.row_id} LIMIT p_sample);
+    seen_not_refreshed_sample := ARRAY(
+        SELECT e.{seen.row_id}::{seen.row_id_type} FROM {seen.entity} AS e
+        WHERE seen_not_refreshed > 0 AND e.updated_at < p_started_at AND {_seen(seen)}
+        ORDER BY e.{seen.row_id} LIMIT p_sample);
+    RETURN NEXT;
+END
+${name}$""",  # noqa: S608 -- composed of module constants only
+    )
+
+
+_SEEN_LIST_STATEMENTS: list[tuple[str, str]] = [
+    (f"{SEEN_LIST_SCHEMA} schema", f"CREATE SCHEMA IF NOT EXISTS {SEEN_LIST_SCHEMA}"),
+    # Unlogged, so crash recovery empties it with the lists it vouches for. A row per list.
+    (
+        f"{SEEN_LIST_REGISTRY} table",
+        f"""CREATE UNLOGGED TABLE IF NOT EXISTS {SEEN_LIST_REGISTRY} (
+            loader    TEXT NOT NULL,
+            data_type TEXT NOT NULL,
+            opened_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            CONSTRAINT lists_pkey PRIMARY KEY (loader, data_type)
+        )""",
+    ),
+    ("musicbrainz.external_link_key function", _external_link_key_function()),
+    (f"{SEEN_LIST_HASH_KEY} function", _SEEN_LIST_HASH_KEY_FUNCTION),
+    *(_seen_list_table(seen) for seen in SEEN_LISTS),
+    (f"{SEEN_LIST_SCHEMA}.start function", _seen_list_start_function()),
+    (f"{SEEN_LIST_SCHEMA}.intact function", _seen_list_intact_function()),
+    (f"{SEEN_LIST_SCHEMA}.status function", _seen_list_status_function()),
+    *(_seen_list_stale_function(seen) for seen in SEEN_LISTS),
+    *(_seen_list_shadow_function(seen) for seen in SEEN_LISTS),
+]
+
+# Removes everything above. Nothing else reads the lists, so dropping them loses only the current
+# reload's evidence: the loaders' next purge is then skipped, as after a crash.
+SEEN_LIST_ROLLBACK_STATEMENTS: tuple[str, ...] = (
+    f"DROP SCHEMA IF EXISTS {SEEN_LIST_SCHEMA} CASCADE",
+    "DROP FUNCTION IF EXISTS musicbrainz.external_link_key(uuid, text, text, text)",
+)
+
+
 def _schema_statements() -> Iterator[tuple[str, Any]]:
     """Yield the complete PostgreSQL schema in compatibility-sensitive order."""
     yield from _entity_schema_statements()
@@ -7877,6 +8210,7 @@ def _schema_statements() -> Iterator[tuple[str, Any]]:
     yield from _MUSICBRAINZ_TABLES
     yield from _MUSICBRAINZ_INDEXES
     yield from _MUSICBRAINZ_RETIRED_INDEXES
+    yield from _SEEN_LIST_STATEMENTS
     yield from _ARTIST_SIMILARITY_STATEMENTS
     yield from _GRAPH_STATEMENTS
     yield from _IDENTITY_LEDGER_STATEMENTS

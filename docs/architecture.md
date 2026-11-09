@@ -1227,6 +1227,304 @@ The inline path can run against this expanded schema unchanged. Rollback of the
 durable worker is to restore inline behavior while retaining these unused additive
 relations; dropping them would be a separate contract migration.
 
+## Reload seen lists
+
+A monthly reload of unchanged rows used to rewrite every one of them. `discogs-sql-loader`'s hash
+gate finds a row unchanged and still runs `UPDATE {table} SET updated_at = NOW()`, and every
+`musicbrainz-sql-loader` upsert rewrites its row on conflict, for one reason: the stale-row purge
+deletes the rows whose `updated_at` predates the extraction, so a row the reload did not rewrite
+would be deleted as gone upstream. On a releases sample shaped like lux's, the touch costs
+230 µs and 7.8 KB of WAL a row, with no HOT updates (13 indexes, and full pages). For lux's 19.6M
+releases that is about 75 minutes and 150 GB of WAL a month, plus 19.6M dead tuples to vacuum.
+The audit estimated 64 minutes and 127 GB.
+
+The seen list records the same fact without the rewrite. In the transaction that used to touch
+the row, the loader appends the row's key to a narrow, unlogged, index-free list. The purge then
+deletes a row only when it is **older than the extraction and not in the list**. An append costs
+14-18 µs and under 2 bytes of WAL a row, and no entity row is written. One design serves both
+loaders (operator decision 2026-11-04; beads `gm-database-schema-uw6d`,
+`gm-discogs-sql-loader-g77f`, `gm-musicbrainz-sql-loader-3osm`). Every statement is declared in
+`_SEEN_LIST_STATEMENTS` in [`postgres.py`](../src/groovemap_schema/postgres.py), and
+`reload_seen_lists` in [the persistence contract](../contracts/persistence/) records it. The
+measurements below come from [`audits/2026-11-08-reload-seen-list`](audits/2026-11-08-reload-seen-list/README.md).
+
+### The lists
+
+There is one list per reconciled table and loader, in the `loader_seen` schema. A purge, and the
+`TRUNCATE` that restarts its list, then reach that one table and nothing else:
+
+| List | Reconciles | `seen_key` |
+| --- | --- | --- |
+| `loader_seen.discogs_artists`, `_labels`, `_masters`, `_releases` | `public.<type>` | `TEXT`: the row's `data_id` |
+| `loader_seen.musicbrainz_relationships` | `musicbrainz.relationships` | `BIGINT`: `loader_seen.hash_key(musicbrainz.relationship_key(...))` over the eight key columns |
+| `loader_seen.musicbrainz_external_links` | `musicbrainz.external_links` | `BIGINT`: `loader_seen.hash_key(musicbrainz.external_link_key(mbid, entity_type, service_name, url))` |
+
+Each list has two columns, `seen_at TIMESTAMPTZ NOT NULL DEFAULT now()` and `seen_key`. `seen_at`
+is the appending transaction's start, which is what `updated_at = NOW()` recorded. A list row
+takes 44 bytes, so lux's releases need about 870 MB. Each list is:
+
+- **Unlogged.** An append writes no WAL (0.4 bytes a row measured, all of it commit records).
+  The cost is that crash recovery empties the list. The registry below turns that loss into a
+  skipped purge.
+- **Index-free.** This was measured at 5M rows, at lux's 64 MB `work_mem`. With a btree on
+  `seen_key`, appends took 2.2 µs a row instead of 0.54 µs and the list was 1.9 times larger. The
+  planner still chose a hash anti-join for the purge, so the index bought nothing.
+- **Append-only, with duplicates allowed.** A redelivered batch, or a MusicBrainz relationship
+  seen from both of its endpoints, appends its key twice. The purge's `EXISTS` and the count's
+  `DISTINCT` both ignore the duplicate. Insert-triggered autovacuum is off
+  (`autovacuum_vacuum_insert_threshold = -1`), because it would only reread a list that is
+  emptied by `TRUNCATE`. Autoanalyze stays on.
+
+A MusicBrainz list keeps 8 of its key's 32 bytes, so the purge's anti-join over 30M relationships
+hashes and spills a quarter of the bytes. At 300k relationships the spill went from 40 MB to
+none. Two different rows can share 8 bytes, about 2.4e-5 times per 30M-row extraction. A
+collision only makes an unseen row look seen, so that row survives one more month. It can never
+delete a live row.
+
+### Intact or lost: the registry
+
+`loader_seen.lists (loader, data_type, opened_at)` holds one row per list and is **unlogged too**.
+Crash recovery resets every unlogged relation, so it empties the registry together with the
+lists it vouches for. A list is *intact* for an extraction only while its registry row exists
+and says the list started at least `SEEN_LIST_CLOCK_MARGIN` (15 minutes) before the
+extraction's `started_at`:
+
+```sql
+SELECT loader_seen.intact('discogs', 'releases', :started_at);  -- one primary-key read
+```
+
+- **After a crash**, the registry row is gone, so `intact` is false and the purge is skipped. A
+  real crash test (SIGKILL of a backend, then crash recovery) proves this on PostgreSQL 18: the
+  list and the registry come back empty, `intact` is false, and the stale function refuses to
+  run. The logged entity rows are untouched.
+- **A list started after the extraction began** is not intact for that extraction. That covers a
+  list restarted while records of the next dump were already arriving, and a list created by a
+  schema upgrade during a load. Their earliest keys were emptied, so the purge waits for the next
+  extraction.
+- **The margin** covers clock skew. `started_at` comes from the extractor's clock and `opened_at`
+  from the database's. Lists restart when the previous extraction settles, weeks before the next,
+  so the margin costs nothing.
+- **`loader_seen.start(loader, data_type)` is the only way to empty a list.** It runs `TRUNCATE`
+  on that list and stamps its registry row in the caller's transaction, so a purge that rolls back
+  leaves the list and its start time as they were. A loader must never `TRUNCATE` or `DELETE`
+  from a list itself: a list emptied behind the registry's back would read as intact.
+- The initializer creates and starts a list **only when the list does not exist yet**. A reapply
+  neither empties a list a load is filling nor restamps one that a crash emptied.
+
+The operator accepted the trade-off: after a PostgreSQL crash, one month of stale rows may
+remain, because live rows must never be deleted.
+
+### Appending in the batch path
+
+The append runs **in the batch's own transaction**, next to the writes it replaces. A batch that
+rolls back therefore appends nothing, and a committed batch has always appended. Appends need no
+coordination: they are plain heap inserts with no key and no index, so concurrent consumers and
+batches never conflict.
+
+- **`discogs-sql-loader`** appends every id the batch processed: unchanged, changed, inserted, and
+  backfilled. In `PostgreSQLBatchWriter._process_batch`, after the writes, it runs
+  `INSERT INTO loader_seen.discogs_<type> (seen_key) SELECT unnest(%s::text[])` with the batch's
+  `latest` ids. Changed and new rows would survive the purge anyway, because the age test keeps
+  them, but appending them too makes the count guard comparable to `record_counts`.
+  `PostgreSQLRecordPersistence.persist_record`, the single-record path, appends in its
+  transaction as well. Every path that writes a row must append it. The shadow comparison finds a
+  path that does not.
+- **`musicbrainz-sql-loader`** appends one key per child row it upserts, in the message's
+  transaction: `INSERT INTO loader_seen.musicbrainz_relationships (seen_key) SELECT
+  loader_seen.hash_key(musicbrainz.relationship_key(...)) FROM unnest(...)` with the conflict
+  target's own eight values, and the same for links with `musicbrainz.external_link_key`.
+- **Redelivery** appends again, which is harmless. **Resumed extractions** keep their
+  `started_at`, so keys appended before the resume still count. If an extraction restarts with a
+  new `started_at`, the earlier session's keys are older than it, so they do not count. Its count
+  then falls below the guard and the purge is skipped. The touch-based purge would have deleted
+  those rows, up to the delete-fraction cap.
+
+### The purge
+
+A seen-mode purge for one list runs in one transaction:
+
+1. The existing vetoes still apply: no `started_at`, a type whose extractor reported 0 records,
+   dead letters (`purge_veto_reason`), and an already settled extraction.
+2. **The list must be intact:** `loader_seen.intact(loader, type, started_at)`. If it is not,
+   skip the purge and treat it like a dead-letter veto: record it in `purge_vetoed`, so the
+   consecutive-veto alert sees it.
+3. **The seen count must not be far below what the extractor sent** (Discogs). The guard skips
+   when `(SELECT seen_keys FROM loader_seen.status(loader, type, started_at))` is less than
+   `SEEN_MIN_FRACTION × record_counts[type]`. Suggested first value: 0.95, calibrated from the
+   ratio the shadow reload logs. The registry catches crashes; this guard catches systematic
+   loss, such as a write path that never appends. MusicBrainz has no per-table producer count
+   for child rows, so for those lists the delete-fraction cap is the count guard.
+4. Compute the purge set once, into a temporary table:
+   `CREATE TEMP TABLE stale ON COMMIT DROP AS SELECT * FROM loader_seen.discogs_<type>_stale(started_at)`
+   (or `loader_seen.musicbrainz_<table>_stale`). The function refuses a list that is not intact
+   with SQLSTATE `55000`, so a loader that forgot step 2 still cannot purge from an emptied list.
+5. Keep `PURGE_MAX_DELETE_FRACTION`: refuse when `count(stale) / count(*)` reaches it.
+6. Delete by the ids in `stale`, never by `updated_at`. That covers the graph rows first
+   (`discogs-sql-loader`'s `purge_document_graph` and `_purge_delete` join `stale.updated_at < %s`
+   today; they must join the temporary table instead), then the entity rows.
+7. `SELECT loader_seen.start(loader, type)` in the same transaction. The list is restarted when
+   the extraction settles for that type: purged, vetoed, or skipped by a guard. A skipped list is
+   started in its own transaction, so the next extraction has an intact one.
+
+`<list>_stale(started_at)` returns the rows with `updated_at < started_at` **and** no key in the
+list since `started_at`. The age test keeps the old purge's meaning for rows the extraction wrote:
+a changed or new row survives even if a path forgot to append it. For Discogs, the anti-join
+reads only `data_id`, through an index-only scan of the primary key (864 MB on lux, against
+16 GB of heap). A reload that no longer touches unchanged rows leaves their pages all-visible.
+Only the few candidates the anti-join leaves are read from the heap for the age test. On the
+200k sample this read 6.8k buffers where a heap scan read 33k.
+
+**Temporary space.** The anti-join and the distinct count hash a whole list. At lux's 64 MB
+`work_mem`, measured at 5M keys and run serially (the worst case), they take 4-5 s with 198 MB of
+temp and 3.4 s with 110 MB. For lux's releases that scales to about 20 s with 0.8 GB, and 13 s
+with 0.45 GB. Both are freed when the query ends. `SET LOCAL work_mem = '256MB'` in the purge
+transaction kept the 5M-key anti-join in memory. The MusicBrainz relationships purge also reads
+the 4 GB heap and hashes the key of each of its 30M rows (about 3 minutes, scaled from 1.75 s
+for 300k).
+
+### Shadow mode
+
+Before switching, each loader runs **one full reload in shadow mode**:
+
+- It keeps the touch and the `updated_at` purge exactly as they are, and also appends.
+- At each purge, before the old delete, it calls `loader_seen.<list>_shadow(started_at)` and logs
+  every column. It never deletes from the new set.
+- Then it restarts the list (`loader_seen.start`) as in seen mode.
+
+`<list>_shadow` compares the two purge sets in one pass:
+
+| Column | Meaning |
+| --- | --- |
+| `intact` | Whether the list is intact for this extraction. A shadow reload whose list is not intact proves nothing: rerun it. |
+| `total_rows` | Rows in the reconciled table. |
+| `touch_purge` | The old purge set, `updated_at < started_at`. |
+| `seen_purge` | What the seen purge would delete once the touch is gone. Without the touch an unchanged row's `updated_at` predates the extraction, so this is every row not in the list. |
+| `refreshed_not_seen` | Rows the extraction refreshed that the list lacks. After the switch they would be deleted while live. **Any one of them blocks the switch.** |
+| `seen_not_refreshed` | Rows in the list that were not refreshed. The old purge deletes them and the new one keeps them. |
+
+Each count has a sample of up to 20 ids (`p_sample`). The switch needs `intact`,
+`refreshed_not_seen = 0`, and `touch_purge = seen_purge`, with every `seen_not_refreshed` row
+explained, all recorded with counts on a real reload, **and operator approval**. After the
+switch, the loader stops touching unchanged rows and purges from `<list>_stale`. Dropping
+`idx_<table>_updated_at` is a separate database-schema change, once nothing else reads it. The
+stale function does not need it.
+
+### MusicBrainz: the no-op check
+
+`musicbrainz-sql-loader` has no hash gate. Its entity, relationship and link upserts rewrite
+every conflict, so a reload costs as much as the first load. The measured lux load wrote 3.6M
+relationship updates for 30M rows, because relationships seen from both endpoints are written
+twice in one load. A seen list removes the reason to rewrite. The upserts also have to stop
+rewriting, and how they skip matters:
+
+| Reload of unchanged rows, per row | Time | WAL | Dead tuples |
+| --- | --- | --- | --- |
+| Relationships: upsert that refreshes `updated_at` (today) | 74 µs | 2,244 B | 1 |
+| Relationships: `ON CONFLICT DO UPDATE ... WHERE ended IS DISTINCT FROM`, plus the append | 65 µs | 412 B | 0 |
+| Relationships: `UPDATE ... WHERE` changed, `INSERT ... ON CONFLICT DO NOTHING`, plus the append | 101 µs | 3.5 B | 0 |
+| Entities (2.3 KB rows): upsert (today) | 74 µs | 2,832 B | 1 |
+| Entities: `ON CONFLICT DO UPDATE ... WHERE (columns) IS DISTINCT FROM (EXCLUDED columns)` | 69 µs | 1,198 B | 0 |
+| Entities: `UPDATE ... WHERE (columns) IS DISTINCT FROM (...)`, then `INSERT ... ON CONFLICT DO NOTHING` | 117 µs | 0.3 B | 0 |
+
+`ON CONFLICT DO UPDATE ... WHERE` skips the update but still **locks** the conflicting row. The
+lock writes the tuple's `xmax`, so it dirties every heap page, and each page is logged whole on
+its first change after a checkpoint. A plain `UPDATE` locks only the rows its `WHERE` keeps, and
+`ON CONFLICT DO NOTHING` locks none. So the lock-free form writes almost nothing, at about 40-60%
+more statement time in this bench. That time does not include the 67 GB of WAL a 30M-row
+relationship reload writes today, or the vacuum of 30M dead tuples. Recommended shapes:
+
+- **Relationships:** `UPDATE musicbrainz.relationships SET ended = $ended, updated_at = NOW() WHERE
+  musicbrainz.relationship_key(<columns>) = musicbrainz.relationship_key(<values>) AND ended IS
+  DISTINCT FROM $ended`. The key expression must be spelled exactly as `relationships_key`
+  declares it, so the index serves the lookup. Then `INSERT ... ON CONFLICT
+  (musicbrainz.relationship_key(...)) DO NOTHING`, then the append.
+- **External links:** `INSERT ... ON CONFLICT (mbid, entity_type, service_name, url) DO NOTHING`
+  (the key is every column), then the append.
+- **Entities:** `UPDATE musicbrainz.<entity> SET ..., updated_at = NOW() WHERE mbid = $mbid AND
+  (<columns>) IS DISTINCT FROM (<values>)`, then `INSERT ... ON CONFLICT (mbid) DO NOTHING`. The
+  `identity_link_events` CTE keeps its `old` read and records an event only when the update or
+  the insert returned a row whose Discogs id differs from the old one. An unchanged entity
+  returns no row and writes no event. The identity ledger's statement-level capture trigger on
+  `musicbrainz.releases` then sees no changed row.
+- `jsonb` comparison is semantic (key order does not matter), so `IS DISTINCT FROM` over `data`
+  is a true no-op check.
+- Two messages that insert the same new child row concurrently both end in `DO NOTHING` after the
+  first commits. If the second carried a different `ended`, its value waits for the next reload.
+  Both endpoints of a relationship come from one extraction, so the two carry the same value.
+- The MusicBrainz entity tables are not purged today, so they need no list. If an entity purge
+  is added later, it gets a list of its own here, keyed on `mbid`.
+
+### Measured
+
+Each run used a 200k-row releases sample shaped like lux's (toasted documents, the full schema's
+13 indexes and triggers), PostgreSQL 18. Writes were in the loader's 100-id batches, one
+transaction each, after a `CHECKPOINT`, so every page is logged whole on its first change, as it
+is over an hour-long reload under lux's 5-minute `checkpoint_timeout`.
+
+| Unchanged reload of 199k releases | Time a row | WAL a row | Updates | HOT | Dead tuples |
+| --- | --- | --- | --- | --- | --- |
+| Touch (`UPDATE ... SET updated_at = NOW()`) | 197-230 µs | 7.75-8.1 KB | 199k | 0 | 199k |
+| Seen-list append | 14-18 µs | 0.4-1.8 B | 0 | 0 | 0 |
+
+| Purge on the 200k sample | Time | Temp |
+| --- | --- | --- |
+| `loader_seen.status` (distinct count) | 0.06 s | 1.6 MB |
+| `loader_seen.discogs_releases_stale` (1,000 rows gone upstream, all found) | 0.07 s | none |
+| `loader_seen.discogs_releases_shadow` (`touch_purge` = `seen_purge` = 1,000, differences 0) | 0.5 s | 7.7 MB |
+
+Scaled to lux's 19.6M releases, the touch is 64-75 minutes and about 150 GB of WAL a month,
+against 5-6 minutes, about 8 MB of WAL, and an 870 MB unlogged list for the seen list. The audit
+measured the touch at 196 µs and 6.5 KB a row on lux itself.
+
+### Upgrade, rollout and rollback
+
+All of it is additive: a new schema, unlogged tables, and functions, plus one new function in
+`musicbrainz`. It takes no lock on an existing table and reads no data. A reapply is a no-op.
+The first extraction that began before the upgrade has no intact list, so a seen-mode purge would
+skip it and a shadow reload would report `intact = false`. The rollout goes expand (this schema),
+then shadow (each loader, one full reload), then switch (each loader, operator approval), then
+contract (drop `idx_<table>_updated_at` if nothing reads it, in a separate change).
+
+Rollback is per loader and by configuration: it touches again and purges by `updated_at`. The
+first purge after switching back must follow a reload that ran with the touch. A reload without
+the touch leaves every unchanged row looking stale, and the delete-fraction cap is then all that
+stands between it and the table. The schema's own rollback is `SEEN_LIST_ROLLBACK_STATEMENTS`,
+which drops the `loader_seen` schema and `musicbrainz.external_link_key`. Nothing else reads them,
+so dropping them loses only the current reload's evidence, as a crash would.
+
+### What each loader implements
+
+`discogs-sql-loader` (`gm-discogs-sql-loader-g77f`):
+
+- Probe at startup for `loader_seen.lists`, the four Discogs lists, and the functions, and run in
+  touch mode if any is missing. Add a mode setting `touch | shadow | seen`, defaulting to touch,
+  then shadow once this schema is deployed.
+- Shadow and seen: append every processed id in `_process_batch` and in `persist_record`, in the
+  write transaction.
+- Shadow: keep the touch and the `updated_at` purge, log `discogs_<type>_shadow(started_at)` at
+  every purge, then `loader_seen.start`.
+- Seen: drop the touch, keep the backfill UPDATEs, and purge as in "The purge": intact check, count
+  guard against `record_counts`, the stale temporary table, the delete-fraction cap,
+  `purge_document_graph` and the entity `DELETE` by id, then `loader_seen.start` in the same
+  transaction. A not-intact list or a failed count guard is recorded like a dead-letter veto.
+- Tests on real PostgreSQL: shadow equality, a crash that empties the list purges nothing, a
+  partial list below the guard purges nothing, live rows survive every failure test, and WAL and
+  dead tuples are measured before and after the switch.
+
+`musicbrainz-sql-loader` (`gm-musicbrainz-sql-loader-3osm`):
+
+- The lock-free no-op upserts above, for the four entity tables, relationships, and external
+  links. They need no list for the entities, and they are worth taking on their own, since they
+  stop the entity rewrite.
+- The same probe and mode setting. Append both child lists' keys in each message's transaction.
+- The four-signal purge, unchanged in when it runs. In shadow mode it logs
+  `musicbrainz_relationships_shadow` and `musicbrainz_external_links_shadow`. In seen mode it
+  checks that both lists are intact, purges both tables from their stale sets under the
+  delete-fraction cap, and calls `loader_seen.start` for both, in the purge's one transaction.
+- Fold in the `_RELATIONSHIP_INSERT` comment correction already on the bead.
+- The same real-PostgreSQL tests. This must land before MusicBrainz is enabled. No MusicBrainz
+  reload has completed yet, so its shadow reload is the first one after this ships.
+
 ## Catalog identifiers, manufacturing credits, and release country
 
 [ADR 0011](https://github.com/groovemap-music/design/blob/main/docs/adr/0011-catalog-identifiers-and-manufacturing-credits.md)
