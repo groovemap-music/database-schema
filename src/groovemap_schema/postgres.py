@@ -4332,8 +4332,8 @@ def _refresh_vertex_degree_function() -> str:
 
     The third shipped function that writes a graph row, and the second with a
     named refresh owner: like the MEMBER_OF union and the counter relations it
-    sums, **`discogs-sql-loader` rebuilds it on the `extraction_complete` latch
-    it already handles**, after `graph.refresh_artist_member_of()` and with the
+    sums, **`discogs-sql-loader` and `musicbrainz-sql-loader` each rebuild it on
+    the `extraction_complete` latch they already handle**, after `graph.refresh_artist_member_of()` and with the
     rest of the post-import pass. It is a sum over relations a loader writes a
     row at a time, so no loader can maintain it incrementally, and it costs no
     new scheduler. The contract records that owner under
@@ -4366,6 +4366,11 @@ AS $refresh_vertex_degree$
 -- `kind` is both an output column and a column of the relation being built, so
 -- the body resolves it to the column rather than failing on the ambiguity.
 BEGIN
+    -- Two loaders own this refresh, so concurrent calls queue here and each one
+    -- rebuilds from the sources as the other left them. Transaction-scoped: the
+    -- lock is held to the caller's commit, so a refresh pair run in one
+    -- transaction cannot be interleaved by the other loader's.
+    PERFORM pg_advisory_xact_lock(hashtextextended('graph.refresh_vertex_degree', 0));
     TRUNCATE graph.vertex_degree;
     INSERT INTO graph.vertex_degree (kind, key, degree)
     SELECT kind, key, degree
@@ -5115,8 +5120,8 @@ def _refresh_artist_member_of_function() -> str:
     """Return `graph.refresh_artist_member_of()`, the union's own rebuild.
 
     The second shipped function that writes a graph row, and one of the two with
-    a named refresh owner: **`discogs-sql-loader` calls it on the
-    `extraction_complete` latch it already handles**, which is the same latch
+    a named refresh owner: **`discogs-sql-loader` and `musicbrainz-sql-loader`
+    call it on the `extraction_complete` latch each already handles**, which is the same latch
     the counter relations are recomputed on and the same one `graphinator` uses
     to start its post-import pass. So the union costs no new scheduler, and it is
     rebuilt on the pass that has just finished moving the rows it reads. The
@@ -5149,6 +5154,11 @@ AS $refresh_artist_member_of$
 -- `source` is both an output column and a column of the relation being built,
 -- so the body resolves it to the column rather than failing on the ambiguity.
 BEGIN
+    -- Two loaders own this refresh, so concurrent calls queue here and each one
+    -- rebuilds from the sources as the other left them. Transaction-scoped: the
+    -- lock is held to the caller's commit, so a refresh pair run in one
+    -- transaction cannot be interleaved by the other loader's.
+    PERFORM pg_advisory_xact_lock(hashtextextended('graph.refresh_artist_member_of', 0));
     TRUNCATE graph.artist_member_of;
     INSERT INTO graph.artist_member_of (member_artist_id, group_artist_id, source)
     SELECT member_artist_id, group_artist_id, source

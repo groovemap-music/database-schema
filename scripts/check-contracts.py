@@ -94,6 +94,10 @@ for column in jobs["job"]["columns"]:
     assert column in user_statements["loader_derived_refresh_job table"], column
 assert "WHERE state IN ('pending', 'retry')" in user_statements["idx_loader_derived_refresh_job_due"]
 assert "WHERE state = 'leased'" in user_statements["idx_loader_derived_refresh_job_lease_expiry"]
+# A musicbrainz job is accepted: nothing restricts the loader discriminator.
+assert "loader IN" not in user_statements["loader_derived_refresh_job table"]
+assert "loader =" not in user_statements["loader_derived_refresh_job table"]
+assert "loader = 'musicbrainz'" in jobs["musicbrainz_job"]
 
 # The metrics-history tables are retired (ADR 0018): the schema drops them and
 # never creates them, so a consumer reading the contract sees them gone.
@@ -539,6 +543,12 @@ assert union["function"] == f"{GRAPH_SCHEMA}.refresh_artist_member_of"
 assert union["function"] in graph["functions"]
 assert union["refresh_owner"] in OWNERS
 assert union["refresh_owner"] == "discogs-sql-loader"
+# A second owner: musicbrainz-sql-loader refreshes on its own extraction_complete latch,
+# so the refresh functions serialize on a transaction-scoped advisory lock.
+assert union["refresh_owners"] == ["discogs-sql-loader", "musicbrainz-sql-loader"]
+assert union["refresh_order"] == [union["function"], f"{GRAPH_SCHEMA}.refresh_vertex_degree"]
+assert union["refresh_lock"]["kind"] == "pg_advisory_xact_lock"
+assert f"pg_advisory_xact_lock({union['refresh_lock']['key']})" in dict(_GRAPH_STATEMENTS)[f"{GRAPH_SCHEMA}.refresh_artist_member_of function"]
 assert union["refresh_latch"] == "extraction_complete"
 assert union["relation"].removeprefix(f"{GRAPH_SCHEMA}.") in storage_only
 assert declared_shapes[union["relation"].removeprefix(f"{GRAPH_SCHEMA}.")] == "table"
@@ -566,6 +576,10 @@ assert degree["function"] == f"{GRAPH_SCHEMA}.refresh_vertex_degree"
 assert degree["function"] in graph["functions"]
 assert degree["refresh_owner"] in OWNERS
 assert degree["refresh_owner"] == "discogs-sql-loader"
+assert degree["refresh_owners"] == union["refresh_owners"]
+assert degree["refresh_order"] == union["refresh_order"]
+assert degree["refresh_lock"]["kind"] == "pg_advisory_xact_lock"
+assert f"pg_advisory_xact_lock({degree['refresh_lock']['key']})" in dict(_GRAPH_STATEMENTS)[f"{GRAPH_SCHEMA}.refresh_vertex_degree function"]
 assert degree["refresh_latch"] == "extraction_complete"
 assert degree["refresh_latch"] == union["refresh_latch"]
 assert degree["relation"].removeprefix(f"{GRAPH_SCHEMA}.") in storage_only

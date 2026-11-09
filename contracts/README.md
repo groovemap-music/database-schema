@@ -54,8 +54,11 @@ usual.
 
 The remaining four functions are the two loader-owned refreshes and the two procedural read
 functions. `graph_schema.member_of_union` and `graph_schema.vertex_degree` name
-`discogs-sql-loader` as the refresh owner for `graph.refresh_artist_member_of()` and
-`graph.refresh_vertex_degree()`. `graph_schema.path_function` records the exact
+`discogs-sql-loader` and `musicbrainz-sql-loader` as refresh owners (`refresh_owners`) of
+`graph.refresh_artist_member_of()` and then `graph.refresh_vertex_degree()` (`refresh_order`), each on its own
+`extraction_complete` latch; both functions take a transaction-scoped advisory lock (`refresh_lock`) so two
+loaders' refreshes queue rather than interleave, and `public.loader_derived_refresh_job` accepts a
+`loader = 'musicbrainz'` row. `graph_schema.path_function` records the exact
 `graph.find_shortest_path` signature, depth clamp, traversal surface, and temporary seen-set
 contract; `graph_schema.explore_function` records the corresponding
 `graph.explore_traversal` signature, hop clamp, parent-pointer projection, and mandatory row
