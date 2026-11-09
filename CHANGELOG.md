@@ -2,6 +2,20 @@
 
 All notable changes to the GrooveMap database schema will be documented here.
 
+## v0.13.0 (2026-11-09)
+
+### Release notes
+
+Before schema-init, as the schema owner and outside a transaction, run `CREATE UNIQUE INDEX CONCURRENTLY issued_on_pkey_new ON graph.issued_on (release_id, source, medium_id);` (about 1.6 GB of temp space on a full catalog) and verify that `indisvalid` is true. Without it, schema-init builds the key blocking. Then stop the loaders and run schema-init. It swaps the primary key of `graph.issued_on` to `(release_id, source, medium_id)` as a catalog-only change (about 250 ms under ACCESS EXCLUSIVE). It creates the `loader_seen` schema (UNLOGGED, index-free seen lists for discogs artists, labels, masters and releases, and musicbrainz relationships and external_links; the lists registry; start, intact, status, `<list>_stale` and `<list>_shadow` objects; `hash_key`) and `musicbrainz.external_link_key`, and starts each list once. A rerun is a no-op. Rollback is the same key swap in the old order. Loaders pick the lists up on restart: shadow mode by default, and seen mode only after operator approval of a matching shadow run. All other changes are additive.
+
+### Feat
+
+- **postgres**: add reload seen lists for the loaders' stale-row purge
+
+### Fix
+
+- **postgres**: key graph.issued_on on (release_id, source, medium_id)
+
 ## v0.12.0 (2026-11-08)
 
 ### Release notes
