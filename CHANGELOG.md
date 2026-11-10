@@ -2,11 +2,15 @@
 
 All notable changes to the GrooveMap database schema will be documented here.
 
-## Unreleased
+## v0.15.0 (2026-11-10)
 
 ### Release notes
 
 Schema-init adds `public.identity_ledger_work_events (event, work_id, at, prev_at, next_at)`, created empty, unique on `(event, work_id, at)` and indexed on `(event, at DESC, work_id) INCLUDE (prev_at, next_at)`. It holds each work's distinct event instants per filter (`'any'` or an event type) with the previous and next instant, so catalog-api's windowed works list counts a `[since, until)` window (`prev_at IS NULL OR prev_at < since`) and pages it (`next_at IS NULL OR next_at >= until`, `ORDER BY at DESC, work_id`) from that index. On a populated ledger schema-init requests one ledger rebuild; after schema-init, as the schema owner and outside a transaction, run `SELECT identity_ledger_refresh();` (a full rebuild, about 6 minutes, of which the new table adds an estimated 30 to 55 seconds), then `SELECT * FROM identity_ledger_verify();` must return `0, 0, 0` for every relation. The table takes about 1.1 GB on lux. catalog-api reads it only after that refresh. All changes are additive.
+
+### Feat
+
+- **postgres**: add identity_ledger_work_events for windowed works lists
 
 ## v0.14.0 (2026-11-10)
 
