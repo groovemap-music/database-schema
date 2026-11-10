@@ -374,6 +374,8 @@ class TestCreatePostgresSchema:
             + len(_ARTIST_SIMILARITY_STATEMENTS)
             + len(_GRAPH_STATEMENTS)
             + len(_IDENTITY_LEDGER_STATEMENTS)
+            # The SECURITY DEFINER EXECUTE sweep: one statement, last in `_schema_statements()`.
+            + 1
             # `_apply_vector_schema` always probes pg_extension and pg_roles
             # (CREATEROLE); with the shared fixture's default (False), the
             # extension gate also probes pg_available_extensions before
@@ -423,6 +425,8 @@ class TestCreatePostgresSchema:
             + len(_ARTIST_SIMILARITY_STATEMENTS)
             + len(_GRAPH_STATEMENTS)
             + len(_IDENTITY_LEDGER_STATEMENTS)
+            # The SECURITY DEFINER EXECUTE sweep: one statement, last in `_schema_statements()`.
+            + 1
             # `_apply_vector_schema` always probes pg_extension and pg_roles
             # (CREATEROLE); with the shared fixture's default (False), the
             # extension gate also probes pg_available_extensions before
@@ -462,7 +466,8 @@ class TestCreatePostgresSchema:
             # IF NOT EXISTS clause: it reads the catalog and acts only when the
             # state it is migrating from is still there, so a second apply is a
             # no-op. Every one of them is checked below instead.
-            guarded_block = upper.startswith("DO $")
+            # Matched after stripping, since a multi-line statement may open with a newline.
+            guarded_block = upper.strip().startswith("DO $")
             # A read-only probe (the vector-extension and CREATEROLE gates) has
             # no state to reapply and is trivially idempotent by never writing
             # anything.
@@ -518,6 +523,8 @@ class TestCreatePostgresSchema:
             + len(_ARTIST_SIMILARITY_STATEMENTS)
             + len(_GRAPH_STATEMENTS)
             + len(_IDENTITY_LEDGER_STATEMENTS)
+            # The SECURITY DEFINER EXECUTE sweep: one statement, last in `_schema_statements()`.
+            + 1
             # `_apply_vector_schema` always probes pg_extension and pg_roles
             # (CREATEROLE); with the shared fixture's default (False), the
             # extension gate also probes pg_available_extensions before
@@ -626,9 +633,19 @@ class TestArtistEmbeddingsStatement:
 
     def test_the_role_holds_no_privilege_outside_graph_and_its_own_table(self) -> None:
         statements = " ".join(statement for _name, statement in _PIPELINE_ROLE_STATEMENTS)
-        assert "public" not in statements
+        # `public` appears only as the schema-level USAGE gate; no table or
+        # sequence privilege on `public` lives in this list (those are the
+        # separate `_EMBEDDINGS_TABLE_GRANT` and similarity grants).
+        assert f"GRANT USAGE ON SCHEMA public TO {EMBEDDING_PIPELINE_ROLE}" in statements
+        assert statements.count("public") == 1
         assert "insights" not in statements
         assert "musicbrainz" not in statements
+
+    def test_the_role_gets_usage_on_public_before_the_table_grants_that_need_it(self) -> None:
+        names = [name for name, _statement in _PIPELINE_ROLE_STATEMENTS]
+        assert names.index(f"{EMBEDDING_PIPELINE_ROLE} public schema usage grant") < names.index(
+            f"{EMBEDDING_PIPELINE_ROLE} graph tables select grant"
+        )
 
     def test_the_role_is_nologin(self) -> None:
         assert f"CREATE ROLE {EMBEDDING_PIPELINE_ROLE} NOLOGIN" in _PIPELINE_ROLE_STATEMENTS[0][1]

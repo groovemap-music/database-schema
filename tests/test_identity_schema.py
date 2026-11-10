@@ -17,6 +17,7 @@ from groovemap_schema.postgres import (
     _MUSICBRAINZ_INDEXES,
     _MUSICBRAINZ_TABLES,
     _RELEASE_SEARCH_STATEMENTS,
+    _REVOKE_DEFINER_EXECUTE_STATEMENT,
     _SEEN_LIST_STATEMENTS,
     _USER_TABLES,
     _entity_schema_statements,
@@ -1128,6 +1129,7 @@ class TestLegacyStatementsUnchanged:
             | _RELEASE_SEARCH_STATEMENT_NAMES
             | _MASTER_SEARCH_STATEMENT_NAMES
             | _SEEN_LIST_STATEMENT_NAMES
+            | {_REVOKE_DEFINER_EXECUTE_STATEMENT[0]}
         )
         surviving = [name for name in names if name not in added]
         assert surviving == _LEGACY_STATEMENT_NAMES

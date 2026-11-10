@@ -2975,6 +2975,217 @@ async def test_already_installed_creates_artist_embeddings_for_a_non_superuser_t
         await admin_connection.close()
 
 
+# ── embedding_pipeline can use `public` where PUBLIC lost USAGE ──────────────
+
+
+async def _initialised_database_without_public_usage() -> tuple[str, str, str, dict[str, Any]]:
+    """Create a fresh database where PUBLIC has lost USAGE on `public`, run schema-init
+    as the admin in it, and return (database, login, password, admin params for it).
+
+    The admin (superuser, database owner) owns every function and table the init
+    creates. Callers drop the database and login in their own `finally`.
+    """
+    admin_params = initializer._postgres_connection_params()
+    login = f"embed_test_login_{uuid4().hex[:12]}"
+    password = uuid4().hex
+    database = f"embed_test_public_usage_{uuid4().hex[:12]}"
+
+    admin_connection = await psycopg.AsyncConnection.connect(**{**admin_params, "dbname": "postgres"}, autocommit=True)
+    try:
+        await admin_connection.execute(sql.SQL("CREATE DATABASE {database}").format(database=sql.Identifier(database)))
+        await admin_connection.execute(
+            sql.SQL("CREATE ROLE {login} LOGIN PASSWORD {password} NOSUPERUSER NOCREATEROLE").format(
+                login=sql.Identifier(login), password=sql.Literal(password)
+            )
+        )
+    finally:
+        await admin_connection.close()
+
+    # Take USAGE on `public` away from PUBLIC before schema-init runs, as the shared
+    # server does. The admin keeps its own access, so the initializer can still create objects.
+    admin_in_database = await psycopg.AsyncConnection.connect(**{**admin_params, "dbname": database}, autocommit=True)
+    async with admin_in_database, admin_in_database.cursor() as revoke_cursor:
+        await revoke_cursor.execute("REVOKE USAGE ON SCHEMA public FROM PUBLIC")
+
+    # Confirm the precondition holds: PUBLIC (grantee oid 0) has no USAGE in the schema ACL.
+    # `has_schema_privilege` can't answer this: it checks the admin, who still owns the schema.
+    assert await _rows_in(
+        database,
+        "SELECT NOT EXISTS (SELECT 1 FROM pg_namespace n, aclexplode(n.nspacl) a "
+        "WHERE n.nspname = 'public' AND a.grantee = 0 AND a.privilege_type = 'USAGE')",
+    ) == [(True,)]
+
+    admin_database_params = {**admin_params, "dbname": database}
+    assert await initializer._apply_postgres_schema(admin_database_params) is True, (
+        "schema-init must finish cleanly where PUBLIC lacks USAGE on public"
+    )
+    return database, login, password, admin_database_params
+
+
+async def _drop_database_and_login(database: str, login: str) -> None:
+    admin_params = initializer._postgres_connection_params()
+    admin_connection = await psycopg.AsyncConnection.connect(**{**admin_params, "dbname": "postgres"}, autocommit=True)
+    try:
+        await admin_connection.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(database)))
+        await admin_connection.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(login)))
+    finally:
+        await admin_connection.close()
+
+
+async def _definer_routines_in_public(database: str) -> list[tuple[str]]:
+    """Every SECURITY DEFINER routine in `public`, schema-qualified (`public.name(args)`).
+
+    `regprocedure::text` omits the schema for anything on the search path, so the
+    name is built here, which keeps each signature usable with `::regprocedure`.
+    """
+    return await _rows_in(
+        database,
+        "SELECT quote_ident(n.nspname) || '.' || quote_ident(p.proname) || '(' || pg_get_function_identity_arguments(p.oid) || ')' "
+        "FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+        "WHERE n.nspname = 'public' AND p.prosecdef ORDER BY 1",
+    )
+
+
+@pytest.mark.asyncio
+async def test_embedding_pipeline_login_can_write_artist_embeddings_when_public_lacks_usage() -> None:
+    """On a server where PUBLIC has lost USAGE on schema `public` (lux's shared
+    server revoked it), the embedding pipeline's login must still reach
+    `public.artist_embeddings` after schema-init: the role itself carries
+    `GRANT USAGE ON SCHEMA public`, not just the table grant.
+
+    A real login role inherits `embedding_pipeline` and writes through its own
+    connection, so this proves the same path the pipeline uses, not only the catalog.
+    Re-running schema-init must leave that working (idempotence).
+    """
+    if not await vector_extension_present():
+        pytest.skip("pgvector is not installed on this tier; artist_embeddings only exists with the vector extension")
+
+    database, login, password, admin_database_params = await _initialised_database_without_public_usage()
+    artist = f"embed-public-usage-{uuid4().hex[:12]}"
+    model_version = f"embed-public-usage-{uuid4().hex[:12]}"
+    try:
+        assert await _rows_in(database, "SELECT has_schema_privilege(%s, 'public', 'USAGE')", (EMBEDDING_PIPELINE_ROLE,)) == [(True,)]
+
+        admin_connection = await psycopg.AsyncConnection.connect(
+            **{**initializer._postgres_connection_params(), "dbname": "postgres"}, autocommit=True
+        )
+        try:
+            await admin_connection.execute(
+                sql.SQL("GRANT {role} TO {login}").format(role=sql.Identifier(EMBEDDING_PIPELINE_ROLE), login=sql.Identifier(login))
+            )
+        finally:
+            await admin_connection.close()
+
+        login_params = {**admin_database_params, "user": login, "password": password}
+
+        async def write_and_read_back() -> None:
+            connection = await psycopg.AsyncConnection.connect(**login_params)
+            async with connection:
+                async with connection.cursor() as cursor:
+                    await cursor.execute(
+                        """
+                        INSERT INTO public.artist_embeddings
+                            (artist_id, model_version, embedding, source_dump_id, source_dump_date)
+                        VALUES (%s, %s, %s::halfvec, 'dump-public-usage', DATE '2026-11-01')
+                        """,
+                        (artist, model_version, _halfvec_literal({0: 1.0})),
+                    )
+                    await cursor.execute("SELECT artist_id FROM public.artist_embeddings WHERE model_version = %s", (model_version,))
+                    assert await cursor.fetchall() == [(artist,)]
+                await connection.rollback()
+
+        await write_and_read_back()
+
+        # Rerun: no error, and the privilege still holds.
+        assert await initializer._apply_postgres_schema(admin_database_params) is True
+        assert await _rows_in(database, "SELECT has_schema_privilege(%s, 'public', 'USAGE')", (EMBEDDING_PIPELINE_ROLE,)) == [(True,)]
+        await write_and_read_back()
+    finally:
+        await _drop_database_and_login(database, login)
+
+
+@pytest.mark.asyncio
+async def test_definer_routines_in_public_are_closed_to_the_login_but_the_owner_and_triggers_keep_them() -> None:
+    """The schema grants `embedding_pipeline` USAGE on `public`, which would otherwise
+    let its login call every SECURITY DEFINER routine there as the owner. Schema-init
+    revokes PUBLIC's EXECUTE on each, so the login can call none of them, while:
+
+    - the owner (the admin, who created them) keeps EXECUTE, as catalog-api and the
+      loaders do, since they connect as the owning role;
+    - the capture triggers still fire on a source write, because a trigger is not
+      EXECUTE-checked when it fires;
+    - re-running schema-init leaves the closed state unchanged (a no-op).
+    """
+    if not await vector_extension_present():
+        pytest.skip("pgvector is not installed on this tier; the ledger routines only exist with the vector extension")
+
+    database, login, password, admin_database_params = await _initialised_database_without_public_usage()
+    admin_user = admin_database_params["user"]
+    try:
+        admin_connection = await psycopg.AsyncConnection.connect(
+            **{**initializer._postgres_connection_params(), "dbname": "postgres"}, autocommit=True
+        )
+        try:
+            await admin_connection.execute(
+                sql.SQL("GRANT {role} TO {login}").format(role=sql.Identifier(EMBEDDING_PIPELINE_ROLE), login=sql.Identifier(login))
+            )
+        finally:
+            await admin_connection.close()
+
+        async def assert_closed_to_login_and_open_to_owner() -> None:
+            routines = await _definer_routines_in_public(database)
+            # The ledger routines must be among them, or the sweep is checking nothing real.
+            signatures = {row[0] for row in routines}
+            assert any(s.startswith("public.identity_ledger_request_rebuild(") for s in signatures), signatures
+            assert any(s.startswith("public.identity_ledger_capture_items(") for s in signatures), signatures
+            for (signature,) in routines:
+                assert await _rows_in(
+                    database, "SELECT has_function_privilege(%s, %s::regprocedure, 'EXECUTE')", (EMBEDDING_PIPELINE_ROLE, signature)
+                ) == [(False,)], f"{EMBEDDING_PIPELINE_ROLE} can EXECUTE {signature}"
+                assert await _rows_in(database, "SELECT has_function_privilege(%s, %s::regprocedure, 'EXECUTE')", (admin_user, signature)) == [
+                    (True,)
+                ], f"owner lost EXECUTE on {signature}"
+
+            # The login can really be refused, not only reported as lacking the privilege.
+            connection = await psycopg.AsyncConnection.connect(**{**admin_database_params, "user": login, "password": password})
+            async with connection, connection.cursor() as cursor:
+                with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                    await cursor.execute("SELECT public.identity_ledger_request_rebuild()")
+                await connection.rollback()
+
+        async def assert_owner_and_triggers_still_work() -> None:
+            # The owner can call a routine directly.
+            owner = await psycopg.AsyncConnection.connect(**admin_database_params, autocommit=True)
+            async with owner, owner.cursor() as cursor:
+                await cursor.execute("SELECT public.identity_ledger_request_rebuild()")
+                await cursor.execute("DELETE FROM public.identity_ledger_changes WHERE rebuild")
+                # A source write fires the capture trigger, which runs as the owner.
+                before = await _count_changes(cursor)
+                await cursor.execute(
+                    "INSERT INTO public.provider_aliases (provider, entity_kind, external_id, native_id) "
+                    "VALUES ('discogs', 'master', %s, gen_random_uuid())",
+                    (f"trigger-probe-{uuid4().hex[:12]}",),
+                )
+                after = await _count_changes(cursor)
+            assert after == before + 1, "the capture trigger must still record the write"
+
+        await assert_closed_to_login_and_open_to_owner()
+        await assert_owner_and_triggers_still_work()
+
+        # Rerun: the sweep is a no-op, the closed state is unchanged, and triggers still fire.
+        assert await initializer._apply_postgres_schema(admin_database_params) is True
+        await assert_closed_to_login_and_open_to_owner()
+        await assert_owner_and_triggers_still_work()
+    finally:
+        await _drop_database_and_login(database, login)
+
+
+async def _count_changes(cursor: Any) -> int:
+    await cursor.execute("SELECT count(*) FROM public.identity_ledger_changes")
+    row = await cursor.fetchone()
+    return int(row[0])
+
+
 # ── Superseded catalog items (ADR 0009, 2026-09-25 amendment) ────────────────
 # catalog-api writes every supersession and ledger row; these tests play that
 # writer's part by hand to prove the shape admits the amendment's merge,

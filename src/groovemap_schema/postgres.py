@@ -8258,6 +8258,48 @@ SEEN_LIST_ROLLBACK_STATEMENTS: tuple[str, ...] = (
 )
 
 
+# A SECURITY DEFINER routine runs with its owner's rights, and PostgreSQL's default
+# grants EXECUTE on every new function to PUBLIC. Once `public` is usable by a role
+# (see `_PIPELINE_ROLE_STATEMENTS`), that default would let it call the ledger and
+# capture functions as the owner. The owner keeps EXECUTE without a grant, and
+# trigger functions are not EXECUTE-checked when a trigger fires, so revoking
+# PUBLIC's EXECUTE leaves the owner's callers and the triggers working.
+#
+# This is a catalog sweep, not a list of names, so a SECURITY DEFINER routine added
+# later is covered without this module changing. It is limited to routines the
+# connecting role owns (the ones this initializer created), so it never tries to
+# alter another owner's objects, and it is idempotent: REVOKE of a privilege that is
+# already gone is a no-op. It runs on every init, which closes existing databases too.
+_REVOKE_DEFINER_EXECUTE_STATEMENT = (
+    "SECURITY DEFINER routines: revoke EXECUTE from PUBLIC",
+    """
+DO $revoke_definer_execute$
+DECLARE
+    routine record;
+BEGIN
+    FOR routine IN
+        SELECT p.oid::regprocedure AS signature, p.proacl
+        FROM pg_proc p
+        JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE p.prosecdef
+          AND pg_get_userbyid(p.proowner) = current_user
+          AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+          AND n.nspname NOT LIKE 'pg_toast%'
+    LOOP
+        -- A NULL ACL is the default, which grants EXECUTE to PUBLIC. Act only while
+        -- PUBLIC still holds it, so a rerun finds nothing to change.
+        IF routine.proacl IS NULL OR EXISTS (
+            SELECT 1 FROM aclexplode(routine.proacl) a WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE'
+        ) THEN
+            EXECUTE format('REVOKE EXECUTE ON ROUTINE %s FROM PUBLIC', routine.signature);
+        END IF;
+    END LOOP;
+END
+$revoke_definer_execute$
+""",
+)
+
+
 def _schema_statements() -> Iterator[tuple[str, Any]]:
     """Yield the complete PostgreSQL schema in compatibility-sensitive order."""
     yield from _entity_schema_statements()
@@ -8275,6 +8317,8 @@ def _schema_statements() -> Iterator[tuple[str, Any]]:
     yield from _ARTIST_SIMILARITY_STATEMENTS
     yield from _GRAPH_STATEMENTS
     yield from _IDENTITY_LEDGER_STATEMENTS
+    # Last, so every function and trigger above exists before the sweep runs.
+    yield _REVOKE_DEFINER_EXECUTE_STATEMENT
 
 
 async def _execute_schema_statements(cursor: Any, statements: Iterable[tuple[str, Any]]) -> tuple[int, int]:
@@ -8634,10 +8678,20 @@ _CREATE_EMBEDDING_PIPELINE_ROLE_STATEMENT = (
 # views and foreign tables, not only base tables). Granting the schema rather
 # than an enumerated relation list also means a graph relation added later is
 # covered the next time the initializer runs, without this list changing.
-# The role gets nothing on `public`, `insights`, `musicbrainz`, or any other
-# schema — ADR 0013: "It holds no other privilege."
+# `public` needs USAGE too: every table grant below names `public.*`, and
+# without USAGE on the schema the role gets "permission denied for schema
+# public" even with the table privilege. A stock database grants USAGE on
+# `public` to PUBLIC, so this only matters where that default was revoked
+# (lux's shared server). USAGE is a schema-level gate, not a privilege on any
+# relation, so it grants the role no object access by itself. The role gets
+# nothing on `insights`, `musicbrainz`, or any other schema — ADR 0013: "It
+# holds no other privilege."
 _PIPELINE_ROLE_STATEMENTS: list[tuple[str, str]] = [
     _CREATE_EMBEDDING_PIPELINE_ROLE_STATEMENT,
+    (
+        f"{EMBEDDING_PIPELINE_ROLE} public schema usage grant",
+        f"GRANT USAGE ON SCHEMA public TO {EMBEDDING_PIPELINE_ROLE}",
+    ),
     (
         f"{EMBEDDING_PIPELINE_ROLE} graph schema usage grant",
         f"GRANT USAGE ON SCHEMA graph TO {EMBEDDING_PIPELINE_ROLE}",
