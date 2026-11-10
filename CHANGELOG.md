@@ -2,6 +2,21 @@
 
 All notable changes to the GrooveMap database schema will be documented here.
 
+## v0.14.0 (2026-11-10)
+
+### Release notes
+
+Stop the loaders, then run schema-init. It replaces `graph.refresh_artist_member_of()` and `graph.refresh_vertex_degree()` (`CREATE OR REPLACE`, milliseconds). Each now takes a transaction-scoped advisory lock before its `TRUNCATE`, so a Discogs refresh and a MusicBrainz refresh queue instead of interleaving. Where the `embedding_pipeline` role exists, schema-init grants it `USAGE` on schema `public`. It then revokes `EXECUTE` from `PUBLIC` on every SECURITY DEFINER routine the schema owner owns, outside the system schemas. The owner keeps its own grant, and trigger functions fire as before, because firing a trigger does not check `EXECUTE`. Where PUBLIC no longer holds the privilege, the revoke is skipped, so a rerun is a no-op. No manual steps are needed before or after. All other changes are additive.
+
+### Feat
+
+- **postgres**: make musicbrainz-sql-loader a second refresh owner of the member-of union and vertex degree
+
+### Fix
+
+- **postgres**: grant embedding_pipeline USAGE on schema public
+- **postgres**: revoke PUBLIC EXECUTE on SECURITY DEFINER routines
+
 ## v0.13.0 (2026-11-09)
 
 ### Release notes
