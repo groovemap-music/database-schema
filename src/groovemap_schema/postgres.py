@@ -8634,10 +8634,20 @@ _CREATE_EMBEDDING_PIPELINE_ROLE_STATEMENT = (
 # views and foreign tables, not only base tables). Granting the schema rather
 # than an enumerated relation list also means a graph relation added later is
 # covered the next time the initializer runs, without this list changing.
-# The role gets nothing on `public`, `insights`, `musicbrainz`, or any other
-# schema — ADR 0013: "It holds no other privilege."
+# `public` needs USAGE too: every table grant below names `public.*`, and
+# without USAGE on the schema the role gets "permission denied for schema
+# public" even with the table privilege. A stock database grants USAGE on
+# `public` to PUBLIC, so this only matters where that default was revoked
+# (lux's shared server). USAGE is a schema-level gate, not a privilege on any
+# relation, so it grants the role no object access by itself. The role gets
+# nothing on `insights`, `musicbrainz`, or any other schema — ADR 0013: "It
+# holds no other privilege."
 _PIPELINE_ROLE_STATEMENTS: list[tuple[str, str]] = [
     _CREATE_EMBEDDING_PIPELINE_ROLE_STATEMENT,
+    (
+        f"{EMBEDDING_PIPELINE_ROLE} public schema usage grant",
+        f"GRANT USAGE ON SCHEMA public TO {EMBEDDING_PIPELINE_ROLE}",
+    ),
     (
         f"{EMBEDDING_PIPELINE_ROLE} graph schema usage grant",
         f"GRANT USAGE ON SCHEMA graph TO {EMBEDDING_PIPELINE_ROLE}",

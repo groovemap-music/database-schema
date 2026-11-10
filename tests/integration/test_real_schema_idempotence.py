@@ -2975,6 +2975,100 @@ async def test_already_installed_creates_artist_embeddings_for_a_non_superuser_t
         await admin_connection.close()
 
 
+# ── embedding_pipeline can use `public` where PUBLIC lost USAGE ──────────────
+
+
+@pytest.mark.asyncio
+async def test_embedding_pipeline_login_can_write_artist_embeddings_when_public_lacks_usage() -> None:
+    """On a server where PUBLIC has lost USAGE on schema `public` (lux's shared
+    server revoked it), the embedding pipeline's login must still reach
+    `public.artist_embeddings` after schema-init: the role itself carries
+    `GRANT USAGE ON SCHEMA public`, not just the table grant.
+
+    Runs against a fresh database so the REVOKE stays local to it. A real login
+    role inherits `embedding_pipeline` and writes through its own connection,
+    so this proves the same path the pipeline uses, not only the catalog.
+    Re-running schema-init must leave that working (idempotence).
+    """
+    if not await vector_extension_present():
+        pytest.skip("pgvector is not installed on this tier; artist_embeddings only exists with the vector extension")
+
+    admin_params = initializer._postgres_connection_params()
+    login = f"embed_test_login_{uuid4().hex[:12]}"
+    password = uuid4().hex
+    database = f"embed_test_public_usage_{uuid4().hex[:12]}"
+    artist = f"embed-public-usage-{uuid4().hex[:12]}"
+    model_version = f"embed-public-usage-{uuid4().hex[:12]}"
+
+    admin_connection = await psycopg.AsyncConnection.connect(**{**admin_params, "dbname": "postgres"}, autocommit=True)
+    try:
+        await admin_connection.execute(sql.SQL("CREATE DATABASE {database}").format(database=sql.Identifier(database)))
+        await admin_connection.execute(
+            sql.SQL("CREATE ROLE {login} LOGIN PASSWORD {password} NOSUPERUSER NOCREATEROLE").format(
+                login=sql.Identifier(login), password=sql.Literal(password)
+            )
+        )
+
+        # Take USAGE on `public` away from PUBLIC before schema-init runs, as the
+        # shared server does. The admin connection (superuser, database owner)
+        # keeps its own access, so the initializer can still create objects.
+        admin_in_database = await psycopg.AsyncConnection.connect(**{**admin_params, "dbname": database}, autocommit=True)
+        async with admin_in_database, admin_in_database.cursor() as revoke_cursor:
+            await revoke_cursor.execute("REVOKE USAGE ON SCHEMA public FROM PUBLIC")
+
+        # Confirm the precondition really holds: PUBLIC (grantee oid 0) no longer
+        # has USAGE in the schema ACL. `has_schema_privilege` can't answer this
+        # because it checks the connecting admin, who still owns the schema.
+        assert await _rows_in(
+            database,
+            "SELECT NOT EXISTS (SELECT 1 FROM pg_namespace n, aclexplode(n.nspacl) a "
+            "WHERE n.nspname = 'public' AND a.grantee = 0 AND a.privilege_type = 'USAGE')",
+        ) == [(True,)]
+
+        succeeded = await initializer._apply_postgres_schema(admin_params | {"dbname": database})
+        assert succeeded is True, "schema-init must finish cleanly where PUBLIC lacks USAGE on public"
+
+        # The pipeline's role, not just the login, must now hold USAGE on `public`.
+        assert await _rows_in(database, "SELECT has_schema_privilege(%s, 'public', 'USAGE')", (EMBEDDING_PIPELINE_ROLE,)) == [(True,)]
+
+        # The login inherits the pipeline role's privileges, as the real one does.
+        await admin_connection.execute(
+            sql.SQL("GRANT {role} TO {login}").format(role=sql.Identifier(EMBEDDING_PIPELINE_ROLE), login=sql.Identifier(login))
+        )
+
+        login_params = {**admin_params, "dbname": database, "user": login, "password": password}
+
+        async def write_and_read_back() -> None:
+            connection = await psycopg.AsyncConnection.connect(**login_params)
+            async with connection:
+                async with connection.cursor() as cursor:
+                    await cursor.execute(
+                        """
+                        INSERT INTO public.artist_embeddings
+                            (artist_id, model_version, embedding, source_dump_id, source_dump_date)
+                        VALUES (%s, %s, %s::halfvec, 'dump-public-usage', DATE '2026-11-01')
+                        """,
+                        (artist, model_version, _halfvec_literal({0: 1.0})),
+                    )
+                    await cursor.execute(
+                        "SELECT artist_id FROM public.artist_embeddings WHERE model_version = %s",
+                        (model_version,),
+                    )
+                    assert await cursor.fetchall() == [(artist,)]
+                await connection.rollback()
+
+        await write_and_read_back()
+
+        # Rerun: no error, and the privilege still holds (a no-op re-grant).
+        assert await initializer._apply_postgres_schema(admin_params | {"dbname": database}) is True
+        assert await _rows_in(database, "SELECT has_schema_privilege(%s, 'public', 'USAGE')", (EMBEDDING_PIPELINE_ROLE,)) == [(True,)]
+        await write_and_read_back()
+    finally:
+        await admin_connection.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(database)))
+        await admin_connection.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(login)))
+        await admin_connection.close()
+
+
 # ── Superseded catalog items (ADR 0009, 2026-09-25 amendment) ────────────────
 # catalog-api writes every supersession and ledger row; these tests play that
 # writer's part by hand to prove the shape admits the amendment's merge,

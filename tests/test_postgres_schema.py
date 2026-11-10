@@ -626,9 +626,19 @@ class TestArtistEmbeddingsStatement:
 
     def test_the_role_holds_no_privilege_outside_graph_and_its_own_table(self) -> None:
         statements = " ".join(statement for _name, statement in _PIPELINE_ROLE_STATEMENTS)
-        assert "public" not in statements
+        # `public` appears only as the schema-level USAGE gate; no table or
+        # sequence privilege on `public` lives in this list (those are the
+        # separate `_EMBEDDINGS_TABLE_GRANT` and similarity grants).
+        assert f"GRANT USAGE ON SCHEMA public TO {EMBEDDING_PIPELINE_ROLE}" in statements
+        assert statements.count("public") == 1
         assert "insights" not in statements
         assert "musicbrainz" not in statements
+
+    def test_the_role_gets_usage_on_public_before_the_table_grants_that_need_it(self) -> None:
+        names = [name for name, _statement in _PIPELINE_ROLE_STATEMENTS]
+        assert names.index(f"{EMBEDDING_PIPELINE_ROLE} public schema usage grant") < names.index(
+            f"{EMBEDDING_PIPELINE_ROLE} graph tables select grant"
+        )
 
     def test_the_role_is_nologin(self) -> None:
         assert f"CREATE ROLE {EMBEDDING_PIPELINE_ROLE} NOLOGIN" in _PIPELINE_ROLE_STATEMENTS[0][1]
