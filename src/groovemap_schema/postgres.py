@@ -5977,6 +5977,7 @@ IDENTITY_LEDGER_VIEWS = (
     "identity_ledger_edition_parents",
     "identity_ledger_work_summary",
     "identity_ledger_work_summary_day",
+    "identity_ledger_work_events",
     "identity_ledger_density",
 )
 
@@ -6280,6 +6281,39 @@ GROUP BY work_id, event, day, prev_day
 """  # noqa: S608 -- composed of module constants only
 
 
+def _ledger_work_events_select(events: str, parents: str, works: str = "") -> str:
+    """Return each work's distinct event instants from EVENTS and PARENTS, per event filter, limited by the join WORKS.
+
+    Rows are `(event, work_id, at, prev_at, next_at)`: one per distinct instant at which any of
+    the work's editions has an event of the filter, where `event` is `'any'` or an event type,
+    the filter set `identity_ledger_work_summary` has.  `prev_at` and `next_at` are the work's
+    previous and next instant of the same filter, NULL at either end of its history.  So for a
+    window `[since, until)`, each work with an event of the filter in it has exactly one row with
+    `at` in the window and `prev_at` NULL or before `since` (its first event in the window), and
+    exactly one with `next_at` NULL or at or after `until` (its last).  The works list counts the
+    first and pages the last, from an index on `(event, at)`, instead of grouping every event in
+    range per work.  Both neighbours span the work's whole history, so a refresh recomputes every
+    row of each dirty work.
+    """
+    return f"""
+WITH work_at AS (
+    SELECT parent.work_id, event.type, event.at
+    FROM {events} AS event
+    JOIN {parents} AS parent ON parent.edition_id = event.edition_id
+    {works}
+    GROUP BY parent.work_id, event.type, event.at
+),
+filtered AS (
+    SELECT 'any'::text AS event, work_id, at FROM work_at GROUP BY work_id, at
+    UNION ALL
+    SELECT type, work_id, at FROM work_at
+)
+SELECT event, work_id, at, lag(at) OVER work AS prev_at, lead(at) OVER work AS next_at
+FROM filtered
+WINDOW work AS (PARTITION BY event, work_id ORDER BY at)
+"""  # noqa: S608 -- composed of module constants only
+
+
 def _ledger_density_select() -> str:
     """Return the full recompute of `identity_ledger_density`: events per UTC month, type, and provenance, per kind.
 
@@ -6319,7 +6353,7 @@ def _ledger_verify_function() -> str:
     otherwise differences are the work the next refresh still has to do.  It
     costs what one full recompute does.
     """
-    events, parents, summary, summary_day, density = IDENTITY_LEDGER_VIEWS
+    events, parents, summary, summary_day, work_events, density = IDENTITY_LEDGER_VIEWS
     compare = "\n    UNION ALL\n".join(
         f"""    SELECT {_sql_literal(view)}::text,
            (SELECT count(*) FROM (TABLE {recomputed} EXCEPT SELECT {columns} FROM public.{view}) AS missing),
@@ -6329,6 +6363,7 @@ def _ledger_verify_function() -> str:
             (parents, "recomputed_parents", "edition_id, work_id"),
             (summary, "recomputed_summary", "work_id, event, evented_editions, repaired_editions, first_event, last_event"),
             (summary_day, "recomputed_summary_day", "work_id, event, day, prev_day, editions, first_event, last_event"),
+            (work_events, "recomputed_work_events", "event, work_id, at, prev_at, next_at"),
             (density, "recomputed_density", "kind, month, type, dated_from, events"),
         )
     )
@@ -6342,6 +6377,7 @@ WITH recomputed_events AS MATERIALIZED ({_ledger_edition_events_select()}),
 recomputed_parents AS MATERIALIZED ({_ledger_edition_parents_select("SELECT DISTINCT edition_id FROM recomputed_events")}),
 recomputed_summary AS MATERIALIZED ({_ledger_work_summary_select("recomputed_events", "recomputed_parents")}),
 recomputed_summary_day AS MATERIALIZED ({_ledger_work_summary_day_select("recomputed_events", "recomputed_parents")}),
+recomputed_work_events AS MATERIALIZED ({_ledger_work_events_select("recomputed_events", "recomputed_parents")}),
 recomputed_density AS MATERIALIZED ({_ledger_density_select()}),
 pending AS (
     SELECT (SELECT count(*) FROM public.identity_ledger_changes)
@@ -6698,6 +6734,7 @@ def _ledger_maintain_function() -> str:
     dirty_works = "JOIN pg_temp.ledger_works AS dirty_work ON dirty_work.work_id = parent.work_id"
     summary = _ledger_work_summary_select("public.identity_ledger_edition_events", "public.identity_ledger_edition_parents", dirty_works)
     summary_day = _ledger_work_summary_day_select("public.identity_ledger_edition_events", "public.identity_ledger_edition_parents", dirty_works)
+    work_events = _ledger_work_events_select("public.identity_ledger_edition_events", "public.identity_ledger_edition_parents", dirty_works)
     evented = """SELECT DISTINCT event.edition_id
     FROM public.identity_ledger_edition_events AS event
     JOIN pg_temp.ledger_parent_editions AS dirty ON dirty.edition_id = event.edition_id"""
@@ -6815,6 +6852,11 @@ BEGIN
     INSERT INTO public.identity_ledger_work_summary_day (work_id, event, day, prev_day, editions, first_event, last_event)
     {summary_day};
 
+    -- Every row of a dirty work: its neighbours span the work's whole history.
+    DELETE FROM public.identity_ledger_work_events AS stored USING pg_temp.ledger_works AS dirty WHERE stored.work_id = dirty.work_id;
+    INSERT INTO public.identity_ledger_work_events (event, work_id, at, prev_at, next_at)
+    {work_events};
+
     DROP TABLE IF EXISTS pg_temp.ledger_density, pg_temp.ledger_editions, pg_temp.ledger_members, pg_temp.ledger_masters,
                pg_temp.ledger_parent_editions, pg_temp.ledger_works;
 END
@@ -6831,6 +6873,7 @@ def _ledger_rebuild_function() -> str:
     parents = _ledger_edition_parents_select("SELECT DISTINCT edition_id FROM public.identity_ledger_edition_events")
     summary = _ledger_work_summary_select("public.identity_ledger_edition_events", "public.identity_ledger_edition_parents")
     summary_day = _ledger_work_summary_day_select("public.identity_ledger_edition_events", "public.identity_ledger_edition_parents")
+    work_events = _ledger_work_events_select("public.identity_ledger_edition_events", "public.identity_ledger_edition_parents")
     tables = (*reversed(IDENTITY_LEDGER_VIEWS), "identity_ledger_item_events", "identity_ledger_item_mints")
     empty = "\n    ".join(f"DELETE FROM public.{table};" for table in tables)  # noqa: S608 -- composed of module constants only
     analyze = "\n    ".join(
@@ -6851,6 +6894,8 @@ BEGIN
     {summary};
     INSERT INTO public.identity_ledger_work_summary_day (work_id, event, day, prev_day, editions, first_event, last_event)
     {summary_day};
+    INSERT INTO public.identity_ledger_work_events (event, work_id, at, prev_at, next_at)
+    {work_events};
     {_ledger_density_rebuild()};
     {analyze}
 END
@@ -6973,7 +7018,8 @@ def _ledger_request_rebuild_for_new_tables() -> str:
     refreshed (its state row exists) and lacks one of `IDENTITY_LEDGER_VIEWS` gets a
     rebuild request, which the next `identity_ledger_refresh()` serves.  It also heals a
     database an earlier release already upgraded without one (v0.11.0 left
-    `identity_ledger_work_summary_day` empty beside a filled `identity_ledger_work_summary`).
+    `identity_ledger_work_summary_day` empty beside a filled `identity_ledger_work_summary`), and
+    likewise `identity_ledger_work_events`, which a filled ledger always has rows in.
     A fresh database has no state row, and a rerun finds every table, filled, or a request
     already waiting, so neither adds one.  The retirement runs first and removes the state
     row itself, so the two never both ask.
@@ -6994,7 +7040,8 @@ BEGIN
         unfilled := true;
     ELSE
         EXECUTE 'SELECT EXISTS (SELECT 1 FROM public.identity_ledger_work_summary)'
-            ' AND NOT EXISTS (SELECT 1 FROM public.identity_ledger_work_summary_day)' INTO unfilled;
+            ' AND (NOT EXISTS (SELECT 1 FROM public.identity_ledger_work_summary_day)'
+            ' OR NOT EXISTS (SELECT 1 FROM public.identity_ledger_work_events))' INTO unfilled;
     END IF;
     IF unfilled THEN
         INSERT INTO public.identity_ledger_changes (rebuild) VALUES (true);
@@ -7117,6 +7164,36 @@ _IDENTITY_LEDGER_STATEMENTS: list[tuple[str, str]] = [
     (
         "idx_identity_ledger_work_summary_day_work",
         "CREATE INDEX IF NOT EXISTS idx_identity_ledger_work_summary_day_work ON public.identity_ledger_work_summary_day (work_id)",
+    ),
+    # The works list in a [since, until) window (gm-database-schema-xq8r): one row per work,
+    # filter, and distinct event instant, with the work's neighbouring instants, so the window's
+    # total and its page read the rows in range from an index instead of grouping the events
+    # per work.
+    (
+        "identity_ledger_work_events table",
+        """
+        CREATE TABLE IF NOT EXISTS identity_ledger_work_events (
+            event   TEXT NOT NULL,
+            work_id UUID NOT NULL,
+            at      TIMESTAMPTZ NOT NULL,
+            prev_at TIMESTAMPTZ,
+            next_at TIMESTAMPTZ
+        )
+        """,
+    ),
+    (
+        "idx_identity_ledger_work_events_key",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_identity_ledger_work_events_key ON public.identity_ledger_work_events (event, work_id, at)",
+    ),
+    # Both reads of a window, index-only: the total counts each work's first instant in it (at in
+    # the window, prev_at NULL or before since), in any order; the page reads each work's last
+    # (next_at NULL or at or after until), most recent first.  One index rather than one per read,
+    # because a rebuild's cost is these random-order inserts (architecture notes, "Measured").
+    # A refresh deletes a dirty work's rows through the key, skipping over its few filters.
+    (
+        "idx_identity_ledger_work_events_page",
+        "CREATE INDEX IF NOT EXISTS idx_identity_ledger_work_events_page "
+        "ON public.identity_ledger_work_events (event, at DESC, work_id) INCLUDE (prev_at, next_at)",
     ),
     (
         "identity_ledger_density table",

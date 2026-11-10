@@ -275,12 +275,12 @@
     "consumers": [
       "catalog-api"
     ],
-    "design_decision": "catalog-api's Identity Ledger works list and density routes computed every release item's event history per request (71.5 s p95 for the default works list at 50% scale, against a 2 s budget), and no index helps because each statement aggregates the whole history before it filters. Four tables hold what those statements compute, and a fifth rolls the works list up per UTC day (gm-database-schema-9dcd), all maintained off the request path by one function. They were materialized views until gm-database-schema-xen5: REFRESH recomputes all history whether or not anything changed, and CONCURRENTLY diffs every row, so a materialized view cannot cost less than its history (45 s on lux to produce 4 rows). The definitions remain catalog-api's route SQL with the filters lifted out, as its prototype composed them (scripts/ledger_scale.py, _view_statements, catalog-api 6d744e2); identity_ledger_verify() and the integration suite pin the tables to them. They are declared after the graph statements because the capture triggers and the refresh reach graph.derived_from.",
+    "design_decision": "catalog-api's Identity Ledger works list and density routes computed every release item's event history per request (71.5 s p95 for the default works list at 50% scale, against a 2 s budget), and no index helps because each statement aggregates the whole history before it filters. Four tables hold what those statements compute, a fifth rolls the works list up per UTC day (gm-database-schema-9dcd), and a sixth holds each work's distinct event instants with their neighbours for windowed lists (gm-database-schema-xq8r), all maintained off the request path by one function. They were materialized views until gm-database-schema-xen5: REFRESH recomputes all history whether or not anything changed, and CONCURRENTLY diffs every row, so a materialized view cannot cost less than its history (45 s on lux to produce 4 rows). The definitions remain catalog-api's route SQL with the filters lifted out, as its prototype composed them (scripts/ledger_scale.py, _view_statements, catalog-api 6d744e2); identity_ledger_verify() and the integration suite pin the tables to them. They are declared after the graph statements because the capture triggers and the refresh reach graph.derived_from.",
     "introduced_in_contract_version": 1,
     "kind": "additive",
     "populate": "every table is created empty, so applying the schema never runs the whole history inline; identity_ledger_refresh_state holds no row until the first refresh commits, and that row, not the tables' emptiness, answers 'refreshed yet?', because a catalog with no events is empty too; reapplying the schema never empties a table",
     "refresh": {
-      "freshness": "all four tables commit together in the refresh's one transaction; a change committed after the refresh drained the log can show in part, and stays in the log, so the next refresh is exact and nothing is lost; freshness is bounded by catalog-api's refresh trigger, since this repository never calls the function",
+      "freshness": "every table commits together in the refresh's one transaction; a change committed after the refresh drained the log can show in part, and stays in the log, so the next refresh is exact and nothing is lost; freshness is bounded by catalog-api's refresh trigger, since this repository never calls the function",
       "function": "public.identity_ledger_refresh(source_watermark jsonb DEFAULT NULL) RETURNS timestamptz",
       "locking": "the refresh writes rows under ordinary row locks, so readers never block and keep the previous rows until it commits, the first build included; it takes the advisory lock hashtext('groovemap:identity-ledger-refresh') that catalog-api already holds, so refreshes run one at a time",
       "order": [
@@ -288,6 +288,7 @@
         "identity_ledger_edition_parents",
         "identity_ledger_work_summary",
         "identity_ledger_work_summary_day",
+        "identity_ledger_work_events",
         "identity_ledger_density"
       ],
       "privilege": "SECURITY INVOKER: the caller needs SELECT, INSERT, UPDATE, DELETE on IDENTITY_LEDGER_REFRESH_GRANTS and SELECT on the six sources. catalog-api connects as the login that owns public, like every service (deployment .env.example), and EXECUTE defaults to PUBLIC, so no grant is declared. The capture functions are SECURITY DEFINER, so a writer of a source needs no grant on the log",
@@ -400,6 +401,27 @@
             "prev_day"
           ],
           "index": "idx_identity_ledger_work_summary_day_key"
+        }
+      },
+      "identity_ledger_work_events": {
+        "columns": [
+          "event",
+          "work_id",
+          "at",
+          "prev_at",
+          "next_at"
+        ],
+        "indexes": [
+          "idx_identity_ledger_work_events_page ON public.identity_ledger_work_events (event, at DESC, work_id) INCLUDE (prev_at, next_at)"
+        ],
+        "meaning": "the works list in a [since, until) window. One row per work, event filter ('any' or an event type: the filter set of identity_ledger_work_summary, with no 'repaired') and distinct instant at which any of the work's editions (identity_ledger_edition_events joined to identity_ledger_edition_parents) has an event of that filter; prev_at and next_at are the work's previous and next instant of the same filter, NULL at its first and its last. WINDOW TOTAL for filter F and [since, until): count(*) over event = F, at >= since, at < until, and (prev_at IS NULL OR prev_at < since), one row per work with an event in the window, its first. WINDOW PAGE: the rows with event = F, the same range, and (next_at IS NULL OR next_at >= until), one per work, its last event in the window, ORDER BY at DESC, work_id. Both are index-only scans of idx_identity_ledger_work_events_page; an all-time window is since = '-infinity', until = 'infinity'. A page's evented and repaired edition counts come from identity_ledger_edition_events for its works only. A refresh replaces every row of a dirty work, since the neighbours span its whole history",
+        "unique": {
+          "columns": [
+            "event",
+            "work_id",
+            "at"
+          ],
+          "index": "idx_identity_ledger_work_events_key"
         }
       },
       "identity_ledger_density": {

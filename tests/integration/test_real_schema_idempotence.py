@@ -66,6 +66,7 @@ EXPECTED_POSTGRES_TABLES = {
         "identity_ledger_refresh_state",
         "identity_ledger_work_summary",
         "identity_ledger_work_summary_day",
+        "identity_ledger_work_events",
         "identity_link_events",
         "labels",
         "loader_extraction_latch",
