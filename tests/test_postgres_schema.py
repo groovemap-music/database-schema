@@ -374,6 +374,8 @@ class TestCreatePostgresSchema:
             + len(_ARTIST_SIMILARITY_STATEMENTS)
             + len(_GRAPH_STATEMENTS)
             + len(_IDENTITY_LEDGER_STATEMENTS)
+            # The SECURITY DEFINER EXECUTE sweep: one statement, last in `_schema_statements()`.
+            + 1
             # `_apply_vector_schema` always probes pg_extension and pg_roles
             # (CREATEROLE); with the shared fixture's default (False), the
             # extension gate also probes pg_available_extensions before
@@ -423,6 +425,8 @@ class TestCreatePostgresSchema:
             + len(_ARTIST_SIMILARITY_STATEMENTS)
             + len(_GRAPH_STATEMENTS)
             + len(_IDENTITY_LEDGER_STATEMENTS)
+            # The SECURITY DEFINER EXECUTE sweep: one statement, last in `_schema_statements()`.
+            + 1
             # `_apply_vector_schema` always probes pg_extension and pg_roles
             # (CREATEROLE); with the shared fixture's default (False), the
             # extension gate also probes pg_available_extensions before
@@ -462,7 +466,8 @@ class TestCreatePostgresSchema:
             # IF NOT EXISTS clause: it reads the catalog and acts only when the
             # state it is migrating from is still there, so a second apply is a
             # no-op. Every one of them is checked below instead.
-            guarded_block = upper.startswith("DO $")
+            # Matched after stripping, since a multi-line statement may open with a newline.
+            guarded_block = upper.strip().startswith("DO $")
             # A read-only probe (the vector-extension and CREATEROLE gates) has
             # no state to reapply and is trivially idempotent by never writing
             # anything.
@@ -518,6 +523,8 @@ class TestCreatePostgresSchema:
             + len(_ARTIST_SIMILARITY_STATEMENTS)
             + len(_GRAPH_STATEMENTS)
             + len(_IDENTITY_LEDGER_STATEMENTS)
+            # The SECURITY DEFINER EXECUTE sweep: one statement, last in `_schema_statements()`.
+            + 1
             # `_apply_vector_schema` always probes pg_extension and pg_roles
             # (CREATEROLE); with the shared fixture's default (False), the
             # extension gate also probes pg_available_extensions before

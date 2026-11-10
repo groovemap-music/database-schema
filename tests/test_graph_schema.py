@@ -20,6 +20,7 @@ from groovemap_schema.postgres import (
     _IDENTITY_LEDGER_STATEMENTS,
     _PATH_RELATIONS,
     _PATH_RELATIONSHIP_TYPES,
+    _REVOKE_DEFINER_EXECUTE_STATEMENT,
     _TEXT_KEY_RETYPES,
     _VERTEX_KIND_NAMES,
     _VERTEX_KINDS,
@@ -332,7 +333,8 @@ class TestGraphSchemaStatement:
         names = [name for name, _statement in _schema_statements()]
         graph_names = [name for name, _statement in _GRAPH_STATEMENTS]
         ledger_names = [name for name, _statement in _IDENTITY_LEDGER_STATEMENTS]
-        assert names[-len(graph_names) - len(ledger_names) :] == graph_names + ledger_names
+        # The EXECUTE sweep is the one statement after the ledger, and it is last.
+        assert names[-len(graph_names) - len(ledger_names) - 1 :] == [*graph_names, *ledger_names, _REVOKE_DEFINER_EXECUTE_STATEMENT[0]]
 
     def test_only_a_guarded_migration_drops_anything(self) -> None:
         """A relation is dropped only by the statement replacing it, and only if it is still there."""
