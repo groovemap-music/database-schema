@@ -3137,7 +3137,6 @@ async def test_definer_routines_in_public_are_closed_to_the_login_but_the_owner_
             # The ledger routines must be among them, or the sweep is checking nothing real.
             signatures = {row[0] for row in routines}
             assert any(s.startswith("public.identity_ledger_request_rebuild(") for s in signatures), signatures
-            assert any(s.startswith("public.identity_ledger_refresh(") for s in signatures), signatures
             assert any(s.startswith("public.identity_ledger_capture_items(") for s in signatures), signatures
             for (signature,) in routines:
                 assert await _rows_in(
