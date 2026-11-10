@@ -356,6 +356,43 @@ An *edition* is a release-kind item resolved one hop through an open supersessio
   `identity_ledger_refresh()` then recomputes all of it, which takes as long as a full rebuild
   (a refresh averages about 354 s on lux). A fresh database and a rerun request nothing. A later
   derived table is covered by the same guard once it is in `IDENTITY_LEDGER_VIEWS`.
+- `identity_ledger_work_events (event, work_id, at, prev_at, next_at)` — the works list in a
+  `[since, until)` window (gm-database-schema-xq8r). One row per work, event filter, and distinct
+  instant at which any of the work's editions has an event of that filter. `event` is `'any'` or
+  an event type, the filter set of `identity_ledger_work_summary` (no `'repaired'`). `prev_at` and
+  `next_at` are the work's previous and next instant of the same filter, NULL at its first and its
+  last. Unique on `(event, work_id, at)`, and indexed on `(event, at DESC, work_id) INCLUDE
+  (prev_at, next_at)` for both reads.
+
+  The day rollup cannot answer a window cheaply: it is keyed per edition, so the window's
+  `count(DISTINCT work)` and each work's last event in it group every row in range per work (8.1 s
+  on lux, 4.6 s from the raw events, against a 2 s budget). Here each work has exactly one row in a
+  window with `prev_at` before it, and exactly one with `next_at` after it:
+
+  - **Total** for filter `F`: `count(*)` over `event = F`, `at >= since`, `at < until`, and
+    `prev_at IS NULL OR prev_at < since`. That counts each work once, at its first instant in the
+    window.
+  - **Page**: the rows with `event = F`, the same range, and `next_at IS NULL OR next_at >= until`,
+    `ORDER BY at DESC, work_id`. That is each work's last event in the window, most recent first.
+
+  Both are index-only scans of the one read index; the total reads its range in any order. An
+  all-time window is `since = '-infinity'`, `until = 'infinity'`. A page's edition counts come from
+  `identity_ledger_edition_events` for that page's works only. The neighbours span a work's whole
+  history, so a refresh replaces every row of each dirty work (the set it already rewrites for the
+  summaries), deleting through the key with a skip scan over the few filters. The integration
+  suite holds the rows to a window function and to a recompute in Python, after a rebuild and
+  after a refresh that adds, moves, and removes a work's events, and holds the total and the page
+  to a `GROUP BY` over the events for every window over the fixture's instants: inside one day,
+  across days, empty, and all time.
+
+  **Measured.** On lux, read-only, the fill's `SELECT` returns 5,183,076 rows (2,469,689 `'any'`)
+  in 9.8 s. Locally on PostgreSQL 18 with 2.09M events and 2.44M parents (5.1M rows), a rebuild's
+  insert takes 34 s, against 60 s for `work_summary` and 50 s for `work_summary_day`. Nearly all of
+  it is index maintenance: 4.8 s with no index. A first shape with a separate `(event, at)
+  INCLUDE (prev_at)` index for the total took 49 to 53 s and 1,510 MB, against 34 s and 1,073 MB
+  for one index. A refresh with 1,000 dirty works adds 60 to 95 ms; with 20,000, 1.8 to 2.0 s, where
+  the planner chooses a sequential scan for the delete in either shape (about 1.1 s). On lux that
+  is an estimated 30 to 55 s more per full rebuild, about 9 to 16% of the 354 s one takes today.
 - `identity_ledger_density (kind, month, type, dated_from, events)` — events per UTC month,
   type, and provenance for each of `release`, `master`, `artist`, and `label`. Unlike the
   edition tables it counts mints, counts a supersession once rather than per side, and counts a
