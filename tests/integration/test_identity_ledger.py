@@ -57,7 +57,10 @@ _COLUMNS = {
 # The per-day rollup postdates catalog-api's prototype, so it has no reference view or v0.6.3 body; it is
 # held to a direct GROUP BY over the events instead (test_the_day_rollup_answers_every_window_as_a_group_by_over_the_events).
 _DAY = "identity_ledger_work_summary_day"
-_REFERENCED_VIEWS = tuple(view for view in IDENTITY_LEDGER_VIEWS if view != _DAY)
+# Likewise the work-level events (gm-database-schema-xq8r), held to a window function and a GROUP BY over the events
+# (test_the_work_events_equal_a_window_function_over_the_events_after_a_rebuild_and_an_incremental_refresh).
+_WORK_EVENTS = "identity_ledger_work_events"
+_REFERENCED_VIEWS = tuple(view for view in IDENTITY_LEDGER_VIEWS if view not in {_DAY, _WORK_EVENTS})
 
 
 def _at(month: int, day: int, year: int = 2026) -> datetime:
@@ -1262,3 +1265,209 @@ async def test_upgrading_a_populated_ledger_without_the_day_rollup_fills_it_on_t
             ) == [(view, 0, 0, 0) for view in sorted(IDENTITY_LEDGER_VIEWS)]
             assert await initializer._apply_postgres_schema(params) is True
             assert await _rebuild_requests(connection) == 0
+
+
+# ── The work-level events (gm-database-schema-xq8r) ──────────────────────────
+
+# The table from scratch: a window function over the events joined to their works, written apart from the module's.
+_WORK_EVENTS_RECOMPUTED = """
+WITH instant AS (
+    SELECT DISTINCT parent.work_id, event.type, event.at
+    FROM identity_ledger_edition_events AS event
+    JOIN identity_ledger_edition_parents AS parent ON parent.edition_id = event.edition_id
+),
+filtered AS (
+    SELECT DISTINCT 'any' AS event, work_id, at FROM instant
+    UNION
+    SELECT type, work_id, at FROM instant
+)
+SELECT event, work_id, at,
+       lag(at) OVER (PARTITION BY event, work_id ORDER BY at),
+       lead(at) OVER (PARTITION BY event, work_id ORDER BY at)
+FROM filtered
+"""
+
+_WORK_EVENTS_ROWS = "SELECT event, work_id, at, prev_at, next_at FROM identity_ledger_work_events"
+
+# The works list's window over the raw events: each work with an event of the filter in [since, until), and its last.
+_WINDOW_GROUPED = """
+SELECT parent.work_id, max(event.at)
+FROM identity_ledger_edition_events AS event
+JOIN identity_ledger_edition_parents AS parent ON parent.edition_id = event.edition_id
+WHERE (%(event)s::text = 'any' OR event.type = %(event)s::text) AND event.at >= %(since)s AND event.at < %(until)s
+GROUP BY parent.work_id
+ORDER BY 2 DESC, 1
+"""
+
+# The two read contracts catalog-api relies on.
+_WINDOW_TOTAL = """
+SELECT count(*) FROM identity_ledger_work_events
+WHERE event = %(event)s AND at >= %(since)s AND at < %(until)s AND (prev_at IS NULL OR prev_at < %(since)s)
+"""
+
+_WINDOW_PAGE = """
+SELECT work_id, at FROM identity_ledger_work_events
+WHERE event = %(event)s AND at >= %(since)s AND at < %(until)s AND (next_at IS NULL OR next_at >= %(until)s)
+ORDER BY at DESC, work_id
+"""
+
+
+async def _expected_work_events(connection: psycopg.AsyncConnection[Any]) -> set[tuple[Any, ...]]:
+    """The table's rows computed in Python from the stored events and parents: a third, independent recompute."""
+    parents: dict[UUID, set[UUID]] = {}
+    for edition, work in await _rows(connection, "SELECT edition_id, work_id FROM identity_ledger_edition_parents"):
+        parents.setdefault(edition, set()).add(work)
+    instants: dict[tuple[str, UUID], set[datetime]] = {}
+    for edition, at, event_type in await _rows(connection, "SELECT edition_id, at, type FROM identity_ledger_edition_events"):
+        for work in parents.get(edition, ()):
+            for event in ("any", event_type):
+                instants.setdefault((event, work), set()).add(at)
+    rows = set()
+    for (event, work), ats in instants.items():
+        ordered = sorted(ats)
+        for position, at in enumerate(ordered):
+            previous = ordered[position - 1] if position else None
+            following = ordered[position + 1] if position + 1 < len(ordered) else None
+            rows.add((event, work, at, previous, following))
+    return rows
+
+
+async def _assert_work_events_recomputed(connection: psycopg.AsyncConnection[Any], context: Any) -> None:
+    stored = set(await _rows(connection, _WORK_EVENTS_ROWS))
+    assert stored, context
+    assert stored == set(await _rows(connection, _WORK_EVENTS_RECOMPUTED)), context
+    assert stored == await _expected_work_events(connection), context
+
+
+async def _assert_windows_match_the_grouping(connection: psycopg.AsyncConnection[Any], windows: list[tuple[datetime, datetime]], context: Any) -> int:
+    """For every window and filter, the total and the ordered page read from the table equal the raw GROUP BY."""
+    events = ["any", *(row[0] for row in await _rows(connection, "SELECT DISTINCT type FROM identity_ledger_edition_events ORDER BY 1"))]
+    checked = 0
+    for since, until in windows:
+        for event in events:
+            keys = {"event": event, "since": since, "until": until}
+            grouped = await _rows(connection, _WINDOW_GROUPED, keys)
+            assert await _rows(connection, _WINDOW_TOTAL, keys) == [(len(grouped),)], (context, keys)
+            assert await _rows(connection, _WINDOW_PAGE, keys) == grouped, (context, keys)
+            checked += 1
+    return checked
+
+
+def _windows_over(instants: list[datetime]) -> list[tuple[datetime, datetime]]:
+    """Every [since, until) over the instants and a microsecond and a day either side, plus all time and empty ones."""
+    edges = sorted(
+        {at + delta for at in instants for delta in (timedelta(0), timedelta(microseconds=1), -timedelta(microseconds=1), timedelta(days=1))}
+    )
+    windows = [(since, until) for since in edges for until in edges if since <= until]
+    far_past, far_future = datetime(1900, 1, 1, tzinfo=UTC), datetime(2100, 1, 1, tzinfo=UTC)
+    return [*windows, (far_past, far_future), (far_future, far_future + timedelta(days=30)), (far_past, far_past + timedelta(days=1))]
+
+
+@pytest.mark.asyncio
+async def test_the_work_events_equal_a_window_function_over_the_events_after_a_rebuild_and_an_incremental_refresh() -> None:
+    """Acceptance 2: rows, neighbours, window totals and pages, after a rebuild and after a refresh that adds, moves and removes events."""
+    fixture = Fixture()
+    async with _ledger_database() as params:
+        connection = await _connect(params)
+        async with connection:
+            async with connection.cursor() as cursor:
+                await _seed(cursor, fixture)
+                work, many, once = await _seed_editions_across_days(cursor)
+            await _build_reference(connection)
+            await _refresh_and_compare(connection, "rebuild")
+            await _assert_work_events_recomputed(connection, "rebuild")
+
+            # The work's history by hand: `many` on March 20 (two events at one instant) and 22, `once` on 22, `late` on 24.
+            mar20, mar22, mar24 = _at(3, 20), _at(3, 22), _at(3, 24)
+            chain = "SELECT at, prev_at, next_at FROM identity_ledger_work_events WHERE work_id = %s AND event = %s ORDER BY at"
+            assert await _rows(connection, chain, (work, "any")) == [(mar20, None, mar22), (mar22, mar20, mar24), (mar24, mar22, None)]
+            assert await _rows(connection, chain, (work, "alias_closed")) == [(mar22, None, None)]
+
+            # Inside one day, across days, between instants, empty, and all time.
+            windows = _windows_over(sorted({row[0] for row in await _rows(connection, "SELECT DISTINCT at FROM identity_ledger_work_events")}))
+            assert await _assert_windows_match_the_grouping(connection, windows, "rebuild") > 1000
+            # The window [March 22, March 23) counts the work once, though two editions have events in it.
+            day = {"event": "any", "since": mar22, "until": _at(3, 23)}
+            assert (work, mar22) in await _rows(connection, _WINDOW_PAGE, day)
+
+            # An untouched work's rows must survive the incremental refresh as they are.
+            untouched = "SELECT ctid::text, xmin::text FROM identity_ledger_work_events WHERE work_id = %s ORDER BY 1"
+            w3_before = await _rows(connection, untouched, (fixture.w3,))
+            assert w3_before
+
+            # Add: a later MusicBrainz release on `once`.  Move: `late`'s link from March 24 to March 21.
+            # Remove: `many`'s closed alias, taking its March 20 evidence and its March 22 closure.
+            added = _at(3, 27)
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    "INSERT INTO provider_aliases (provider, entity_kind, external_id, native_id, valid_from) VALUES ('musicbrainz', 'release', %s, %s, %s)",
+                    (str(uuid4()), once, added),
+                )
+                await cursor.execute(
+                    "UPDATE provider_aliases SET valid_from = %s WHERE provider = 'musicbrainz' AND valid_from = %s AND native_id NOT IN (%s, %s)",
+                    (_at(3, 21), mar24, many, once),
+                )
+                await cursor.execute("DELETE FROM provider_aliases WHERE native_id = %s AND valid_to = %s", (many, mar22))
+            assert await _rows(connection, "SELECT count(*) FROM identity_ledger_changes WHERE rebuild") == [(0,)]
+            await _refresh_and_compare(connection, "incremental")
+            await _assert_work_events_recomputed(connection, "incremental")
+            assert await _rows(connection, untouched, (fixture.w3,)) == w3_before
+
+            assert await _rows(connection, chain, (work, "any")) == [
+                (mar20, None, _at(3, 21)),
+                (_at(3, 21), mar20, mar22),
+                (mar22, _at(3, 21), added),
+                (added, mar22, None),
+            ]
+            assert await _rows(connection, chain, (work, "alias_closed")) == []
+            windows = _windows_over(sorted({row[0] for row in await _rows(connection, "SELECT DISTINCT at FROM identity_ledger_work_events")}))
+            assert await _assert_windows_match_the_grouping(connection, windows, "incremental") > 1000
+
+
+@pytest.mark.asyncio
+async def test_the_work_events_read_contracts_are_answered_from_their_indexes() -> None:
+    """Both reads use the one (event, at DESC, work_id) index without the heap, and a refresh's delete finds a work by index."""
+    async with _ledger_database() as params:
+        connection = await _connect(params)
+        async with connection:
+            async with connection.cursor() as cursor:
+                await _seed(cursor, Fixture())
+                await _seed_editions_across_days(cursor)
+            await _rows(connection, "SELECT identity_ledger_refresh()")
+            await connection.execute("VACUUM (ANALYZE) identity_ledger_work_events")
+            await connection.execute("SET enable_seqscan = off")
+            await connection.execute("SET enable_bitmapscan = off")
+            keys = {"event": "any", "since": _at(3, 1), "until": _at(4, 1)}
+            for query in (_WINDOW_TOTAL, _WINDOW_PAGE + " LIMIT 50"):
+                plan = "\n".join(row[0] for row in await _rows(connection, "EXPLAIN " + query, keys))
+                assert "Index Only Scan using idx_identity_ledger_work_events_page" in plan, plan
+                assert "Sort" not in plan, plan
+            # Every index leads with the filter, so a delete by work alone skips over the filters (the key, at scale).
+            ((work,),) = await _rows(connection, "SELECT work_id FROM identity_ledger_work_events LIMIT 1")
+            plan = "\n".join(row[0] for row in await _rows(connection, "EXPLAIN DELETE FROM identity_ledger_work_events WHERE work_id = %s", (work,)))
+            assert "Index Cond: (work_id = " in plan, plan
+
+
+@pytest.mark.asyncio
+async def test_upgrading_a_populated_ledger_without_the_work_events_fills_them_on_the_next_refresh() -> None:
+    """The v0.14.0 shape: a refreshed ledger with no work_events table asks for one rebuild, which fills it."""
+    async with _ledger_database() as params:
+        connection = await _connect(params)
+        async with connection:
+            async with connection.cursor() as cursor:
+                await _seed(cursor, Fixture())
+                await _seed_editions_across_days(cursor)
+            await _rows(connection, "SELECT identity_ledger_refresh()")
+            expected = set(await _rows(connection, _WORK_EVENTS_ROWS))
+            assert expected
+            await connection.execute(f"DROP TABLE {_WORK_EVENTS}")
+
+            assert await initializer._apply_postgres_schema(params) is True
+            assert await _rebuild_requests(connection) == 1
+            await _rows(connection, "SELECT identity_ledger_refresh()")
+            assert set(await _rows(connection, _WORK_EVENTS_ROWS)) == expected
+            await connection.execute(f"DELETE FROM {_WORK_EVENTS}")  # noqa: S608 -- module constant
+            assert await initializer._apply_postgres_schema(params) is True
+            assert await _rebuild_requests(connection) == 1  # an emptied table is healed the same way
+            await _rows(connection, "SELECT identity_ledger_refresh()")
+            assert set(await _rows(connection, _WORK_EVENTS_ROWS)) == expected

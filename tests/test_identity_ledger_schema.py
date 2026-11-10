@@ -28,6 +28,7 @@ _UNIQUE_KEYS = {
     "identity_ledger_edition_parents": ("idx_identity_ledger_edition_parents_key", "(edition_id, work_id)"),
     "identity_ledger_work_summary": ("idx_identity_ledger_work_summary_key", "(event, work_id)"),
     "identity_ledger_work_summary_day": ("idx_identity_ledger_work_summary_day_key", "(event, day, work_id, prev_day)"),
+    "identity_ledger_work_events": ("idx_identity_ledger_work_events_key", "(event, work_id, at)"),
     "identity_ledger_density": ("idx_identity_ledger_density_key", "(kind, month, type, dated_from)"),
 }
 
@@ -154,6 +155,40 @@ class TestIdentityLedgerStatements:
             "DELETE FROM public.identity_ledger_work_summary_day AS stored USING pg_temp.ledger_works AS dirty"
             in _STATEMENTS["identity_ledger_maintain function"]
         )
+
+    def test_the_work_events_chain_each_instant_to_its_neighbours_over_the_whole_work(self) -> None:
+        statement = _STATEMENTS["identity_ledger_work_events table"]
+        assert "prev_at TIMESTAMPTZ,\n" in statement  # NULL at a work's first instant
+        assert "next_at TIMESTAMPTZ\n" in statement  # NULL at its last
+        verify = _STATEMENTS["identity_ledger_verify function"]
+        assert "lag(at) OVER work AS prev_at, lead(at) OVER work AS next_at" in verify
+        assert "WINDOW work AS (PARTITION BY event, work_id ORDER BY at)" in verify
+        assert "SELECT 'any'::text AS event, work_id, at FROM work_at GROUP BY work_id, at" in verify
+
+    def test_the_work_events_read_indexes_serve_the_window_total_and_the_page(self) -> None:
+        assert _STATEMENTS["idx_identity_ledger_work_events_page"].endswith(
+            "ON public.identity_ledger_work_events (event, at DESC, work_id) INCLUDE (prev_at, next_at)"
+        )
+        assert [name for name in _STATEMENTS if name.startswith("idx_identity_ledger_work_events_")] == [
+            "idx_identity_ledger_work_events_key",
+            "idx_identity_ledger_work_events_page",
+        ]
+
+    def test_the_work_events_are_replaced_whole_for_dirty_works_and_rebuilt_whole(self) -> None:
+        for name in ("identity_ledger_maintain function", "identity_ledger_rebuild function"):
+            assert "INSERT INTO public.identity_ledger_work_events (event, work_id, at, prev_at, next_at)" in _STATEMENTS[name]
+        maintain = _STATEMENTS["identity_ledger_maintain function"]
+        assert (
+            "DELETE FROM public.identity_ledger_work_events AS stored USING pg_temp.ledger_works AS dirty WHERE stored.work_id = dirty.work_id"
+            in maintain
+        )
+        assert "JOIN pg_temp.ledger_works AS dirty_work ON dirty_work.work_id = parent.work_id" in maintain
+        assert "DELETE FROM public.identity_ledger_work_events;" in _STATEMENTS["identity_ledger_rebuild function"]
+        assert "ANALYZE public.identity_ledger_work_events;" in _STATEMENTS["identity_ledger_rebuild function"]
+
+    def test_the_rebuild_request_heals_an_unfilled_work_events_table(self) -> None:
+        statement = _STATEMENTS["identity ledger rebuild request for new derived tables"]
+        assert "OR NOT EXISTS (SELECT 1 FROM public.identity_ledger_work_events)" in statement
 
     def test_verify_recomputes_every_kind_in_one_statement(self) -> None:
         statement = _STATEMENTS["identity_ledger_verify function"]
