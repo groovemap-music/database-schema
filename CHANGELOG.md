@@ -2,7 +2,7 @@
 
 All notable changes to the GrooveMap database schema will be documented here.
 
-## Unreleased
+## v0.15.1 (2026-11-11)
 
 ### Release notes
 
