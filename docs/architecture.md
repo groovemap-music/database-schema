@@ -3592,11 +3592,19 @@ A `NOLOGIN` group role, created and granted by `_PIPELINE_ROLE_STATEMENTS` and
 | --- | --- |
 | `USAGE` on schema `graph` | Lets the role see the schema at all. |
 | `SELECT` on `ALL TABLES IN SCHEMA graph` | Every vertex and edge relation the FastRP pipeline reads — the schema's shorthand reaches both plain tables and views, so a relation added later is covered the next time the initializer runs without this grant list changing. |
-| `SELECT, INSERT, UPDATE, DELETE` on `public.artist_embeddings` | The one relation the pipeline writes. No `TRUNCATE`, no DDL, no ownership. |
+| `SELECT, INSERT, UPDATE, DELETE` on `public.artist_embeddings` | The one embedding relation the pipeline writes. No `TRUNCATE`, no DDL, no ownership. |
+| `SELECT, INSERT, UPDATE, DELETE` on `public.artist_similar_artists` and `public.artist_embedding_releases` | The similarity relations the monthly batch job fills. Same shape as `artist_embeddings`: no `TRUNCATE`, no DDL, no ownership. |
+| `USAGE` on sequence `public.artist_embedding_releases_release_id_seq` | Lets the batch job insert into `artist_embedding_releases`. |
+| `SELECT` on `public.loader_extraction_latch` | Read-only. analytics-engine's nightly similar-artists job reads the latch before each run, to skip while a Discogs or MusicBrainz load holds it. Its columns are `loader`, `version`, `signals`, and timestamps only: no catalog data. No write, no `TRUNCATE`. |
 
-The role holds nothing else: no privilege on `public`'s catalog document tables (`artists`,
-`labels`, `masters`, `releases`), `insights`, `musicbrainz`, or any other schema. ADR 0013:
-"It holds no other privilege." The login that is a member of this role is provisioned where
+Outside the pipeline's own tables (the embedding and similarity relations above), the latch is
+the one read-only grant on `public`. The role holds nothing else: no privilege on `public`'s
+catalog document tables (`artists`, `labels`, `masters`, `releases`), `insights`, `musicbrainz`,
+or any other schema. ADR 0013: "It holds no other privilege." That sentence has this one
+exception, the latch grant in the table above, which the job needs to run rather than fail
+nightly. The grant is in `_PIPELINE_ROLE_STATEMENTS`, so it is
+applied on every schema-init, guarded on the role's existence like the other role grants, and a
+rerun is a no-op. The login that is a member of this role is provisioned where
 credentials live — `deployment` for development and CI, and the homelab for the shared
 production instance — never in this repository.
 

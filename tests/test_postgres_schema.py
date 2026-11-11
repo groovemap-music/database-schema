@@ -633,13 +633,30 @@ class TestArtistEmbeddingsStatement:
 
     def test_the_role_holds_no_privilege_outside_graph_and_its_own_table(self) -> None:
         statements = " ".join(statement for _name, statement in _PIPELINE_ROLE_STATEMENTS)
-        # `public` appears only as the schema-level USAGE gate; no table or
-        # sequence privilege on `public` lives in this list (those are the
-        # separate `_EMBEDDINGS_TABLE_GRANT` and similarity grants).
+        # `public` appears as the schema-level USAGE gate and the one read-only
+        # latch grant; no other table or sequence privilege on `public` lives in
+        # this list (those are the separate `_EMBEDDINGS_TABLE_GRANT` and
+        # similarity grants).
         assert f"GRANT USAGE ON SCHEMA public TO {EMBEDDING_PIPELINE_ROLE}" in statements
-        assert statements.count("public") == 1
+        assert statements.count("public") == 2
         assert "insights" not in statements
         assert "musicbrainz" not in statements
+
+    def test_the_latch_grant_is_select_only_on_the_latch_and_nothing_more(self) -> None:
+        grants = [statement for name, statement in _PIPELINE_ROLE_STATEMENTS if "loader extraction latch" in name]
+        assert grants == [f"GRANT SELECT ON public.loader_extraction_latch TO {EMBEDDING_PIPELINE_ROLE}"]
+
+    def test_the_latch_grant_is_rendered_after_the_role_exists(self) -> None:
+        names = [name for name, _statement in _PIPELINE_ROLE_STATEMENTS]
+        assert names.index(f"{EMBEDDING_PIPELINE_ROLE} role") < names.index(f"{EMBEDDING_PIPELINE_ROLE} loader extraction latch select grant")
+
+    def test_the_latch_grant_follows_the_latch_table_in_the_schema(self) -> None:
+        # The grant only works once the latch table exists; `_schema_statements()`
+        # creates it before `_apply_vector_schema` runs `_PIPELINE_ROLE_STATEMENTS`.
+        from groovemap_schema.postgres import _schema_statements
+
+        names = [name for name, _statement in _schema_statements()]
+        assert names.index("loader_extraction_latch table") < names.index("loader_extraction_latch generation column")
 
     def test_the_role_gets_usage_on_public_before_the_table_grants_that_need_it(self) -> None:
         names = [name for name, _statement in _PIPELINE_ROLE_STATEMENTS]
