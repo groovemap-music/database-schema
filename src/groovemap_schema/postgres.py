@@ -8761,8 +8761,13 @@ _CREATE_EMBEDDING_PIPELINE_ROLE_STATEMENT = (
 # `public` to PUBLIC, so this only matters where that default was revoked
 # (lux's shared server). USAGE is a schema-level gate, not a privilege on any
 # relation, so it grants the role no object access by itself. The role gets
-# nothing on `insights`, `musicbrainz`, or any other schema — ADR 0013: "It
-# holds no other privilege."
+# nothing on `insights`, `musicbrainz`, or any other schema. Outside the
+# pipeline's own tables (the embedding and similarity tables, granted separately
+# below), `loader_extraction_latch` is the one read-only grant on `public`:
+# analytics-engine's nightly similar-artists job reads it to skip while a
+# Discogs or MusicBrainz load runs, and it fails outright without that read.
+# docs/architecture.md records it as that exception to ADR 0013's "It holds no
+# other privilege."
 _PIPELINE_ROLE_STATEMENTS: list[tuple[str, str]] = [
     _CREATE_EMBEDDING_PIPELINE_ROLE_STATEMENT,
     (
@@ -8776,6 +8781,16 @@ _PIPELINE_ROLE_STATEMENTS: list[tuple[str, str]] = [
     (
         f"{EMBEDDING_PIPELINE_ROLE} graph tables select grant",
         f"GRANT SELECT ON ALL TABLES IN SCHEMA graph TO {EMBEDDING_PIPELINE_ROLE}",
+    ),
+    # The loader extraction latch, read-only. analytics-engine's similar-artists job
+    # (insights/similar_artists_job.py, `_LATCH_SQL`) reads it before each run and skips
+    # while a Discogs or MusicBrainz load holds it. Single relation, SELECT only: the
+    # role cannot write the latch, and the latch's columns (loader, version, signals,
+    # timestamps) hold no catalog data. Declared here, not in `_EMBEDDINGS_TABLE_GRANT`,
+    # because the latch table is created unconditionally, so this grant needs only the role.
+    (
+        f"{EMBEDDING_PIPELINE_ROLE} loader extraction latch select grant",
+        f"GRANT SELECT ON public.loader_extraction_latch TO {EMBEDDING_PIPELINE_ROLE}",
     ),
 ]
 

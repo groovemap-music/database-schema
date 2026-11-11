@@ -2,6 +2,16 @@
 
 All notable changes to the GrooveMap database schema will be documented here.
 
+## Unreleased
+
+### Release notes
+
+Schema-init grants `embedding_pipeline` `SELECT` on `public.loader_extraction_latch`, and nothing more. It is needed by analytics-engine v0.9.0's nightly similar-artists job, which reads the latch before each run so it can skip while a Discogs or MusicBrainz load is running. The role cannot write the latch. The grant is applied on every schema-init, guarded on the role's existence like the other role grants, and a rerun is a no-op. No manual steps are needed before or after. The change is additive. Deploy it before analytics-engine v0.9.0 runs its nightly job; on lux, the grant is applied by the next schema-init.
+
+### Fix
+
+- **postgres**: grant embedding_pipeline SELECT on loader_extraction_latch
+
 ## v0.15.0 (2026-11-10)
 
 ### Release notes
