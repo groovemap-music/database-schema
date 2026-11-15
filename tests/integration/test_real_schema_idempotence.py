@@ -367,7 +367,10 @@ async def assert_every_edge_table_is_indexed_both_ways() -> None:
                 definitions,
             )
             continue
-        assert any(definition.endswith(f"({reverse})") for definition in definitions), (relation, definitions)
+        if reverse is not None:
+            assert any(definition.endswith(f"({reverse})") for definition in definitions), (relation, definitions)
+        else:  # `track_by_artist`: the reverse index is retired (gm-database-schema-zd7u), only the key remains
+            assert relation == "track_by_artist", relation
         assert any("_pkey" in definition for definition in definitions), (relation, definitions)
 
 

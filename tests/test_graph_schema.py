@@ -341,6 +341,9 @@ class TestGraphSchemaStatement:
         for name, statement in _GRAPH_STATEMENTS:
             if "DROP" not in statement.upper():
                 continue
+            if name.endswith(" retirement"):
+                assert statement == f"DROP INDEX IF EXISTS {name.removesuffix(' retirement')}", name  # an unread index, guarded
+                continue
             assert name.endswith(" migration"), f"{name} contains a DROP"
             if name.endswith((" free-text key migration", " two-hash key migration", " key-order migration")):
                 continue  # `test_a_free_text_key_migration_...` and its sibling hold these to their own guards.
@@ -620,6 +623,10 @@ class TestEdgeViews:
                 assert any(statement.startswith(f"CREATE UNIQUE INDEX IF NOT EXISTS {relation}_key") for statement in indexes), relation
                 assert any(" USING hash (" in statement for statement in indexes) == (_FREE_TEXT_KEYS[relation][1] is not None), relation
                 continue
+            if reverse is None:  # `track_by_artist`: its reverse index is retired, and nothing may recreate it
+                assert relation == "track_by_artist"
+                assert not any("CREATE" in statement and f"{relation}_reverse" in statement for statement in index_statements_for(relation))
+                continue
             assert f"CREATE INDEX IF NOT EXISTS {relation}_reverse ON graph.{relation} ({reverse})" in index_statements_for(relation), relation
 
     def test_every_edge_key_column_is_text(self) -> None:
@@ -869,10 +876,8 @@ class TestTrackCredits:
             "CREATE UNIQUE INDEX IF NOT EXISTS track_credited_on_key ON graph.track_credited_on "
             "(release_id, track_ordinal, sub_track_ordinal, graph.credit_key(person_name, role))"
         ) in index_statements_for("track_credited_on")
-        assert (
-            "CREATE INDEX IF NOT EXISTS track_by_artist_reverse "
-            "ON graph.track_by_artist (artist_id, release_id, track_ordinal, sub_track_ordinal)" in index_statements_for("track_by_artist")
-        )
+        # `track_by_artist_reverse` (artist_id first) is retired: nothing walks the relation from the artist.
+        assert not any("track_by_artist_reverse" in candidate and "CREATE" in candidate for candidate in index_statements_for("track_by_artist"))
 
     def test_track_sources_read_both_the_track_and_its_sub_tracks(self) -> None:
         """Each relation unions its track-level rows with its sub-track-level rows."""

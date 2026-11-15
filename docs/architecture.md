@@ -1569,12 +1569,13 @@ adds two PostgreSQL GIN indexes over the additive `identifiers` and `companies` 
 `discogs-ingestion` attaches to every Discogs `releases` event, a Neo4j `Company` node, the
 `CREDITED_TO` manufacturing-credit edge, and a `Release.country` range index.
 
-PostgreSQL gains `idx_releases_identifiers` on `data->'identifiers'` and
-`idx_releases_companies` on `data->'companies'`, GIN indexes declared beside
-`idx_releases_genres`, `idx_releases_labels`, and `idx_releases_media_families` in
-`_SPECIFIC_INDEXES` in [`src/groovemap_schema/postgres.py`](../src/groovemap_schema/postgres.py).
-They serve analytical containment queries over the two blocks; exact barcode and
-catalogue-number lookup resolves through `provider_aliases` (see Identity above) instead.
+PostgreSQL gained `idx_releases_identifiers` on `data->'identifiers'` and
+`idx_releases_companies` on `data->'companies'`, GIN indexes meant to serve analytical containment
+queries over the two blocks. No such query was ever written: exact barcode and catalogue-number lookup
+resolves through `provider_aliases` (see Identity above), and every other read of the blocks goes by
+`data_id`. Both indexes, and `idx_releases_labels`, are retired and schema-init drops them
+(see [Unread indexes retired](#unread-indexes-retired)). `idx_releases_genres` and
+`idx_releases_media_families` stay.
 
 Neo4j gains `Company` — one manufacturing, mastering, or distribution credit party, unique on
 `id` (the `company_id` constraint) — alongside the existing Artist, Label, Master, Release,
@@ -4016,3 +4017,23 @@ Rollback requires restoring the prior code and consumers, recreating the prior t
 contracts in a disposable database, and recomputing lists. Do not retain array rows for a
 rank-row consumer or apply this reset to live catalog data. Schema application, release
 publication, and pushing remain separate maintainer actions; package version stays 0.4.x.
+
+## Unread indexes retired
+
+[`docs/audits/2026-11-14-unread-index-drops.md`](audits/2026-11-14-unread-index-drops.md) holds the evidence for
+each of these and for the indexes that stay. Sixteen indexes with no scan on lux and no reader in any consumer
+repository are dropped, which frees about 14.6 GiB on lux (15.7 GB):
+
+- the `hash` index on each of the four Discogs entity tables;
+- the name and title hash indexes on `artists`, `labels`, `masters` and `releases`, and on the MusicBrainz artists and
+  labels (they replace the hash migration above, which now only clears a v0.6.0 btree of the same name);
+- the GIN indexes `idx_releases_identifiers`, `idx_releases_companies` and `idx_releases_labels`;
+- `insights.idx_release_rarity_gem`, `musicbrainz.idx_mb_links_mbid` (a left prefix of the unique key) and
+  `graph.track_by_artist_reverse`.
+
+Each keeps its statement in `src/groovemap_schema/postgres.py`, under the same name and in the same place, as
+`DROP INDEX IF EXISTS`: a fresh database never builds the index, an upgraded one loses it on the next schema-init,
+and a rerun takes no lock. They are not `CONCURRENTLY`, which cannot run in a transaction block; a plain drop holds
+its table lock for milliseconds, within the init's `lock_timeout`. Run schema-init with the loaders stopped.
+Rollback is the original `CREATE INDEX` (kept in `tests/integration/test_unread_index_drops.py`) and a rebuild.
+`idx_*_gm_item_id` on the entity tables stay: `catalog-api`'s merge recompute probes them.

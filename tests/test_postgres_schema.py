@@ -39,6 +39,7 @@ from groovemap_schema.postgres import (
     _RETIRED_BTREE_INDEXES,
     _SEEN_LIST_STATEMENTS,
     _SPECIFIC_INDEXES,
+    _UNREAD_INDEX_DROPS,
     _USER_TABLES,
     _VECTOR_EXTENSION_INSTALLED_QUERY,
     _VECTOR_SCHEMA_STATEMENTS,
@@ -117,11 +118,14 @@ class TestSpecificIndexes:
 
     def test_all_indexes_use_if_not_exists(self) -> None:
         for name, stmt in _SPECIFIC_INDEXES:
-            assert "IF NOT EXISTS" in stmt, f"Index '{name}' is missing IF NOT EXISTS"
+            assert "IF NOT EXISTS" in stmt or stmt == f"DROP INDEX IF EXISTS {stmt.rsplit(' ', 1)[-1]}", f"Index '{name}' is missing IF NOT EXISTS"
 
-    def test_no_drop_statements(self) -> None:
+    def test_only_a_retired_index_is_dropped(self) -> None:
+        """A DROP is allowed only as the guarded drop of an index on `_UNREAD_INDEX_DROPS`."""
         for name, stmt in _SPECIFIC_INDEXES:
-            assert "DROP" not in stmt.upper(), f"Index '{name}' contains a DROP statement"
+            if "DROP" in stmt.upper():
+                assert stmt.startswith("DROP INDEX IF EXISTS "), name
+                assert stmt.removeprefix("DROP INDEX IF EXISTS ") in _UNREAD_INDEX_DROPS, name
 
     def test_covers_all_entity_tables(self) -> None:
         # _SPECIFIC_INDEXES also carries the "releases add media column" ALTER
@@ -153,14 +157,12 @@ class TestSpecificIndexes:
             assert "to_tsvector" in stmt, f"{name} missing to_tsvector"
             assert "english" in stmt, f"{name} missing language 'english'"
 
-    def test_identifiers_and_companies_gin_indexes_defined(self) -> None:
-        """ADR 0011: containment queries over the additive identifiers/companies
-        blocks need the same GIN index shape media families already has."""
+    def test_identifiers_and_companies_gin_indexes_are_retired(self) -> None:
+        """No reader ever used them (docs/audits/2026-11-14-unread-index-drops.md): exact
+        identifier lookups resolve through provider_aliases, so the statements only drop them."""
         indexes = dict(_SPECIFIC_INDEXES)
-        assert (
-            indexes["idx_releases_identifiers"] == "CREATE INDEX IF NOT EXISTS idx_releases_identifiers ON releases USING GIN ((data->'identifiers'))"
-        )
-        assert indexes["idx_releases_companies"] == "CREATE INDEX IF NOT EXISTS idx_releases_companies ON releases USING GIN ((data->'companies'))"
+        assert indexes["idx_releases_identifiers"] == "DROP INDEX IF EXISTS public.idx_releases_identifiers"
+        assert indexes["idx_releases_companies"] == "DROP INDEX IF EXISTS public.idx_releases_companies"
 
 
 class TestInsightsSchema:
@@ -476,7 +478,7 @@ class TestCreatePostgresSchema:
             session_setting = upper.startswith(("SET LOCK_TIMEOUT", "RESET LOCK_TIMEOUT"))
             # A retirement is `DROP TABLE IF EXISTS`: the guard makes it a no-op
             # once the table is gone, which the DROP guard below also checks.
-            retirement = upper.startswith("DROP TABLE IF EXISTS ")
+            retirement = upper.startswith(("DROP TABLE IF EXISTS ", "DROP INDEX IF EXISTS "))
             # A column storage option: setting the same value again changes nothing.
             statistics_option = "ALTER COLUMN" in upper and " SET (N_DISTINCT = " in upper
             exempt = (

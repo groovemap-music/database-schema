@@ -19,10 +19,10 @@ class TestReleaseRaritySchema:
         names = [name for name, _ddl in _INSIGHTS_TABLES]
         assert "idx_release_rarity_tier" in names
 
-    def test_release_rarity_gem_index_defined(self) -> None:
-        """Verify hidden_gem_score index exists."""
-        names = [name for name, _ddl in _INSIGHTS_TABLES]
-        assert "idx_release_rarity_gem" in names
+    def test_release_rarity_gem_index_is_retired(self) -> None:
+        """No route orders by hidden_gem_score, so the statement only drops the index."""
+        statements = dict(_INSIGHTS_TABLES)
+        assert statements["idx_release_rarity_gem"] == "DROP INDEX IF EXISTS insights.idx_release_rarity_gem"
 
     def test_release_rarity_ddl_has_required_columns(self) -> None:
         """Verify DDL includes all required columns."""

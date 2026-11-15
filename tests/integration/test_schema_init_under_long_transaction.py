@@ -255,8 +255,9 @@ CREATE TABLE graph.credited_to (
     PRIMARY KEY (release_id, company_id, role, source)
 );
 CREATE INDEX credited_to_reverse ON graph.credited_to (company_id, release_id);
-DROP INDEX public.idx_artists_name, public.idx_labels_name, public.idx_masters_title, public.idx_releases_title;
-DROP INDEX musicbrainz.idx_mb_artists_name, musicbrainz.idx_mb_labels_name;
+-- A fresh init no longer builds these six (gm-database-schema-zd7u), so the drop is IF EXISTS.
+DROP INDEX IF EXISTS public.idx_artists_name, public.idx_labels_name, public.idx_masters_title, public.idx_releases_title;
+DROP INDEX IF EXISTS musicbrainz.idx_mb_artists_name, musicbrainz.idx_mb_labels_name;
 CREATE INDEX idx_artists_name ON public.artists ((data->>'name'));
 CREATE INDEX idx_labels_name ON public.labels ((data->>'name'));
 CREATE INDEX idx_masters_title ON public.masters ((data->>'title'));
@@ -300,10 +301,12 @@ async def _fingerprint(name: str) -> list[tuple[Any, ...]]:
 
 
 async def test_a_recreate_after_a_drop_in_the_same_init_is_not_skipped() -> None:
-    """The reproduced defect: a btree idx_artists_name was dropped by a migration, then not rebuilt.
+    """The reproduced defect: a migration drops an index and a later CREATE INDEX IF NOT EXISTS must rebuild it.
 
-    The skip decision is made right before each statement, so the hash index the later CREATE
-    INDEX IF NOT EXISTS builds exists afterwards, exactly as with the unguarded statement list.
+    The skip decision is made right before each statement, so an index a migration dropped is built
+    again by the statement that follows, exactly as with the unguarded statement list. The six name
+    and title indexes this once exercised are retired (gm-database-schema-zd7u), so the proof is the
+    free-text keys the migrations replace, and that a retired index stays gone in both runs.
     """
     plain, guarded = await _create_database("init_plain"), await _create_database("init_guard")
     try:
@@ -319,16 +322,12 @@ async def test_a_recreate_after_a_drop_in_the_same_init_is_not_skipped() -> None
         assert await create_postgres_schema(_Pool(guarded)) == 0
 
         async with await psycopg.AsyncConnection.connect(**_params(guarded), autocommit=True) as conn:
-            method = await (
-                await conn.execute(
-                    "SELECT am.amname FROM pg_class c JOIN pg_am am ON am.oid = c.relam WHERE c.oid = to_regclass('public.idx_artists_name')"
-                )
-            ).fetchone()
+            retired = await (await conn.execute("SELECT to_regclass('public.idx_artists_name')")).fetchone()
             keys = [
                 (await (await conn.execute("SELECT to_regclass(%s)", (name,))).fetchone())[0]  # type: ignore[index]
                 for name in ("graph.credited_on_key", "graph.track_credited_on_key", "graph.person_key")
             ]
-        assert method == ("hash",), f"idx_artists_name is {method}"
+        assert retired == (None,), f"idx_artists_name is {retired}"
         assert all(key is not None for key in keys), keys
         assert await _fingerprint(guarded) == await _fingerprint(plain)
     finally:

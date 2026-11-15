@@ -27,6 +27,44 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# ── Unread indexes retired (gm-database-schema-zd7u) ─────────────────────────
+# Each index below had zero scans on lux and no reader in any consumer repository, and
+# `docs/audits/2026-11-14-unread-index-drops.md` holds the evidence and the indexes that stayed.
+# A retired index keeps its statement name and position in the schema, because
+# `tests/test_identity_schema.py` pins the legacy names as expand-only; only the SQL changes, from
+# `CREATE INDEX IF NOT EXISTS` to the drop below. A fresh database never builds one, a database that
+# has one loses it on its next schema-init, and a rerun is a no-op that takes no lock (`DROP INDEX
+# IF EXISTS` on a missing index only raises a notice). It is not `CONCURRENTLY`: that cannot run in
+# a transaction block, and a plain drop only unlinks files, so its table lock lasts milliseconds and
+# is bounded by the schema-init `lock_timeout` like every other statement. Rollback is the
+# index's original `CREATE INDEX`, kept in the audit, then a rebuild.
+_UNREAD_INDEX_DROPS: tuple[str, ...] = (
+    "public.idx_artists_hash",
+    "public.idx_labels_hash",
+    "public.idx_masters_hash",
+    "public.idx_releases_hash",
+    "public.idx_artists_name",
+    "public.idx_labels_name",
+    "public.idx_masters_title",
+    "public.idx_releases_title",
+    "public.idx_releases_labels",
+    "public.idx_releases_identifiers",
+    "public.idx_releases_companies",
+    "insights.idx_release_rarity_gem",
+    "musicbrainz.idx_mb_artists_name",
+    "musicbrainz.idx_mb_labels_name",
+    "musicbrainz.idx_mb_links_mbid",
+    "graph.track_by_artist_reverse",
+)
+
+
+def _drop_unread_index(qualified_name: str) -> str:
+    """Return the idempotent drop for one retired index, refusing a name not on the list."""
+    if qualified_name not in _UNREAD_INDEX_DROPS:
+        raise ValueError(f"{qualified_name} is not a retired index")
+    return f"DROP INDEX IF EXISTS {qualified_name}"
+
+
 # The four Discogs entity tables.  Each has the same base structure:
 #   data_id VARCHAR PRIMARY KEY  — Discogs numeric ID as a string
 #   hash    VARCHAR NOT NULL     — SHA-256 of the record, used for change detection
@@ -40,17 +78,17 @@ _SPECIFIC_INDEXES: list[tuple[str, str]] = [
     # Artists
     (
         "idx_artists_name",
-        "CREATE INDEX IF NOT EXISTS idx_artists_name ON artists USING hash ((data->>'name'))",
+        _drop_unread_index("public.idx_artists_name"),
     ),
     # Labels
     (
         "idx_labels_name",
-        "CREATE INDEX IF NOT EXISTS idx_labels_name ON labels USING hash ((data->>'name'))",
+        _drop_unread_index("public.idx_labels_name"),
     ),
     # Masters
     (
         "idx_masters_title",
-        "CREATE INDEX IF NOT EXISTS idx_masters_title ON masters USING hash ((data->>'title'))",
+        _drop_unread_index("public.idx_masters_title"),
     ),
     (
         "idx_masters_year",
@@ -59,7 +97,7 @@ _SPECIFIC_INDEXES: list[tuple[str, str]] = [
     # Releases
     (
         "idx_releases_title",
-        "CREATE INDEX IF NOT EXISTS idx_releases_title ON releases USING hash ((data->>'title'))",
+        _drop_unread_index("public.idx_releases_title"),
     ),
     (
         "idx_releases_year",
@@ -75,7 +113,7 @@ _SPECIFIC_INDEXES: list[tuple[str, str]] = [
     ),
     (
         "idx_releases_labels",
-        "CREATE INDEX IF NOT EXISTS idx_releases_labels ON releases USING GIN ((data->'labels'))",
+        _drop_unread_index("public.idx_releases_labels"),
     ),
     # Catalog identifiers and manufacturing credits (ADR 0011) — GIN indexes on
     # the additive identifiers/companies blocks for containment queries. Exact
@@ -83,11 +121,11 @@ _SPECIFIC_INDEXES: list[tuple[str, str]] = [
     # instead; these serve analytical containment queries.
     (
         "idx_releases_identifiers",
-        "CREATE INDEX IF NOT EXISTS idx_releases_identifiers ON releases USING GIN ((data->'identifiers'))",
+        _drop_unread_index("public.idx_releases_identifiers"),
     ),
     (
         "idx_releases_companies",
-        "CREATE INDEX IF NOT EXISTS idx_releases_companies ON releases USING GIN ((data->'companies'))",
+        _drop_unread_index("public.idx_releases_companies"),
     ),
     # Canonical media block (ADR 0007) — additive column plus a GIN index on the
     # sorted family-id list for fast media-family filtering.
@@ -1047,7 +1085,7 @@ _INSIGHTS_TABLES: list[tuple[str, str]] = [
     ),
     (
         "idx_release_rarity_gem",
-        "CREATE INDEX IF NOT EXISTS idx_release_rarity_gem ON insights.release_rarity (hidden_gem_score DESC NULLS LAST)",
+        _drop_unread_index("insights.idx_release_rarity_gem"),
     ),
     # The tier browse catalog-api serves is WHERE tier = $1 ORDER BY rarity_score DESC,
     # release_id (release_id ascending, as the route writes it). The index matches that
@@ -2227,11 +2265,11 @@ _MUSICBRAINZ_INDEXES: list[tuple[str, str]] = [
     ),
     (
         "idx_mb_artists_name",
-        "CREATE INDEX IF NOT EXISTS idx_mb_artists_name ON musicbrainz.artists USING hash (name)",
+        _drop_unread_index("musicbrainz.idx_mb_artists_name"),
     ),
     (
         "idx_mb_labels_name",
-        "CREATE INDEX IF NOT EXISTS idx_mb_labels_name ON musicbrainz.labels USING hash (name)",
+        _drop_unread_index("musicbrainz.idx_mb_labels_name"),
     ),
     (
         "idx_mb_rels_target",
@@ -2257,7 +2295,7 @@ _MUSICBRAINZ_INDEXES: list[tuple[str, str]] = [
     ),
     (
         "idx_mb_links_mbid",
-        "CREATE INDEX IF NOT EXISTS idx_mb_links_mbid ON musicbrainz.external_links (mbid)",
+        _drop_unread_index("musicbrainz.idx_mb_links_mbid"),
     ),
     (
         "idx_mb_links_service",
@@ -4003,7 +4041,7 @@ _EDGE_TABLES: list[tuple[str, str, str | None, tuple[tuple[str, str], ...]]] = [
     artist_id         text NOT NULL,
     PRIMARY KEY (release_id, track_ordinal, sub_track_ordinal, artist_id)
 """,
-        "artist_id, release_id, track_ordinal, sub_track_ordinal",
+        None,
         (),
     ),
     # `source` stays in the key, as ADR 0011 and the phase 0 view already have
@@ -4099,6 +4137,9 @@ def _edge_table_statements() -> list[tuple[str, str]]:
             statements.append(("graph.issued_on key-order migration", _ISSUED_ON_KEY_MIGRATION))
         if reverse is not None:
             statements.append(_table_index(relation, "reverse", reverse))
+        if relation == "track_by_artist":
+            # No consumer walks it from the artist end (docs/audits/2026-11-14-unread-index-drops.md).
+            statements.append(("graph.track_by_artist_reverse retirement", _drop_unread_index("graph.track_by_artist_reverse")))
         statements.extend(_table_index(relation, suffix, index_columns) for suffix, index_columns in extras)
         if relation in _RELEASE_ID_DISTINCT_FRACTIONS:
             statements.append(_release_id_distinct_statement(relation))
@@ -7336,15 +7377,17 @@ def _entity_schema_statements() -> Iterator[tuple[str, Any]]:
                 """
             ).format(table=sql.Identifier(table_name)),
         )
-        for column, template in (
-            ("hash", "CREATE INDEX IF NOT EXISTS {index} ON {table} (hash)"),
-            ("updated_at", "CREATE INDEX IF NOT EXISTS {index} ON {table} (updated_at)"),
-        ):
-            index_name = f"idx_{table_name}_{column}"
-            yield (
-                index_name,
-                sql.SQL(template).format(index=sql.Identifier(index_name), table=sql.Identifier(table_name)),
-            )
+        # The `hash` index is retired, not created: see `_UNREAD_INDEX_DROPS`. Its statement keeps its
+        # name and its place, which `tests/test_identity_schema.py` pins, and drops the index where
+        # an earlier release built it.
+        yield (f"idx_{table_name}_hash", _drop_unread_index(f"public.idx_{table_name}_hash"))
+        index_name = f"idx_{table_name}_updated_at"
+        yield (
+            index_name,
+            sql.SQL("CREATE INDEX IF NOT EXISTS {index} ON {table} (updated_at)").format(
+                index=sql.Identifier(index_name), table=sql.Identifier(table_name)
+            ),
+        )
         yield (
             f"{table_name} add gm_item_id column",
             sql.SQL("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS gm_item_id UUID").format(table=sql.Identifier(table_name)),

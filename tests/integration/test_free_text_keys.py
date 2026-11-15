@@ -317,8 +317,9 @@ CREATE TABLE graph.credited_to (
     PRIMARY KEY (release_id, company_id, role, source)
 );
 CREATE INDEX credited_to_reverse ON graph.credited_to (company_id, release_id);
-DROP INDEX public.idx_artists_name, public.idx_labels_name, public.idx_masters_title, public.idx_releases_title;
-DROP INDEX musicbrainz.idx_mb_artists_name, musicbrainz.idx_mb_labels_name;
+-- A fresh init no longer builds these six (gm-database-schema-zd7u), so the drop is IF EXISTS.
+DROP INDEX IF EXISTS public.idx_artists_name, public.idx_labels_name, public.idx_masters_title, public.idx_releases_title;
+DROP INDEX IF EXISTS musicbrainz.idx_mb_artists_name, musicbrainz.idx_mb_labels_name;
 CREATE INDEX idx_artists_name ON public.artists ((data->>'name'));
 CREATE INDEX idx_labels_name ON public.labels ((data->>'name'));
 CREATE INDEX idx_masters_title ON public.masters ((data->>'title'));
@@ -360,15 +361,6 @@ async def _key_definition(dbname: str, index: str) -> str:
     return str(rows[0][0])
 
 
-async def _index_method(dbname: str, index: str) -> str:
-    rows = await _rows(
-        dbname,
-        "SELECT method.amname FROM pg_class AS relation JOIN pg_am AS method ON method.oid = relation.relam WHERE relation.oid = to_regclass(%s)",
-        (index,),
-    )
-    return str(rows[0][0])
-
-
 async def test_an_existing_database_upgrades_in_place_and_converges(database: str) -> None:
     fresh = await _key_shape(database)
     async with await psycopg.AsyncConnection.connect(**_params(database), autocommit=True) as connection:
@@ -390,8 +382,10 @@ async def test_an_existing_database_upgrades_in_place_and_converges(database: st
     # The same indexes a fresh database has, and no table rewrite to get them.
     assert await _key_shape(database) == fresh
     assert await _rows(database, "SELECT pg_relation_filenode('graph.credited_on')") == heap_file
+    # The v0.6.0 btree name and title indexes are gone, not converted: they are retired indexes now
+    # (gm-database-schema-zd7u), and the hash migration that once rebuilt them only clears the way.
     for index in _RETIRED_BTREE_INDEXES:
-        assert await _index_method(database, index) == "hash", index
+        assert await _rows(database, "SELECT to_regclass(%s)", (index,)) == [(None,)], index
     for relation in _FREE_TEXT_KEYS:
         primary_keys = await _rows(database, "SELECT 1 FROM pg_constraint WHERE conrelid = to_regclass(%s) AND contype = 'p'", (f"graph.{relation}",))
         assert primary_keys == [], relation
