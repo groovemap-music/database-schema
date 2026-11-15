@@ -27,7 +27,6 @@ _UNIQUE_KEYS = {
     "identity_ledger_edition_events": ("idx_identity_ledger_edition_events_key", "(edition_id, at, type)"),
     "identity_ledger_edition_parents": ("idx_identity_ledger_edition_parents_key", "(edition_id, work_id)"),
     "identity_ledger_work_summary": ("idx_identity_ledger_work_summary_key", "(event, work_id)"),
-    "identity_ledger_work_summary_day": ("idx_identity_ledger_work_summary_day_key", "(event, day, work_id, prev_day)"),
     "identity_ledger_work_events": ("idx_identity_ledger_work_events_key", "(event, work_id, at)"),
     "identity_ledger_density": ("idx_identity_ledger_density_key", "(kind, month, type, dated_from)"),
 }
@@ -135,26 +134,12 @@ class TestIdentityLedgerStatements:
         assert "'any'::text AS event" in statement
         assert "('reattached', 'promoted', 'reverted')" in statement
 
-    def test_the_day_rollup_chains_each_edition_to_its_previous_day_so_a_window_counts_it_once(self) -> None:
-        statement = _STATEMENTS["identity_ledger_work_summary_day table"]
-        assert "prev_day    DATE NOT NULL" in statement  # -infinity for an edition's first day, never NULL
-        verify = _STATEMENTS["identity_ledger_verify function"]
-        assert "lag(day) OVER (PARTITION BY work_id, edition_id ORDER BY day)" in verify
-        assert "lag(day) OVER (PARTITION BY work_id, edition_id, type ORDER BY day)" in verify
-        assert "'-infinity'::date" in verify
-        assert "(event.at AT TIME ZONE 'UTC')::date" in verify
-        assert "'repaired'" in verify
-
-    def test_the_day_rollup_is_maintained_for_dirty_works_and_rebuilt_whole(self) -> None:
-        for name in ("identity_ledger_maintain function", "identity_ledger_rebuild function"):
-            assert (
-                "INSERT INTO public.identity_ledger_work_summary_day (work_id, event, day, prev_day, editions, first_event, last_event)"
-                in _STATEMENTS[name]
-            )
-        assert (
-            "DELETE FROM public.identity_ledger_work_summary_day AS stored USING pg_temp.ledger_works AS dirty"
-            in _STATEMENTS["identity_ledger_maintain function"]
-        )
+    def test_the_retired_day_rollup_is_dropped_and_no_longer_maintained(self) -> None:
+        assert _STATEMENTS["identity_ledger_work_summary_day table retired"] == "DROP TABLE IF EXISTS public.identity_ledger_work_summary_day"
+        assert "identity_ledger_work_summary_day table" not in _STATEMENTS
+        assert "identity_ledger_work_summary_day" not in IDENTITY_LEDGER_VIEWS
+        for name in ("identity_ledger_maintain function", "identity_ledger_rebuild function", "identity_ledger_verify function"):
+            assert "work_summary_day" not in _STATEMENTS[name], name
 
     def test_the_work_events_chain_each_instant_to_its_neighbours_over_the_whole_work(self) -> None:
         statement = _STATEMENTS["identity_ledger_work_events table"]
@@ -188,7 +173,7 @@ class TestIdentityLedgerStatements:
 
     def test_the_rebuild_request_heals_an_unfilled_work_events_table(self) -> None:
         statement = _STATEMENTS["identity ledger rebuild request for new derived tables"]
-        assert "OR NOT EXISTS (SELECT 1 FROM public.identity_ledger_work_events)" in statement
+        assert "AND NOT EXISTS (SELECT 1 FROM public.identity_ledger_work_events)" in statement
 
     def test_verify_recomputes_every_kind_in_one_statement(self) -> None:
         statement = _STATEMENTS["identity_ledger_verify function"]
