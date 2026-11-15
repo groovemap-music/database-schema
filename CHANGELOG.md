@@ -2,6 +2,16 @@
 
 All notable changes to the GrooveMap database schema will be documented here.
 
+## Unreleased
+
+### Release notes
+
+Schema-init drops 16 indexes that nothing reads, freeing 14.6 GiB (15.7 GB) on lux: the `hash` index on `artists`, `labels`, `masters` and `releases` (4.3 GB); the name and title hash indexes on those four tables and on `musicbrainz.artists` and `musicbrainz.labels` (1.4 GB); the GIN indexes `idx_releases_identifiers`, `idx_releases_companies` and `idx_releases_labels` (5.3 GB); `graph.track_by_artist_reverse` (2.8 GB); `insights.idx_release_rarity_gem` (1.6 GB); and `musicbrainz.idx_mb_links_mbid` (0.4 GB, a left prefix of the unique key). Each had 0 scans on lux and no reader in any consumer repository, including the rarely-run paths; `docs/audits/2026-11-14-unread-index-drops.md` has the per-index evidence and the 68 indexes that stay, with the reason for each. Stop the loaders, then run schema-init: every drop is `DROP INDEX IF EXISTS`, takes its table lock for milliseconds, and a rerun is a no-op. Reload write amplification falls with them; reads that exist today use other indexes (`data_id`, the relation keys). No manual steps. Rollback is the original `CREATE INDEX` plus a rebuild; the statements are in `tests/integration/test_unread_index_drops.py`. All other indexes are unchanged.
+
+### Perf
+
+- **postgres**: drop 16 unread indexes
+
 ## v0.15.1 (2026-11-11)
 
 ### Release notes

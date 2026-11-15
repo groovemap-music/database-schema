@@ -55,14 +55,15 @@ def test_musicbrainz_indexes_defined():
     assert "idx_mb_releases_discogs_id" in index_names
     # idx_mb_rels_source is retired: relationships_natural_key leads with source_mbid.
     assert "idx_mb_rels_source" not in index_names
-    assert "idx_mb_links_mbid" in index_names
+    # idx_mb_links_mbid is retired: it is a left prefix of the unique key.
+    assert dict(_MUSICBRAINZ_INDEXES)["idx_mb_links_mbid"] == "DROP INDEX IF EXISTS musicbrainz.idx_mb_links_mbid"
     assert "idx_mb_rels_updated_at" in index_names
     assert "idx_mb_links_updated_at" in index_names
 
 
 def test_musicbrainz_indexes_use_if_not_exists():
     for name, sql in _MUSICBRAINZ_INDEXES:
-        assert "IF NOT EXISTS" in sql, f"{name} missing IF NOT EXISTS"
+        assert "IF NOT EXISTS" in sql or sql.startswith("DROP INDEX IF EXISTS "), f"{name} missing IF NOT EXISTS"
 
 
 def test_relationships_has_no_natural_key_constraint_and_one_hash_key():

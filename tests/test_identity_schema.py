@@ -396,7 +396,7 @@ _GRAPH_STATEMENT_NAMES = frozenset(
         "graph.track_credited_on_role_category index",
         "graph.track_credited_on.release_id n_distinct",
         "graph.track_by_artist table",
-        "graph.track_by_artist_reverse index",
+        "graph.track_by_artist_reverse retirement",
         "graph.credited_to table",
         "graph.credited_to_key index",
         "graph.credited_to_company_id_hash index",
