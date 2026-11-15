@@ -322,40 +322,12 @@ An *edition* is a release-kind item resolved one hop through an open supersessio
   every event type, and one per work and event type. `repaired_editions` counts editions with a
   `reattached`, `promoted`, or `reverted` event. Unique on `(event, work_id)`, and indexed on
   `(event, last_event DESC, work_id)` for the page and on `(work_id)` for the refresh.
-- `identity_ledger_work_summary_day (work_id, event, day, prev_day, editions, first_event,
-  last_event)` — the works list's rollup per UTC day, for windows of full days (what the route
-  groups from the events otherwise: 2.09M events joined to 2.44M parents, 2.5 s on lux). `event`
-  is `'any'`, an event type, or the pseudo filter `'repaired'` (reattached, promoted, or
-  reverted). `editions` counts the work's editions with an event of that filter on that day.
-  `prev_day` is that edition's previous day with an event of the same filter, `-infinity` for
-  its first, so the key `(event, day, work_id, prev_day)` has no NULL. Indexed on `(work_id)`
-  for the refresh.
-
-  **Window rule.** The works list counts *distinct* editions in a window, so adding the days
-  would count an edition once per day it has events. For full UTC days `[a, b]`, per work and
-  event filter `F`:
-
-  - `evented_editions` = `sum(editions)` over `event = F`, `day` in `[a, b]`, and
-    `prev_day < a`. An edition counts once, at its first day in the window.
-  - `repaired_editions` = the same sum over `event = 'repaired'` when `F` is `'any'`; `editions`
-    itself when `F` is a repair type; `0` otherwise.
-  - `first_event` and `last_event` = `min(first_event)` and `max(last_event)` over every row of
-    `event = F` with `day` in `[a, b]`, whatever `prev_day` is.
-
-  A window with partial edge days reads the full days from here and the edge days from
-  `identity_ledger_edition_events`, and must count an edition with events in both once.
-  The integration suite holds the rule to a direct `GROUP BY` over the events for every window
-  over the fixture's days and every filter, with an edition whose events fall on two days.
-  The refresh adds this table to the same transaction: it replaces the dirty works' rows, and a
-  rebuild recomputes all of it. Its added cost is measured in CI (see the 9dcd bead).
-
-  **Upgrading a populated ledger.** Maintenance rewrites only the works that changed, so schema
-  init requests one rebuild (`identity_ledger_request_rebuild()`'s own insert) when the ledger
-  has been refreshed and a derived table is missing, or when this rollup is empty beside a filled
-  `identity_ledger_work_summary` (what v0.11.0 left on an upgraded database). The next
-  `identity_ledger_refresh()` then recomputes all of it, which takes as long as a full rebuild
-  (a refresh averages about 354 s on lux). A fresh database and a rerun request nothing. A later
-  derived table is covered by the same guard once it is in `IDENTITY_LEDGER_VIEWS`.
+- `identity_ledger_work_summary_day` — **retired** (gm-database-schema-ahg8). It was the works
+  list's rollup per UTC day, for windows of full days. catalog-api v0.15.2 reads
+  `identity_ledger_work_events` (below) instead, so schema-init runs `DROP TABLE IF EXISTS` on it,
+  which takes its two indexes along. A rebuild and a refresh no longer fill it, `identity_ledger_verify()`
+  no longer recomputes it, and the rebuild request no longer checks it, so the upgrade requests no
+  rebuild. On lux it held 5.2M rows and 796 MB, and its fill was about 50 s of each full rebuild.
 - `identity_ledger_work_events (event, work_id, at, prev_at, next_at)` — the works list in a
   `[since, until)` window (gm-database-schema-xq8r). One row per work, event filter, and distinct
   instant at which any of the work's editions has an event of that filter. `event` is `'any'` or
@@ -364,7 +336,7 @@ An *edition* is a release-kind item resolved one hop through an open supersessio
   last. Unique on `(event, work_id, at)`, and indexed on `(event, at DESC, work_id) INCLUDE
   (prev_at, next_at)` for both reads.
 
-  The day rollup cannot answer a window cheaply: it is keyed per edition, so the window's
+  The retired day rollup could not answer a window cheaply: it is keyed per edition, so the window's
   `count(DISTINCT work)` and each work's last event in it group every row in range per work (8.1 s
   on lux, 4.6 s from the raw events, against a 2 s budget). Here each work has exactly one row in a
   window with `prev_at` before it, and exactly one with `next_at` after it:
@@ -387,7 +359,7 @@ An *edition* is a release-kind item resolved one hop through an open supersessio
 
   **Measured.** On lux, read-only, the fill's `SELECT` returns 5,183,076 rows (2,469,689 `'any'`)
   in 9.8 s. Locally on PostgreSQL 18 with 2.09M events and 2.44M parents (5.1M rows), a rebuild's
-  insert takes 34 s, against 60 s for `work_summary` and 50 s for `work_summary_day`. Nearly all of
+  insert takes 34 s, against 60 s for `work_summary` and 50 s for the since-retired `work_summary_day`. Nearly all of
   it is index maintenance: 4.8 s with no index. A first shape with a separate `(event, at)
   INCLUDE (prev_at)` index for the total took 49 to 53 s and 1,510 MB, against 34 s and 1,073 MB
   for one index. A refresh with 1,000 dirty works adds 60 to 95 ms; with 20,000, 1.8 to 2.0 s, where
