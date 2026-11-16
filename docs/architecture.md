@@ -1546,8 +1546,8 @@ PostgreSQL gained `idx_releases_identifiers` on `data->'identifiers'` and
 queries over the two blocks. No such query was ever written: exact barcode and catalogue-number lookup
 resolves through `provider_aliases` (see Identity above), and every other read of the blocks goes by
 `data_id`. Both indexes, and `idx_releases_labels`, are retired and schema-init drops them
-(see [Unread indexes retired](#unread-indexes-retired)). `idx_releases_genres` and
-`idx_releases_media_families` stay.
+(see [Unread indexes retired](#unread-indexes-retired)). So are `idx_releases_genres` and
+`idx_releases_media_families`: the search filters read `public.release_search`.
 
 Neo4j gains `Company` — one manufacturing, mastering, or distribution credit party, unique on
 `id` (the `company_id` constraint) — alongside the existing Artist, Label, Master, Release,
@@ -2014,9 +2014,10 @@ The six name-keyed vertex relations are tables because their views were the most
 relations in the schema and could not carry an index. Each was a `SELECT DISTINCT` over a full
 unnest of every release and every master to yield a few hundred rows, which is why a scan of
 `masters` appeared in the label DNA plan even though that query has nothing to do with
-masters. `graph.genre`, `graph.style`, and `graph.person` also carry a `GIN` trigram index on
+masters. `graph.genre` and `graph.style` also carry a `GIN` trigram index on
 `name`, which the six full-text query functions the coverage spike found need and which a view
-cannot carry at all. The extension is created by the initializer and each index is guarded on
+cannot carry at all. `graph.person` had one too, retired with the PostgreSQL graph read (see
+[Keys over free text](#keys-over-free-text)). The extension is created by the initializer and each index is guarded on
 it actually being present, so a deployment whose role cannot create an extension loses trigram
 search rather than the schema.
 
@@ -2054,8 +2055,8 @@ because the ported Cypher enters these edges from the target end as often as fro
 A table indexed one way only reproduces the exact failure the views had. "Reverse index" is
 that second index; the primary key is the key column set in the column before it. The four
 edge relations keyed on free text have no primary key. The UNIQUE index that replaces it serves
-the walk from the release or artist, a hash index serves `same_as` and `credited_to` from the
-other end, and the two credit relations have no second index, as
+the walk from the release or artist, a hash index serves `same_as` from the other end, and
+`credited_to` and the two credit relations have no second index, as
 [Keys over free text](#keys-over-free-text) sets out.
 
 | Neo4j relationship | Relation | Shape | Key columns | Reverse index | Source → target | Source |
@@ -2371,14 +2372,14 @@ The length is what keeps `('ab', 'c')` and `('a', 'bc')` apart: without it the t
 key, and `ON CONFLICT DO NOTHING` would drop the second in silence. The function is one
 expression, so the planner inlines it.
 
-| Relation | Unique key (`<relation>_key`) | Hash index (`<relation>_<column>_hash`) |
-| --- | --- | --- |
-| `graph.person` | `text_key(name)` | `name` |
-| `graph.company` | `text_key(company_id)` | `company_id` |
-| `graph.credited_on` | `release_id, credit_key(person_name, role)` | none |
-| `graph.same_as` | `artist_id, text_key(person_name)` | `person_name` |
-| `graph.track_credited_on` | `release_id, track_ordinal, sub_track_ordinal, credit_key(person_name, role)` | none |
-| `graph.credited_to` | `release_id, text_key(company_id), role, source` | `company_id` |
+| Relation | Unique key (`<relation>_key`) | Hash index (`<relation>_<column>_hash`) | NOT NULL restored by the migration |
+| --- | --- | --- | --- |
+| `graph.person` | `text_key(name)` | none (retired) | `name` |
+| `graph.company` | `text_key(company_id)` | none (retired) | `company_id` |
+| `graph.credited_on` | `release_id, credit_key(person_name, role)` | none | none: declared by the table |
+| `graph.same_as` | `artist_id, text_key(person_name)` | `person_name` | `person_name` |
+| `graph.track_credited_on` | `release_id, track_ordinal, sub_track_ordinal, credit_key(person_name, role)` | none | none: declared by the table |
+| `graph.credited_to` | `release_id, text_key(company_id), role, source` | none (retired) | `company_id` |
 
 The natural keys are unchanged: the same rows are the same row and two rows that differed still
 do. A primary key cannot hold an expression, so these six relations have a unique index instead.
@@ -2394,9 +2395,26 @@ repeated a million times cost 906 µs an insert against a btree's 6.7 µs, and `
 for about 386,000 track credits. `same_as` keeps its index, because the embedding pipeline's join
 reads it.
 
+**The person, company and `credited_to` lookups are retired with the PostgreSQL graph read**
+(gm-database-schema-ntr5). `person_name_hash`, `company_company_id_hash`, `credited_to_company_id_hash`
+and the trigram index `person_name_trgm` were built for a planned PostgreSQL read of person and company.
+That read went away when `catalog-api` removed its PostgreSQL graph backend in October 2026 (see
+[SQL/PGQ removal](#sqlpgq-removal)): person and company reads, autocomplete included, run on Neo4j. On
+lux on 2026-11-16 none of the four had been scanned since the statistics were created, and no repository
+reads these columns by `=`, `LIKE` or similarity: the loaders delete `credited_to` by `release_id` and
+`source`, which leads the unique key, and every writer's `ON CONFLICT` uses `<relation>_key`. Dropping
+them frees 2.12 GB (1.97 GiB) on lux: `credited_to_company_id_hash` 1,405 MB, `person_name_trgm` 357 MB,
+`person_name_hash` 306 MB, `company_company_id_hash` 51 MB. Each keeps its statement's place as
+`DROP INDEX IF EXISTS` (see [Unread indexes retired](#unread-indexes-retired)). The NOT NULL these columns
+lost with the old primary key does not depend on the index: each `_FREE_TEXT_KEYS` entry declares its
+lookup index and its NOT NULL restoration separately, so a database upgraded from the primary-key shape
+still gets `person.name`, `company.company_id` and `credited_to.company_id` back as NOT NULL, with no
+lookup index built.
+
 `credited_on_role_category` moves from `(role_category, person_name)` to
-`(role_category, release_id)` for the same reason. The trigram index on `graph.person.name` needs
-no change: `pg_trgm` stores three-byte trigrams, not the value.
+`(role_category, release_id)` for the same reason. The trigram index on `graph.person.name` needed
+no change for the key, since `pg_trgm` stores three-byte trigrams, not the value. It is retired with
+the person lookup (above).
 
 **Writers change nothing.** Every loader statement names its columns and uses a target-less
 `ON CONFLICT DO NOTHING`, which fires on any unique index, so `discogs-sql-loader`'s
@@ -2462,7 +2480,7 @@ Every btree index in the schema with a text member was read from `pg_index` on a
 | `graph.media_family.name`, `graph.medium.medium_id`, `graph.issued_on.medium_id` | Safe: rendered from the media taxonomy, a closed list. |
 | Every `*_id`, `graph.vertex_degree.key`, `data_id` | Safe: numeric ids, or the closed vocabularies above for a genre or style vertex. |
 | `role_category`, `source`, `relationship_type`, `kind`, `status` | Safe: closed vocabularies or literals this schema or its writers state. |
-| `idx_releases_country`, `idx_masters_year`, `idx_releases_year` | Safe: a closed country list and a date fragment. |
+| `idx_releases_country`, `idx_masters_year`, `idx_releases_year` | Safe: a closed country list and a date fragment. The two year indexes are retired since (gm-database-schema-ntr5). |
 | `public.provider_aliases.external_id` | **Measured, and left a btree**: the longest real value is 758 bytes. See [the two keys that stay btrees](#the-two-keys-that-stay-btrees). |
 | `musicbrainz.external_links.url` | **Measured, and left a btree**: MusicBrainz's own unique index bounds it, and the largest real URL stores at 2,252 bytes. Same section. |
 | `Person.name` in Neo4j | Not this limit. The `person_name` constraint's RANGE index took 8,160 bytes and refused 12,000 on the integration image, against values Neo4j does not compress. |
@@ -2673,14 +2691,14 @@ The length is what keeps `('ab', 'c')` and `('a', 'bc')` apart: without it the t
 key, and `ON CONFLICT DO NOTHING` would drop the second in silence. The function is one
 expression, so the planner inlines it.
 
-| Relation | Unique key (`<relation>_key`) | Hash index (`<relation>_<column>_hash`) |
-| --- | --- | --- |
-| `graph.person` | `text_key(name)` | `name` |
-| `graph.company` | `text_key(company_id)` | `company_id` |
-| `graph.credited_on` | `release_id, credit_key(person_name, role)` | none |
-| `graph.same_as` | `artist_id, text_key(person_name)` | `person_name` |
-| `graph.track_credited_on` | `release_id, track_ordinal, sub_track_ordinal, credit_key(person_name, role)` | none |
-| `graph.credited_to` | `release_id, text_key(company_id), role, source` | `company_id` |
+| Relation | Unique key (`<relation>_key`) | Hash index (`<relation>_<column>_hash`) | NOT NULL restored by the migration |
+| --- | --- | --- | --- |
+| `graph.person` | `text_key(name)` | none (retired) | `name` |
+| `graph.company` | `text_key(company_id)` | none (retired) | `company_id` |
+| `graph.credited_on` | `release_id, credit_key(person_name, role)` | none | none: declared by the table |
+| `graph.same_as` | `artist_id, text_key(person_name)` | `person_name` | `person_name` |
+| `graph.track_credited_on` | `release_id, track_ordinal, sub_track_ordinal, credit_key(person_name, role)` | none | none: declared by the table |
+| `graph.credited_to` | `release_id, text_key(company_id), role, source` | none (retired) | `company_id` |
 
 The natural keys are unchanged: the same rows are the same row and two rows that differed still
 do. A primary key cannot hold an expression, so these six relations have a unique index instead.
@@ -2696,9 +2714,26 @@ repeated a million times cost 906 µs an insert against a btree's 6.7 µs, and `
 for about 386,000 track credits. `same_as` keeps its index, because the embedding pipeline's join
 reads it.
 
+**The person, company and `credited_to` lookups are retired with the PostgreSQL graph read**
+(gm-database-schema-ntr5). `person_name_hash`, `company_company_id_hash`, `credited_to_company_id_hash`
+and the trigram index `person_name_trgm` were built for a planned PostgreSQL read of person and company.
+That read went away when `catalog-api` removed its PostgreSQL graph backend in October 2026 (see
+[SQL/PGQ removal](#sqlpgq-removal)): person and company reads, autocomplete included, run on Neo4j. On
+lux on 2026-11-16 none of the four had been scanned since the statistics were created, and no repository
+reads these columns by `=`, `LIKE` or similarity: the loaders delete `credited_to` by `release_id` and
+`source`, which leads the unique key, and every writer's `ON CONFLICT` uses `<relation>_key`. Dropping
+them frees 2.12 GB (1.97 GiB) on lux: `credited_to_company_id_hash` 1,405 MB, `person_name_trgm` 357 MB,
+`person_name_hash` 306 MB, `company_company_id_hash` 51 MB. Each keeps its statement's place as
+`DROP INDEX IF EXISTS` (see [Unread indexes retired](#unread-indexes-retired)). The NOT NULL these columns
+lost with the old primary key does not depend on the index: each `_FREE_TEXT_KEYS` entry declares its
+lookup index and its NOT NULL restoration separately, so a database upgraded from the primary-key shape
+still gets `person.name`, `company.company_id` and `credited_to.company_id` back as NOT NULL, with no
+lookup index built.
+
 `credited_on_role_category` moves from `(role_category, person_name)` to
-`(role_category, release_id)` for the same reason. The trigram index on `graph.person.name` needs
-no change: `pg_trgm` stores three-byte trigrams, not the value.
+`(role_category, release_id)` for the same reason. The trigram index on `graph.person.name` needed
+no change for the key, since `pg_trgm` stores three-byte trigrams, not the value. It is retired with
+the person lookup (above).
 
 **Writers change nothing.** Every loader statement names its columns and uses a target-less
 `ON CONFLICT DO NOTHING`, which fires on any unique index, so `discogs-sql-loader`'s
@@ -2764,7 +2799,7 @@ Every btree index in the schema with a text member was read from `pg_index` on a
 | `graph.media_family.name`, `graph.medium.medium_id`, `graph.issued_on.medium_id` | Safe: rendered from the media taxonomy, a closed list. |
 | Every `*_id`, `graph.vertex_degree.key`, `data_id` | Safe: numeric ids, or the closed vocabularies above for a genre or style vertex. |
 | `role_category`, `source`, `relationship_type`, `kind`, `status` | Safe: closed vocabularies or literals this schema or its writers state. |
-| `idx_releases_country`, `idx_masters_year`, `idx_releases_year` | Safe: a closed country list and a date fragment. |
+| `idx_releases_country`, `idx_masters_year`, `idx_releases_year` | Safe: a closed country list and a date fragment. The two year indexes are retired since (gm-database-schema-ntr5). |
 | `public.provider_aliases.external_id` | **Measured, and left a btree**: the longest real value is 758 bytes. See [the two keys that stay btrees](#the-two-keys-that-stay-btrees). |
 | `musicbrainz.external_links.url` | **Measured, and left a btree**: MusicBrainz's own unique index bounds it, and the largest real URL stores at 2,252 bytes. Same section. |
 | `Person.name` in Neo4j | Not this limit. The `person_name` constraint's RANGE index took 8,160 bytes and refused 12,000 on the integration image, against values Neo4j does not compress. |
@@ -4009,3 +4044,16 @@ and a rerun takes no lock. They are not `CONCURRENTLY`, which cannot run in a tr
 its table lock for milliseconds, within the init's `lock_timeout`. Run schema-init with the loaders stopped.
 Rollback is the original `CREATE INDEX` (kept in `tests/integration/test_unread_index_drops.py`) and a rebuild.
 `idx_*_gm_item_id` on the entity tables stay: `catalog-api`'s merge recompute probes them.
+
+A second pass (gm-database-schema-ntr5) retires eight more, about 2.35 GB (2.19 GiB) on lux, measured
+2026-11-16:
+
+- The free-text key lookups `graph.credited_to_company_id_hash`, `graph.person_name_trgm`,
+  `graph.person_name_hash` and `graph.company_company_id_hash`, 2.12 GB. They were built for the PostgreSQL
+  read of person and company that went away with `catalog-api`'s PostgreSQL graph backend. The free-text key
+  migration still restores those columns' NOT NULL (see [Keys over free text](#keys-over-free-text)).
+  `graph.same_as_person_name_hash` stays: the embedding pipeline joins the credits to `same_as` by name.
+- The search filter indexes `idx_releases_year`, `idx_masters_year`, `idx_releases_genres` and
+  `idx_releases_media_families`, 232 MB (gm-catalog-api-q6fy). `catalog-api`'s release filters read
+  `public.release_search`, its year filter casts to `int`, and its master branch filters `master_search`,
+  so no query reaches them. `idx_releases_country` stays.

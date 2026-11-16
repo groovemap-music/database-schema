@@ -28,20 +28,14 @@ class TestReleasesMediaColumn:
         stmts = dict(_SPECIFIC_INDEXES)
         assert "IF NOT EXISTS" in stmts["releases add media column"]
 
-    def test_media_families_gin_index_defined(self) -> None:
-        names = [name for name, _stmt in _SPECIFIC_INDEXES]
-        assert "idx_releases_media_families" in names
-
-    def test_media_families_gin_index_shape(self) -> None:
-        stmt = dict(_SPECIFIC_INDEXES)["idx_releases_media_families"]
-        assert "ON releases USING GIN" in stmt
-        assert "media->'families'" in stmt
-        assert "IF NOT EXISTS" in stmt
-
-    def test_media_column_precedes_its_index(self) -> None:
-        """The ALTER must run before the GIN index that reads the new column."""
+    def test_media_families_gin_index_keeps_its_slot(self) -> None:
+        """The statement name stays, after the column, because the identity snapshot pins it."""
         names = [name for name, _stmt in _SPECIFIC_INDEXES]
         assert names.index("releases add media column") < names.index("idx_releases_media_families")
+
+    def test_media_families_gin_index_is_retired(self) -> None:
+        """The media filter reads `release_search.media_families`; nothing reached this index (gm-database-schema-ntr5)."""
+        assert dict(_SPECIFIC_INDEXES)["idx_releases_media_families"] == "DROP INDEX IF EXISTS public.idx_releases_media_families"
 
 
 class TestMusicBrainzReleasesMediaColumn:

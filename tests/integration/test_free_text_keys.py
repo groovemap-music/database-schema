@@ -246,7 +246,11 @@ async def _plan(dbname: str, query: str, *, setting: str | None = None) -> str:
 
 
 async def test_lookups_by_name_stay_on_an_index(database: str) -> None:
-    """A consumer's query names the column; nothing has to hash its parameter."""
+    """A consumer's query names the column; nothing has to hash its parameter.
+
+    `same_as` is the one relation a consumer reads by its free-text column. The person, company and
+    credited_to lookups are retired (gm-database-schema-ntr5), and a fresh database never builds them.
+    """
     await _rows(
         database,
         """
@@ -269,15 +273,15 @@ async def test_lookups_by_name_stay_on_an_index(database: str) -> None:
     await _rows(database, "ANALYZE graph.credited_on")
     await _rows(database, "ANALYZE graph.same_as")
 
-    assert "person_name_hash" in await _plan(database, "SELECT name FROM graph.person WHERE name = 'Person 42'")
+    for retired in ("person_name_hash", "person_name_trgm", "company_company_id_hash", "credited_to_company_id_hash"):
+        assert await _rows(database, "SELECT to_regclass(%s)", (f"graph.{retired}",)) == [(None,)], retired
+    assert "person_key" in await _plan(database, "SELECT name FROM graph.person WHERE graph.text_key(name) = graph.text_key('Person 42')")
     assert await _rows(database, "SELECT to_regclass('graph.credited_on_person_name_hash')") == [(None,)]
     assert await _rows(database, "SELECT to_regclass('graph.track_credited_on_person_name_hash')") == [(None,)]
     assert "same_as_person_name_hash" in await _plan(database, "SELECT artist_id FROM graph.same_as WHERE person_name = 'Person 42'")
     assert "credited_on_key" in await _plan(database, "SELECT person_name FROM graph.credited_on WHERE release_id = '7'")
     assert "same_as_key" in await _plan(database, "SELECT person_name FROM graph.same_as WHERE artist_id = '7'")
-    # A table this small is cheaper to scan, so the planner is asked for the index it can use.
-    trigram_plan = await _plan(database, "SELECT name FROM graph.person WHERE name ILIKE '%erson 4242%'", setting="SET enable_seqscan = off")
-    assert "person_name_trgm" in trigram_plan
+    # With no trigram index a substring match is a scan, and still finds the whole long name.
     assert await _rows(database, "SELECT count(*) FROM graph.person WHERE name ILIKE %s", (f"%{LONG_NAME[-40:]}%",)) == [(1,)]
 
 
@@ -389,13 +393,23 @@ async def test_an_existing_database_upgrades_in_place_and_converges(database: st
     for relation in _FREE_TEXT_KEYS:
         primary_keys = await _rows(database, "SELECT 1 FROM pg_constraint WHERE conrelid = to_regclass(%s) AND contype = 'p'", (f"graph.{relation}",))
         assert primary_keys == [], relation
-    required = await _rows(
-        database,
-        "SELECT attname, attnotnull FROM pg_attribute WHERE attrelid IN ('graph.person'::regclass, 'graph.company'::regclass) "
-        "AND attname IN ('name', 'company_id') ORDER BY 1, 2",
-    )
-    assert ("company_id", True) in required
-    assert ("name", True) in required
+    # Each column that was NOT NULL through the primary key has it back, and none of them a lookup
+    # index: the migration restores the constraint without building the retired index.
+    for relation, entry in _FREE_TEXT_KEYS.items():
+        if entry.not_null is None:
+            continue
+        required = await _rows(
+            database,
+            "SELECT attnotnull FROM pg_attribute WHERE attrelid = to_regclass(%s) AND attname = %s",
+            (f"graph.{relation}", entry.not_null),
+        )
+        assert required == [(True,)], relation
+        lookup = await _rows(database, "SELECT to_regclass(%s)", (f"graph.{relation}_{entry.not_null}_hash",))
+        assert (lookup != [(None,)]) == (entry.lookup is not None), relation
+    with pytest.raises(psycopg.errors.NotNullViolation):
+        await _rows(database, "INSERT INTO graph.person (name) VALUES (NULL)")
+    with pytest.raises(psycopg.errors.NotNullViolation):
+        await _rows(database, "INSERT INTO graph.company (company_id) VALUES (NULL)")
     credit_columns = await _rows(
         database,
         "SELECT bool_and(attnotnull) FROM pg_attribute WHERE attrelid IN ('graph.credited_on'::regclass, 'graph.track_credited_on'::regclass) "
@@ -418,6 +432,11 @@ async def test_an_existing_database_upgrades_in_place_and_converges(database: st
     # A second apply finds nothing left to do.
     await _apply_schema(database)
     assert await _key_shape(database) == fresh
+    # The unique keys themselves are what they were before the lookups were retired.
+    for relation in ("person", "company", "credited_to"):
+        assert await _key_definition(database, f"{relation}_key") == (
+            f"CREATE UNIQUE INDEX {relation}_key ON graph.{relation} USING btree ({_FREE_TEXT_KEYS[relation].key})"
+        ), relation
     assert await _rows(database, "SELECT count(*) FROM graph.credited_on") == [(2,)]
 
 

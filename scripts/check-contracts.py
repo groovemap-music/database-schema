@@ -718,9 +718,10 @@ assert free_text_keys["function"] in graph["functions"]
 assert free_text_keys["credit_key_function"] in graph["functions"]
 assert sorted(free_text_keys["relations"]) == sorted(_FREE_TEXT_KEYS)
 for relation, recorded in free_text_keys["relations"].items():
-    key, lookup, _stale = _FREE_TEXT_KEYS[relation]
-    assert recorded["key"] == free_text_key_columns(key), relation
-    assert recorded["lookup"] == lookup, relation
+    entry = _FREE_TEXT_KEYS[relation]
+    assert recorded["key"] == free_text_key_columns(entry.key), relation
+    assert recorded["lookup"] == entry.lookup, relation
+    assert recorded["not_null_restored"] == entry.not_null, relation
 
 # Every vertex key is a published column now, not an appended restatement. The
 # contract records the retirement; this is what proves it happened.
@@ -746,7 +747,7 @@ def table_key(relation: str, statement: str, columns: dict[str, str]) -> list[st
     """Return the key columns of one `CREATE TABLE` body, or of its free-text unique index."""
     free_text_key = _FREE_TEXT_KEYS.get(relation.removeprefix("graph."))
     if free_text_key:
-        return free_text_key_columns(free_text_key[0])
+        return free_text_key_columns(free_text_key.key)
     composite = re.search(r"PRIMARY KEY \(([^)]*)\)", statement)
     if composite:
         return [name.strip() for name in composite.group(1).split(",")]

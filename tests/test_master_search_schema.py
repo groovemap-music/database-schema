@@ -56,7 +56,8 @@ class TestTheValues:
         """Verbatim text: catalog-api's `year::int` filter and decade regex apply to it unchanged."""
         assert MASTER_YEAR == "data->>'year'"
         assert _master_year("n") == "n.data->>'year'"
-        assert f"ON masters (({MASTER_YEAR}))" in dict(_SPECIFIC_INDEXES)["idx_masters_year"]
+        # `idx_masters_year` over the same expression is retired: the `::int` cast never matched it.
+        assert dict(_SPECIFIC_INDEXES)["idx_masters_year"] == "DROP INDEX IF EXISTS public.idx_masters_year"
 
     def test_every_writer_computes_both_expressions_over_one_row(self) -> None:
         for name in (

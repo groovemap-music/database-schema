@@ -135,9 +135,10 @@ class TestSpecificIndexes:
         for table in _ENTITY_TABLES:
             assert table in index_tables, f"No specific indexes for table '{table}'"
 
-    def test_releases_has_gin_indexes(self) -> None:
+    def test_releases_keeps_only_its_full_text_gin_index(self) -> None:
+        """The genre and media GIN indexes are retired (gm-database-schema-ntr5); the search reads `release_search`."""
         release_gin = [n for n, s in _SPECIFIC_INDEXES if "releases" in s and "GIN" in s]
-        assert len(release_gin) >= 2
+        assert release_gin == ["idx_releases_fts"]
 
     def test_fts_gin_indexes_defined(self) -> None:
         """All four entity tables must have a GIN FTS index."""

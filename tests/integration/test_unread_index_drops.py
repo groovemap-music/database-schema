@@ -44,6 +44,15 @@ _PREVIOUS_RELEASE: dict[str, str] = {
     "musicbrainz.idx_mb_labels_name": "CREATE INDEX idx_mb_labels_name ON musicbrainz.labels USING hash (name)",
     "musicbrainz.idx_mb_links_mbid": "CREATE INDEX idx_mb_links_mbid ON musicbrainz.external_links (mbid)",
     "graph.track_by_artist_reverse": "CREATE INDEX track_by_artist_reverse ON graph.track_by_artist (artist_id, release_id, track_ordinal, sub_track_ordinal)",
+    # gm-database-schema-ntr5
+    "graph.credited_to_company_id_hash": "CREATE INDEX credited_to_company_id_hash ON graph.credited_to USING hash (company_id)",
+    "graph.person_name_trgm": "CREATE INDEX person_name_trgm ON graph.person USING gin (name gin_trgm_ops)",
+    "graph.person_name_hash": "CREATE INDEX person_name_hash ON graph.person USING hash (name)",
+    "graph.company_company_id_hash": "CREATE INDEX company_company_id_hash ON graph.company USING hash (company_id)",
+    "public.idx_releases_year": "CREATE INDEX idx_releases_year ON public.releases ((data->>'year'))",
+    "public.idx_masters_year": "CREATE INDEX idx_masters_year ON public.masters ((data->>'year'))",
+    "public.idx_releases_genres": "CREATE INDEX idx_releases_genres ON public.releases USING GIN ((data->'genres'))",
+    "public.idx_releases_media_families": "CREATE INDEX idx_releases_media_families ON public.releases USING GIN ((media->'families'))",
 }
 
 # Indexes that look like these but have a reader or a documented rare path, and must survive.
@@ -53,14 +62,12 @@ _KEPT = (
     "public.idx_masters_gm_item_id",
     "public.idx_labels_gm_item_id",
     "public.idx_releases_country",
-    "public.idx_releases_year",
-    "public.idx_masters_year",
-    "public.idx_releases_genres",
-    "public.idx_releases_media_families",
     "insights.idx_release_rarity_artist_ids",  # documented containment route, deploy-gated
     "graph.by_artist_reverse",
-    "graph.person_name_hash",
-    "graph.credited_to_company_id_hash",
+    "graph.same_as_person_name_hash",  # the embedding pipeline joins the credits to same_as by name
+    "graph.person_key",  # the unique free-text keys: every loader's ON CONFLICT
+    "graph.company_key",
+    "graph.credited_to_key",
 )
 
 
@@ -144,3 +151,38 @@ async def test_the_reads_that_remain_do_not_need_a_retired_index(database: str) 
     for label, query in plans.items():
         plan = "\n".join(line for (line,) in await _rows(database, "EXPLAIN " + query))
         assert "Index" in plan and "Seq Scan" not in plan, f"{label}: {plan}"
+
+
+async def test_the_free_text_reads_that_remain_use_the_keys_and_the_same_as_lookup(database: str) -> None:
+    """gm-database-schema-ntr5: what still reads `person`, `company`, `credited_to` and `same_as`.
+
+    The Discogs loader deletes `credited_to` by `release_id` and `source`, which leads the unique key;
+    every writer's ON CONFLICT probes the `<relation>_key` index; and the embedding pipeline joins the
+    credits to `same_as` by `person_name`, which is the one lookup index that stays.
+    """
+    await _init(database)
+    await _rows(database, "INSERT INTO graph.person (name) SELECT 'Person ' || g FROM generate_series(1, 20000) AS g")
+    await _rows(database, "INSERT INTO graph.company (company_id, name) SELECT g::text, 'Company ' || g FROM generate_series(1, 20000) AS g")
+    await _rows(
+        database,
+        """INSERT INTO graph.credited_to (release_id, company_id, role, source)
+           SELECT (g % 5000)::text, (g % 900)::text, 'Pressed By', 'discogs' FROM generate_series(1, 20000) AS g""",
+    )
+    await _rows(
+        database,
+        "INSERT INTO graph.same_as (person_name, artist_id) SELECT 'Person ' || g, g::text FROM generate_series(1, 20000) AS g",
+    )
+    for relation in ("person", "company", "credited_to", "same_as"):
+        await _rows(database, f"ANALYZE graph.{relation}")
+    plans = {
+        "credited_to delete by release": (
+            "credited_to_key",
+            "SELECT 1 FROM graph.credited_to WHERE release_id = ANY(ARRAY['7', '8']) AND source = 'discogs'",
+        ),
+        "person by key": ("person_key", "SELECT 1 FROM graph.person WHERE graph.text_key(name) = graph.text_key('Person 42')"),
+        "company by key": ("company_key", "SELECT 1 FROM graph.company WHERE graph.text_key(company_id) = graph.text_key('42')"),
+        "same_as by name": ("same_as_person_name_hash", "SELECT artist_id FROM graph.same_as WHERE person_name = 'Person 42'"),
+    }
+    for label, (index, query) in plans.items():
+        plan = "\n".join(line for (line,) in await _rows(database, "EXPLAIN " + query))
+        assert index in plan and "Seq Scan" not in plan, f"{label}: {plan}"
