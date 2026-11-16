@@ -616,8 +616,14 @@ async def test_upgrading_from_the_materialized_views_rebuilds_on_the_first_refre
             )
 
             assert await initializer._apply_postgres_schema(params) is True
+            # Public only: `_build_reference` made materialized views of the same names in a scratch
+            # schema, and a name-only match let whichever row the catalog scan met last win the dict.
             relkinds = dict(
-                await _rows(connection, "SELECT relname, relkind::text FROM pg_class WHERE relname = ANY(%s)", (list(IDENTITY_LEDGER_VIEWS),))
+                await _rows(
+                    connection,
+                    "SELECT relname, relkind::text FROM pg_class WHERE relnamespace = 'public'::regnamespace AND relname = ANY(%s)",
+                    (list(IDENTITY_LEDGER_VIEWS),),
+                )
             )
             assert relkinds == dict.fromkeys(IDENTITY_LEDGER_VIEWS, "r")
             assert await _refresh_state(connection) == []
