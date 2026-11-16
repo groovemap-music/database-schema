@@ -22,6 +22,7 @@ from groovemap_schema.postgres import (
     _PATH_RELATIONSHIP_TYPES,
     _REVOKE_DEFINER_EXECUTE_STATEMENT,
     _TEXT_KEY_RETYPES,
+    _UNREAD_INDEX_DROPS,
     _VERTEX_KIND_NAMES,
     _VERTEX_KINDS,
     EXPLORE_DEFAULT_HOPS,
@@ -466,7 +467,7 @@ class TestVertexViews:
             (key,) = VERTEX_KEYS[relation]
             if relation in _FREE_TEXT_KEYS:
                 assert re.search(rf"^\s+{key}\s+text NOT NULL", ddl_for(relation), re.MULTILINE), relation
-                assert f"graph.text_key({key})" in _FREE_TEXT_KEYS[relation][0], relation
+                assert f"graph.text_key({key})" in _FREE_TEXT_KEYS[relation].key, relation
                 continue
             assert re.search(rf"^\s+{key}\s+text PRIMARY KEY", ddl_for(relation), re.MULTILINE), relation
 
@@ -516,10 +517,17 @@ class TestVertexViews:
 
     def test_autocomplete_relations_carry_a_guarded_trigram_index(self) -> None:
         """A view cannot carry an index at all, which is half of why these are tables."""
-        for relation in ("genre", "style", "person"):
+        for relation in ("genre", "style"):
             trigram = [statement for statement in index_statements_for(relation) if "gin_trgm_ops" in statement]
             assert len(trigram) == 1, relation
             assert "WHERE extname = 'pg_trgm'" in trigram[0], relation
+
+    def test_the_person_trigram_index_is_retired_in_its_place(self) -> None:
+        """Person autocomplete is a Neo4j read; the PostgreSQL read it was built for is gone (gm-database-schema-ntr5)."""
+        assert not [statement for statement in index_statements_for("person") if "gin_trgm_ops" in statement]
+        assert GRAPH_STATEMENTS["graph.person_name_trgm retirement"] == "DROP INDEX IF EXISTS graph.person_name_trgm"
+        names = [name for name, _statement in _GRAPH_STATEMENTS]
+        assert names.index("graph.person_key index") < names.index("graph.person_name_trgm retirement") < names.index("graph.media_family table")
 
     def test_the_trigram_extension_is_created_before_the_indexes_that_need_it(self) -> None:
         names = [name for name, _statement in _GRAPH_STATEMENTS]
@@ -606,7 +614,7 @@ class TestEdgeViews:
             if relation in _FREE_TEXT_KEYS:
                 # A free-text key column is hashed; every natural key column is still in it.
                 for key in keys:
-                    assert key in _FREE_TEXT_KEYS[relation][0], (relation, key)
+                    assert key in _FREE_TEXT_KEYS[relation].key, (relation, key)
                 continue
             assert f"PRIMARY KEY ({', '.join(keys)})" in ddl_for(relation), relation
 
@@ -621,7 +629,7 @@ class TestEdgeViews:
                 assert reverse is None, relation
                 indexes = index_statements_for(relation)
                 assert any(statement.startswith(f"CREATE UNIQUE INDEX IF NOT EXISTS {relation}_key") for statement in indexes), relation
-                assert any(" USING hash (" in statement for statement in indexes) == (_FREE_TEXT_KEYS[relation][1] is not None), relation
+                assert any(" USING hash (" in statement for statement in indexes) == (_FREE_TEXT_KEYS[relation].lookup is not None), relation
                 continue
             if reverse is None:  # `track_by_artist`: its reverse index is retired, and nothing may recreate it
                 assert relation == "track_by_artist"
@@ -676,7 +684,7 @@ class TestEdgeViews:
         for relation in ("credited_to", "issued_on"):
             statement = ddl_for(relation)
             assert "source        text NOT NULL" in statement or "source     text NOT NULL" in statement, relation
-            key = _FREE_TEXT_KEYS[relation][0] + ")" if relation in _FREE_TEXT_KEYS else statement
+            key = _FREE_TEXT_KEYS[relation].key + ")" if relation in _FREE_TEXT_KEYS else statement
             assert "source" in key, relation
             assert any(candidate.endswith("(source)") for candidate in index_statements_for(relation)), relation
 
@@ -732,7 +740,7 @@ class TestFreeTextKeys:
     def test_every_free_text_relation_is_keyed_through_the_hash(self) -> None:
         assert set(_FREE_TEXT_KEYS) == set(self.FREE_TEXT_COLUMNS)
         for relation, columns in self.FREE_TEXT_COLUMNS.items():
-            key, _lookup, _stale = _FREE_TEXT_KEYS[relation]
+            key = _FREE_TEXT_KEYS[relation].key
             if relation in _COMBINED_KEY_RELATIONS:
                 assert "graph.credit_key(person_name, role)" in key, relation
                 assert "graph.text_key" not in key, relation
@@ -753,28 +761,49 @@ class TestFreeTextKeys:
                     assert column not in members, (relation, statement)
 
     def test_a_lookup_index_exists_only_where_a_consumer_reads_by_the_column(self) -> None:
-        """`same_as` is read by `person_name`; the two credit relations are not."""
-        for relation, (_key, column, _stale) in _FREE_TEXT_KEYS.items():
+        """`same_as` is read by `person_name`; nothing reads the others by their free-text column."""
+        assert [relation for relation, entry in _FREE_TEXT_KEYS.items() if entry.lookup is not None] == ["same_as"]
+        for relation, entry in _FREE_TEXT_KEYS.items():
             hash_indexes = [statement for statement in index_statements_for(relation) if " USING hash (" in statement]
-            if column is None:
+            if entry.lookup is None:
                 assert hash_indexes == [], relation
                 continue
+            column = entry.lookup
             assert hash_indexes == [f"CREATE INDEX IF NOT EXISTS {relation}_{column}_hash ON graph.{relation} USING hash ({column})"], relation
 
+    def test_a_retired_lookup_keeps_its_place_as_a_guarded_drop(self) -> None:
+        """gm-database-schema-ntr5: the index statement became the drop, in the same slot."""
+        retired = {"person": "name", "company": "company_id", "credited_to": "company_id"}
+        for relation, column in retired.items():
+            name = f"graph.{relation}_{column}_hash"
+            assert name in _UNREAD_INDEX_DROPS, relation
+            assert GRAPH_STATEMENTS[f"{name} retirement"] == f"DROP INDEX IF EXISTS {name}", relation
+            assert f"{name} index" not in GRAPH_STATEMENTS, relation
+            names = [statement_name for statement_name, _statement in _GRAPH_STATEMENTS]
+            assert names.index(f"graph.{relation}_key index") + 1 == names.index(f"{name} retirement"), relation
+        assert "graph.same_as_person_name_hash" not in _UNREAD_INDEX_DROPS
+
+    def test_not_null_restoration_is_declared_apart_from_the_lookup(self) -> None:
+        """Each column that was NOT NULL only through the primary key gets it back, index or not."""
+        restored = {relation: entry.not_null for relation, entry in _FREE_TEXT_KEYS.items() if entry.not_null is not None}
+        assert restored == {"person": "name", "company": "company_id", "same_as": "person_name", "credited_to": "company_id"}
+
     def test_a_free_text_key_migration_is_atomic_and_guarded_on_the_primary_key(self) -> None:
-        for relation, (_key, column, stale) in _FREE_TEXT_KEYS.items():
+        for relation, entry in _FREE_TEXT_KEYS.items():
             statement = GRAPH_STATEMENTS[f"graph.{relation} free-text key migration"]
             assert statement.startswith("DO $"), relation
             assert "constraint_row.contype = 'p'" in statement, relation
             built = statement.index(f"CREATE UNIQUE INDEX IF NOT EXISTS {relation}_key")
             dropped = statement.index("DROP CONSTRAINT")
             assert built < dropped, f"{relation} must never be without a uniqueness rule"
-            if column is None:
+            if entry.not_null is None:
                 assert "SET NOT NULL" not in statement, relation
-                assert "USING hash" not in statement, relation
             else:
-                assert f"ALTER COLUMN {column} SET NOT NULL" in statement, relation
-            for index in stale:
+                restored = statement.index(f"ALTER TABLE graph.{relation} ALTER COLUMN {entry.not_null} SET NOT NULL;")
+                assert restored < dropped, relation
+            # A lookup index is built only where one is declared: a retired lookup is never rebuilt.
+            assert ("USING hash" in statement) == (entry.lookup is not None), relation
+            for index in entry.stale:
                 assert f"DROP INDEX IF EXISTS graph.{index};" in statement, relation
 
     def test_a_two_hash_key_migration_is_atomic_and_guarded_on_the_old_key(self) -> None:
@@ -783,7 +812,7 @@ class TestFreeTextKeys:
             statement = GRAPH_STATEMENTS[f"graph.{relation} two-hash key migration"]
             assert statement.startswith("DO $"), relation
             assert f"pg_get_indexdef(to_regclass('graph.{relation}_key')) LIKE '%text_key(role)%'" in statement, relation
-            built = statement.index(f"CREATE UNIQUE INDEX {relation}_key_combined ON graph.{relation} ({_FREE_TEXT_KEYS[relation][0]})")
+            built = statement.index(f"CREATE UNIQUE INDEX {relation}_key_combined ON graph.{relation} ({_FREE_TEXT_KEYS[relation].key})")
             dropped = statement.index(f"DROP INDEX graph.{relation}_key;")
             renamed = statement.index(f"ALTER INDEX graph.{relation}_key_combined RENAME TO {relation}_key;")
             hash_dropped = statement.index(f"DROP INDEX IF EXISTS graph.{relation}_person_name_hash;")
@@ -851,7 +880,7 @@ class TestTrackCredits:
             statement = ddl_for(relation)
             assert "track_ordinal     bigint NOT NULL" in statement
             assert "sub_track_ordinal bigint NOT NULL" in statement
-            key = _FREE_TEXT_KEYS[relation][0] if relation in _FREE_TEXT_KEYS else statement.split("PRIMARY KEY")[1]
+            key = _FREE_TEXT_KEYS[relation].key if relation in _FREE_TEXT_KEYS else statement.split("PRIMARY KEY")[1]
             assert "track_ordinal" in key and "sub_track_ordinal" in key
             assert "track_position" not in key
 

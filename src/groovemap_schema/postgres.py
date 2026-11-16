@@ -12,7 +12,7 @@ import asyncio
 import logging
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 from common.credit_roles import ROLE_CATEGORIES
 from common.media import medium_ids, medium_label
@@ -55,6 +55,20 @@ _UNREAD_INDEX_DROPS: tuple[str, ...] = (
     "musicbrainz.idx_mb_labels_name",
     "musicbrainz.idx_mb_links_mbid",
     "graph.track_by_artist_reverse",
+    # gm-database-schema-ntr5: the free-text key lookups, built for a PostgreSQL read of person and
+    # company that went away when catalog-api removed its PostgreSQL graph backend (October 2026).
+    # `graph.same_as_person_name_hash` stays: the embedding pipeline joins `same_as` on it.
+    "graph.credited_to_company_id_hash",
+    "graph.person_name_trgm",
+    "graph.person_name_hash",
+    "graph.company_company_id_hash",
+    # gm-database-schema-ntr5 (from gm-catalog-api-q6fy): the search filters read
+    # `public.release_search` and `public.master_search` after the title match, and cast the year
+    # to `int`, so no query reaches these four.
+    "public.idx_releases_year",
+    "public.idx_masters_year",
+    "public.idx_releases_genres",
+    "public.idx_releases_media_families",
 )
 
 
@@ -92,7 +106,7 @@ _SPECIFIC_INDEXES: list[tuple[str, str]] = [
     ),
     (
         "idx_masters_year",
-        "CREATE INDEX IF NOT EXISTS idx_masters_year ON masters ((data->>'year'))",
+        _drop_unread_index("public.idx_masters_year"),
     ),
     # Releases
     (
@@ -101,7 +115,7 @@ _SPECIFIC_INDEXES: list[tuple[str, str]] = [
     ),
     (
         "idx_releases_year",
-        "CREATE INDEX IF NOT EXISTS idx_releases_year ON releases ((data->>'year'))",
+        _drop_unread_index("public.idx_releases_year"),
     ),
     (
         "idx_releases_country",
@@ -109,7 +123,7 @@ _SPECIFIC_INDEXES: list[tuple[str, str]] = [
     ),
     (
         "idx_releases_genres",
-        "CREATE INDEX IF NOT EXISTS idx_releases_genres ON releases USING GIN ((data->'genres'))",
+        _drop_unread_index("public.idx_releases_genres"),
     ),
     (
         "idx_releases_labels",
@@ -127,15 +141,15 @@ _SPECIFIC_INDEXES: list[tuple[str, str]] = [
         "idx_releases_companies",
         _drop_unread_index("public.idx_releases_companies"),
     ),
-    # Canonical media block (ADR 0007) — additive column plus a GIN index on the
-    # sorted family-id list for fast media-family filtering.
+    # Canonical media block (ADR 0007) — additive column. Its GIN index on the family-id list
+    # is retired: the media filter reads `release_search.media_families` instead.
     (
         "releases add media column",
         "ALTER TABLE releases ADD COLUMN IF NOT EXISTS media JSONB",
     ),
     (
         "idx_releases_media_families",
-        "CREATE INDEX IF NOT EXISTS idx_releases_media_families ON releases USING GIN ((media->'families'))",
+        _drop_unread_index("public.idx_releases_media_families"),
     ),
     # Full-text search GIN indexes — used by /api/search
     (
@@ -3650,30 +3664,50 @@ def _trigram_index(relation: str, column: str) -> tuple[str, str]:
 #   that end, and each relation's `<relation>_reverse` index retires into it.
 # - The walk from the free-text end, where a consumer takes it, is a hash index on the
 #   column itself, because `ON same_as.person_name = ...` names the column. A btree over
-#   the hash could only serve a query rewritten to hash its own parameter. The two credit
-#   relations have no such index: no consumer reads them by person, and a hash insert
-#   walks the bucket's overflow chain, so one repeated name costs 906 us an insert at a
-#   million rows against a btree's 6.7. docs/audits/2026-11-04-index-view-function-audit.md
-#   has the measurement.
-#
-# Each entry is the relation, its unique key, the column the hash index covers, if any, and
-# the indexes of the old shape that named that column and so go with the primary key.
-_FREE_TEXT_KEYS: dict[str, tuple[str, str | None, tuple[str, ...]]] = {
-    "person": ("graph.text_key(name)", "name", ()),
-    "company": ("graph.text_key(company_id)", "company_id", ()),
-    "credited_on": (
+#   the hash could only serve a query rewritten to hash its own parameter. Only `same_as`
+#   has one, because the embedding pipeline joins the credits to it by name. The two credit
+#   relations never had one: no consumer reads them by person, and a hash insert walks the
+#   bucket's overflow chain, so one repeated name costs 906 us an insert at a million rows
+#   against a btree's 6.7. docs/audits/2026-11-04-index-view-function-audit.md has the
+#   measurement. `person`, `company` and `credited_to` had one each for a PostgreSQL read
+#   of person and company that went away with catalog-api's PostgreSQL graph backend;
+#   they are retired (`_UNREAD_INDEX_DROPS`, gm-database-schema-ntr5).
+# - A free-text column that was NOT NULL only because the primary key covered it loses the
+#   constraint with the key, so the migration restores it. That is separate from the
+#   lookup index: `person.name`, `company.company_id` and `credited_to.company_id` get
+#   their NOT NULL back and no index.
+class _FreeTextKey(NamedTuple):
+    """One relation keyed over free text."""
+
+    key: str
+    """The members of the unique `<relation>_key` index."""
+    lookup: str | None
+    """The column a hash index answers `=` on, or None for no lookup index."""
+    not_null: str | None
+    """The column whose NOT NULL the migration restores after the primary key goes, if any."""
+    stale: tuple[str, ...]
+    """The indexes of the old shape that named the column and so go with the primary key."""
+
+
+_FREE_TEXT_KEYS: dict[str, _FreeTextKey] = {
+    "person": _FreeTextKey("graph.text_key(name)", None, "name", ()),
+    "company": _FreeTextKey("graph.text_key(company_id)", None, "company_id", ()),
+    # Both free-text columns are declared NOT NULL by the table itself and kept it.
+    "credited_on": _FreeTextKey(
         "release_id, graph.credit_key(person_name, role)",
+        None,
         None,
         ("credited_on_reverse", "credited_on_role_category"),
     ),
-    "same_as": ("artist_id, graph.text_key(person_name)", "person_name", ("same_as_reverse",)),
-    "track_credited_on": (
+    "same_as": _FreeTextKey("artist_id, graph.text_key(person_name)", "person_name", "person_name", ("same_as_reverse",)),
+    "track_credited_on": _FreeTextKey(
         "release_id, track_ordinal, sub_track_ordinal, graph.credit_key(person_name, role)",
+        None,
         None,
         ("track_credited_on_reverse",),
     ),
     # `role` stays a plain member: it is Discogs' `entity_type_name`, a closed list.
-    "credited_to": ("release_id, graph.text_key(company_id), role, source", "company_id", ("credited_to_reverse",)),
+    "credited_to": _FreeTextKey("release_id, graph.text_key(company_id), role, source", None, "company_id", ("credited_to_reverse",)),
 }
 
 # Moves one relation off its btree primary key. Everything it does is one transaction,
@@ -3693,7 +3727,7 @@ BEGIN
     WHERE constraint_row.conrelid = to_regclass('graph.{relation}')
       AND constraint_row.contype = 'p';
     IF FOUND THEN
-        {key_statement};{lookup_statements}
+        {key_statement};{lookup_statements}{not_null_statement}
         EXECUTE format('ALTER TABLE graph.{relation} DROP CONSTRAINT IF EXISTS %I', primary_key);{stale_drops}
     END IF;
 END
@@ -3721,48 +3755,62 @@ $combine_{relation}$
 """
 
 # The relations keyed through `graph.credit_key`.
-_COMBINED_KEY_RELATIONS: tuple[str, ...] = tuple(relation for relation, entry in _FREE_TEXT_KEYS.items() if "graph.credit_key(" in entry[0])
+_COMBINED_KEY_RELATIONS: tuple[str, ...] = tuple(relation for relation, entry in _FREE_TEXT_KEYS.items() if "graph.credit_key(" in entry.key)
 
 
 def _free_text_key_index(relation: str) -> str:
     """Return the UNIQUE index enforcing one relation's natural key over its hash."""
-    return f"CREATE UNIQUE INDEX IF NOT EXISTS {relation}_key ON graph.{relation} ({_FREE_TEXT_KEYS[relation][0]})"
+    return f"CREATE UNIQUE INDEX IF NOT EXISTS {relation}_key ON graph.{relation} ({_FREE_TEXT_KEYS[relation].key})"
 
 
 def _free_text_lookup_index(relation: str) -> str:
     """Return the hash index answering `=` on one relation's free-text column."""
-    column = _FREE_TEXT_KEYS[relation][1]
+    column = _FREE_TEXT_KEYS[relation].lookup
     if column is None:
         raise ValueError(f"graph.{relation} has no lookup index")
     return f"CREATE INDEX IF NOT EXISTS {relation}_{column}_hash ON graph.{relation} USING hash ({column})"
 
 
+def _retired_lookup_index(relation: str) -> str | None:
+    """Return the qualified name of one relation's retired lookup index, if it had one."""
+    entry = _FREE_TEXT_KEYS[relation]
+    if entry.lookup is not None or entry.not_null is None:
+        return None
+    retired = f"graph.{relation}_{entry.not_null}_hash"
+    return retired if retired in _UNREAD_INDEX_DROPS else None
+
+
 def _free_text_key_statements(relation: str) -> list[tuple[str, str]]:
-    """Return the named indexes replacing one relation's primary key, if it has them."""
+    """Return the named indexes replacing one relation's primary key, if it has them.
+
+    A retired lookup keeps the place its index statement had, as the guarded drop.
+    """
     if relation not in _FREE_TEXT_KEYS:
         return []
-    column = _FREE_TEXT_KEYS[relation][1]
+    column = _FREE_TEXT_KEYS[relation].lookup
     statements = [(f"graph.{relation}_key index", _free_text_key_index(relation))]
     if column is not None:
         statements.append((f"graph.{relation}_{column}_hash index", _free_text_lookup_index(relation)))
+    retired = _retired_lookup_index(relation)
+    if retired is not None:
+        statements.append((f"{retired} retirement", _drop_unread_index(retired)))
     return statements
 
 
 def _free_text_key_migration(relation: str) -> tuple[str, str]:
     """Return the guarded statement moving one existing relation off its primary key."""
-    _key, column, stale = _FREE_TEXT_KEYS[relation]
-    stale_drops = "".join(f"\n        DROP INDEX IF EXISTS graph.{index};" for index in stale)
-    # A column that gave up its only NOT NULL with the primary key gets it back here. A
-    # relation with no lookup declares both of its free-text columns NOT NULL itself.
-    lookup_statements = ""
-    if column is not None:
-        lookup_statements = (
-            f"\n        {_free_text_lookup_index(relation)};\n        ALTER TABLE graph.{relation} ALTER COLUMN {column} SET NOT NULL;"
-        )
+    entry = _FREE_TEXT_KEYS[relation]
+    stale_drops = "".join(f"\n        DROP INDEX IF EXISTS graph.{index};" for index in entry.stale)
+    lookup_statements = "" if entry.lookup is None else f"\n        {_free_text_lookup_index(relation)};"
+    # A column that gave up its only NOT NULL with the primary key gets it back here, whether
+    # or not it has a lookup index. The credit relations declare both free-text columns NOT
+    # NULL themselves.
+    not_null_statement = "" if entry.not_null is None else f"\n        ALTER TABLE graph.{relation} ALTER COLUMN {entry.not_null} SET NOT NULL;"
     statement = _FREE_TEXT_KEY_MIGRATION.format(
         relation=relation,
         key_statement=_free_text_key_index(relation),
         lookup_statements=lookup_statements,
+        not_null_statement=not_null_statement,
         stale_drops=stale_drops,
     )
     return (f"graph.{relation} free-text key migration", statement.strip())
@@ -3770,7 +3818,7 @@ def _free_text_key_migration(relation: str) -> tuple[str, str]:
 
 def _two_hash_key_migration(relation: str) -> tuple[str, str]:
     """Return the guarded statement moving one credit relation off its two-hash key."""
-    statement = _TWO_HASH_KEY_MIGRATION.format(relation=relation, key=_FREE_TEXT_KEYS[relation][0])
+    statement = _TWO_HASH_KEY_MIGRATION.format(relation=relation, key=_FREE_TEXT_KEYS[relation].key)
     return (f"graph.{relation} two-hash key migration", statement.strip())
 
 
@@ -3791,7 +3839,8 @@ def _vertex_table_statements() -> list[tuple[str, str]]:
         # key is enforced over its hash; see `_FREE_TEXT_KEYS`.
         _table("person", "name text NOT NULL"),
         *_free_text_key_statements("person"),
-        _trigram_index("person", "name"),
+        # Person autocomplete is a Neo4j read; the PostgreSQL one this index was for went away.
+        ("graph.person_name_trgm retirement", _drop_unread_index("graph.person_name_trgm")),
         _table("media_family", "name text PRIMARY KEY"),
         _table(
             "medium",
@@ -3827,7 +3876,9 @@ def _vertex_table_statements() -> list[tuple[str, str]]:
 # its column block, the reverse index that makes the target-end walk cheap, and
 # any extra index the table lists. `part_of`, `in_family`, and `sublabel_of` are
 # absent on purpose and stay views; see `_discogs_edge_views` and `_credit_views`.
-# A relation with no reverse index here takes both directions from `_FREE_TEXT_KEYS`.
+# A relation with no reverse index here takes its directions from `_FREE_TEXT_KEYS`: the
+# unique key is the walk from the fixed-size end, and a lookup index, where there is one,
+# the walk from the free-text end.
 _EDGE_TABLES: list[tuple[str, str, str | None, tuple[tuple[str, str], ...]]] = [
     (
         "by_artist",

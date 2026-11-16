@@ -2,6 +2,16 @@
 
 All notable changes to the GrooveMap database schema will be documented here.
 
+## Unreleased
+
+### Release notes
+
+Schema-init drops eight more indexes that nothing reads, freeing 2.35 GB (2.19 GiB) on lux, measured 2026-11-16. The free-text key lookups `graph.credited_to_company_id_hash`, `graph.person_name_trgm`, `graph.person_name_hash` and `graph.company_company_id_hash` (2.12 GB) were built for a planned PostgreSQL read of person and company, which went away when catalog-api removed its PostgreSQL graph backend in October 2026. Person and company reads, autocomplete included, run on Neo4j. The search filter indexes `idx_releases_year`, `idx_masters_year`, `idx_releases_genres` and `idx_releases_media_families` (232 MB) are never reached: catalog-api filters on `public.release_search` and `public.master_search` and casts the year to `int` (gm-catalog-api-q6fy). Lux shows 0 scans for seven of the eight and 2 for `idx_releases_year`, and no repository has a query that could use any of them; `docs/audits/2026-11-14-unread-index-drops.md` has the evidence. `graph.same_as_person_name_hash` stays, because the embedding pipeline joins on it. The unique `<relation>_key` indexes are unchanged. The free-text key migration now restores `NOT NULL` on `graph.person.name`, `graph.company.company_id` and `graph.credited_to.company_id` without building a lookup index. The persistence contract's `graph_schema.free_text_keys` records `lookup: null` for those three relations, and a new `not_null_restored` field; no consumer reads either field and no writer changes. Stop the loaders, then run schema-init. Every drop is `DROP INDEX IF EXISTS`, takes its table lock for milliseconds, and a rerun is a no-op. No manual steps. Rollback is the original `CREATE INDEX` (in `tests/integration/test_unread_index_drops.py`) plus a rebuild, `CONCURRENTLY` on a live database.
+
+### Perf
+
+- **postgres**: retire the unread free-text key lookups and search filter indexes
+
 ## v0.16.0 (2026-11-15)
 
 ### Release notes
